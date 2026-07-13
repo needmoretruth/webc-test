@@ -1,0 +1,438 @@
+# WEBC development plan
+
+Status: authoritative implementation plan  
+Date: 2026-07-12
+
+Implementation checkpoint: Phase 0 and Phase 1 passed their repository gates on
+2026-07-13; Phase 2 is active. This marker records progress and does not weaken
+any acceptance criterion below.
+
+This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
+
+## Working rule
+
+The current repository is a prototype, not the new protocol baseline. Preserve useful code, but do not extend known-invalid assumptions merely because tests currently pass.
+
+Every phase must:
+
+- keep deterministic state transitions;
+- use typed errors;
+- add invariant and adversarial tests;
+- update implementation status and decision records;
+- avoid claims not demonstrated by repeatable tests;
+- keep real bridge funds disabled;
+- keep economics configurable until the relevant phase freezes them.
+
+## Phase 0: repository and specification baseline
+
+Goal: make the repository safe to continue.
+
+### Tasks
+
+- initialize/verify Git history and add a suitable `.gitignore`;
+- install/pin the Rust toolchain and formatting/lint configuration;
+- configure workspace lints to forbid `unsafe` in protocol crates by default and fail CI on unexplained warnings;
+- define the module/public-interface documentation template and apply it to every module changed in this phase;
+- introduce distinct Rust types for consensus values that must not be mixed, beginning with amounts/base units, heights, epochs, nonces, chain IDs, assets, and validator IDs;
+- replace panic-based handling of external and consensus input with typed errors as affected modules are repaired;
+- add CI for format, lint, Rust tests, TypeScript build/tests, and documentation-link checks;
+- fix broken text encoding in legacy documentation/comments;
+- mark legacy prototype defaults as non-authoritative;
+- add architecture decision records for state, consensus, fees, wallet authorization, proofs, contracts, and bridges;
+- add a protocol configuration version and chain ID policy.
+
+### Acceptance
+
+- clean reproducible build from a fresh checkout;
+- Rust documentation generation succeeds, changed public interfaces are documented, and protocol crates contain no unexplained `unsafe`, panic-on-input, or unchecked consensus-number conversion;
+- `cargo fmt --check`, `cargo clippy`, and `cargo test --workspace` pass;
+- TypeScript SDK/widget build and tests pass;
+- no document claims the prototype is mainnet-ready;
+- all confirmed decisions link to `docs/decision-record.md`.
+
+## Phase 1: repair the reusable protocol core
+
+Goal: create a correct deterministic single-node state machine before networking.
+
+### Mandatory replacements/fixes
+
+- change native precision from 9 to 12 decimals;
+- replace six-month halving code with the confirmed annual-rate decay and 1% floor;
+- remove zero-collateral/bootstrap validator behavior from the new protocol path;
+- enforce operator self-stake >=20% of pool stake;
+- implement 7-minute devnet and configurable 7-day mainnet unstaking queues;
+- make stake changes epoch-snapshotted so an intra-epoch exit cannot change the
+  current validator set;
+- implement the lifecycle and global FIFO churn queue from ADR-0008, including
+  `PendingActivation`, `Active`, `ExitQueued`, `CoolingDown`, `Withdrawable`, and
+  one-time `Withdrawn` accounting;
+- treat 7-minute devnet and 7-day mainnet delays as normal minimum targets while
+  allowing bounded queue congestion to extend mass exits;
+- move pools that fail projected 100/20/80 rules into a deterministic draining
+  state for the next snapshot rather than removing voting power mid-epoch;
+- repair genesis accounting so balances, stake, supply, burns, bridge escrow, and rewards reconcile;
+- make block execution atomic, not merely individual transactions;
+- enforce block byte/unit limits before commit;
+- validate declared access lists against actual native-operation access;
+- make slashing evidence contain and verify real signed artifacts;
+- update delegated balances when delegated stake is slashed;
+- preserve pending rewards across partial/full undelegation according to an explicit rule;
+- checkpoint earned rewards when an exit is admitted, stop new rewards during
+  cooldown, and keep the position slashable through its evidence window;
+- remove/deprecate PoH from the authoritative block protocol;
+- delete stale Rust/TypeScript signing-mismatch documentation only after executable cross-language tests prove compatibility.
+
+### New state primitives
+
+- versioned `StateKey` covering accounts, token balances, objects, modules, application namespaces, and protocol state;
+- account authorization lanes for parallel multi-site activity;
+- versioned object ID/owner/version model;
+- atomic transaction journal/overlay;
+- supply invariant report.
+
+### Tests
+
+- conservation: genesis + issuance = liquid + staked + delegated + escrowed + rewards + burned adjustments;
+- block rollback after a late failing transaction;
+- undeclared access rejection;
+- cross-application non-conflict scheduling;
+- same-wallet independent lane concurrency;
+- slashing updates operator, validator aggregate, delegators, and accounts consistently;
+- FIFO/churn processing survives serialization/restart and mass-exit tests;
+- current-epoch validator power is unchanged by exit requests;
+- inflation reference vectors across floor transition;
+- 12-decimal amount serialization across Rust/TypeScript.
+
+## Phase 2: wallet wire format and security foundation
+
+Goal: browser-created transactions are exactly understood by Rust nodes without exposing keys to host sites.
+
+### Tasks
+
+- freeze canonical transaction and signing schemas with explicit version/domain/chain ID;
+- generate shared Rust/TypeScript test vectors;
+- replace camelCase/snake_case ambiguity with one documented wire schema;
+- restore/create the missing SDK public entry point and package exports;
+- use standard mnemonic and Ed25519 derivation libraries rather than custom derivation;
+- define encrypted keystore v1 with authenticated encryption and password-hardening parameters;
+- implement isolated trusted-origin wallet UI and postMessage request protocol;
+- add permission scopes, spend limits, origin display, and human-readable signing confirmation;
+- add versioned account authorization policies and post-quantum root-key fields;
+- prototype ML-DSA signing in browser/WASM and Rust;
+- add recovery, rotation, revocation, and limited session-key tests.
+
+### Acceptance
+
+- Rust verifies transactions signed by every supported browser;
+- TypeScript verifies Rust vectors;
+- host page cannot read wallet secrets through the supported integration API;
+- malformed origins/messages and blind-sign requests are rejected;
+- keystore corruption/wrong-password tests fail safely;
+- no private key is logged, serialized accidentally, or sent to the node.
+
+## Phase 3: local node, storage, and developer APIs
+
+Goal: a restartable node usable by browsers and local applications.
+
+### Tasks
+
+- define storage traits before choosing a database backend;
+- store finalized blocks, headers, receipts, state snapshots/deltas, validator sets, and proof metadata;
+- implement crash-safe transactional commits and startup recovery;
+- add HTTP/WebSocket APIs for health, account/object queries, proofs, blocks, transaction submission, subscriptions, fees, and faucet;
+- add mempool validation, per-lane nonce ordering, expiration, replacement, and fee prioritization;
+- create devnet-only faucet with rate limits and clear no-value labeling;
+- add browser SDK clients and a reference demo site.
+
+### Acceptance
+
+- restart without losing or duplicating committed state;
+- corruption is detected and reported;
+- invalid transactions do not mutate state;
+- browser creates wallet, receives faucet funds, verifies proof, submits transfer, and sees finality;
+- APIs publish explicit versioning and resource limits.
+
+## Phase 4: networking and signed consensus
+
+Goal: a real multi-machine devnet with staked permissionless validators.
+
+### Tasks
+
+- implement authenticated peer identities and peer discovery;
+- gossip transactions, proposals, votes, and finality certificates;
+- rate-limit and score peers without making stake mandatory for ordinary verification nodes;
+- implement deterministic leader schedule and stake snapshots;
+- implement signed prevote/precommit (or selected BFT equivalent);
+- select rotating stake-weighted voting committees without a global validator-count cap;
+- verify chain ID, height, round, proposal hash, validator membership, and voting power;
+- implement fork choice, lock rules, timeout/round changes, and state sync;
+- implement objective double-vote/invalid-proposal evidence;
+- keep PoH absent from consensus.
+
+### Acceptance
+
+- geographically separated nodes converge on one finalized chain;
+- normal blocks finalize in 6-8 seconds under the target test topology;
+- delayed/lost messages trigger safe round changes, not conflicting finality;
+- <1/3 malicious voting power cannot finalize invalid/conflicting blocks;
+- evidence from signed conflicting votes triggers the correct slash exactly once;
+- a joining node syncs from a checkpoint without replaying all history.
+
+## Phase 5: staking pools and economics
+
+Goal: complete the economic-security rules before public incentivization.
+
+### Tasks
+
+- enforce 20/80 operator/delegator pool ratio continuously;
+- enforce the confirmed 100 WEBC activation minimum and 20 WEBC operator minimum at activation;
+- enforce the confirmed 1 WEBC minimum for each active delegation position;
+- implement activation/deactivation queues and epoch snapshots;
+- make stake splitting unable to increase voting power or bypass activation/rate limits;
+- implement commission, reward accounting, claims, compounding options, and dust rules;
+- implement inflation curve and fee distribution against supply invariants;
+- define severe malicious slashes and softer operational penalties;
+- define correlated slashing for coordinated provable attacks;
+- add public validator performance/reward/slash data;
+- add faucet-funded devnet staking UX.
+
+### Acceptance
+
+- property tests cover arbitrary delegation/reward/slash/withdraw sequences;
+- no operator can use delegation above the allowed leverage;
+- pools below 100 WEBC cannot produce or vote, and falling below the threshold follows an explicit safe deactivation rule;
+- delegations below 1 WEBC cannot become active or create reward-accounting dust;
+- withdrawal cannot evade evidence from the slashable period;
+- reward totals reconcile exactly;
+- economic simulations document centralization and attack-cost scenarios.
+
+## Phase 6: parallel execution and localized fees
+
+Goal: unrelated sites and applications do not block each other at the state scheduler or localized fee layer.
+
+### Tasks
+
+- implement application namespace registry;
+- implement enforced account/object read/write declarations;
+- build deterministic parallel batches and transactional overlays;
+- resolve deterministic commit order and retry behavior;
+- implement per-resource/application congestion measurement;
+- implement localized base/priority pricing plus a network-wide minimum;
+- implement fair block packing so one hot application cannot monopolize all capacity;
+- implement sponsor/paymaster accounts with budgets and abuse protection;
+- build sharded examples for tokens, games, swaps, and site sessions.
+
+### Benchmarks
+
+Run on at least:
+
+- minimum reference machine: 4 CPU cores, 8 GB RAM, SSD;
+- recommended reference machine: 8 CPU cores, 16 GB RAM, NVMe;
+- performance machine with published full specifications.
+
+Measure simple transfers, conflicting transfers, independent applications, token transfers, swaps, games, storage-heavy contracts, and adversarial access lists.
+
+### Acceptance
+
+- unrelated application traffic executes concurrently;
+- congestion price for one isolated application does not raise another's localized price;
+- global saturation remains bounded by fair capacity rules;
+- sustained simple-transfer benchmark reaches staged 100/500/1,000/2,000+ TPS gates before any claim is published;
+- deterministic roots match across thread counts and machines.
+
+## Phase 7: contract runtime bakeoff
+
+Goal: select one initial public runtime using evidence, not preference.
+
+### Candidates
+
+- restricted deterministic WebAssembly, Rust-first;
+- Move VM with WEBC storage integration;
+- EVM/Solidity compatibility runtime.
+
+### Common reference applications
+
+- fungible token with mint/freeze/revoke policy;
+- NFT collection;
+- constant-product token swap;
+- commit/reveal rock-paper-scissors;
+- conditional payment/refund;
+- sponsored website membership/payment;
+- object/account contention stress test.
+
+### Evaluation
+
+- execution throughput and latency;
+- memory and binary size;
+- deterministic sandbox complexity;
+- parallel access enforcement;
+- developer code volume and tooling;
+- TypeScript client generation;
+- auditability and known security history;
+- ZK proof cost;
+- Solidity ecosystem compatibility;
+- upgrade and maintenance burden.
+
+### Acceptance
+
+- publish benchmark code/results;
+- choose one initial runtime and freeze a versioned ABI;
+- keep other runtimes disabled unless separately specified/audited;
+- never claim source-level Solidity compatibility without EVM-semantic conformance tests.
+
+## Phase 8: succinct proofs and post-quantum experiments
+
+Goal: browsers verify compact finalized state and WEBC determines a defensible mainnet quantum posture.
+
+### Tasks
+
+- define versioned `StateProof` and finalized-checkpoint proof interfaces;
+- retain Merkle proof implementation as fallback;
+- compare at least two proof backends where practical;
+- prefer post-quantum-friendly hash/STARK assumptions for long-term design;
+- benchmark block/state-transition proof generation and browser verification;
+- benchmark ML-DSA transactions and post-quantum validator attestations;
+- prototype proof aggregation of post-quantum signatures;
+- define proof-lag rules and failure fallback;
+- publish a cryptographic threat model and migration plan.
+
+### Acceptance
+
+- browser verifies checkpoint and account/object inclusion without trusting one RPC;
+- proof verification stays small and fast on target browsers;
+- invalid state transition and invalid signature batches cannot produce accepted proofs;
+- mainnet security wording exactly matches what is implemented;
+- no dependency on one proof vendor is embedded without a replacement/version path.
+
+## Phase 9: website platform
+
+Goal: safe embedded website use.
+
+### Tasks
+
+- publish TypeScript SDK, isolated wallet surface, and framework-free widget;
+- add React/Vue/Svelte adapters only after the core API stabilizes;
+- add payment requests, subscriptions, sponsored transactions, token/NFT operations, staking, and governance clients;
+- add application namespace registration and permission inspection;
+- add event subscriptions and headless-agent toolkit;
+- add file/content hash helpers and encrypted-access examples;
+- add one-click voluntary donation/payment links;
+- add origin/security indicators and a user-readable transaction simulator.
+
+### Acceptance
+
+- malicious host-site test suite cannot read keys through supported APIs;
+- unrelated sites use the same wallet without sharing site permissions;
+- demo sites run concurrently without scheduler contention when state is independent;
+- file purchase/download demo verifies payment and content hash without storing file bytes on-chain.
+
+## Phase 10: tokens, NFTs, and application governance
+
+Goal: native low-cost asset creation and configurable application rules.
+
+### Tasks
+
+- implement native token/NFT registries and metadata commitments;
+- implement mint/burn/freeze/pause/authority transfer/revocation;
+- implement transfer-policy hooks without a global token bottleneck;
+- implement governance instances with snapshots, quorum, timelocks, delegation, and execution policy;
+- implement wallet warnings for centralized/restrictive assets;
+- add spam-resistant creation/deployment/storage fees.
+
+### Acceptance
+
+- ordinary transfers do not write one global mint object;
+- freeze/pause powers are visible before acceptance/signing;
+- revoked authority cannot be restored;
+- governance snapshots prevent double voting and balance-after-snapshot manipulation.
+
+## Phase 11: bridge prototypes
+
+Goal: prove bidirectional accounting with no real value.
+
+### Tasks
+
+- freeze versioned cross-chain message format and asset identifiers;
+- build Solidity Ethereum mock bridge and wrapped WEBC token;
+- build Rust Solana mock bridge program and wrapped WEBC mint;
+- implement WEBC lock/mint/burn/release state machines;
+- support standard Ethereum tokens and Solana Token/Token-2022 metadata;
+- add relayer/guardian test service, replay database, reorg handling, and confirmation rules;
+- add browser bridge UI for test assets;
+- add per-asset limits, pause, delayed large exits, monitoring, and incident drills.
+
+### Acceptance
+
+- native WEBC round-trips WEBC -> Ethereum/Solana -> WEBC in test environments;
+- external test tokens round-trip origin -> WEBC -> origin;
+- double mint/release and cross-domain replay fail;
+- decimal conversion is exact or rejects unsupported amounts;
+- origin-chain reorg tests do not create unbacked assets;
+- all UIs state that assets are valueless test assets.
+
+## Phase 12: public incentivized testnet and distribution measurement
+
+Goal: begin the only activity period eligible for the 30% contributor distribution.
+
+### Preconditions
+
+- public contribution/distribution specification published before start;
+- metrics, caps/diminishing returns, anti-duplicate strategy, audit method, and appeal process frozen;
+- no retrospective private-development rewards;
+- security reporting and privacy policy published.
+
+### Tasks
+
+- operate long-running public testnet;
+- reward useful verified validation, proof work, bugs, code, documentation, tooling, and adversarial tests;
+- publish contribution ledger and periodic audits;
+- test validator geographic/network diversity;
+- rehearse upgrades, outages, attacks, and recovery.
+
+### Acceptance
+
+- distribution results are reproducible from public evidence;
+- no single contribution class can dominate the pool;
+- major Sybil/farming scenarios are measured and mitigated;
+- network survives extended public adversarial operation.
+
+## Phase 13: mainnet gates
+
+Mainnet does not launch merely because features exist.
+
+Required gates:
+
+- protocol, consensus, economics, wallet, runtime, proof, and distribution specifications frozen;
+- multiple independent security audits;
+- bridge remains disabled for real funds unless separately approved/audited;
+- genesis file and allocation proofs publicly reproducible;
+- validator set has sufficient independent stake/operators before genesis;
+- monitoring and incident response operational;
+- client release reproducible and signed;
+- no founder master key;
+- upgrade/governance process published;
+- public risk disclosure published.
+
+## Phase 14: production bridges
+
+Real-fund bridges are a post-mainnet or separately gated launch.
+
+- Prefer light-client/ZK verification where feasible.
+- If a guardian/quorum bridge is temporarily used, publish every trust assumption, key holder, threshold, limit, pause path, and exit risk.
+- Require separate audits for Ethereum contracts, Solana programs, WEBC bridge logic, relayers, and operations.
+- Begin with low per-asset limits and increase only after measured safe operation.
+
+## Immediate next implementation milestone
+
+Do not start with RPC or P2P yet.
+
+The next implementation milestone is **Phase 0 plus the first half of Phase 1**:
+
+1. establish reproducible toolchain/CI;
+2. add invariant tests that expose current genesis, block atomicity, slashing, access-list, and delegation inconsistencies;
+3. introduce versioned protocol configuration;
+4. implement 12-decimal amounts and the new inflation curve;
+5. remove zero-collateral bootstrap behavior from the new protocol path;
+6. update `docs/implementation-status.md` after every completed item.
+
+Only after the single-node state machine is internally consistent should networking, RPC, contracts, proofs, or bridges be expanded.
