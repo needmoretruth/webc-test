@@ -95,12 +95,22 @@ Deliberately out of scope: producing the ML-DSA root reveal in the browser
 constructors accept a reveal the owner produces elsewhere). Session subkeys sign
 transfers through the normal `signTransaction` flow.
 
-### Step 8 — benchmarks (only remaining item)
-Session-key transaction verification vs ordinary Ed25519 transfer, and ML-DSA-65
-verify/sign vs Ed25519. Use the reference machines in `development-plan.md`
-§Phase 6 and publish numbers before any performance claim. Deferred because this
-container is not a reference machine, so numbers taken here would be misleading as
-a basis for any claim; a rough ratio can still be captured and clearly labelled.
+### Step 8 — benchmarks — tool landed; reference numbers still pending
+`webc-node bench [--iterations N]` times Ed25519 sign/verify against ML-DSA-65
+keygen/sign/verify and prints per-op microseconds, the verify/sign ratios, and
+the key/signature sizes. It is prominently labelled indicative — **not** a
+reference machine and **not** a performance claim.
+
+Indicative ratios observed in this dev container (release build, ~300–500
+iterations; do not cite as a claim): ML-DSA-65 verify ≈ 4–4.5× Ed25519 verify,
+ML-DSA-65 sign ≈ 34–36× Ed25519 sign, signature 3309 B vs 64 B, public key
+1952 B vs 32 B. Design takeaway: ML-DSA-65 is used only for the root signature on
+rare critical actions (session-key install/revoke, active-key and root rotation),
+never per ordinary Ed25519 transaction, so its cost and size are amortised.
+
+Still to do on a real reference machine (`development-plan.md` §Phase 6): capture
+session-key transaction verification vs an ordinary Ed25519 transfer end to end,
+and publish reference numbers before making any performance claim.
 
 ### Sibling (outside the session-key plan) — DONE
 Primary-key **recovery and rotation** is implemented.

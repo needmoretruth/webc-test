@@ -411,10 +411,11 @@ pruned deterministically at each epoch boundary. The TypeScript SDK now exposes
 the full session-key and rotation surface (operation constructors, access lists,
 `deriveSessionKeyIdHex` matching Rust, browser session-subkey generation, and
 epoch-based expiry display), with cross-language fixtures pinning byte-parity for
-the four operations and the id derivation. The only remaining session-key item is
-benchmarks (session-key and ML-DSA verify/sign vs Ed25519), deferred until a
-reference machine is available. `docs/continuation-guide.md` and
-`docs/session-keys-next-steps.md` hold the exact remaining sequence.
+the four operations and the id derivation. A `webc-node bench` command gives an
+indicative (non-reference, not-a-claim) ML-DSA-65 vs Ed25519 signature comparison;
+reference-machine numbers and an end-to-end session-key vs Ed25519-transfer
+benchmark are the only remaining session-key item. `docs/continuation-guide.md`
+and `docs/session-keys-next-steps.md` hold the exact remaining sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.
