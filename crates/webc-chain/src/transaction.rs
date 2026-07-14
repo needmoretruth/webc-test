@@ -135,6 +135,22 @@ pub enum Operation {
         /// Reveal proving knowledge of the committed post-quantum root.
         post_quantum_root_reveal: PostQuantumRootReveal,
     },
+    /// Rotates the account's active Ed25519 transaction key (recovery/rotation).
+    ///
+    /// Critical action: requires the default lane, an installed policy, and a
+    /// post-quantum root signature over the exact new key. Recovery works even
+    /// when the old key is lost or compromised, because the transaction envelope
+    /// may be signed by the *new* key and the real authority is the root
+    /// signature. A successful rotation advances the policy revision, which
+    /// invalidates every outstanding session key; the post-quantum root itself is
+    /// preserved.
+    RotateActiveTransactionKey {
+        /// Replacement Ed25519 key that will authorize ordinary transactions.
+        new_active_transaction_key: PublicKeyBytes,
+        /// Root signature over the exact rotation (chain, owner, revision, nonce,
+        /// new key), proving control of the account's recovery root.
+        post_quantum_root_reveal: PostQuantumRootReveal,
+    },
     /// Creates revision one of an address-owned application object.
     CreateObject {
         /// Caller-chosen collision-resistant object identity.
@@ -268,7 +284,9 @@ impl Operation {
     pub fn required_units(&self) -> u64 {
         match self {
             Self::Transfer { .. } => 500,
-            Self::InstallAuthorizationPolicy { .. } => 25_000,
+            Self::InstallAuthorizationPolicy { .. } | Self::RotateActiveTransactionKey { .. } => {
+                25_000
+            }
             Self::InstallSessionKey { .. } | Self::RevokeSessionKey { .. } => 15_000,
             Self::OpenAuthorizationLane { .. } | Self::FundAuthorizationLane { .. } => 10_000,
             Self::CreateObject { .. } | Self::MutateObject { .. } | Self::TransferObject { .. } => {
@@ -327,6 +345,13 @@ impl Operation {
             Self::RevokeSessionKey { session_key, .. } => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::session_key(sender, *session_key));
+            }
+            Self::RotateActiveTransactionKey { .. } => {
+                // Rotation writes the account (nonce/fees) and the policy record
+                // it replaces. It intentionally touches no session-key records:
+                // the revision bump alone invalidates them lazily at use time.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::authorization_policy(sender));
             }
             Self::CreateObject {
                 object_id,
@@ -456,7 +481,10 @@ impl Operation {
                 }
             }
         }
-        if !matches!(self, Self::InstallAuthorizationPolicy { .. }) {
+        if !matches!(
+            self,
+            Self::InstallAuthorizationPolicy { .. } | Self::RotateActiveTransactionKey { .. }
+        ) {
             push_unique_key(&mut read_only, StateKey::authorization_policy(sender));
         }
         push_unique_key(

@@ -32,11 +32,11 @@ pub use account::Account;
 pub use amount::{Amount, WEBC_DECIMALS, WEBC_UNIT};
 pub use authorization::AuthorizationLane;
 pub use authorization_policy::{
-    AccountAuthorizationPolicy, AccountAuthorizationPolicyV1, AuthorizationPolicyRevision,
-    PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
-    INITIAL_AUTHORIZATION_POLICY_REVISION, LEGACY_AUTHORIZATION_POLICY_REVISION,
-    MAX_AUTHORIZATION_POLICY_REVISION, MAX_POST_QUANTUM_PUBLIC_KEY_BYTES,
-    MAX_POST_QUANTUM_SIGNATURE_BYTES,
+    active_key_rotation_message, AccountAuthorizationPolicy, AccountAuthorizationPolicyV1,
+    AuthorizationPolicyRevision, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+    ACTIVE_KEY_ROTATION_DOMAIN, INITIAL_AUTHORIZATION_POLICY_REVISION,
+    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_AUTHORIZATION_POLICY_REVISION,
+    MAX_POST_QUANTUM_PUBLIC_KEY_BYTES, MAX_POST_QUANTUM_SIGNATURE_BYTES,
 };
 pub use block::{Block, BlockHeader};
 pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildInput};
@@ -268,6 +268,12 @@ pub enum ChainError {
     SessionKeyFeeBudgetExceeded,
     #[error("session-key constraints are invalid")]
     InvalidSessionKeyConstraints,
+    #[error("active-key rotation must use the default lane")]
+    ActiveKeyRotationRequiresDefaultLane,
+    #[error("active-key rotation requires an installed policy with a post-quantum root")]
+    ActiveKeyRotationRequiresInstalledPolicy,
+    #[error("active-key rotation must change the active transaction key")]
+    ActiveKeyRotationToSameKey,
 }
 
 impl From<bincode::Error> for ChainError {
