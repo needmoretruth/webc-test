@@ -9,9 +9,9 @@
 //! checks against the stored commitment and verifies. The separate policy
 //! revision invalidates signatures prepared under older keys.
 
-use crate::ChainError;
+use crate::{ChainError, ChainId};
 use serde::{Deserialize, Serialize};
-use webc_crypto::{Hash256, PublicKeyBytes};
+use webc_crypto::{Address, Hash256, PublicKeyBytes};
 
 /// Revision used by address-derived Ed25519 accounts before policy installation.
 pub const LEGACY_AUTHORIZATION_POLICY_REVISION: AuthorizationPolicyRevision =
@@ -261,6 +261,35 @@ impl AccountAuthorizationPolicy {
         }))
     }
 
+    /// Produces the policy after rotating the active transaction key.
+    ///
+    /// The revision advances by one (invalidating every session key bound to the
+    /// old revision, since each session key stores the revision it was installed
+    /// under) and the post-quantum recovery root is preserved unchanged, so
+    /// rotation can never silently drop portable recovery. This is a pure
+    /// transformation: the caller authorizes it with a root signature and commits
+    /// the result to state.
+    pub fn rotate_active_key(
+        &self,
+        new_active_transaction_key: PublicKeyBytes,
+    ) -> Result<Self, ChainError> {
+        match self {
+            Self::V1(policy) => {
+                let revision = policy
+                    .revision
+                    .checked_next()
+                    .ok_or(ChainError::InvalidAuthorizationPolicyRevision)?;
+                let rotated = Self::V1(AccountAuthorizationPolicyV1 {
+                    revision,
+                    active_transaction_key: new_active_transaction_key,
+                    post_quantum_root: policy.post_quantum_root,
+                });
+                rotated.validate()?;
+                Ok(rotated)
+            }
+        }
+    }
+
     /// Returns the revision every transaction authorized by this policy signs.
     pub const fn revision(&self) -> AuthorizationPolicyRevision {
         match self {
@@ -316,6 +345,51 @@ impl AccountAuthorizationPolicyV1 {
         self.revision.validate()?;
         self.post_quantum_root.validate()
     }
+}
+
+/// Domain tag separating active-key rotation signatures from every other
+/// post-quantum-root-authorized action.
+///
+/// The tag is embedded in the signed message (not the ML-DSA context), so a
+/// root signature prepared for a session-key install or revoke can never be
+/// replayed as a key rotation, and vice versa. Bumping it invalidates all
+/// previously prepared rotation signatures.
+pub const ACTIVE_KEY_ROTATION_DOMAIN: &str = "WEBC_ACTIVE_KEY_ROTATION_V1";
+
+/// Canonical bytes the post-quantum root must sign to authorize one exact
+/// active-key rotation.
+///
+/// The message binds the domain, chain id, owning account, the current policy
+/// revision, the account nonce, and the exact new active key. A signature
+/// captured for this rotation therefore cannot move to another key, nonce,
+/// account, chain, or post-rotation revision: any change rebuilds different
+/// bytes that the stored root signature no longer covers. Both the signer
+/// (wallet/recovery tool) and the verifier in `state` must build this with the
+/// identical function.
+pub fn active_key_rotation_message(
+    chain_id: &ChainId,
+    owner: Address,
+    policy_revision: AuthorizationPolicyRevision,
+    nonce: u64,
+    new_active_transaction_key: &PublicKeyBytes,
+) -> Result<Vec<u8>, ChainError> {
+    #[derive(Serialize)]
+    struct RotationMessage<'a> {
+        domain: &'a str,
+        chain_id: &'a ChainId,
+        owner: Address,
+        policy_revision: AuthorizationPolicyRevision,
+        nonce: u64,
+        new_active_transaction_key: &'a PublicKeyBytes,
+    }
+    crate::canonical::canonical_json_bytes(&RotationMessage {
+        domain: ACTIVE_KEY_ROTATION_DOMAIN,
+        chain_id,
+        owner,
+        policy_revision,
+        nonce,
+        new_active_transaction_key,
+    })
 }
 
 #[cfg(test)]
