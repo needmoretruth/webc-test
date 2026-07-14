@@ -171,6 +171,12 @@ pub enum Event {
         /// Opaque identity of the revoked session key.
         session_key: SessionKeyId,
     },
+    SessionKeyExpired {
+        /// Account whose session key was pruned at an epoch boundary.
+        owner: Address,
+        /// Opaque identity of the expired session key.
+        session_key: SessionKeyId,
+    },
     ActiveTransactionKeyRotated {
         /// Account whose active transaction key was replaced.
         owner: Address,
@@ -911,6 +917,29 @@ impl ChainState {
             }
         }
         self.current_epoch = next_epoch;
+
+        // Epoch-boundary pruning of expired session keys. A key is usable while
+        // `current_epoch <= expires_after_epoch`; once the epoch passes it, the
+        // key can never authorize again (epochs only ever increase), so removing
+        // it is safe. The use-time check already rejects expired keys, so this
+        // changes no authorization outcome — it only reclaims space and bounds
+        // session-key map growth. It is deterministic: `next_epoch` is committed
+        // state, iteration is sorted, and it is a pure function of the snapshot,
+        // so replaying from a serialized state prunes identically.
+        let expired: Vec<(Address, SessionKeyId)> = self
+            .session_keys
+            .iter()
+            .filter(|(_, session)| session.expires_after_epoch.get() < next_epoch)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expired {
+            self.session_keys.remove(&key);
+            events.push(Event::SessionKeyExpired {
+                owner: key.0,
+                session_key: key.1,
+            });
+        }
+
         Ok(events)
     }
 
@@ -6761,5 +6790,76 @@ mod tests {
         // The recovery root is still B after the active-key rotation.
         assert_eq!(*policy.post_quantum_root(), new_root);
         assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    // ----- epoch-boundary session-key pruning -----
+
+    #[test]
+    fn expired_session_keys_are_pruned_at_the_epoch_boundary_deterministically() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let short = Keypair::from_seed([9u8; 32]);
+        let long = Keypair::from_seed([10u8; 32]);
+        let short_id = SessionKeyId::derive(&short.public_key());
+        let long_id = SessionKeyId::derive(&long.public_key());
+
+        // Installed at epoch 0: `short` expires after epoch 1, `long` after 50.
+        let mut short_c = session_constraints();
+        short_c.lifetime_epochs = 1;
+        let mut long_c = session_constraints();
+        long_c.lifetime_epochs = 50;
+        state
+            .execute_transaction(&install_session_key_tx(&alice, &short, 1, short_c), &config)
+            .unwrap();
+        state
+            .execute_transaction(&install_session_key_tx(&alice, &long, 2, long_c), &config)
+            .unwrap();
+
+        // Advance to epoch 1: `short` is still usable at its expiry epoch, so
+        // nothing is pruned yet.
+        state.distribute_epoch_rewards(&config).unwrap();
+        assert_eq!(state.current_epoch, 1);
+        assert!(state
+            .session_keys
+            .contains_key(&(alice.address(), short_id)));
+        assert!(state.session_keys.contains_key(&(alice.address(), long_id)));
+
+        // Snapshot at epoch 1, then advance to epoch 2 on both the live state and
+        // a serialized-then-restored copy. Pruning is a pure function of committed
+        // state, so both must produce identical state, root, and events.
+        // bincode (not JSON) because state maps use non-string tuple keys.
+        let snapshot = bincode::serialize(&state).unwrap();
+        let mut restored: ChainState = bincode::deserialize(&snapshot).unwrap();
+        let live_events = state.distribute_epoch_rewards(&config).unwrap();
+        let restored_events = restored.distribute_epoch_rewards(&config).unwrap();
+        assert_eq!(state, restored);
+        assert_eq!(state.state_root().unwrap(), restored.state_root().unwrap());
+        assert_eq!(live_events, restored_events);
+
+        // At epoch 2 the short key is gone (its expiry epoch has passed) and the
+        // long key survives; a prune event was emitted for the short key.
+        assert_eq!(state.current_epoch, 2);
+        assert!(!state
+            .session_keys
+            .contains_key(&(alice.address(), short_id)));
+        assert!(state.session_keys.contains_key(&(alice.address(), long_id)));
+        assert!(live_events.iter().any(|event| matches!(
+            event,
+            Event::SessionKeyExpired { owner, session_key }
+                if *owner == alice.address() && *session_key == short_id
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Pruning removes only unusable keys, so it never changes an authorization
+        // outcome: the surviving long key still authorizes a transfer.
+        let transfer = session_transfer_tx(
+            &alice,
+            &long,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            _bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
     }
 }
