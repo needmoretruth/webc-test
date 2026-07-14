@@ -72,18 +72,35 @@ check already rejects expired keys — it only bounds map growth. A
 restart-equivalence test advances a live state and a bincode-restored copy across
 the same boundary and asserts identical state, root, and events.
 
-### Step 8 — benchmarks
-Session-key transaction verification vs ordinary Ed25519 transfer; and (after
-step 6) ML-DSA-65 verify/sign vs Ed25519. Use the reference machines in
-`development-plan.md` §Phase 6. Publish numbers before any policy claim.
+### Step 9 — browser/SDK session-key surface — DONE
+The TypeScript SDK now builds every session-key and rotation operation with
+byte-identical canonical encoding to Rust:
+- `types.ts` adds `SessionKeyIdJson`, `SessionAllowedOperationsJson`,
+  `SessionKeyConstraintsJson`, `PostQuantumRootRevealJson`, and the four new
+  `OperationJson` variants (`InstallSessionKey`, `RevokeSessionKey`,
+  `RotateActiveTransactionKey`, `RotatePostQuantumRoot`).
+- `transaction.ts` adds the four operation constructors, a `sessionKeyKey`
+  state-key helper, `deriveSessionKeyIdHex` (matching Rust `SessionKeyId::derive`),
+  and access-list logic (rotations write the policy and are excluded from
+  read-only; install derives its session-key id and needs the async builder).
+- `session-key.ts` adds `generateSessionSubkey` (non-extractable Ed25519 via the
+  `wallet.ts` pattern), `sessionSubkeyPublicKeyHex`, `sessionSubkeyIdHex`, and
+  `describeSessionKeyExpiry` (epoch-based; never wall-clock).
+- Cross-language fixtures pin byte-parity: a Rust test hashes the four operations
+  with deterministic placeholder bytes and the SDK test asserts the identical
+  canonical hash; a second pair pins the session-key id derivation.
 
-### Step 9 — browser/SDK session-key surface
-Session subkey generation (non-extractable Ed25519 via existing `wallet.ts`
-pattern), install/session-signing helpers, expiry display, and the TS
-`OperationJson` + cross-language fixtures for `InstallSessionKey`/`RevokeSessionKey`
-and the new `PostQuantumRootReveal` shape. Note: ML-DSA signing in the browser
-(for install/revoke) is heavy (WASM); scope it explicitly. The TS state-key
-`SessionKey` variant already exists.
+Deliberately out of scope: producing the ML-DSA root reveal in the browser
+(signing with the recovery root is heavy WASM and lives outside this SDK — the
+constructors accept a reveal the owner produces elsewhere). Session subkeys sign
+transfers through the normal `signTransaction` flow.
+
+### Step 8 — benchmarks (only remaining item)
+Session-key transaction verification vs ordinary Ed25519 transfer, and ML-DSA-65
+verify/sign vs Ed25519. Use the reference machines in `development-plan.md`
+§Phase 6 and publish numbers before any performance claim. Deferred because this
+container is not a reference machine, so numbers taken here would be misleading as
+a basis for any claim; a rough ratio can still be captured and clearly labelled.
 
 ### Sibling (outside the session-key plan) — DONE
 Primary-key **recovery and rotation** is implemented.

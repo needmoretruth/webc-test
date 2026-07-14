@@ -89,7 +89,9 @@ Resume with the first incomplete item in this order:
    - session-key and ML-DSA (verify/sign vs Ed25519) benchmarks before any policy
      claim;
    - the browser/SDK session-key surface (subkey generation, install and session
-     signing, expiry display, and cross-language operation and reveal fixtures);
+     signing, expiry display, and cross-language operation and reveal fixtures) —
+     **implemented**; only benchmarks remain, deferred until a reference machine
+     is available;
    - (sibling, outside the session-key plan) primary-key recovery and rotation
      operations — **implemented**. Root-gated `RotateActiveTransactionKey`
      replaces the active key (recovery works via a new-key-signed envelope plus
