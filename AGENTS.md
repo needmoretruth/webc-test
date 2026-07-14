@@ -158,6 +158,13 @@ Read `docs/implementation-status.md` for the audit summary.
 - Speak in simple Korean unless the user requests another language.
 - Lead with the outcome. Explain every unavoidable technical term immediately in ordinary words.
 - Never make a user-owned product or economic decision silently. Present choices, practical advantages, disadvantages, and a recommendation, then wait for confirmation.
+- When a question is genuinely the user's to answer, ask it in plain prose in the
+  chat: lay out the candidate options with their details, pros, and cons in
+  easy-to-understand language, and give a recommendation. Do not use the built-in
+  structured question UI for this; write the question and choices out as text.
+- Decide everything the user has delegated — technical direction, architecture,
+  library, and implementation choices that evidence or tests can settle — yourself,
+  autonomously, without pausing. Only stop for a genuinely user-owned decision.
 - Do not push implementation-only constants onto the user when tests, measurements, or security analysis can decide them.
 - Clearly label what is confirmed, recommended, experimental, unimplemented, or unsafe for real funds.
 
