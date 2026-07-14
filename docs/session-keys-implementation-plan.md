@@ -2,11 +2,11 @@
 
 Status: **core implemented (single-node); devnet-only, disabled for real funds.**
 The on-chain state machine, operations, constraint enforcement, state-root and
-supply integration, and the full Rust test matrix (steps 1–5 of [§13](#13-staged-implementation-each-step-compiles-tests-and-commits-alone))
-are implemented and passing. Remaining: the ML-DSA root-signature gate (step 6),
-optional expiry pruning (step 7), benchmarks (step 8), and the browser/SDK
-surface (step 9). The macro policy choice it prototypes is still an open
-technical gate (see [§14](#14-open-decisions-and-gates)).
+supply integration, the full Rust test matrix (steps 1–5 of [§13](#13-staged-implementation-each-step-compiles-tests-and-commits-alone)),
+and the **real ML-DSA-65 root-signature gate on install/revoke (step 6)** are
+implemented and passing. Remaining: optional expiry pruning (step 7), benchmarks
+(step 8), and the browser/SDK surface (step 9). The macro policy choice it
+prototypes is still an open technical gate (see [§14](#14-open-decisions-and-gates)).
 
 Implementation note: during review the design gained a **cumulative fee budget**
 (`total_fee_budget` / `spent_fees`) beyond the original per-use fee cap, so a
@@ -52,10 +52,11 @@ kinds of action, only from that site, and only until it expires.
   remains an **open gate** (`docs/decision-record.md` line 190) resolved only by
   benchmarks, threat models, and audits. This plan builds the session-key path
   as a prototype to measure, not a frozen decision.
-- Real ML-DSA signature verification. No post-quantum crate exists in the
-  workspace yet; the post-quantum root stays a hash commitment
-  (`crates/webc-chain/src/authorization_policy.rs:79-109`). The plan implements
-  the parts that are real and testable today and marks the deferred pieces.
+- Post-quantum-**security** claims. Real ML-DSA-65 signature verification is now
+  implemented on install/revoke behind the replaceable `webc-crypto::mldsa`
+  boundary (step 6), but ML-DSA-65 remains a named devnet candidate: no
+  benchmarks, no external review, and no security claim until step 8 and a later
+  audit. The path stays disabled for real funds.
 - Networking, RPC, mempool, and persistent storage integration (Phase 3/4).
 - Any real-fund or mainnet enablement.
 
@@ -280,21 +281,29 @@ They:
 2. require the **default lane** and are signed by the account's **active
    transaction key**, matching how `InstallAuthorizationPolicy` and lane
    management are gated (`state.rs:1079-1080, 1097-1100`);
-3. carry a **reveal of the post-quantum root public key** whose SHA-256
-   commitment must equal the stored `post_quantum_root.public_key_hash`
-   (`crates/webc-chain/src/authorization_policy.rs:79-108`).
+3. carry a **reveal that both binds the root public key to the stored commitment
+   and proves an ML-DSA-65 signature by that root** over the exact action. The
+   revealed key's SHA-256 commitment must equal the stored
+   `post_quantum_root.public_key_hash`, and the accompanying signature must
+   verify over the canonical authorization message
+   (`crates/webc-chain/src/authorization_policy.rs`, `PostQuantumRootReveal::verify`).
 
-**Honest limitation, recorded as required by `AGENTS.md` line 108.** Step 3 today
-can only verify the *hash commitment* of the revealed root, not an ML-DSA
-*signature* by that root, because no post-quantum verifier exists in the
-workspace. So the v1 gate proves "the caller knows the committed root public
-key" but not "the root signed this exact request." Until ML-DSA verification
-lands, session-key authorization is therefore **no stronger than the active-key
-gate plus a root-knowledge check**, and must be labelled devnet-only and
-disabled for real funds. When ML-DSA arrives, the reveal is extended to a root
-**signature** over the domain-separated install/revoke payload, which is the
-point at which the `docs/decision-record.md` line 120 requirement is truly met.
-This staging is spelled out in §13 (step 6) and §14.
+**Implemented (step 6).** The reveal is a real ML-DSA-65 signature, not a
+commitment-knowledge check. `PostQuantumRootReveal` carries `{scheme, public_key,
+signature}`; `verify` (a) bounds both fields, (b) checks the scheme, (c) binds
+the revealed public key to the stored commitment, then (d) verifies the signature
+under it via the replaceable `webc-crypto::mldsa` boundary. The signed message is
+`session_key_authorization_message(chain_id, owner, policy_revision, nonce,
+action)` under the `WEBC_SESSION_KEY_AUTHORIZATION_V1` domain, so the signature is
+bound to one exact install/revoke, one policy revision, and one nonce. This closes
+the earlier gap: a public key is public and copyable from on-chain history, so
+proving *knowledge* of it was no defense; proving control of the root *secret* for
+this exact message is. A compromised active Ed25519 key therefore still cannot
+authorize a critical action on its own. This satisfies the intent of
+`docs/decision-record.md` line 120 for the single-node state machine. It remains
+**devnet-only, disabled for real funds**: ML-DSA-65 is a named candidate behind a
+replaceable boundary, not a benchmarked, reviewed post-quantum-security claim
+(benchmarks are step 8).
 
 Requiring an installed policy also satisfies the "must not silently replace
 portable recovery" rule (`docs/decision-record.md` line 111): the recovery root
@@ -692,10 +701,10 @@ ADR-0008's invariant list):
    only by integer epoch comparison against committed state — never by wall clock.
 4. A session key is bound to one lane and one origin; it cannot act on another
    origin's lane.
-5. Installing or revoking a session key requires the account's post-quantum root
-   (v1: root-commitment reveal; full signature is a recorded later gate), the
-   default lane, and an installed policy. A legacy account cannot own session
-   keys.
+5. Installing or revoking a session key requires a valid **ML-DSA-65 signature by
+   the account's post-quantum root** over the exact action (bound to chain id,
+   owner, policy revision, and nonce), plus the default lane and an installed
+   policy. A legacy account cannot own session keys.
 6. A session key can never install a policy, install or revoke another session
    key, rotate or revoke the root, or otherwise perform a critical action; the
    portable recovery root always outranks it and is never replaced by it.
@@ -730,6 +739,15 @@ ADR-0008's invariant list):
 - *Root exposure under a quantum adversary.* Critical actions stay behind the
   post-quantum root; a compromised classical session key cannot escalate to
   recovery, rotation, staking, or policy changes.
+- *Compromised active key forging a critical action.* Install/revoke require an
+  ML-DSA-65 signature by the root over the exact action, not merely knowledge of
+  the (public, copyable) root key. Holding the active Ed25519 key is not enough
+  to install or revoke a session key; the root secret is required.
+- *Root-signature replay / repurposing.* The signed message binds chain id,
+  owner, policy revision, nonce, and the exact action, so a captured root
+  signature cannot be moved to another action, another nonce, or a post-rotation
+  policy revision. Adversarial tests cover wrong-action, wrong-nonce,
+  wrong-key, and garbage-signature reveals.
 
 **New attacks the design introduces and how each is closed.**
 
@@ -835,10 +853,14 @@ continuation-guide commit rule.
    cumulative budget, and fee-cap checks plus `spent_amount` write-back and
    `SessionKeyUsed`. Lifecycle, boundary, property, and restart tests; supply
    reconciliation assertion.
-6. **Post-quantum root signature (gated).** When an ML-DSA verifier lands, extend
-   the root reveal to a root **signature** over `WEBC_SESSION_KEY_AUTHORIZATION_V1`,
-   flipping the gate from commitment-knowledge to true root authorization. Until
-   then, keep the recorded limitation in code and `docs/implementation-status.md`.
+6. **Post-quantum root signature. Done.** Added the pinned `fips204` ML-DSA-65
+   verifier behind `webc-crypto::mldsa`; extended `PostQuantumRootReveal` to carry
+   a signature and become `verify(root, message)`; built
+   `session_key_authorization_message` over `WEBC_SESSION_KEY_AUTHORIZATION_V1`
+   binding chain id, owner, policy revision, nonce, and action; wired both
+   install/revoke arms; added adversarial tests (wrong action, wrong nonce, wrong
+   key, garbage signature). The gate is now true root authorization, not
+   commitment-knowledge. Still devnet-only pending benchmarks (step 8) and audit.
 7. **Optional expiry pruning.** Add an epoch-boundary sweep in `finish_epoch` that
    drops expired records to bound map growth. Correctness does not depend on it
    (use-time checks already reject expired keys); it is purely a state-size guard,
@@ -871,9 +893,12 @@ changes, `docs/continuation-guide.md`.
   `max_lifetime_epochs` and `max_session_keys_per_account`, and the fee/amount
   cap conventions. Defaults ship as conservative devnet placeholders,
   documented as such.
-- **ML-DSA verification** is a hard prerequisite for the true root-signature gate
-  (step 6) and for any real-fund claim. No post-quantum crate exists yet; adding
-  one is its own reviewed, benchmarked task.
+- **ML-DSA verification** is now implemented for the root-signature gate (step 6)
+  via the pinned `fips204` ML-DSA-65 crate behind the replaceable
+  `webc-crypto::mldsa` boundary. It is still not a post-quantum-**security** claim
+  or a real-fund enabler: the scheme choice, its performance, and its
+  side-channel posture remain a benchmark (step 8) and audit gate. Swapping the
+  scheme should touch only the `mldsa` module and the `PostQuantumScheme` enum.
 - **Fee source for session transfers.** v1 reuses whatever lane the key is bound
   to (default → owner balance; non-default → prepaid lane balance). A dedicated
   session fee-budget could be added later but would reintroduce a supply bucket
@@ -891,15 +916,16 @@ Per `AGENTS.md` lines 147-154:
 - `cargo fmt --check`, strict Clippy, `cargo test --workspace`, doc build with
   warnings denied, and the node demo pass; SDK build and tests pass;
 - the state-root and supply invariants hold across all session-key sequences;
-- the recorded limitations (commitment-only root gate; devnet-only; disabled for
-  real funds; open policy gate) are stated in code and
-  `docs/implementation-status.md`;
+- the recorded limitations (ML-DSA-65 is an unbenchmarked, unaudited devnet
+  candidate; devnet-only; disabled for real funds; open policy gate) are stated in
+  code and `docs/implementation-status.md`;
 - `docs/implementation-status.md` and `docs/continuation-guide.md` accurately
   state what is implemented and what remains.
 
-The path stays **devnet-only and disabled for real funds** until the post-quantum
-root signature gate closes, benchmarks are published, and independent audits and
-adversarial testing pass.
+The post-quantum root **signature** gate is now closed for the single-node state
+machine (step 6). The path nonetheless stays **devnet-only and disabled for real
+funds** until ML-DSA-65 benchmarks are published (step 8) and independent audits
+and adversarial testing pass.
 
 ---
 

@@ -7,106 +7,63 @@ file is.
 
 ## Where things stand
 
-- **Done and committed** (`ecdd8fc`, pushed to `claude/docs-session-keys-plan-ppk0dl`):
-  plan steps 1–5 of `session-keys-implementation-plan.md` §13 — the full on-chain
-  single-node state machine for constrained session keys, plus 20 Rust tests and
-  an adversarial review with two medium findings fixed (unbounded fee drain →
-  cumulative `total_fee_budget`; non-default-lane transfer access-list bug).
-- **Gates last green**: `cargo fmt --check`, strict clippy, 98 Rust tests, rustdoc
-  (warnings denied), node demo; both TS packages build; cross-language state-key
-  vector passes. One pre-existing TS test (`wallet-service.test.ts`) fails only on
-  Node 22 (repo wants Node 24) — unrelated to this work.
-- **Working tree is clean.** Nothing uncommitted.
+- **Done and committed** (`ecdd8fc`): plan steps 1–5 of
+  `session-keys-implementation-plan.md` §13 — the full on-chain single-node state
+  machine for constrained session keys, plus Rust tests and an adversarial review
+  with two medium findings fixed (unbounded fee drain → cumulative
+  `total_fee_budget`; non-default-lane transfer access-list bug).
+- **Done — step 6, the real ML-DSA-65 root *signature* gate** (this session, on
+  `claude/docs-session-keys-plan-ppk0dl`): `PostQuantumRootReveal` now carries a
+  signature and verifies it under the committed root over the exact action. See
+  "Step 6 — DONE" below for exactly what shipped.
+- **Gates last green**: `cargo fmt --check`, strict clippy, 115 Rust tests (102
+  `webc-chain` + 13 `webc-crypto`), rustdoc (warnings denied), node demo; both TS
+  packages build; cross-language state-key vector passes. One pre-existing TS test
+  (`wallet-service.test.ts`) fails only on Node 22 (repo wants Node 24) —
+  unrelated to this work.
+- **Working tree is clean** after each committed step.
 
 ## Remaining plan steps (do in this order, commit + push after each)
 
-### Step 6 — real ML-DSA root **signature** gate (highest value, do first)
+### Step 6 — real ML-DSA root **signature** gate — DONE
 
-Why it matters: today `PostQuantumRootReveal` only proves knowledge of the root
-**public** key. A public key is public — anyone can copy it from on-chain history —
-so the current gate is cryptographically weak. The real gate is an ML-DSA
-**signature** by the private root key over the exact critical action. This defends
-the actual threat: a compromised active Ed25519 key must not be able to authorize
-a new critical action (install/revoke session key).
+Shipped this session. What exists now (do not redo):
 
-Concrete build:
+- `crates/webc-crypto/src/mldsa.rs` wraps the pinned `fips204` ML-DSA-65 crate:
+  `ml_dsa65_verify(pk, msg, sig, ctx) -> Result<bool, CryptoError>` (deterministic,
+  length-checked, fails closed on unparseable key), plus `ml_dsa65_keygen()` and a
+  non-`Debug`/`Serialize`/`Clone` `MlDsa65SecretKey::sign`. Exported from
+  `webc-crypto`. `fips204 = { version = "0.4.6", default-features = false,
+  features = ["ml-dsa-65", "default-rng"] }` pinned in the workspace + crate.
+- `PostQuantumRootReveal` is now `{ scheme, public_key (hex), signature (hex) }`.
+  `verify(&self, root, message) -> Result<bool>` bounds both fields, checks the
+  scheme, binds the public key to the stored commitment, then verifies the
+  signature via the `mldsa` boundary. `matches` is gone.
+  `MAX_POST_QUANTUM_SIGNATURE_BYTES` added.
+- `session_key_authorization_message(chain_id, owner, policy_revision, nonce,
+  action)` in `session_key.rs` builds the canonical signed bytes under
+  `WEBC_SESSION_KEY_AUTHORIZATION_V1`; `SessionKeyAuthorizationAction` is
+  `Install { session_public_key, constraints }` / `Revoke { session_key }`.
+- Both install/revoke arms in `state.rs` build the message from
+  `(config.chain_id, tx.sender, policy.revision(), tx.nonce, action)` and call
+  `reveal.verify(&root, &message)?`.
+- Tests: a process-wide ML-DSA keypair via `OnceLock`; `installed_policy_state`
+  commits the root to the real public key; adversarial tests reject wrong-action,
+  wrong-nonce, wrong-key, and garbage-signature reveals with rollback; a dedicated
+  `install_session_key_binds_signature_to_constraints_owner_and_chain` test proves
+  the signature also binds the exact constraints, owner, and chain id (an
+  adversarial review found these three axes were unguarded — the test now closes
+  that gap); a focused
+  `reveal_verifies_only_a_real_root_signature_over_the_message` in
+  `authorization_policy.rs`; seven `mldsa` unit tests.
 
-1. **Dependency**: `fips204 = { version = "0.4.6", default-features = false,
-   features = ["ml-dsa-65", "default-rng"] }` in `crates/webc-crypto/Cargo.toml`.
-   Confirmed available via `cargo` (crates.io HTTP API is blocked, but the cargo
-   index works; `cargo add --dry-run` succeeded). `default-rng` is only for
-   keygen/signing (wallet/tests); verification is deterministic and uses no RNG,
-   so consensus stays deterministic. Pin it; note it as the named ML-DSA-65
-   candidate, devnet-only, no post-quantum-security claim.
+Replay binding (unchanged reasoning, now enforced): the message binds `chain_id +
+owner + policy_revision + tx.nonce + action`. Install/revoke require the default
+lane, so `tx.nonce` is the account nonce and single-use; a captured signature
+cannot be replayed at another nonce, moved to another action, or reused after a
+rotation (different `policy_revision`).
 
-2. **`crates/webc-crypto/src/mldsa.rs`** (new module, replaceable crypto boundary):
-   - `pub const ML_DSA_65_PUBLIC_KEY_LEN` / `ML_DSA_65_SIGNATURE_LEN` (from
-     `fips204::ml_dsa_65::{PK_LEN, SIG_LEN}`; expect 1952 / 3309).
-   - `pub fn ml_dsa65_verify(public_key: &[u8], message: &[u8], signature: &[u8],
-     context: &[u8]) -> Result<bool, CryptoError>` — length-check first, then
-     `PublicKey::try_from_bytes` + `pk.verify(msg, &sig, ctx)`. Deterministic.
-   - Wallet/test helpers: `ml_dsa65_keygen() -> (pub, secret)` and a secret type
-     with `.sign(msg, ctx) -> Vec<u8>` and a public type with `.to_bytes()`.
-     Do **not** derive `Debug`/`Serialize`/`Clone` on the secret key.
-   - fips204 0.4 API: `use fips204::ml_dsa_65; use fips204::traits::{SerDes,
-     Signer, Verifier};` — `ml_dsa_65::try_keygen()` → `(PublicKey, PrivateKey)`;
-     `sk.try_sign(&msg, &ctx)` → `[u8; SIG_LEN]`; `pk.verify(&msg, &sig, &ctx)` →
-     `bool`; `pk.into_bytes()` / `PublicKey::try_from_bytes(bytes)`. Verify the
-     exact signatures on first compile and adjust.
-   - Export from `webc-crypto/src/lib.rs`.
-
-3. **`crates/webc-chain/src/authorization_policy.rs`**: change
-   `PostQuantumRootReveal` to `{ scheme, public_key: Vec<u8> (hex), signature:
-   Vec<u8> (hex) }`. Add `MAX_POST_QUANTUM_SIGNATURE_BYTES` (~4096). `validate()`
-   bounds both fields before any crypto. Replace `matches(&root)` with
-   `verify(&self, root: &PostQuantumRoot, message: &[u8]) -> Result<bool>`:
-   (1) size checks; (2) scheme == root.scheme; (3)
-   `PostQuantumRoot::commit(scheme, &public_key) == root.public_key_hash`;
-   (4) `webc_crypto::ml_dsa65_verify(&public_key, message, &signature, b"")`.
-   Keep `WEBC_POST_QUANTUM_ROOT_V1` commitment domain.
-
-4. **Canonical authorization message** (builder in
-   `crates/webc-chain/src/session_key.rs`):
-   `session_key_authorization_message(chain_id, owner, policy_revision, nonce,
-   action) -> Result<Vec<u8>>`, where `action` is
-   `enum SessionKeyAuthorizationAction { Install { session_public_key,
-   constraints }, Revoke { session_key } }`. Serialize a struct with fields
-   `domain: "WEBC_SESSION_KEY_AUTHORIZATION_V1"`, `chain_id`, `owner`,
-   `policy_revision`, `nonce`, `action` via `crate::canonical::canonical_json_bytes`.
-   Pass empty ML-DSA context (domain lives in the message).
-
-   **Replay binding**: the message binds `chain_id + owner + policy_revision +
-   tx.nonce + action`. Install/revoke require the default lane, so `tx.nonce` is
-   the account nonce and is single-use; a captured PQ signature cannot be replayed
-   (a second tx at that nonce fails `NonceMismatch`), and it cannot be moved to a
-   different action because the action is signed.
-
-5. **`crates/webc-chain/src/state.rs`** install/revoke arms: build the message
-   from `(config.chain_id, tx.sender, policy.revision(), tx.nonce, action)` and
-   call `reveal.verify(&root, &message)?` instead of `matches`. Everything else
-   (default-lane gate, installed-policy gate, constraints, count cap) stays.
-
-6. **Tests**: generate an ML-DSA-65 keypair in the helper; install the policy with
-   `PostQuantumRoot::from_public_key(MlDsa65, &ml_dsa_pub_bytes)`; for each
-   install/revoke, sign the authorization message with the ML-DSA secret key and
-   put `{pubkey, signature}` in the reveal. Update `pq_reveal()` so it takes the
-   action + nonce context (it must sign the exact message the chain rebuilds).
-   Add adversarial tests: (a) valid pubkey but signature over the **wrong
-   action/nonce** → rejected (proves binding); (b) wrong pubkey → rejected;
-   (c) garbage signature → rejected. All fail closed with
-   `InvalidPostQuantumRootReveal` and roll back.
-
-7. **Docs**: update `session-keys-implementation-plan.md` §5.5 and §14 (gate is
-   now a real signature, not commitment-only; ML-DSA-65 crate added behind the
-   replaceable crypto boundary; still devnet-only, replaceable, no PQ-security
-   claim), `implementation-status.md`, and this file.
-
-Watch-outs: fips204 signatures are ~3.3 KB, so the InstallSessionKey operation and
-its canonical tx bytes grow — fine for devnet. The workspace `forbid(unsafe)` lint
-applies to our crates, not to the fips204 dependency. Strict clippy must stay
-clean.
-
-### Step 7 — optional expiry pruning
+### Step 7 — optional expiry pruning (do this next)
 Epoch-boundary sweep in `finish_epoch` dropping session keys whose
 `expires_after_epoch < current_epoch`, deterministic and restart-stable. Not
 needed for correctness (use-time check already rejects expired keys); it only

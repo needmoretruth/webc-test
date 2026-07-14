@@ -17,11 +17,13 @@
 //! bound is validated before use and enforced with checked arithmetic.
 //!
 //! This path is a devnet prototype and is disabled for real funds. The
-//! post-quantum-root gate on install/revoke is a commitment reveal today, not an
-//! ML-DSA signature, because no post-quantum verifier exists in the workspace
-//! yet (see `docs/session-keys-implementation-plan.md` sections 5.5 and 14).
+//! post-quantum-root gate on install/revoke is a real ML-DSA-65 signature over
+//! the canonical [`session_key_authorization_message`] (verified through the
+//! replaceable `webc-crypto::mldsa` boundary), not a commitment-knowledge check.
+//! ML-DSA-65 remains a named devnet candidate pending benchmarks and audit (see
+//! `docs/session-keys-implementation-plan.md` sections 5.5 and 14).
 
-use crate::{Amount, AuthorizationLaneId, AuthorizationPolicyRevision, ChainError, Epoch};
+use crate::{Amount, AuthorizationLaneId, AuthorizationPolicyRevision, ChainError, ChainId, Epoch};
 use serde::{Deserialize, Serialize};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
 
@@ -30,6 +32,15 @@ use webc_crypto::{Address, Hash256, PublicKeyBytes};
 /// Domain separation keeps a session-key id from colliding with an address or
 /// any other 32-byte WEBC artifact derived from the same public key.
 const SESSION_KEY_ID_DOMAIN: &[u8] = b"WEBC_SESSION_KEY_ID_V1";
+
+/// Domain tag for the message a post-quantum root signs to authorize a critical
+/// session-key action.
+///
+/// The tag lives inside the signed message (not in the ML-DSA context) so both
+/// Rust and a future browser signer reproduce identical bytes through the shared
+/// canonical-JSON encoder. Changing it invalidates every previously prepared
+/// root signature, so treat it as a signing-format breaking change.
+pub const SESSION_KEY_AUTHORIZATION_DOMAIN: &str = "WEBC_SESSION_KEY_AUTHORIZATION_V1";
 
 /// Versioned-chain session-key limits, in consensus epochs and record counts.
 ///
@@ -238,6 +249,70 @@ impl SessionKey {
         }
         Ok(())
     }
+}
+
+/// The exact critical action a post-quantum root signature authorizes.
+///
+/// The action is part of the signed message, so a root signature captured for
+/// one action cannot be replayed against another: installing a specific key
+/// under specific constraints and revoking a specific key produce different
+/// messages, and neither can be forged without the root secret key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum SessionKeyAuthorizationAction {
+    /// Install a session key with an exact public key and constraint grant.
+    Install {
+        /// The Ed25519 key the session will sign transactions with.
+        session_public_key: PublicKeyBytes,
+        /// The exact immutable constraints the owner is granting. This MUST be
+        /// serialized into the signed message so the root signature binds the
+        /// exact grant; never `#[serde(skip)]` it.
+        constraints: SessionKeyConstraints,
+    },
+    /// Revoke a previously installed session key by its opaque id.
+    Revoke {
+        /// The id of the session key being revoked.
+        session_key: SessionKeyId,
+    },
+}
+
+/// Builds the canonical bytes a post-quantum root signs to authorize a critical
+/// session-key action.
+///
+/// The message binds `chain_id + owner + policy_revision + nonce + action` under
+/// a domain tag, using the shared canonical-JSON encoder so a future browser
+/// signer reproduces identical bytes. Replay is prevented on two axes:
+/// - the `action` binds the signature to one exact install/revoke, so a captured
+///   signature cannot be moved to a different action; and
+/// - critical actions must use the default lane, where `nonce` is the account
+///   nonce and is single-use, so the same signature cannot be replayed at a
+///   later nonce (the second transaction fails the nonce check).
+///
+/// `policy_revision` binds the signature to the current policy, so a signature
+/// prepared before a key rotation cannot be reused afterward.
+pub fn session_key_authorization_message(
+    chain_id: &ChainId,
+    owner: Address,
+    policy_revision: AuthorizationPolicyRevision,
+    nonce: u64,
+    action: &SessionKeyAuthorizationAction,
+) -> Result<Vec<u8>, ChainError> {
+    #[derive(Serialize)]
+    struct AuthorizationMessage<'a> {
+        domain: &'a str,
+        chain_id: &'a ChainId,
+        owner: Address,
+        policy_revision: AuthorizationPolicyRevision,
+        nonce: u64,
+        action: &'a SessionKeyAuthorizationAction,
+    }
+    crate::canonical::canonical_json_bytes(&AuthorizationMessage {
+        domain: SESSION_KEY_AUTHORIZATION_DOMAIN,
+        chain_id,
+        owner,
+        policy_revision,
+        nonce,
+        action,
+    })
 }
 
 #[cfg(test)]

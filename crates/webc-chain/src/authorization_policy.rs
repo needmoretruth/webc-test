@@ -1,10 +1,13 @@
 //! Versioned account authorization policy and post-quantum root commitments.
 //!
 //! This module owns policy data and local invariant validation. It does not
-//! verify transaction signatures, mutate chain state, or implement ML-DSA.
-//! Consensus stores only a domain-separated hash of the post-quantum public
-//! key until the selected implementation is benchmarked and reviewed. The
-//! separate policy revision invalidates signatures prepared under older keys.
+//! verify ordinary transaction signatures or mutate chain state, and it does
+//! not implement ML-DSA itself: root-signature verification is delegated to the
+//! replaceable `webc-crypto::mldsa` boundary. Consensus stores only a
+//! domain-separated hash of the post-quantum public key; a critical action
+//! reveals the key and a signature over the exact action, which this module
+//! checks against the stored commitment and verifies. The separate policy
+//! revision invalidates signatures prepared under older keys.
 
 use crate::ChainError;
 use serde::{Deserialize, Serialize};
@@ -68,6 +71,13 @@ const POST_QUANTUM_ROOT_DOMAIN: &[u8] = b"WEBC_POST_QUANTUM_ROOT_V1";
 /// ML-DSA-65 public keys are 1,952 bytes; the ceiling bounds hostile reveals
 /// before hashing so a malformed operation cannot force large allocations.
 pub const MAX_POST_QUANTUM_PUBLIC_KEY_BYTES: usize = 4_096;
+
+/// Upper bound on a revealed post-quantum signature, in bytes.
+///
+/// ML-DSA-65 signatures are 3,309 bytes; the ceiling bounds hostile reveals
+/// before any verification work. Exact-length checking happens in the scheme
+/// verifier; this is only a denial-of-service guard.
+pub const MAX_POST_QUANTUM_SIGNATURE_BYTES: usize = 4_096;
 
 /// Standards identifier for a post-quantum account root.
 ///
@@ -141,44 +151,87 @@ impl PostQuantumRoot {
     }
 }
 
-/// A reveal of the post-quantum root public key committed by an account policy.
+/// Empty ML-DSA signing context for root-authorization signatures.
+///
+/// Domain separation lives in the signed message itself (its
+/// `WEBC_SESSION_KEY_AUTHORIZATION_V1` domain tag), so the scheme context is
+/// intentionally empty. Both the signer and the verifier must use this exact
+/// value or the signature will not verify.
+const POST_QUANTUM_AUTHORIZATION_CONTEXT: &[u8] = b"";
+
+/// A post-quantum root signature authorizing one exact critical action.
 ///
 /// Critical account actions (installing or revoking a session key, and later
-/// recovery/rotation) require proving knowledge of the committed root.
+/// recovery/rotation) require a signature by the account's committed
+/// post-quantum root over the exact action. The reveal carries the root public
+/// key (checked against the stored commitment) and a signature over the
+/// caller-supplied authorization message.
 ///
-/// Limitation recorded per `AGENTS.md`: this reveal proves the caller knows the
-/// exact committed public key, not that the root *signed* the request. Real
-/// ML-DSA signature verification is a later gate; until then this path is
-/// devnet-only and disabled for real funds.
+/// This closes the earlier commitment-only gap: knowing the committed public
+/// key is no longer enough, because a public key is public and copyable from
+/// on-chain history. A valid reveal now proves control of the root *secret* key
+/// for this specific message, so a compromised active Ed25519 key still cannot
+/// authorize a critical action on its own.
+///
+/// Scope: ML-DSA-65 is a devnet candidate behind the replaceable
+/// `webc-crypto::mldsa` boundary. This is not a post-quantum-security claim, and
+/// the whole path remains disabled for real funds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostQuantumRootReveal {
-    /// Scheme the revealed key is interpreted under; must match the root.
+    /// Scheme the revealed key and signature are interpreted under.
     pub scheme: PostQuantumScheme,
     /// Exact encoded post-quantum public key bytes, hex on the wire.
     #[serde(with = "crate::hex_bytes")]
     pub public_key: Vec<u8>,
+    /// Post-quantum signature over the authorization message, hex on the wire.
+    #[serde(with = "crate::hex_bytes")]
+    pub signature: Vec<u8>,
 }
 
 impl PostQuantumRootReveal {
-    /// Validates the reveal size before any hashing work.
+    /// Bounds both reveal fields before any hashing or verification work.
+    ///
+    /// Exact lengths are enforced by the scheme verifier; this is only a
+    /// denial-of-service guard against oversized hostile reveals.
     pub fn validate(&self) -> Result<(), ChainError> {
         if self.public_key.is_empty() || self.public_key.len() > MAX_POST_QUANTUM_PUBLIC_KEY_BYTES {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        if self.signature.is_empty() || self.signature.len() > MAX_POST_QUANTUM_SIGNATURE_BYTES {
             return Err(ChainError::InvalidPostQuantumRootReveal);
         }
         Ok(())
     }
 
-    /// Returns whether this reveal reproduces the committed root exactly.
+    /// Returns whether this reveal proves the root signed `message`.
     ///
-    /// Fails closed on an oversized/empty reveal, a scheme mismatch, or a
-    /// commitment mismatch.
-    pub fn matches(&self, root: &PostQuantumRoot) -> Result<bool, ChainError> {
+    /// Fails closed (`Ok(false)`) on a scheme mismatch, a commitment mismatch,
+    /// or a signature that does not verify, and returns an error only on an
+    /// oversized/empty reveal. The revealed public key is first bound to the
+    /// stored commitment, then the signature is verified under it, so the caller
+    /// must control the root secret key for this exact message.
+    pub fn verify(&self, root: &PostQuantumRoot, message: &[u8]) -> Result<bool, ChainError> {
         self.validate()?;
         if self.scheme != root.scheme {
             return Ok(false);
         }
-        Ok(PostQuantumRoot::commit(self.scheme, &self.public_key) == root.public_key_hash)
+        if PostQuantumRoot::commit(self.scheme, &self.public_key) != root.public_key_hash {
+            return Ok(false);
+        }
+        // Any verification problem (unparseable key, wrong-length signature, or a
+        // non-verifying signature) is a rejection, not a distinct error, so the
+        // gate fails closed deterministically.
+        let verified = match self.scheme {
+            PostQuantumScheme::MlDsa65 => webc_crypto::ml_dsa65_verify(
+                &self.public_key,
+                message,
+                &self.signature,
+                POST_QUANTUM_AUTHORIZATION_CONTEXT,
+            )
+            .unwrap_or(false),
+        };
+        Ok(verified)
     }
 }
 
@@ -300,5 +353,45 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reveal_verifies_only_a_real_root_signature_over_the_message() {
+        let (public_key, secret) = webc_crypto::ml_dsa65_keygen().unwrap();
+        let root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &public_key.to_bytes())
+                .unwrap();
+        let message = b"session-key authorization message".as_slice();
+        let reveal = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: public_key.to_bytes(),
+            signature: secret.sign(message, b"").unwrap(),
+        };
+
+        // A genuine signature over the exact message verifies.
+        assert!(reveal.verify(&root, message).unwrap());
+        // A different message does not.
+        assert!(!reveal.verify(&root, b"other message").unwrap());
+
+        // A different public key (with its own valid signature) fails the
+        // commitment check: knowledge of *some* root key is not enough.
+        let (other_public, other_secret) = webc_crypto::ml_dsa65_keygen().unwrap();
+        let mismatched = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: other_public.to_bytes(),
+            signature: other_secret.sign(message, b"").unwrap(),
+        };
+        assert!(!mismatched.verify(&root, message).unwrap());
+
+        // An oversized reveal fails validation before any crypto work.
+        let oversized = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: vec![0u8; MAX_POST_QUANTUM_PUBLIC_KEY_BYTES + 1],
+            signature: reveal.signature.clone(),
+        };
+        assert!(matches!(
+            oversized.verify(&root, message),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
     }
 }
