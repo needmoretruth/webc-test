@@ -13,6 +13,7 @@ export * from "./canonical.js";
 export * from "./hex.js";
 export * from "./keystore.js";
 export * from "./protocol-hash.js";
+export * from "./session-key.js";
 export * from "./transaction.js";
 export * from "./types.js";
 export * from "./wallet.js";
