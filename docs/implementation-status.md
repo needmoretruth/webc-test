@@ -246,10 +246,10 @@ with atomic rollback. Earlier adversarial reviews also fixed two medium findings
 The post-quantum root **signature** gate (step 6) is now implemented behind the
 replaceable `webc-crypto::mldsa` boundary. ML-DSA-65 is a named devnet candidate,
 not a benchmarked or audited post-quantum-security claim, and the path stays
-disabled for real funds. Still incomplete for this gate: optional epoch-boundary
-expiry pruning, benchmarks (session-key and ML-DSA verify/sign vs Ed25519), and
-the browser/SDK session-key surface (subkey generation, install/session signing,
-expiry display, cross-language operation and reveal fixtures).
+disabled for real funds. Still incomplete for this gate: benchmarks (session-key
+and ML-DSA verify/sign vs Ed25519) and the browser/SDK session-key surface
+(subkey generation, install/session signing, expiry display, cross-language
+operation and reveal fixtures).
 
 Primary-key **recovery and rotation** is now implemented on-chain, reusing the
 same root-signature gate. `Operation::RotateActiveTransactionKey` replaces the
@@ -406,10 +406,11 @@ portion, and the ML-DSA-65 root-signature gate on install/revoke are now
 implemented (see the Phase 2 section above and
 `docs/session-keys-implementation-plan.md`). Primary-key recovery and rotation
 (`RotateActiveTransactionKey`) and recovery-root rotation
-(`RotatePostQuantumRoot`) are now implemented too. Optional expiry pruning,
-session-key and ML-DSA benchmarks, and the browser/SDK session-key surface
-remain. `docs/continuation-guide.md` and `docs/session-keys-next-steps.md` hold
-the exact remaining sequence.
+(`RotatePostQuantumRoot`) are now implemented too, and expired session keys are
+pruned deterministically at each epoch boundary. Session-key and ML-DSA
+benchmarks and the browser/SDK session-key surface remain.
+`docs/continuation-guide.md` and `docs/session-keys-next-steps.md` hold the exact
+remaining sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.

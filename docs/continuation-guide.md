@@ -84,7 +84,8 @@ Resume with the first incomplete item in this order:
    benchmarked or audited security claim.
 4. Remaining for this gate, in order. `docs/session-keys-next-steps.md` holds the
    detailed, actionable resume plan for each; start there.
-   - optional epoch-boundary pruning of expired session keys (next);
+   - epoch-boundary pruning of expired session keys — **implemented** (a
+     deterministic, restart-stable `finish_epoch` sweep);
    - session-key and ML-DSA (verify/sign vs Ed25519) benchmarks before any policy
      claim;
    - the browser/SDK session-key surface (subkey generation, install and session

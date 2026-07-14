@@ -63,11 +63,14 @@ lane, so `tx.nonce` is the account nonce and single-use; a captured signature
 cannot be replayed at another nonce, moved to another action, or reused after a
 rotation (different `policy_revision`).
 
-### Step 7 — optional expiry pruning (do this next)
-Epoch-boundary sweep in `finish_epoch` dropping session keys whose
-`expires_after_epoch < current_epoch`, deterministic and restart-stable. Not
-needed for correctness (use-time check already rejects expired keys); it only
-bounds map growth. Add a restart-equivalence test.
+### Step 7 — expiry pruning — DONE
+`finish_epoch` now sweeps session keys whose `expires_after_epoch < next_epoch`
+and removes them, emitting a `SessionKeyExpired` event per key. It is
+deterministic (pure function of committed `next_epoch`, sorted iteration) and
+restart-stable, and it changes no authorization outcome because the use-time
+check already rejects expired keys — it only bounds map growth. A
+restart-equivalence test advances a live state and a bincode-restored copy across
+the same boundary and asserts identical state, root, and events.
 
 ### Step 8 — benchmarks
 Session-key transaction verification vs ordinary Ed25519 transfer; and (after
