@@ -83,9 +83,12 @@ and the new `PostQuantumRootReveal` shape. Note: ML-DSA signing in the browser
 `SessionKey` variant already exists.
 
 ### Sibling (outside the session-key plan, next per continuation-guide)
-Primary-key **recovery and rotation** operations in Rust. Session keys already
-invalidate when the policy revision changes, so wire the revision bump through
-rotation and add tests.
+Primary-key **recovery and rotation** operations in Rust — **IN PROGRESS**.
+Uncommitted WIP is in the tree (not yet compiling). Resume from
+`docs/active-key-rotation-progress.md`: it has the full design, exactly what is
+already edited, and the remaining apply arm + `Event` variant + tests to finish.
+Session keys already invalidate when the policy revision changes, and rotation
+bumps that revision.
 
 ## Working style (standing user instructions for this work)
 - Only stop for decisions that are genuinely the user's (confirmed monetary
