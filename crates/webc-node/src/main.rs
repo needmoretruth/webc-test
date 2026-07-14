@@ -22,6 +22,12 @@ enum Command {
     GenesisTemplate,
     /// Run a deterministic local chain demo: transfer, validator registration, delegation, rewards.
     Demo,
+    /// Micro-benchmark ML-DSA-65 vs Ed25519 sign/verify (indicative ratio only).
+    Bench {
+        /// Iterations per measured operation.
+        #[arg(long, default_value_t = 300)]
+        iterations: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -30,7 +36,88 @@ fn main() -> Result<()> {
         Command::Keygen => keygen(),
         Command::GenesisTemplate => genesis_template(),
         Command::Demo => demo(),
+        Command::Bench { iterations } => bench(iterations),
     }
+}
+
+/// Prints an indicative signature micro-benchmark.
+///
+/// This is a developer tool, not a consensus path, so wall-clock timing is fine
+/// here (deterministic state transitions never read a clock). The numbers are a
+/// rough ratio for engineering intuition on the chosen host — NOT a reference
+/// measurement and NOT a performance or post-quantum-security claim. Publish only
+/// numbers taken on the reference machines in `docs/development-plan.md` before
+/// making any claim.
+fn bench(iterations: u32) -> Result<()> {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+    use webc_crypto::{
+        ml_dsa65_keygen, ml_dsa65_verify, verify_signature, ML_DSA_65_PUBLIC_KEY_LEN,
+        ML_DSA_65_SIGNATURE_LEN,
+    };
+
+    let n = iterations.max(1);
+    let message = [0x42u8; 96];
+
+    // Ed25519 baseline.
+    let ed = Keypair::generate();
+    let ed_public = ed.public_key();
+    let start = Instant::now();
+    for _ in 0..n {
+        black_box(ed.sign(black_box(&message)));
+    }
+    let ed_sign = start.elapsed() / n;
+    let ed_signature = ed.sign(&message);
+    let start = Instant::now();
+    for _ in 0..n {
+        black_box(verify_signature(&ed_public, black_box(&message), &ed_signature).is_ok());
+    }
+    let ed_verify = start.elapsed() / n;
+
+    // ML-DSA-65 candidate.
+    let start = Instant::now();
+    for _ in 0..n {
+        black_box(ml_dsa65_keygen()?);
+    }
+    let ml_keygen = start.elapsed() / n;
+    let (ml_public, ml_secret) = ml_dsa65_keygen()?;
+    let ml_public_bytes = ml_public.to_bytes();
+    let start = Instant::now();
+    for _ in 0..n {
+        black_box(ml_secret.sign(black_box(&message), b"")?);
+    }
+    let ml_sign = start.elapsed() / n;
+    let ml_signature = ml_secret.sign(&message, b"")?;
+    let start = Instant::now();
+    for _ in 0..n {
+        black_box(
+            ml_dsa65_verify(&ml_public_bytes, black_box(&message), &ml_signature, b"").is_ok(),
+        );
+    }
+    let ml_verify = start.elapsed() / n;
+
+    let micros = |duration: Duration| duration.as_secs_f64() * 1e6;
+    println!("Indicative signature micro-benchmark — NOT a reference machine.");
+    println!("Rough ratio for engineering intuition only; not a performance claim.");
+    println!("iterations per measured op: {n}\n");
+    println!("Ed25519    sign:   {:>10.2} us", micros(ed_sign));
+    println!("Ed25519    verify: {:>10.2} us", micros(ed_verify));
+    println!("ML-DSA-65  keygen: {:>10.2} us", micros(ml_keygen));
+    println!("ML-DSA-65  sign:   {:>10.2} us", micros(ml_sign));
+    println!("ML-DSA-65  verify: {:>10.2} us", micros(ml_verify));
+    println!(
+        "\nverify ratio (ML-DSA-65 / Ed25519): {:>5.1}x",
+        micros(ml_verify) / micros(ed_verify).max(f64::MIN_POSITIVE)
+    );
+    println!(
+        "sign ratio   (ML-DSA-65 / Ed25519): {:>5.1}x",
+        micros(ml_sign) / micros(ed_sign).max(f64::MIN_POSITIVE)
+    );
+    println!(
+        "\nsizes: Ed25519 pubkey 32 B, sig 64 B; \
+         ML-DSA-65 pubkey {ML_DSA_65_PUBLIC_KEY_LEN} B, sig {ML_DSA_65_SIGNATURE_LEN} B"
+    );
+    Ok(())
 }
 
 fn keygen() -> Result<()> {
