@@ -68,6 +68,10 @@ Resume with the first incomplete item in this order:
 1. Add versioned account authorization policies and the post-quantum root field,
    then benchmark the ML-DSA candidate before enabling any claim.
 2. Add recovery, rotation, revocation, and constrained session-key state/tests.
+   The constrained session-key design, data model, integration points, security
+   invariants, test matrix, and staged build order are specified in
+   `docs/session-keys-implementation-plan.md`; implement it in the staged order
+   given there (§13), committing and testing each step before the next.
 
 Do not start RPC, networking, a public VM, ZK, or a real bridge before the Phase
 2 wallet wire and secret-isolation gates pass.

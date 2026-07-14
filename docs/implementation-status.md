@@ -190,6 +190,13 @@ Still incomplete: persistent encrypted permission storage, automatic lane setup,
 versioned on-chain authorization policy, recovery/rotation/revocation, session
 constraints, and the ML-DSA prototype.
 
+The constrained on-chain session-key design is now specified end to end in
+`docs/session-keys-implementation-plan.md`: data model, the single key-binding
+change point, deterministic epoch expiry, post-quantum-root-gated install/revoke,
+supply/state-root impact, the browser/SDK surface, security invariants, threat
+model, the full test matrix, and a staged implementation order. This is a plan
+only; no session-key code, operation, state-key variant, or config exists yet.
+
 ## Reusable prototype pieces
 
 ### `webc-crypto`
@@ -308,8 +315,10 @@ Phase 2's schema, shared-vector, snake-case wire, SDK-entry-point, independent
 nonce-lane, standard mnemonic/Ed25519 derivation, authenticated encrypted
 keystore, and isolated trusted-popup request/confirmation foundations now exist.
 The first incomplete gate is the versioned on-chain account authorization policy
-with recovery, rotation, revocation, and constrained session keys.
-`docs/continuation-guide.md` holds the exact implementation sequence.
+with recovery, rotation, revocation, and constrained session keys. The
+constrained session-key portion of that gate is now fully specified in
+`docs/session-keys-implementation-plan.md`; `docs/continuation-guide.md` holds
+the exact implementation sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.
