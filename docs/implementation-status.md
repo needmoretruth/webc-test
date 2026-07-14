@@ -407,10 +407,14 @@ implemented (see the Phase 2 section above and
 `docs/session-keys-implementation-plan.md`). Primary-key recovery and rotation
 (`RotateActiveTransactionKey`) and recovery-root rotation
 (`RotatePostQuantumRoot`) are now implemented too, and expired session keys are
-pruned deterministically at each epoch boundary. Session-key and ML-DSA
-benchmarks and the browser/SDK session-key surface remain.
-`docs/continuation-guide.md` and `docs/session-keys-next-steps.md` hold the exact
-remaining sequence.
+pruned deterministically at each epoch boundary. The TypeScript SDK now exposes
+the full session-key and rotation surface (operation constructors, access lists,
+`deriveSessionKeyIdHex` matching Rust, browser session-subkey generation, and
+epoch-based expiry display), with cross-language fixtures pinning byte-parity for
+the four operations and the id derivation. The only remaining session-key item is
+benchmarks (session-key and ML-DSA verify/sign vs Ed25519), deferred until a
+reference machine is available. `docs/continuation-guide.md` and
+`docs/session-keys-next-steps.md` hold the exact remaining sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.
