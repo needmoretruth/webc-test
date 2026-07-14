@@ -169,6 +169,12 @@ export type StateKeyKindJson =
         lane: AuthorizationLaneIdJson;
       };
     }
+  | {
+      SessionKey: {
+        owner: WebcAddress;
+        session_key: HexString;
+      };
+    }
   | { BridgeMessage: { message_hash: HexString } }
   | { BridgeEscrow: { domain: ExternalChainJson } }
   | { SlashingEvidence: { evidence_hash: HexString } }

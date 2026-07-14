@@ -132,6 +132,15 @@ because MSVC Build Tools are not installed. This is not the verified project
 path; use the pinned GNU toolchain and checksum-verified WinLibs compiler recorded
 in Phase 0.
 
+On 2026-07-14, after adding constrained session keys, the pinned Rust `1.96.0`
+GNU toolchain (on Linux for this session) passed `cargo fmt --check`, strict
+workspace Clippy, 98 unit tests, documentation with warnings denied, and the node
+demo. Both TypeScript packages build. One pre-existing browser end-to-end test
+(`wallet-service.test.ts`) fails only on this host's Node 22 because it requires
+the verified Node 24 WebCrypto behaviour; it is unrelated to the session-key
+change and fails identically without it. The cross-language state-key wire vector
+passes on both Rust and TypeScript with its updated digest.
+
 ## Phase 2 work in progress
 
 Completed and verified:
@@ -190,12 +199,41 @@ Still incomplete: persistent encrypted permission storage, automatic lane setup,
 versioned on-chain authorization policy, recovery/rotation/revocation, session
 constraints, and the ML-DSA prototype.
 
-The constrained on-chain session-key design is now specified end to end in
-`docs/session-keys-implementation-plan.md`: data model, the single key-binding
-change point, deterministic epoch expiry, post-quantum-root-gated install/revoke,
-supply/state-root impact, the browser/SDK surface, security invariants, threat
-model, the full test matrix, and a staged implementation order. This is a plan
-only; no session-key code, operation, state-key variant, or config exists yet.
+Constrained on-chain session keys are now implemented for the single-node state
+machine, following `docs/session-keys-implementation-plan.md`:
+
+- `webc-chain::session_key` defines `SessionKeyId` (domain-separated derivation),
+  `SessionKeyConstraints` (bound lane, allowed operations, per-use and cumulative
+  amount and fee budgets, relative lifetime), the `SessionKey` record, and
+  `SessionKeyConfig` (max lifetime epochs, max keys per account);
+- `PostQuantumRoot` gained a domain-separated `commit`/`from_public_key`, and a
+  new `PostQuantumRootReveal` proves knowledge of the committed root before a
+  critical action. This is a commitment reveal, not yet an ML-DSA signature;
+- `StateKeyKind::SessionKey`, a `session_key_root` in the state commitment (bumped
+  to `WEBC_STATE_COMMITMENT_V6`), and `ChainState.session_keys` store and commit
+  the records; the Rust/TypeScript state-key wire vector was updated together;
+- `Operation::InstallSessionKey`/`RevokeSessionKey` are critical actions gated to
+  the default lane, an installed policy, and a matching post-quantum-root reveal;
+- `verify_transaction_authorization` accepts a registered, policy-current,
+  lane-bound session key in place of the active key, and execution enforces
+  expiry (by epoch, never wall-clock), the transfers-only allow-list, per-use and
+  cumulative amount, and per-use and cumulative fee before the operation runs,
+  advancing the session's spend atomically;
+- session keys hold no funds, so supply reconciliation is unchanged; a rotation
+  (policy-revision change) invalidates outstanding keys; revocation is immediate.
+
+Twenty Rust tests cover the lifecycle, per-use/budget/fee caps, the cumulative
+fee budget bounding a compromised key, expiry boundaries, disallowed operations,
+lane binding and non-default-lane transfers, revision invalidation, fail-closed
+install/revoke paths, the per-account cap, serialization restart, and a
+randomized spend-sequence property test. An adversarial review of the diff
+raised two medium findings (unbounded fee drain; non-default-lane transfers
+failing their access-list check) — both were fixed and covered by new tests.
+
+Still incomplete for this gate: the ML-DSA root-*signature* gate (reveal is
+commitment-only today), optional epoch-boundary expiry pruning, benchmarks, and
+the browser/SDK session-key surface (subkey generation, install/session signing,
+expiry display, cross-language operation fixtures).
 
 ## Reusable prototype pieces
 
@@ -314,11 +352,12 @@ of floating-point canonical signing input.
 Phase 2's schema, shared-vector, snake-case wire, SDK-entry-point, independent
 nonce-lane, standard mnemonic/Ed25519 derivation, authenticated encrypted
 keystore, and isolated trusted-popup request/confirmation foundations now exist.
-The first incomplete gate is the versioned on-chain account authorization policy
-with recovery, rotation, revocation, and constrained session keys. The
-constrained session-key portion of that gate is now fully specified in
-`docs/session-keys-implementation-plan.md`; `docs/continuation-guide.md` holds
-the exact implementation sequence.
+The versioned on-chain account authorization policy and its constrained
+session-key portion are now implemented (see the Phase 2 section above and
+`docs/session-keys-implementation-plan.md`). Recovery, rotation, and revocation
+of the primary key, plus the ML-DSA root-signature gate and the browser/SDK
+session-key surface, remain. `docs/continuation-guide.md` holds the exact
+remaining sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.

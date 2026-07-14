@@ -7,9 +7,10 @@
 
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
-    ChainId, ExternalChain, ObjectId, ObjectVersion, PostQuantumRoot, ProtocolStateKey,
-    ProtocolVersion, SlashingEvidence, StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
+    ChainId, ExternalChain, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
+    ProtocolStateKey, ProtocolVersion, SessionKeyConstraints, SessionKeyId, SlashingEvidence,
+    StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, SignatureBytes};
@@ -111,6 +112,28 @@ pub enum Operation {
         lane: AuthorizationLaneId,
         /// Native base units moved from liquid balance into the lane.
         fee_deposit: Amount,
+    },
+    /// Installs a constrained session key under the sender's account policy.
+    ///
+    /// Critical action: requires the default lane, an installed policy, and a
+    /// reveal of the committed post-quantum root. The session key can only
+    /// authorize the operations, amounts, fees, lane, and lifetime it declares.
+    InstallSessionKey {
+        /// Ed25519 key the session may sign transactions with.
+        session_public_key: PublicKeyBytes,
+        /// Immutable constraint grant fixed at installation.
+        constraints: SessionKeyConstraints,
+        /// Reveal proving knowledge of the committed post-quantum root.
+        post_quantum_root_reveal: PostQuantumRootReveal,
+    },
+    /// Revokes an installed session key immediately.
+    ///
+    /// Critical action: requires the default lane and a post-quantum root reveal.
+    RevokeSessionKey {
+        /// Opaque identity of the session key to remove.
+        session_key: SessionKeyId,
+        /// Reveal proving knowledge of the committed post-quantum root.
+        post_quantum_root_reveal: PostQuantumRootReveal,
     },
     /// Creates revision one of an address-owned application object.
     CreateObject {
@@ -246,6 +269,7 @@ impl Operation {
         match self {
             Self::Transfer { .. } => 500,
             Self::InstallAuthorizationPolicy { .. } => 25_000,
+            Self::InstallSessionKey { .. } | Self::RevokeSessionKey { .. } => 15_000,
             Self::OpenAuthorizationLane { .. } | Self::FundAuthorizationLane { .. } => 10_000,
             Self::CreateObject { .. } | Self::MutateObject { .. } | Self::TransferObject { .. } => {
                 20_000
@@ -290,6 +314,19 @@ impl Operation {
             Self::OpenAuthorizationLane { lane, .. } | Self::FundAuthorizationLane { lane, .. } => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::authorization_lane(sender, *lane));
+            }
+            Self::InstallSessionKey {
+                session_public_key, ..
+            } => {
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::session_key(sender, SessionKeyId::derive(session_public_key)),
+                );
+            }
+            Self::RevokeSessionKey { session_key, .. } => {
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::session_key(sender, *session_key));
             }
             Self::CreateObject {
                 object_id,
@@ -427,6 +464,24 @@ impl Operation {
             StateKey::fee_accumulator_for_lane(sender, lane),
         );
         Ok(AccessList::new(read_only, read_write))
+    }
+
+    /// Builds the exact access for a transaction signed by a session key.
+    ///
+    /// This is the lane access list plus the session-key record, which execution
+    /// reads to enforce constraints and writes to advance cumulative spend.
+    pub fn default_access_list_for_session(
+        &self,
+        sender: Address,
+        lane: AuthorizationLaneId,
+        session_key: SessionKeyId,
+    ) -> Result<AccessList, ChainError> {
+        let mut list = self.default_access_list_for_lane(sender, lane)?;
+        push_unique_key(
+            &mut list.read_write,
+            StateKey::session_key(sender, session_key),
+        );
+        Ok(list)
     }
 }
 

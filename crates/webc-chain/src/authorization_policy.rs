@@ -60,6 +60,15 @@ impl AuthorizationPolicyRevision {
     }
 }
 
+/// Domain tag separating post-quantum root commitments from other hashes.
+const POST_QUANTUM_ROOT_DOMAIN: &[u8] = b"WEBC_POST_QUANTUM_ROOT_V1";
+
+/// Upper bound on a revealed post-quantum public key, in bytes.
+///
+/// ML-DSA-65 public keys are 1,952 bytes; the ceiling bounds hostile reveals
+/// before hashing so a malformed operation cannot force large allocations.
+pub const MAX_POST_QUANTUM_PUBLIC_KEY_BYTES: usize = 4_096;
+
 /// Standards identifier for a post-quantum account root.
 ///
 /// ML-DSA-65 is a candidate selected for Phase 2 interoperability and
@@ -69,6 +78,15 @@ impl AuthorizationPolicyRevision {
 pub enum PostQuantumScheme {
     /// NIST FIPS 204 ML-DSA parameter set 65.
     MlDsa65,
+}
+
+impl PostQuantumScheme {
+    /// Stable domain-separation bytes identifying this scheme in a commitment.
+    pub const fn wire_tag(self) -> &'static [u8] {
+        match self {
+            Self::MlDsa65 => b"ML-DSA-65",
+        }
+    }
 }
 
 /// Commitment to the public half of a post-quantum recovery root.
@@ -87,10 +105,7 @@ pub struct PostQuantumRoot {
 
 impl PostQuantumRoot {
     /// Creates a candidate root and rejects the reserved empty commitment.
-    pub fn new(
-        scheme: PostQuantumScheme,
-        public_key_hash: Hash256,
-    ) -> Result<Self, ChainError> {
+    pub fn new(scheme: PostQuantumScheme, public_key_hash: Hash256) -> Result<Self, ChainError> {
         let root = Self {
             scheme,
             public_key_hash,
@@ -99,12 +114,71 @@ impl PostQuantumRoot {
         Ok(root)
     }
 
+    /// Domain-separated commitment to an exact post-quantum public key.
+    ///
+    /// The hash is `SHA-256(domain || scheme_tag || public_key)`. Both the
+    /// creator of a root and a later reveal must use this exact function so a
+    /// reveal can be checked against the stored commitment.
+    pub fn commit(scheme: PostQuantumScheme, public_key: &[u8]) -> Hash256 {
+        let parts: [&[u8]; 3] = [POST_QUANTUM_ROOT_DOMAIN, scheme.wire_tag(), public_key];
+        Hash256::digest_many(parts)
+    }
+
+    /// Builds a root by committing to an exact public key.
+    pub fn from_public_key(
+        scheme: PostQuantumScheme,
+        public_key: &[u8],
+    ) -> Result<Self, ChainError> {
+        Self::new(scheme, Self::commit(scheme, public_key))
+    }
+
     /// Validates consensus invariants without allocating or performing crypto.
     pub fn validate(self) -> Result<(), ChainError> {
         if self.public_key_hash == Hash256::ZERO {
             return Err(ChainError::InvalidPostQuantumRoot);
         }
         Ok(())
+    }
+}
+
+/// A reveal of the post-quantum root public key committed by an account policy.
+///
+/// Critical account actions (installing or revoking a session key, and later
+/// recovery/rotation) require proving knowledge of the committed root.
+///
+/// Limitation recorded per `AGENTS.md`: this reveal proves the caller knows the
+/// exact committed public key, not that the root *signed* the request. Real
+/// ML-DSA signature verification is a later gate; until then this path is
+/// devnet-only and disabled for real funds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostQuantumRootReveal {
+    /// Scheme the revealed key is interpreted under; must match the root.
+    pub scheme: PostQuantumScheme,
+    /// Exact encoded post-quantum public key bytes, hex on the wire.
+    #[serde(with = "crate::hex_bytes")]
+    pub public_key: Vec<u8>,
+}
+
+impl PostQuantumRootReveal {
+    /// Validates the reveal size before any hashing work.
+    pub fn validate(&self) -> Result<(), ChainError> {
+        if self.public_key.is_empty() || self.public_key.len() > MAX_POST_QUANTUM_PUBLIC_KEY_BYTES {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        Ok(())
+    }
+
+    /// Returns whether this reveal reproduces the committed root exactly.
+    ///
+    /// Fails closed on an oversized/empty reveal, a scheme mismatch, or a
+    /// commitment mismatch.
+    pub fn matches(&self, root: &PostQuantumRoot) -> Result<bool, ChainError> {
+        self.validate()?;
+        if self.scheme != root.scheme {
+            return Ok(false);
+        }
+        Ok(PostQuantumRoot::commit(self.scheme, &self.public_key) == root.public_key_hash)
     }
 }
 
@@ -145,6 +219,13 @@ impl AccountAuthorizationPolicy {
     pub const fn active_transaction_key(&self) -> &PublicKeyBytes {
         match self {
             Self::V1(policy) => &policy.active_transaction_key,
+        }
+    }
+
+    /// Returns the committed post-quantum recovery root for critical actions.
+    pub const fn post_quantum_root(&self) -> &PostQuantumRoot {
+        match self {
+            Self::V1(policy) => &policy.post_quantum_root,
         }
     }
 
@@ -214,8 +295,10 @@ mod tests {
         let maximum = AuthorizationPolicyRevision::new(MAX_AUTHORIZATION_POLICY_REVISION);
         maximum.validate().unwrap();
         assert_eq!(maximum.checked_next(), None);
-        assert!(AuthorizationPolicyRevision::new(MAX_AUTHORIZATION_POLICY_REVISION + 1)
-            .validate()
-            .is_err());
+        assert!(
+            AuthorizationPolicyRevision::new(MAX_AUTHORIZATION_POLICY_REVISION + 1)
+                .validate()
+                .is_err()
+        );
     }
 }

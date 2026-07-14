@@ -1,10 +1,19 @@
 # WEBC constrained session-key implementation plan
 
-Status: **plan / not yet implemented.** Devnet-only prototype path; disabled for
-real funds. The macro policy choice it prototypes is still an open technical gate
-(see [§14](#14-open-decisions-and-gates)).
+Status: **core implemented (single-node); devnet-only, disabled for real funds.**
+The on-chain state machine, operations, constraint enforcement, state-root and
+supply integration, and the full Rust test matrix (steps 1–5 of [§13](#13-staged-implementation-each-step-compiles-tests-and-commits-alone))
+are implemented and passing. Remaining: the ML-DSA root-signature gate (step 6),
+optional expiry pruning (step 7), benchmarks (step 8), and the browser/SDK
+surface (step 9). The macro policy choice it prototypes is still an open
+technical gate (see [§14](#14-open-decisions-and-gates)).
 
-Date: 2026-07-14
+Implementation note: during review the design gained a **cumulative fee budget**
+(`total_fee_budget` / `spent_fees`) beyond the original per-use fee cap, so a
+compromised key's total blast radius is bounded by
+`total_amount_budget + total_fee_budget` regardless of how many times it is used.
+
+Date: 2026-07-14 (plan); 2026-07-14 (implementation)
 
 This document specifies how WEBC will add **constrained session keys** to the
 versioned account authorization model. It is the last file in the required
@@ -337,6 +346,14 @@ constraints, validation) plus small additions to `state_key.rs`, `transaction.rs
 final code; field docs, module header, and `Invariants:` blocks follow
 `docs/code-documentation-template.md` and the `authorization_policy.rs` model.
 
+The shipped code (`crates/webc-chain/src/session_key.rs`) is authoritative and
+refines these sketches in two ways: (1) the signed `SessionKeyConstraints` carry
+a relative `lifetime_epochs`, and the stored `SessionKey` record holds the
+absolute `expires_after_epoch` resolved at install (per §5.4), rather than an
+absolute expiry inside the constraints; (2) the constraints gained a cumulative
+`total_fee_budget` and the record a `spent_fees` counter, so fees are bounded
+both per use and cumulatively.
+
 ```rust
 // crates/webc-chain/src/session_key.rs (proposed)
 
@@ -666,8 +683,11 @@ ADR-0008's invariant list):
    means transfers only, and never a critical, staking, bridge, or lane/policy
    operation.
 2. A session-signed transaction never moves more than `max_amount_per_use` in one
-   transaction, never exceeds `total_amount_budget` cumulatively, and never pays
-   more than `max_fee_per_use` in fees.
+   transaction and never exceeds `total_amount_budget` cumulatively; it never pays
+   more than `max_fee_per_use` in one transaction and never exceeds
+   `total_fee_budget` in cumulative fees. A compromised key's total blast radius
+   is therefore bounded by `total_amount_budget + total_fee_budget` regardless of
+   how many times it is used.
 3. A session key is unusable once `current_epoch > expires_after_epoch`, decided
    only by integer epoch comparison against committed state — never by wall clock.
 4. A session key is bound to one lane and one origin; it cannot act on another
