@@ -196,9 +196,10 @@ Completed and verified:
   blind-display injection, DOM injection, same-origin widget, and full
   host/service exchange tests pass.
 
-Still incomplete: persistent encrypted permission storage, automatic lane setup,
-versioned on-chain authorization policy, recovery/rotation/revocation, session
-constraints, and the ML-DSA prototype.
+Still incomplete: persistent encrypted permission storage and automatic lane
+setup. (Versioned on-chain authorization policy, on-chain recovery/rotation,
+session-key revocation and constraints, and the ML-DSA-65 signature gate are now
+implemented for the single-node state machine — see below.)
 
 Constrained on-chain session keys are now implemented for the single-node state
 machine, following `docs/session-keys-implementation-plan.md`:
@@ -249,6 +250,25 @@ disabled for real funds. Still incomplete for this gate: optional epoch-boundary
 expiry pruning, benchmarks (session-key and ML-DSA verify/sign vs Ed25519), and
 the browser/SDK session-key surface (subkey generation, install/session signing,
 expiry display, cross-language operation and reveal fixtures).
+
+Primary-key **recovery and rotation** is now implemented on-chain, reusing the
+same root-signature gate. `Operation::RotateActiveTransactionKey` replaces the
+account's sole active Ed25519 key and is a critical action: default lane, an
+installed policy, and a real ML-DSA-65 root signature over
+`active_key_rotation_message` (`WEBC_ACTIVE_KEY_ROTATION_V1`, binding chain id,
+owner, current policy revision, nonce, and the exact new key). Recovery works
+even when the old key is lost or compromised: the transaction envelope may be
+signed by the new key through a `PostQuantumRootRecovery` authorization path,
+while the root signature is the real authority. A successful rotation advances
+the policy revision — which invalidates every outstanding session key at use
+time — and preserves the post-quantum recovery root, so portable recovery is
+never silently dropped. Rotating to the same key is rejected. Eight adversarial
+tests cover new-key recovery (with session invalidation), current-key rotation,
+old-key rejection afterward, same-key, non-default-lane, missing-policy,
+third-party envelope signer, and a misbound/forged-signature matrix over every
+binding axis, all with atomic rollback. Session keys can never rotate: a session
+signer is neither the active key nor the proposed new key, so authorization
+rejects it before execution.
 
 ## Reusable prototype pieces
 
@@ -370,10 +390,11 @@ keystore, and isolated trusted-popup request/confirmation foundations now exist.
 The versioned on-chain account authorization policy, its constrained session-key
 portion, and the ML-DSA-65 root-signature gate on install/revoke are now
 implemented (see the Phase 2 section above and
-`docs/session-keys-implementation-plan.md`). Recovery, rotation, and revocation
-of the primary key, optional expiry pruning, session-key and ML-DSA benchmarks,
-and the browser/SDK session-key surface remain. `docs/continuation-guide.md` and
-`docs/session-keys-next-steps.md` hold the exact remaining sequence.
+`docs/session-keys-implementation-plan.md`). Primary-key recovery and rotation
+(root-gated `RotateActiveTransactionKey`) is now implemented too. Optional expiry
+pruning, session-key and ML-DSA benchmarks, the browser/SDK session-key surface,
+and rotating the post-quantum root itself remain. `docs/continuation-guide.md`
+and `docs/session-keys-next-steps.md` hold the exact remaining sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.

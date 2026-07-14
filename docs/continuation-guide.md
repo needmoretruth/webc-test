@@ -90,10 +90,14 @@ Resume with the first incomplete item in this order:
    - the browser/SDK session-key surface (subkey generation, install and session
      signing, expiry display, and cross-language operation and reveal fixtures);
    - (sibling, outside the session-key plan) primary-key recovery and rotation
-     operations — not started. `docs/active-key-rotation-progress.md` holds the
-     full design and the exact code (per file) and tests to implement it from the
-     current base. Session keys already invalidate on a policy-revision change,
-     and rotation bumps that revision.
+     operations — **implemented**. Root-gated `RotateActiveTransactionKey`
+     replaces the active key (recovery works via a new-key-signed envelope plus
+     the root signature), bumps the policy revision (invalidating session keys),
+     and preserves the recovery root; full adversarial tests pass.
+   - (next sibling) rotating the post-quantum root itself
+     (`RotatePostQuantumRoot`, signed by the current root; domain
+     `WEBC_POST_QUANTUM_ROOT_ROTATION_V1`) — not started. See
+     `docs/session-keys-next-steps.md`.
 
 Do not start RPC, networking, a public VM, ZK, or a real bridge before the Phase
 2 wallet wire and secret-isolation gates pass.

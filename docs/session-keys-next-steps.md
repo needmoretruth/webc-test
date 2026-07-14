@@ -82,11 +82,28 @@ and the new `PostQuantumRootReveal` shape. Note: ML-DSA signing in the browser
 (for install/revoke) is heavy (WASM); scope it explicitly. The TS state-key
 `SessionKey` variant already exists.
 
-### Sibling (outside the session-key plan, next per continuation-guide)
-Primary-key **recovery and rotation** operations in Rust — not started. See
-`docs/active-key-rotation-progress.md` for the full design and the exact code (per
-file) and tests. Session keys already invalidate when the policy revision changes,
-and rotation bumps that revision.
+### Sibling (outside the session-key plan) — DONE
+Primary-key **recovery and rotation** is implemented.
+`Operation::RotateActiveTransactionKey` replaces the active Ed25519 key, gated by
+the default lane, an installed policy, and a real ML-DSA-65 root signature over
+`active_key_rotation_message` (`WEBC_ACTIVE_KEY_ROTATION_V1`). Recovery works
+without the old key via a new-key-signed envelope and a `PostQuantumRootRecovery`
+authorization path; rotation bumps the policy revision (invalidating session
+keys) and preserves the recovery root. Eight adversarial tests pass. The
+from-scratch recipe that used to live here has been removed now that the work has
+landed; the implementation is in `crates/webc-chain/src/{state,transaction,
+authorization_policy}.rs`.
+
+### Next sibling — rotate the post-quantum root itself
+`RotatePostQuantumRoot { new_post_quantum_root, post_quantum_root_reveal }` —
+rotate the recovery root, signed by the **current** root over the new commitment;
+new domain `WEBC_POST_QUANTUM_ROOT_ROTATION_V1`. Deferred from the active-key
+change to keep it small. Mirror the `RotateActiveTransactionKey` shape: a new
+message builder, an operation variant, `required_units` = 25_000, the same
+default-lane + installed-policy gate, an apply arm that verifies the reveal
+against the *current* root then swaps in the new root (preserving the active
+key), and an adversarial test matrix (wrong new root / nonce / owner / chain /
+forged, same-root rejection, non-default lane, missing policy).
 
 ## Working style (standing user instructions for this work)
 - Only stop for decisions that are genuinely the user's (confirmed monetary

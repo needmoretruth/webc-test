@@ -23,8 +23,7 @@ If documents disagree, the higher item in this list wins. Fix the lower document
 - `continuation-guide.md` — exact starting point for the next development session
 - `ai-handoff.md` — prevents stale conversation summaries from becoming decisions
 - `session-keys-implementation-plan.md` — constrained on-chain session-key design and staged build order (Phase 2 gate)
-- `session-keys-next-steps.md` — durable resume plan for the remaining session-key steps (pruning, benchmarks, SDK); the ML-DSA signature gate is done
-- `active-key-rotation-progress.md` — full design + exact per-file code and tests to implement primary-key recovery/rotation (not started in the tree)
+- `session-keys-next-steps.md` — durable resume plan for the remaining steps (pruning, benchmarks, SDK, post-quantum-root rotation); the ML-DSA signature gate and primary-key recovery/rotation are done
 
 ## Editing rule
 
