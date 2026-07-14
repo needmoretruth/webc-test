@@ -90,11 +90,10 @@ Resume with the first incomplete item in this order:
    - the browser/SDK session-key surface (subkey generation, install and session
      signing, expiry display, and cross-language operation and reveal fixtures);
    - (sibling, outside the session-key plan) primary-key recovery and rotation
-     operations — **IN PROGRESS, uncommitted, not yet compiling**. Resume from
-     `docs/active-key-rotation-progress.md`, which has the design, what is already
-     edited in the tree, and the exact remaining code (apply arm + `Event` variant)
-     and tests to finish it. Session keys already invalidate on a policy-revision
-     change, and rotation bumps that revision.
+     operations — not started. `docs/active-key-rotation-progress.md` holds the
+     full design and the exact code (per file) and tests to implement it from the
+     current base. Session keys already invalidate on a policy-revision change,
+     and rotation bumps that revision.
 
 Do not start RPC, networking, a public VM, ZK, or a real bridge before the Phase
 2 wallet wire and secret-isolation gates pass.
