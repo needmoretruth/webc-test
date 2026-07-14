@@ -15,11 +15,18 @@ import {
   createObject,
   delegate,
   defaultAccessList,
+  defaultAccessListAsync,
+  deriveSessionKeyIdHex,
   fundAuthorizationLane,
   installAuthorizationPolicy,
+  installSessionKey,
   openAuthorizationLane,
   mutateObject,
   registerValidator,
+  revokeSessionKey,
+  rotateActiveTransactionKey,
+  rotatePostQuantumRoot,
+  sessionKeyKey,
   submitSlashingEvidence,
   transactionHashHex,
   transactionSigningPayload,
@@ -33,6 +40,8 @@ import type {
   AssetIdJson,
   BridgeMessageJson,
   OperationJson,
+  PostQuantumRootRevealJson,
+  SessionKeyConstraintsJson,
   SignedTransactionJson,
   SlashingEvidenceJson,
 } from "./types";
@@ -287,6 +296,120 @@ describe("transaction signing schema", () => {
       "2d417a59882276e5908593eae97e323e4db4fceb324e5ff9d27ae895a0bbd1f5",
     );
     expect(claimValidatorRewards()).toBe("ClaimValidatorRewards");
+  });
+
+  const sessionReveal: PostQuantumRootRevealJson = {
+    scheme: "MlDsa65",
+    public_key: "33".repeat(1952),
+    signature: "44".repeat(3309),
+  };
+  const sessionConstraints: SessionKeyConstraintsJson = {
+    authorization_lane: "00".repeat(32),
+    allowed_operations: { transfer: true },
+    max_amount_per_use: "5",
+    total_amount_budget: "20",
+    max_fee_per_use: "1",
+    total_fee_budget: "5",
+    lifetime_epochs: 60,
+  };
+
+  it("matches the Rust session-key and rotation wire variants", async () => {
+    const operations: OperationJson[] = [
+      installSessionKey({
+        sessionPublicKey: "11".repeat(32),
+        constraints: sessionConstraints,
+        postQuantumRootReveal: sessionReveal,
+      }),
+      revokeSessionKey({
+        sessionKey: "55".repeat(32),
+        postQuantumRootReveal: sessionReveal,
+      }),
+      rotateActiveTransactionKey({
+        newActiveTransactionKey: "66".repeat(32),
+        postQuantumRootReveal: sessionReveal,
+      }),
+      rotatePostQuantumRoot({
+        newPostQuantumRoot: { scheme: "MlDsa65", public_key_hash: "22".repeat(32) },
+        postQuantumRootReveal: sessionReveal,
+      }),
+    ];
+    // Must equal the Rust vector in
+    // `session_and_rotation_operations_have_a_stable_cross_language_wire_vector`.
+    expect(await canonicalJsonHashHex(operations)).toBe(
+      "272f10267381f778bb9dc0d2d81c3aba143081facb9f677216e0e7bb538dbf1d",
+    );
+  });
+
+  it("derives the Rust session-key id for a public key", async () => {
+    // Must equal Rust `SessionKeyId::derive(PublicKeyBytes([0x11; 32]))`.
+    expect(await deriveSessionKeyIdHex("11".repeat(32))).toBe(
+      "0ccf7ce5d50b1e08cb4b7d2f7c5b7af9eb094dce0c9d1668a2e270de7fb40c74",
+    );
+  });
+
+  it("builds session-key and rotation access lists matching Rust", async () => {
+    const owner = "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3";
+    const account = { version: 1, kind: { Account: { address: owner } } };
+    const policy = { version: 1, kind: { AuthorizationPolicy: { owner } } };
+    const baseFee = { version: 1, kind: { Protocol: { field: "BaseFee" } } };
+    const feeAcc = {
+      version: 1,
+      kind: { FeeAccumulator: { payer: owner, lane: "00".repeat(32) } },
+    };
+
+    // Revoke reads the policy and writes the account and the named session key.
+    const revoke = defaultAccessList(
+      owner,
+      revokeSessionKey({
+        sessionKey: "55".repeat(32),
+        postQuantumRootReveal: sessionReveal,
+      }),
+    );
+    expect(revoke).toEqual({
+      read_only: [baseFee, policy],
+      read_write: [account, sessionKeyKey(owner, "55".repeat(32)), feeAcc],
+    });
+
+    // Both rotations write the policy, so it must not appear in read_only.
+    const rotate = defaultAccessList(
+      owner,
+      rotateActiveTransactionKey({
+        newActiveTransactionKey: "66".repeat(32),
+        postQuantumRootReveal: sessionReveal,
+      }),
+    );
+    expect(rotate).toEqual({
+      read_only: [baseFee],
+      read_write: [account, policy, feeAcc],
+    });
+
+    const rotateRoot = defaultAccessList(
+      owner,
+      rotatePostQuantumRoot({
+        newPostQuantumRoot: { scheme: "MlDsa65", public_key_hash: "22".repeat(32) },
+        postQuantumRootReveal: sessionReveal,
+      }),
+    );
+    expect(rotateRoot).toEqual({
+      read_only: [baseFee],
+      read_write: [account, policy, feeAcc],
+    });
+
+    // Install derives the session-key id, so the synchronous builder refuses it
+    // and the async builder writes the derived key.
+    const install = installSessionKey({
+      sessionPublicKey: "11".repeat(32),
+      constraints: sessionConstraints,
+      postQuantumRootReveal: sessionReveal,
+    });
+    expect(() => defaultAccessList(owner, install)).toThrow(
+      /defaultAccessListAsync/u,
+    );
+    const derivedId = await deriveSessionKeyIdHex("11".repeat(32));
+    expect(await defaultAccessListAsync(owner, install)).toEqual({
+      read_only: [baseFee, policy],
+      read_write: [account, sessionKeyKey(owner, derivedId), feeAcc],
+    });
   });
 
   it("decodes, verifies, and hashes the complete Rust signed transaction wire", async () => {

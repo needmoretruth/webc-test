@@ -388,6 +388,18 @@ mod tests {
     }
 
     #[test]
+    fn id_derivation_has_a_stable_cross_language_vector() {
+        // Fixed vector: the browser SDK's `deriveSessionKeyIdHex` must reproduce
+        // this exact id for the all-0x11 public key. If it changes, the SDK vector
+        // in `sdk/webc-js/src/transaction.test.ts` MUST be updated to match.
+        let id = SessionKeyId::derive(&PublicKeyBytes([0x11; 32]));
+        assert_eq!(
+            id.hash().to_hex(),
+            "0ccf7ce5d50b1e08cb4b7d2f7c5b7af9eb094dce0c9d1668a2e270de7fb40c74"
+        );
+    }
+
+    #[test]
     fn record_validate_detects_tampered_identity_and_overspend() {
         let record = SessionKey::new(
             Address::from_public_key(&PublicKeyBytes([1u8; 32])),

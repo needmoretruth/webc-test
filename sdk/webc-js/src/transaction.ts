@@ -26,8 +26,12 @@ import type {
   ExternalChainJson,
   FeeBid,
   FeeBidJson,
+  HexString,
   OperationJson,
   PostQuantumRootJson,
+  PostQuantumRootRevealJson,
+  SessionKeyConstraintsJson,
+  SessionKeyIdJson,
   SlashingEvidenceJson,
   SignedTransactionJson,
   StateAccessListJson,
@@ -37,9 +41,12 @@ import type {
 import type { WebcWallet } from "./wallet.js";
 import { signWithWallet } from "./wallet.js";
 import { addressFromBytes } from "./address.js";
-import { bytesToHex, hexToBytes } from "./hex.js";
+import { bytesToHex, concatBytes, hexToBytes, toArrayBuffer } from "./hex.js";
 import { canonicalJsonBytes } from "./canonical.js";
 import { bridgeMessageHashHex } from "./protocol-hash.js";
+
+/** Domain for session-key id derivation — must match Rust `SESSION_KEY_ID_DOMAIN`. */
+const SESSION_KEY_ID_DOMAIN = new TextEncoder().encode("WEBC_SESSION_KEY_ID_V1");
 
 /** Stable signing domain — must match Rust `crate::SIGNING_DOMAIN`. */
 export const TRANSACTION_SIGNING_DOMAIN = "WEBC_SIGNED_TRANSACTION_V4";
@@ -344,6 +351,116 @@ export function bridgeRelease(message: BridgeMessageJson): OperationJson {
   return { BridgeRelease: { message } };
 }
 
+/** Rejects hex that is not lowercase or not an even number of nibbles. */
+function requireLowercaseHex(value: string, label: string): void {
+  if (value.length % 2 !== 0 || value !== value.toLowerCase()) {
+    throw new Error(`invalid lowercase hex for ${label}`);
+  }
+  hexToBytes(value); // throws on any non-hex character
+}
+
+/** Validates a post-quantum root reveal's scheme and hex fields. */
+function requireValidReveal(reveal: PostQuantumRootRevealJson): void {
+  if (reveal.scheme !== "MlDsa65") {
+    throw new Error("unsupported post-quantum scheme");
+  }
+  if (reveal.public_key.length === 0 || reveal.signature.length === 0) {
+    throw new Error("post-quantum reveal must carry a key and signature");
+  }
+  requireLowercaseHex(reveal.public_key, "reveal public key");
+  requireLowercaseHex(reveal.signature, "reveal signature");
+}
+
+/** Validates a committed post-quantum root's scheme and non-zero hash. */
+function requireValidRoot(root: PostQuantumRootJson): void {
+  if (
+    root.scheme !== "MlDsa65" ||
+    root.public_key_hash.length !== 64 ||
+    root.public_key_hash !== root.public_key_hash.toLowerCase() ||
+    root.public_key_hash === "00".repeat(32)
+  ) {
+    throw new Error("invalid post-quantum root commitment");
+  }
+  hexToBytes(root.public_key_hash);
+}
+
+/**
+ * Installs a constrained session key. Critical action: the node requires the
+ * default lane, an installed policy, and a valid post-quantum root signature
+ * over this exact install. Build `postQuantumRootReveal` with the account's
+ * recovery root; this SDK does not hold or sign with that root.
+ */
+export function installSessionKey(args: {
+  sessionPublicKey: HexString;
+  constraints: SessionKeyConstraintsJson;
+  postQuantumRootReveal: PostQuantumRootRevealJson;
+}): OperationJson {
+  requireLowercaseHex(args.sessionPublicKey, "session public key");
+  requireValidReveal(args.postQuantumRootReveal);
+  return {
+    InstallSessionKey: {
+      session_public_key: args.sessionPublicKey,
+      constraints: args.constraints,
+      post_quantum_root_reveal: args.postQuantumRootReveal,
+    },
+  };
+}
+
+/** Revokes an installed session key immediately (critical action). */
+export function revokeSessionKey(args: {
+  sessionKey: SessionKeyIdJson;
+  postQuantumRootReveal: PostQuantumRootRevealJson;
+}): OperationJson {
+  requireLowercaseHex(args.sessionKey, "session key id");
+  requireValidReveal(args.postQuantumRootReveal);
+  return {
+    RevokeSessionKey: {
+      session_key: args.sessionKey,
+      post_quantum_root_reveal: args.postQuantumRootReveal,
+    },
+  };
+}
+
+/**
+ * Rotates the account's active Ed25519 transaction key (recovery/rotation). The
+ * envelope may be signed by the new key; the real authority is the root
+ * signature. Advances the policy revision, invalidating session keys.
+ */
+export function rotateActiveTransactionKey(args: {
+  newActiveTransactionKey: HexString;
+  postQuantumRootReveal: PostQuantumRootRevealJson;
+}): OperationJson {
+  requireLowercaseHex(args.newActiveTransactionKey, "new active transaction key");
+  requireValidReveal(args.postQuantumRootReveal);
+  return {
+    RotateActiveTransactionKey: {
+      new_active_transaction_key: args.newActiveTransactionKey,
+      post_quantum_root_reveal: args.postQuantumRootReveal,
+    },
+  };
+}
+
+/**
+ * Rotates the account's post-quantum recovery root, preserving the active key.
+ * The reveal must be a signature by the CURRENT root over the new commitment.
+ */
+export function rotatePostQuantumRoot(args: {
+  newPostQuantumRoot: PostQuantumRootJson;
+  postQuantumRootReveal: PostQuantumRootRevealJson;
+}): OperationJson {
+  requireValidRoot(args.newPostQuantumRoot);
+  requireValidReveal(args.postQuantumRootReveal);
+  return {
+    RotatePostQuantumRoot: {
+      new_post_quantum_root: {
+        scheme: args.newPostQuantumRoot.scheme,
+        public_key_hash: args.newPostQuantumRoot.public_key_hash,
+      },
+      post_quantum_root_reveal: args.postQuantumRootReveal,
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -358,10 +475,6 @@ export function defaultAccessList(
   operation: OperationJson,
   authorizationLane: AuthorizationLaneIdJson = DEFAULT_AUTHORIZATION_LANE,
 ): StateAccessListJson {
-  const installsPolicy =
-    typeof operation === "object" &&
-    operation !== null &&
-    "InstallAuthorizationPolicy" in operation;
   const readWrite: StateKeyJson[] = authorizationLane === DEFAULT_AUTHORIZATION_LANE
     ? [accountKey(sender)]
     : [authorizationLaneKey(sender, authorizationLane)];
@@ -372,11 +485,27 @@ export function defaultAccessList(
   }
   readWrite.push(feeAccumulatorKey(sender, authorizationLane));
   return {
-    read_only: installsPolicy
+    read_only: writesAuthorizationPolicy(operation)
       ? [protocolKey("BaseFee")]
       : [protocolKey("BaseFee"), authorizationPolicyKey(sender)],
     read_write: readWrite,
   };
+}
+
+/**
+ * Operations that WRITE the authorization policy key, so it must not also appear
+ * as a read-only key. Mirrors the Rust exclusion in `default_access_list_for_lane`:
+ * policy installation and both rotations replace the policy record; session-key
+ * install/revoke only read it.
+ */
+function writesAuthorizationPolicy(operation: OperationJson): boolean {
+  return (
+    typeof operation === "object" &&
+    operation !== null &&
+    ("InstallAuthorizationPolicy" in operation ||
+      "RotateActiveTransactionKey" in operation ||
+      "RotatePostQuantumRoot" in operation)
+  );
 }
 
 /**
@@ -406,6 +535,16 @@ export async function defaultAccessListAsync(
         ...(message.asset === "NativeWebc"
           ? [bridgeEscrowKey(message.source_chain)]
           : []),
+      ]);
+    }
+    if ("InstallSessionKey" in operation) {
+      // The writable session-key record is keyed by the derived id.
+      const sessionKeyId = await deriveSessionKeyIdHex(
+        operation.InstallSessionKey.session_public_key,
+      );
+      return assembleAccessList(sender, authorizationLane, [
+        accountKey(sender),
+        sessionKeyKey(sender, sessionKeyId),
       ]);
     }
     if ("SubmitSlashingEvidence" in operation) {
@@ -540,6 +679,26 @@ function extraReadWriteKeys(
       applicationKey(payload.namespace, payload.object_id),
     ];
   }
+  if ("RevokeSessionKey" in operation) {
+    return [
+      accountKey(sender),
+      sessionKeyKey(sender, operation.RevokeSessionKey.session_key),
+    ];
+  }
+  if (
+    "RotateActiveTransactionKey" in operation ||
+    "RotatePostQuantumRoot" in operation
+  ) {
+    // Both rotations write the account (nonce/fees) and the policy record.
+    return [accountKey(sender), authorizationPolicyKey(sender)];
+  }
+  if ("InstallSessionKey" in operation) {
+    // The writable session-key id is a SHA-256 of the session public key, so the
+    // access list needs an async hash. Callers must use defaultAccessListAsync.
+    throw new Error(
+      "InstallSessionKey requires defaultAccessListAsync (session-key id derivation)",
+    );
+  }
   if ("Transfer" in operation) {
     return [accountKey(sender), accountKey(operation.Transfer.to)];
   }
@@ -625,6 +784,32 @@ export function accountKey(address: WebcAddress): StateKeyJson {
 /** Returns the versioned signing/recovery policy key for one account. */
 export function authorizationPolicyKey(owner: WebcAddress): StateKeyJson {
   return { version: 1, kind: { AuthorizationPolicy: { owner } } };
+}
+
+/** Returns the state key for one session key under an owning account. */
+export function sessionKeyKey(
+  owner: WebcAddress,
+  sessionKey: SessionKeyIdJson,
+): StateKeyJson {
+  return { version: 1, kind: { SessionKey: { owner, session_key: sessionKey } } };
+}
+
+/**
+ * Derives the opaque session-key id committing to a session public key:
+ * `SHA-256("WEBC_SESSION_KEY_ID_V1" || session_public_key)`, lowercase hex. This
+ * must match Rust `SessionKeyId::derive` so state keys agree across languages.
+ */
+export async function deriveSessionKeyIdHex(
+  sessionPublicKeyHex: string,
+): Promise<string> {
+  const payload = concatBytes([
+    SESSION_KEY_ID_DOMAIN,
+    hexToBytes(sessionPublicKeyHex),
+  ]);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", toArrayBuffer(payload)),
+  );
+  return bytesToHex(digest);
 }
 
 /** Returns the current state key for one validator pool. */
