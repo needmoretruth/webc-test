@@ -33,6 +33,12 @@ describe("state-key wire schema", () => {
       },
       {
         version: 1,
+        kind: {
+          SessionKey: { owner, session_key: "ab".repeat(32) },
+        },
+      },
+      {
+        version: 1,
         kind: { FeeAccumulator: { payer: owner, lane: defaultLane } },
       },
       {
@@ -67,7 +73,7 @@ describe("state-key wire schema", () => {
     ];
 
     expect(await canonicalJsonHashHex(keys)).toBe(
-      "32109df973ae36bf9963250ace31eb14b23f1887101241e26c8c6b00cc193333",
+      "86b42dee5ac735a7435d64b12b3f6f958e90c03ac03173ef6f98ec88169c9e20",
     );
   });
 });

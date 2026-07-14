@@ -66,12 +66,23 @@ ESM package-entry smoke test, and the local Markdown-link check. On this Windows
 Resume with the first incomplete item in this order:
 
 1. Add versioned account authorization policies and the post-quantum root field,
-   then benchmark the ML-DSA candidate before enabling any claim.
-2. Add recovery, rotation, revocation, and constrained session-key state/tests.
-   The constrained session-key design, data model, integration points, security
-   invariants, test matrix, and staged build order are specified in
-   `docs/session-keys-implementation-plan.md`; implement it in the staged order
-   given there (§13), committing and testing each step before the next.
+   then benchmark the ML-DSA candidate before enabling any claim. (Policy + root
+   field are implemented; ML-DSA benchmarking remains.)
+2. Constrained session-key state and tests are **implemented** for the
+   single-node state machine (see `docs/session-keys-implementation-plan.md` and
+   the Phase 2 section of `docs/implementation-status.md`): install/revoke gated
+   by the post-quantum-root reveal, epoch expiry, per-use and cumulative amount
+   and fee budgets, lane binding, rotation invalidation, and 20 Rust tests.
+3. Remaining for this gate, in order:
+   - primary-key recovery and rotation operations (session keys already invalidate
+     on a policy-revision change, so wire that revision bump through rotation);
+   - the ML-DSA root-**signature** gate, replacing today's commitment-only reveal
+     on `InstallSessionKey`/`RevokeSessionKey` (needs a reviewed post-quantum
+     crate; none is in the workspace yet);
+   - optional epoch-boundary pruning of expired session keys;
+   - the browser/SDK session-key surface (subkey generation, install and session
+     signing, expiry display, and cross-language operation fixtures);
+   - session-key and strict-post-quantum benchmarks before any policy claim.
 
 Do not start RPC, networking, a public VM, ZK, or a real bridge before the Phase
 2 wallet wire and secret-isolation gates pass.

@@ -14,6 +14,7 @@ use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalC
 use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy};
 use crate::genesis::GenesisConfig;
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
+use crate::session_key::{SessionAllowedOperations, SessionKey, SessionKeyConfig, SessionKeyId};
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
 };
@@ -46,6 +47,9 @@ pub struct ChainConfig {
     pub slashing: SlashingPolicy,
     pub inflation: InflationSchedule,
     pub bridge: BridgeConfig,
+    /// Constrained session-key lifetime and per-account count limits.
+    #[serde(default)]
+    pub session_keys: SessionKeyConfig,
 }
 
 impl Default for ChainConfig {
@@ -59,6 +63,7 @@ impl Default for ChainConfig {
             slashing: SlashingPolicy::default(),
             inflation: InflationSchedule::default(),
             bridge: BridgeConfig::default(),
+            session_keys: SessionKeyConfig::default(),
         }
     }
 }
@@ -147,6 +152,28 @@ pub enum Event {
         /// Committed post-quantum recovery root, not a verification claim.
         post_quantum_root: crate::PostQuantumRoot,
     },
+    SessionKeyInstalled {
+        /// Account that owns the new session key.
+        owner: Address,
+        /// Opaque session-key identity.
+        session_key: SessionKeyId,
+        /// Absolute last epoch the key may be used.
+        expires_after_epoch: Epoch,
+    },
+    SessionKeyRevoked {
+        /// Account whose session key was removed.
+        owner: Address,
+        /// Opaque identity of the revoked session key.
+        session_key: SessionKeyId,
+    },
+    SessionKeyUsed {
+        /// Account that owns the session key.
+        owner: Address,
+        /// Opaque identity of the session key that authorized the transaction.
+        session_key: SessionKeyId,
+        /// Native principal moved under this use.
+        amount: Amount,
+    },
     ObjectCreated {
         object_id: ObjectId,
         namespace: Hash256,
@@ -214,6 +241,12 @@ pub struct ChainState {
     pub authorization_policies: BTreeMap<Address, AccountAuthorizationPolicy>,
     /// Non-default wallet lanes with independent nonce and prepaid fee state.
     pub authorization_lanes: BTreeMap<(Address, AuthorizationLaneId), AuthorizationLane>,
+    /// Constrained session keys delegated under each account's policy.
+    ///
+    /// Keyed by owner and opaque session-key id. Records hold constraints and
+    /// cumulative spend, never funds, so they do not enter supply reconciliation.
+    #[serde(default)]
+    pub session_keys: BTreeMap<(Address, SessionKeyId), SessionKey>,
     /// Persistent versioned application/NFT objects keyed by stable identity.
     pub objects: BTreeMap<ObjectId, StateObject>,
     pub validators: BTreeMap<Address, Validator>,
@@ -290,6 +323,18 @@ enum IncomingBridgeAction {
     ReleaseNative,
 }
 
+/// Which account authority approved a verified transaction.
+///
+/// Returned by `verify_transaction_authorization` and consumed by execution so
+/// session-key constraint enforcement runs only for session-signed transactions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionAuthorization {
+    /// The account's active transaction key, or its legacy address-derived key.
+    AccountKey,
+    /// A registered constrained session key, identified for constraint checks.
+    SessionKey(SessionKeyId),
+}
+
 impl Default for ChainState {
     fn default() -> Self {
         Self {
@@ -298,6 +343,7 @@ impl Default for ChainState {
             accounts: BTreeMap::new(),
             authorization_policies: BTreeMap::new(),
             authorization_lanes: BTreeMap::new(),
+            session_keys: BTreeMap::new(),
             objects: BTreeMap::new(),
             validators: BTreeMap::new(),
             delegations: BTreeMap::new(),
@@ -505,10 +551,10 @@ impl ChainState {
             return Err(ChainError::TransactionChainIdMismatch);
         }
         tx.verify()?;
-        self.verify_transaction_authorization(tx)?;
+        let authorization = self.verify_transaction_authorization(tx)?;
         let tx_hash = tx.hash()?;
         let mut next = self.clone();
-        let receipt = next.apply_verified_transaction(tx, config, tx_hash)?;
+        let receipt = next.apply_verified_transaction(tx, config, tx_hash, authorization)?;
         *self = next;
         Ok(receipt)
     }
@@ -520,7 +566,10 @@ impl ChainState {
     /// first policy. Installed accounts require an exact revision and active
     /// key match; address derivation is no longer consulted, allowing later key
     /// rotation without changing the stable account address.
-    fn verify_transaction_authorization(&self, tx: &Transaction) -> Result<(), ChainError> {
+    fn verify_transaction_authorization(
+        &self,
+        tx: &Transaction,
+    ) -> Result<TransactionAuthorization, ChainError> {
         tx.authorization_policy_revision.validate()?;
         let Some(policy) = self.authorization_policies.get(&tx.sender) else {
             if tx.authorization_policy_revision != LEGACY_AUTHORIZATION_POLICY_REVISION {
@@ -532,7 +581,7 @@ impl ChainState {
             if Address::from_public_key(&tx.public_key) != tx.sender {
                 return Err(ChainError::SenderPublicKeyMismatch);
             }
-            return Ok(());
+            return Ok(TransactionAuthorization::AccountKey);
         };
 
         policy.validate()?;
@@ -542,10 +591,27 @@ impl ChainState {
                 actual: tx.authorization_policy_revision.get(),
             });
         }
-        if &tx.public_key != policy.active_transaction_key() {
+        if &tx.public_key == policy.active_transaction_key() {
+            return Ok(TransactionAuthorization::AccountKey);
+        }
+
+        // The active key did not sign. The only other acceptable signer is a
+        // registered, policy-current, lane-bound session key. Expiry and spend
+        // limits are enforced in execution, where the operation and epoch are in
+        // hand and rollback is atomic; here we only bind the key to the account.
+        let id = SessionKeyId::derive(&tx.public_key);
+        let Some(session) = self.session_keys.get(&(tx.sender, id)) else {
+            return Err(ChainError::AuthorizationKeyMismatch);
+        };
+        if session.session_public_key != tx.public_key
+            || session.policy_revision != policy.revision()
+        {
             return Err(ChainError::AuthorizationKeyMismatch);
         }
-        Ok(())
+        if tx.authorization_lane != session.constraints.authorization_lane {
+            return Err(ChainError::SessionKeyLaneMismatch);
+        }
+        Ok(TransactionAuthorization::SessionKey(id))
     }
 
     /// Commits the next deterministic base fee after a completed block.
@@ -819,6 +885,7 @@ impl ChainState {
             account_root: Hash256,
             authorization_policy_root: Hash256,
             authorization_lane_root: Hash256,
+            session_key_root: Hash256,
             object_root: Hash256,
             validator_root: Hash256,
             delegation_root: Hash256,
@@ -838,7 +905,7 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            domain: "WEBC_STATE_COMMITMENT_V5",
+            domain: "WEBC_STATE_COMMITMENT_V6",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -849,6 +916,10 @@ impl ChainState {
             authorization_lane_root: ordered_value_root(
                 b"WEBC_AUTHORIZATION_LANE_LEAF_V1",
                 self.authorization_lanes.iter(),
+            )?,
+            session_key_root: ordered_value_root(
+                b"WEBC_SESSION_KEY_LEAF_V1",
+                self.session_keys.iter(),
             )?,
             object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V1", self.objects.iter())?,
             validator_root: ordered_value_root(b"WEBC_VALIDATOR_LEAF_V1", self.validators.iter())?,
@@ -965,6 +1036,7 @@ impl ChainState {
         tx: &Transaction,
         config: &ChainConfig,
         tx_hash: Hash256,
+        authorization: TransactionAuthorization,
     ) -> Result<Receipt, ChainError> {
         let mut access =
             StateAccessRecorder::new(&tx.access_list.read_only, &tx.access_list.read_write)?;
@@ -1074,6 +1146,13 @@ impl ChainState {
             breakdown: fee,
         }];
 
+        // A session key authorizes only within its fixed constraints. This runs
+        // before the operation mutates balances; any failure rolls back the
+        // whole transaction because execution is applied to a cloned overlay.
+        if let TransactionAuthorization::SessionKey(id) = authorization {
+            self.enforce_session_key_use(tx, id, total_fee, &mut access, &mut events)?;
+        }
+
         match &tx.operation {
             Operation::InstallAuthorizationPolicy { post_quantum_root } => {
                 if !tx.authorization_lane.is_default() {
@@ -1082,10 +1161,7 @@ impl ChainState {
                 if self.authorization_policies.contains_key(&tx.sender) {
                     return Err(ChainError::AuthorizationPolicyAlreadyExists);
                 }
-                let policy = AccountAuthorizationPolicy::new_v1(
-                    tx.public_key,
-                    *post_quantum_root,
-                )?;
+                let policy = AccountAuthorizationPolicy::new_v1(tx.public_key, *post_quantum_root)?;
                 let revision = policy.revision();
                 self.authorization_policies.insert(tx.sender, policy);
                 events.push(Event::AuthorizationPolicyInstalled {
@@ -1140,6 +1216,101 @@ impl ChainState {
                     owner: tx.sender,
                     lane: *lane,
                     fee_deposit: *fee_deposit,
+                });
+            }
+            Operation::InstallSessionKey {
+                session_public_key,
+                constraints,
+                post_quantum_root_reveal,
+            } => {
+                // Installing a session key is a critical action: it must use the
+                // default lane and prove knowledge of the account's committed
+                // post-quantum root. A legacy account without a policy has no
+                // root to gate the action and therefore cannot own session keys.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+                }
+                let (policy_revision, root) = {
+                    let policy = self
+                        .authorization_policies
+                        .get(&tx.sender)
+                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+                    policy.validate()?;
+                    (policy.revision(), *policy.post_quantum_root())
+                };
+                if !post_quantum_root_reveal.matches(&root)? {
+                    return Err(ChainError::InvalidPostQuantumRootReveal);
+                }
+                constraints.validate()?;
+                if constraints.lifetime_epochs > config.session_keys.max_lifetime_epochs {
+                    return Err(ChainError::SessionKeyLifetimeTooLong);
+                }
+                // Expiry is an absolute epoch derived from the install epoch, so
+                // the deadline never depends on a wall clock.
+                let expires_after_epoch = Epoch::new(
+                    self.current_epoch
+                        .checked_add(constraints.lifetime_epochs)
+                        .ok_or(ChainError::ArithmeticOverflow)?,
+                );
+                let id = SessionKeyId::derive(session_public_key);
+                access.write(StateKey::session_key(tx.sender, id))?;
+                if self.session_keys.contains_key(&(tx.sender, id)) {
+                    return Err(ChainError::SessionKeyAlreadyExists);
+                }
+                let installed = self
+                    .session_keys
+                    .keys()
+                    .filter(|(owner, _)| *owner == tx.sender)
+                    .count();
+                if installed >= config.session_keys.max_session_keys_per_account as usize {
+                    return Err(ChainError::SessionKeyLimitExceeded);
+                }
+                let record = SessionKey::new(
+                    tx.sender,
+                    *session_public_key,
+                    policy_revision,
+                    constraints.clone(),
+                    expires_after_epoch,
+                )?;
+                self.session_keys.insert((tx.sender, id), record);
+                events.push(Event::SessionKeyInstalled {
+                    owner: tx.sender,
+                    session_key: id,
+                    expires_after_epoch,
+                });
+            }
+            Operation::RevokeSessionKey {
+                session_key,
+                post_quantum_root_reveal,
+            } => {
+                // Revocation is immediate and unconditional so a compromised key
+                // can be killed at once. It is a critical action under the same
+                // default-lane and post-quantum-root gate as installation.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+                }
+                let root = {
+                    let policy = self
+                        .authorization_policies
+                        .get(&tx.sender)
+                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+                    policy.validate()?;
+                    *policy.post_quantum_root()
+                };
+                if !post_quantum_root_reveal.matches(&root)? {
+                    return Err(ChainError::InvalidPostQuantumRootReveal);
+                }
+                access.write(StateKey::session_key(tx.sender, *session_key))?;
+                if self
+                    .session_keys
+                    .remove(&(tx.sender, *session_key))
+                    .is_none()
+                {
+                    return Err(ChainError::SessionKeyNotFound);
+                }
+                events.push(Event::SessionKeyRevoked {
+                    owner: tx.sender,
+                    session_key: *session_key,
                 });
             }
             Operation::CreateObject {
@@ -1207,6 +1378,11 @@ impl ChainState {
                 });
             }
             Operation::Transfer { to, amount } => {
+                // The sender account is debited for the principal. On the default
+                // lane the fee step already recorded this write, but on a
+                // non-default lane fees come from the lane, so record it here or
+                // the signed access list's sender-account entry stays unused.
+                access.write(StateKey::account(tx.sender))?;
                 access.write(StateKey::account(*to))?;
                 self.debit_native(tx.sender, *amount)?;
                 self.credit_native(*to, *amount)?;
@@ -1864,6 +2040,75 @@ impl ChainState {
         Ok(())
     }
 
+    /// Enforces a session key's constraints and advances its cumulative spend.
+    ///
+    /// Runs during execution before the operation mutates balances. Every
+    /// failure returns a typed error and, because execution runs on a cloned
+    /// overlay, rolls back the entire transaction. A session key never gains
+    /// authority beyond its declared lane, operations, per-use amount,
+    /// cumulative budget, per-use fee, and expiry epoch. The lane binding was
+    /// already checked in `verify_transaction_authorization`.
+    fn enforce_session_key_use(
+        &mut self,
+        tx: &Transaction,
+        id: SessionKeyId,
+        total_fee: Amount,
+        access: &mut StateAccessRecorder,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
+        access.write(StateKey::session_key(tx.sender, id))?;
+        let session = self
+            .session_keys
+            .get(&(tx.sender, id))
+            .ok_or(ChainError::SessionKeyNotFound)?;
+        if self.current_epoch > session.expires_after_epoch.get() {
+            return Err(ChainError::SessionKeyExpired);
+        }
+        let principal =
+            session_permitted_principal(&tx.operation, session.constraints.allowed_operations)?;
+        if principal > session.constraints.max_amount_per_use {
+            return Err(ChainError::SessionKeyAmountExceeded);
+        }
+        let next_spent = session
+            .spent_amount
+            .checked_add(principal)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if next_spent > session.constraints.total_amount_budget {
+            return Err(ChainError::SessionKeyBudgetExceeded);
+        }
+        // Bound the maximum fee the transaction authorizes, independent of the
+        // current base fee, matching the off-chain grant's per-transaction cap.
+        let max_fee = Amount(
+            u128::from(tx.fee.gas_limit)
+                .checked_mul(u128::from(tx.fee.max_fee_per_unit))
+                .ok_or(ChainError::ArithmeticOverflow)?,
+        );
+        if max_fee > session.constraints.max_fee_per_use {
+            return Err(ChainError::SessionKeyFeeExceeded);
+        }
+        // Bound cumulative fees on the fee actually charged, so a compromised key
+        // cannot drain the account through fees on unlimited tiny transfers.
+        let next_fees = session
+            .spent_fees
+            .checked_add(total_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if next_fees > session.constraints.total_fee_budget {
+            return Err(ChainError::SessionKeyFeeBudgetExceeded);
+        }
+        let record = self
+            .session_keys
+            .get_mut(&(tx.sender, id))
+            .ok_or(ChainError::SessionKeyNotFound)?;
+        record.spent_amount = next_spent;
+        record.spent_fees = next_fees;
+        events.push(Event::SessionKeyUsed {
+            owner: tx.sender,
+            session_key: id,
+            amount: principal,
+        });
+        Ok(())
+    }
+
     fn account_mut(&mut self, address: Address) -> Result<&mut Account, ChainError> {
         self.accounts
             .get_mut(&address)
@@ -1988,6 +2233,22 @@ fn validate_owned_object(
     Ok(())
 }
 
+/// Returns the native principal a session key would move for an operation, or
+/// rejects an operation kind the session key is not permitted to authorize.
+///
+/// v1 permits only native transfers. Critical, staking, bridge, object, and
+/// lane/policy operations are never delegable to a session key, so they fall
+/// through to a rejection regardless of the grant's allow-list.
+fn session_permitted_principal(
+    operation: &Operation,
+    allowed: SessionAllowedOperations,
+) -> Result<Amount, ChainError> {
+    match operation {
+        Operation::Transfer { amount, .. } if allowed.transfer => Ok(*amount),
+        _ => Err(ChainError::SessionKeyOperationNotPermitted),
+    }
+}
+
 fn ordered_value_root<'a, K, V, I>(domain: &'static [u8], entries: I) -> Result<Hash256, ChainError>
 where
     K: Serialize + 'a,
@@ -2028,9 +2289,10 @@ fn leaf_hash<T: Serialize + ?Sized>(
 mod tests {
     use super::*;
     use crate::{
-        AuthorizationPolicyRevision, DoubleVoteEvidence, FeeBid, GenesisAccount,
-        GenesisValidator, Nonce, Operation, PostQuantumRoot, PostQuantumScheme, SignedVote,
-        SlashingEvidence, ValidatorSet, Vote, VoteType, MAX_AUTHORIZATION_POLICY_REVISION,
+        AuthorizationPolicyRevision, DoubleVoteEvidence, FeeBid, GenesisAccount, GenesisValidator,
+        Nonce, Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+        SessionKeyConstraints, SignedVote, SlashingEvidence, ValidatorSet, Vote, VoteType,
+        MAX_AUTHORIZATION_POLICY_REVISION,
     };
     use proptest::prelude::*;
     use webc_crypto::{Keypair, PublicKeyBytes};
@@ -2049,6 +2311,781 @@ mod tests {
         };
         let state = ChainState::from_genesis(&genesis).unwrap();
         (config, state, alice, bob)
+    }
+
+    // ----- session-key test helpers -----
+
+    /// Deterministic stand-in for an ML-DSA-65 public key (1,952 bytes).
+    fn pq_public_key() -> Vec<u8> {
+        vec![0xC3u8; 1_952]
+    }
+
+    /// A reveal matching the root installed by `installed_policy_state`.
+    fn pq_reveal() -> PostQuantumRootReveal {
+        PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: pq_public_key(),
+        }
+    }
+
+    /// Funded Alice with an installed policy whose post-quantum root commits to
+    /// `pq_public_key()`. Alice's account nonce is 1 after installation.
+    fn installed_policy_state() -> (ChainConfig, ChainState, Keypair, Keypair) {
+        let (config, mut state, alice, bob) = funded_state();
+        let root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &pq_public_key()).unwrap();
+        let install = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::InstallAuthorizationPolicy {
+                post_quantum_root: root,
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .unwrap();
+        state.execute_transaction(&install, &config).unwrap();
+        (config, state, alice, bob)
+    }
+
+    /// Default-lane transfer constraints: 5 WEBC per use, 20 WEBC budget.
+    fn session_constraints() -> SessionKeyConstraints {
+        SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_webc(5),
+            total_amount_budget: Amount::from_webc(20),
+            max_fee_per_use: Amount::from_webc(1),
+            total_fee_budget: Amount::from_webc(5),
+            lifetime_epochs: 60,
+        }
+    }
+
+    fn install_session_key_tx(
+        owner: &Keypair,
+        session: &Keypair,
+        nonce: u64,
+        constraints: SessionKeyConstraints,
+        reveal: PostQuantumRootReveal,
+    ) -> Transaction {
+        Transaction::for_operation_with_policy(
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            Operation::InstallSessionKey {
+                session_public_key: session.public_key(),
+                constraints,
+                post_quantum_root_reveal: reveal,
+            },
+            FeeBid {
+                gas_limit: 20_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Builds and signs a transfer authorized by a session key.
+    fn session_transfer_tx(
+        owner: &Keypair,
+        session: &Keypair,
+        lane: AuthorizationLaneId,
+        nonce: u64,
+        to: Address,
+        amount: Amount,
+        fee: FeeBid,
+    ) -> Transaction {
+        let id = SessionKeyId::derive(&session.public_key());
+        let operation = Operation::Transfer { to, amount };
+        let access_list = operation
+            .default_access_list_for_session(owner.address(), lane, id)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            owner.address(),
+            session.public_key(),
+            lane,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign_with_policy_key(session).unwrap();
+        tx
+    }
+
+    fn small_fee() -> FeeBid {
+        FeeBid {
+            gas_limit: 1_000,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        }
+    }
+
+    // ----- session-key tests -----
+
+    #[test]
+    fn session_key_install_use_and_revoke_lifecycle() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+
+        let before_install = state.state_root().unwrap();
+        let install =
+            install_session_key_tx(&alice, &session, 1, session_constraints(), pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+        assert!(state.session_keys.contains_key(&(alice.address(), id)));
+        assert_ne!(state.state_root().unwrap(), before_install);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A within-limits transfer signed by the session key succeeds and moves
+        // the owner's funds, advancing only the session's cumulative spend.
+        let bob_before = state.accounts.get(&bob.address()).map(|a| a.balance);
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(4),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_amount,
+            Amount::from_webc(4)
+        );
+        let bob_after = state.accounts.get(&bob.address()).unwrap().balance;
+        assert_eq!(
+            bob_after,
+            bob_before
+                .unwrap_or(Amount::ZERO)
+                .checked_add(Amount::from_webc(4))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Revocation removes the key; the same key can no longer authorize.
+        let revoke = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            3,
+            Operation::RevokeSessionKey {
+                session_key: id,
+                post_quantum_root_reveal: pq_reveal(),
+            },
+            small_fee_with_units(20_000),
+        )
+        .unwrap();
+        state.execute_transaction(&revoke, &config).unwrap();
+        assert!(!state.session_keys.contains_key(&(alice.address(), id)));
+
+        let after_revoke = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&after_revoke, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    fn small_fee_with_units(gas_limit: u64) -> FeeBid {
+        FeeBid {
+            gas_limit,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        }
+    }
+
+    #[test]
+    fn session_transfer_respects_per_use_budget_and_fee_caps() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        // Per-use 5 WEBC, cumulative budget 12 WEBC, per-use fee cap 1 WEBC.
+        let mut constraints = session_constraints();
+        constraints.total_amount_budget = Amount::from_webc(12);
+        let install = install_session_key_tx(&alice, &session, 1, constraints, pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // Over the per-use cap (5 WEBC): rejected atomically, nonce unchanged.
+        let over_use = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(6),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over_use, &config),
+            Err(ChainError::SessionKeyAmountExceeded)
+        ));
+        assert_eq!(state, before);
+
+        // Two 5 WEBC transfers succeed and reach 10 WEBC cumulative spend.
+        for nonce in [2u64, 3] {
+            let tx = session_transfer_tx(
+                &alice,
+                &session,
+                AuthorizationLaneId::DEFAULT,
+                nonce,
+                bob.address(),
+                Amount::from_webc(5),
+                small_fee(),
+            );
+            state.execute_transaction(&tx, &config).unwrap();
+        }
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_amount,
+            Amount::from_webc(10)
+        );
+
+        // A third 5 WEBC transfer would reach 15 WEBC, above the 12 WEBC budget,
+        // and is rejected atomically.
+        let over_budget = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            4,
+            bob.address(),
+            Amount::from_webc(5),
+            small_fee(),
+        );
+        let before_budget = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over_budget, &config),
+            Err(ChainError::SessionKeyBudgetExceeded)
+        ));
+        assert_eq!(state, before_budget);
+
+        // A fee bid whose ceiling exceeds the per-use fee cap (1 WEBC) fails,
+        // even though the 1 WEBC principal is within budget.
+        let over_fee = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            4,
+            bob.address(),
+            Amount::from_webc(1),
+            FeeBid {
+                gas_limit: 2_000_000_000,
+                max_fee_per_unit: 1_000,
+                priority_fee_per_unit: 0,
+            },
+        );
+        let before_fee = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over_fee, &config),
+            Err(ChainError::SessionKeyFeeExceeded)
+        ));
+        assert_eq!(state, before_fee);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn expired_session_key_is_rejected_at_the_boundary() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let mut constraints = session_constraints();
+        constraints.lifetime_epochs = 2;
+        let install = install_session_key_tx(&alice, &session, 1, constraints, pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // Valid through the expiry epoch (inclusive). Advancing the epoch is a
+        // deterministic integer step; expiry never reads a wall clock.
+        state.current_epoch = 2;
+        let at_expiry = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        state.execute_transaction(&at_expiry, &config).unwrap();
+
+        // One epoch later the key is expired and cannot authorize.
+        state.current_epoch = 3;
+        let after_expiry = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&after_expiry, &config),
+            Err(ChainError::SessionKeyExpired)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_cannot_authorize_a_non_transfer_operation() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let install =
+            install_session_key_tx(&alice, &session, 1, session_constraints(), pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A claim operation is not in the session allow-list and is refused
+        // before any state change, even though the key is otherwise valid.
+        let operation = Operation::ClaimValidatorRewards;
+        let id = SessionKeyId::derive(&session.public_key());
+        let access_list = operation
+            .default_access_list_for_session(alice.address(), AuthorizationLaneId::DEFAULT, id)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            session.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            AuthorizationPolicyRevision::new(1),
+            2,
+            operation,
+            access_list,
+            small_fee_with_units(10_000),
+        );
+        tx.sign_with_policy_key(&session).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::SessionKeyOperationNotPermitted)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_bound_lane_mismatch_is_rejected() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let bound_lane = AuthorizationLaneId::new(Hash256([0x77; 32]));
+        let mut constraints = session_constraints();
+        constraints.authorization_lane = bound_lane;
+        let install = install_session_key_tx(&alice, &session, 1, constraints, pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // The key is bound to `bound_lane`; a transfer on the default lane is
+        // refused during authorization, before any fee or state change.
+        let wrong_lane = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&wrong_lane, &config),
+            Err(ChainError::SessionKeyLaneMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_is_invalidated_when_bound_policy_revision_changes() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        let install =
+            install_session_key_tx(&alice, &session, 1, session_constraints(), pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A key rotation bumps the account policy revision. Simulate the stored
+        // effect: the session was installed under revision 1, so a policy now at
+        // revision 2 must invalidate it.
+        state
+            .session_keys
+            .get_mut(&(alice.address(), id))
+            .unwrap()
+            .policy_revision = AuthorizationPolicyRevision::new(2);
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&transfer, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn install_session_key_fail_closed_paths() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+
+        // Wrong post-quantum root reveal.
+        let bad_reveal = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: vec![0xC4u8; 1_952],
+        };
+        let install_bad =
+            install_session_key_tx(&alice, &session, 1, session_constraints(), bad_reveal);
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&install_bad, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // Lifetime beyond the configured maximum.
+        let mut too_long = session_constraints();
+        too_long.lifetime_epochs = config.session_keys.max_lifetime_epochs + 1;
+        let install_long = install_session_key_tx(&alice, &session, 1, too_long, pq_reveal());
+        assert!(matches!(
+            state.execute_transaction(&install_long, &config),
+            Err(ChainError::SessionKeyLifetimeTooLong)
+        ));
+
+        // Invalid constraints (budget below per-use).
+        let mut invalid = session_constraints();
+        invalid.total_amount_budget = Amount::from_webc(1);
+        let install_invalid = install_session_key_tx(&alice, &session, 1, invalid, pq_reveal());
+        assert!(matches!(
+            state.execute_transaction(&install_invalid, &config),
+            Err(ChainError::InvalidSessionKeyConstraints)
+        ));
+
+        // Duplicate installation is rejected.
+        let install =
+            install_session_key_tx(&alice, &session, 1, session_constraints(), pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+        let dup = install_session_key_tx(&alice, &session, 2, session_constraints(), pq_reveal());
+        assert!(matches!(
+            state.execute_transaction(&dup, &config),
+            Err(ChainError::SessionKeyAlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn session_key_management_requires_default_lane() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let lane = AuthorizationLaneId::new(Hash256([0x55; 32]));
+        // Open a funded non-default lane so its nonce/fee lookup succeeds and the
+        // critical-action default-lane guard is the check that actually fires.
+        let open = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            small_fee_with_units(10_000),
+        )
+        .unwrap();
+        state.execute_transaction(&open, &config).unwrap();
+
+        let session = Keypair::from_seed([9u8; 32]);
+        let operation = Operation::InstallSessionKey {
+            session_public_key: session.public_key(),
+            constraints: session_constraints(),
+            post_quantum_root_reveal: pq_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), lane)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            lane,
+            AuthorizationPolicyRevision::new(1),
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(20_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::SessionKeyManagementRequiresDefaultLane)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn legacy_account_cannot_own_session_keys() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        // Alice has no installed policy, so `for_operation` uses revision zero.
+        let install = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::InstallSessionKey {
+                session_public_key: session.public_key(),
+                constraints: session_constraints(),
+                post_quantum_root_reveal: pq_reveal(),
+            },
+            small_fee_with_units(20_000),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&install, &config),
+            Err(ChainError::SessionKeyRequiresInstalledPolicy)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_count_cap_is_enforced() {
+        let (mut config, mut state, alice, _bob) = installed_policy_state();
+        config.session_keys.max_session_keys_per_account = 2;
+        for (i, seed) in [[10u8; 32], [11u8; 32]].into_iter().enumerate() {
+            let session = Keypair::from_seed(seed);
+            let install = install_session_key_tx(
+                &alice,
+                &session,
+                1 + i as u64,
+                session_constraints(),
+                pq_reveal(),
+            );
+            state.execute_transaction(&install, &config).unwrap();
+        }
+        let third = Keypair::from_seed([12u8; 32]);
+        let install = install_session_key_tx(&alice, &third, 3, session_constraints(), pq_reveal());
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&install, &config),
+            Err(ChainError::SessionKeyLimitExceeded)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn revoke_unknown_session_key_is_rejected() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let missing = SessionKeyId::new(Hash256([0xEE; 32]));
+        let revoke = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::RevokeSessionKey {
+                session_key: missing,
+                post_quantum_root_reveal: pq_reveal(),
+            },
+            small_fee_with_units(20_000),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&revoke, &config),
+            Err(ChainError::SessionKeyNotFound)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_keys_survive_serialization_restart() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let install =
+            install_session_key_tx(&alice, &session, 1, session_constraints(), pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(3),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
+
+        // The whole chain state uses tuple-keyed maps, so it round-trips through
+        // bincode (a non-string-key format) rather than JSON.
+        let bytes = bincode::serialize(&state).unwrap();
+        let restored: ChainState = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+    }
+
+    #[test]
+    fn cumulative_fee_budget_bounds_a_compromised_key() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        // Tiny principal, but a cumulative fee budget of 3,000 base units. Each
+        // transfer below charges exactly 1,000 base units in real fees.
+        let mut constraints = session_constraints();
+        constraints.max_fee_per_use = Amount::from_units(2_000);
+        constraints.total_fee_budget = Amount::from_units(3_000);
+        let install = install_session_key_tx(&alice, &session, 1, constraints, pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A fee bid that charges 1,000 base units per transfer (500 units * 2).
+        let drain_fee = FeeBid {
+            gas_limit: 500,
+            max_fee_per_unit: 2,
+            priority_fee_per_unit: 2,
+        };
+        for nonce in [2u64, 3, 4] {
+            let tx = session_transfer_tx(
+                &alice,
+                &session,
+                AuthorizationLaneId::DEFAULT,
+                nonce,
+                bob.address(),
+                Amount::from_units(1),
+                drain_fee,
+            );
+            state.execute_transaction(&tx, &config).unwrap();
+        }
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_fees,
+            Amount::from_units(3_000)
+        );
+
+        // The fourth transfer would push cumulative fees to 4,000 > 3,000 and is
+        // rejected, so the total fee drain is bounded regardless of use count.
+        let over = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            5,
+            bob.address(),
+            Amount::from_units(1),
+            drain_fee,
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over, &config),
+            Err(ChainError::SessionKeyFeeBudgetExceeded)
+        ));
+        assert_eq!(state, before);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn session_transfer_works_on_a_bound_non_default_lane() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let lane = AuthorizationLaneId::new(Hash256::digest(b"origin-lane"));
+        // Open and fund the origin lane from the default lane.
+        let open = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            small_fee_with_units(10_000),
+        )
+        .unwrap();
+        state.execute_transaction(&open, &config).unwrap();
+
+        // Install a session key bound to that lane.
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        let mut constraints = session_constraints();
+        constraints.authorization_lane = lane;
+        let install = install_session_key_tx(&alice, &session, 2, constraints, pq_reveal());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A session transfer on the bound lane succeeds: principal leaves the
+        // owner account, the lane nonce advances, and cumulative spend updates.
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            lane,
+            0,
+            bob.address(),
+            Amount::from_webc(3),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
+        assert_eq!(
+            state.accounts.get(&bob.address()).unwrap().balance,
+            Amount::from_webc(3)
+        );
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_amount,
+            Amount::from_webc(3)
+        );
+        assert_eq!(
+            state.authorization_lanes[&(alice.address(), lane)].next_nonce,
+            Nonce::new(1)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn session_spend_never_exceeds_budget(
+            amounts in proptest::collection::vec(1u64..8, 1..24)
+        ) {
+            let (config, mut state, alice, bob) = installed_policy_state();
+            let session = Keypair::from_seed([9u8; 32]);
+            let id = SessionKeyId::derive(&session.public_key());
+            let install = install_session_key_tx(
+                &alice, &session, 1, session_constraints(), pq_reveal());
+            state.execute_transaction(&install, &config).unwrap();
+
+            let per_use = Amount::from_webc(5);
+            let budget = Amount::from_webc(20);
+            let mut expected_spent = Amount::ZERO;
+            let mut nonce = 2u64;
+            for raw in amounts {
+                let amount = Amount::from_webc(raw);
+                let next = expected_spent.checked_add(amount).unwrap();
+                let accepted = amount <= per_use && next <= budget;
+                let tx = session_transfer_tx(
+                    &alice, &session, AuthorizationLaneId::DEFAULT,
+                    nonce, bob.address(), amount, small_fee());
+                let before = state.clone();
+                let result = state.execute_transaction(&tx, &config);
+                if accepted {
+                    prop_assert!(result.is_ok());
+                    expected_spent = next;
+                    nonce += 1;
+                } else {
+                    prop_assert!(result.is_err());
+                    prop_assert_eq!(&state, &before);
+                }
+                prop_assert_eq!(
+                    state.session_keys[&(alice.address(), id)].spent_amount,
+                    expected_spent
+                );
+                prop_assert!(state.session_keys[&(alice.address(), id)].spent_amount <= budget);
+                prop_assert!(state.supply_invariant_report().unwrap().balanced);
+            }
+        }
     }
 
     #[test]

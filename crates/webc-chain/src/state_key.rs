@@ -7,7 +7,8 @@
 //! keep hostile access lists bounded independently of future storage backends.
 
 use crate::{
-    AssetId, AuthorizationLaneId, ChainError, ObjectId, ProtocolVersion, CURRENT_PROTOCOL_VERSION,
+    AssetId, AuthorizationLaneId, ChainError, ObjectId, ProtocolVersion, SessionKeyId,
+    CURRENT_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -57,6 +58,11 @@ pub enum StateKeyKind {
     FeeAccumulator {
         payer: Address,
         lane: AuthorizationLaneId,
+    },
+    /// Constraint and cumulative-spend state for one constrained session key.
+    SessionKey {
+        owner: Address,
+        session_key: SessionKeyId,
     },
     /// Replay marker for one incoming bridge message.
     BridgeMessage { message_hash: Hash256 },
@@ -133,6 +139,11 @@ impl StateKey {
     /// Returns the default-lane fee-accounting key.
     pub const fn fee_accumulator(payer: Address) -> Self {
         Self::fee_accumulator_for_lane(payer, AuthorizationLaneId::DEFAULT)
+    }
+
+    /// Returns the state key for one constrained session key under `owner`.
+    pub const fn session_key(owner: Address, session_key: SessionKeyId) -> Self {
+        Self::current(StateKeyKind::SessionKey { owner, session_key })
     }
 
     /// Returns one lane-scoped fee-accounting key.
@@ -329,6 +340,7 @@ mod tests {
             StateKey::validator(validator),
             StateKey::delegation(owner, validator),
             StateKey::authorization_lane(owner, AuthorizationLaneId::new(Hash256([0x99; 32]))),
+            StateKey::session_key(owner, SessionKeyId::new(Hash256([0xab; 32]))),
             StateKey::fee_accumulator(owner),
             StateKey::bridge_message(Hash256([0x11; 32])),
             StateKey::bridge_escrow(ExternalChain::Ethereum),
@@ -348,7 +360,7 @@ mod tests {
             crate::canonical::canonical_json_bytes(&keys).expect("state-key vector serializes");
         assert_eq!(
             Hash256::digest(bytes).to_hex(),
-            "32109df973ae36bf9963250ace31eb14b23f1887101241e26c8c6b00cc193333"
+            "86b42dee5ac735a7435d64b12b3f6f958e90c03ac03173ef6f98ec88169c9e20"
         );
     }
 }

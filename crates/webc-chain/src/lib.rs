@@ -20,6 +20,7 @@ pub mod inflation;
 pub mod object;
 pub mod protocol;
 pub mod scheduler;
+pub mod session_key;
 pub mod slashing;
 pub mod staking;
 pub mod state;
@@ -32,8 +33,9 @@ pub use amount::{Amount, WEBC_DECIMALS, WEBC_UNIT};
 pub use authorization::AuthorizationLane;
 pub use authorization_policy::{
     AccountAuthorizationPolicy, AccountAuthorizationPolicyV1, AuthorizationPolicyRevision,
-    PostQuantumRoot, PostQuantumScheme, INITIAL_AUTHORIZATION_POLICY_REVISION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_AUTHORIZATION_POLICY_REVISION,
+    PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+    INITIAL_AUTHORIZATION_POLICY_REVISION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    MAX_AUTHORIZATION_POLICY_REVISION, MAX_POST_QUANTUM_PUBLIC_KEY_BYTES,
 };
 pub use block::{Block, BlockHeader};
 pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildInput};
@@ -51,6 +53,9 @@ pub use protocol::{
     ProtocolVersion, ValidatorId, CURRENT_PROTOCOL_VERSION,
 };
 pub use scheduler::parallel_batches;
+pub use session_key::{
+    SessionAllowedOperations, SessionKey, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
+};
 pub use slashing::{SlashingEvidence, SlashingOutcome, SlashingPolicy};
 pub use staking::{
     Delegation, StakingConfig, Validator, ValidatorStatus, SEVEN_DAY_TARGET_AT_ONE_MINUTE_EPOCHS,
@@ -106,7 +111,9 @@ pub enum ChainError {
     MissingSignature,
     #[error("public key does not match transaction sender address")]
     SenderPublicKeyMismatch,
-    #[error("transaction authorization policy revision mismatch: expected {expected}, got {actual}")]
+    #[error(
+        "transaction authorization policy revision mismatch: expected {expected}, got {actual}"
+    )]
     AuthorizationPolicyRevisionMismatch { expected: u64, actual: u64 },
     #[error("transaction public key is not active in the account authorization policy")]
     AuthorizationKeyMismatch,
@@ -228,6 +235,36 @@ pub enum ChainError {
     ObjectVersionMismatch { expected: u64, actual: u64 },
     #[error("object data contains {actual} bytes, above the maximum of {maximum}")]
     ObjectDataTooLarge { actual: usize, maximum: usize },
+    #[error("post-quantum root reveal does not match the committed account root")]
+    InvalidPostQuantumRootReveal,
+    #[error("session key was not found")]
+    SessionKeyNotFound,
+    #[error("session key already exists")]
+    SessionKeyAlreadyExists,
+    #[error("session key has expired")]
+    SessionKeyExpired,
+    #[error("account is at its maximum number of session keys")]
+    SessionKeyLimitExceeded,
+    #[error("requested session-key lifetime exceeds the configured maximum")]
+    SessionKeyLifetimeTooLong,
+    #[error("account has no installed policy able to own session keys")]
+    SessionKeyRequiresInstalledPolicy,
+    #[error("session-key management must use the default lane")]
+    SessionKeyManagementRequiresDefaultLane,
+    #[error("session-key transaction used a lane other than its bound lane")]
+    SessionKeyLaneMismatch,
+    #[error("session key is not permitted to authorize this operation")]
+    SessionKeyOperationNotPermitted,
+    #[error("session-key transaction exceeds the per-use amount limit")]
+    SessionKeyAmountExceeded,
+    #[error("session-key transaction exceeds the cumulative amount budget")]
+    SessionKeyBudgetExceeded,
+    #[error("session-key transaction exceeds the per-use fee limit")]
+    SessionKeyFeeExceeded,
+    #[error("session-key transaction exceeds the cumulative fee budget")]
+    SessionKeyFeeBudgetExceeded,
+    #[error("session-key constraints are invalid")]
+    InvalidSessionKeyConstraints,
 }
 
 impl From<bincode::Error> for ChainError {
