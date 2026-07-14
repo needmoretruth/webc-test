@@ -9,7 +9,9 @@
 
 use crate::account::Account;
 use crate::authorization::AuthorizationLane;
-use crate::authorization_policy::{active_key_rotation_message, AccountAuthorizationPolicy};
+use crate::authorization_policy::{
+    active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
+};
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy};
 use crate::genesis::GenesisConfig;
@@ -176,6 +178,14 @@ pub enum Event {
         new_revision: crate::AuthorizationPolicyRevision,
         /// New Ed25519 key now authorizing ordinary transactions.
         new_active_transaction_key: webc_crypto::PublicKeyBytes,
+    },
+    PostQuantumRootRotated {
+        /// Account whose post-quantum recovery root was replaced.
+        owner: Address,
+        /// Revision after rotation; every prior-revision session key is now dead.
+        new_revision: crate::AuthorizationPolicyRevision,
+        /// New committed recovery root now required for critical actions.
+        new_post_quantum_root: crate::PostQuantumRoot,
     },
     SessionKeyUsed {
         /// Account that owns the session key.
@@ -1081,6 +1091,7 @@ impl ChainState {
             &tx.operation,
             Operation::InstallAuthorizationPolicy { .. }
                 | Operation::RotateActiveTransactionKey { .. }
+                | Operation::RotatePostQuantumRoot { .. }
         ) {
             access.write(StateKey::authorization_policy(tx.sender))?;
         } else {
@@ -1435,6 +1446,60 @@ impl ChainState {
                     owner: tx.sender,
                     new_revision,
                     new_active_transaction_key: *new_active_transaction_key,
+                });
+            }
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root,
+                post_quantum_root_reveal,
+            } => {
+                // Replacing the recovery root is a critical action gated on a
+                // signature by the CURRENT root, so only the present recovery-root
+                // holder can change it. The envelope is signed by the active key
+                // (the AccountKey path), so a stolen root alone cannot rotate the
+                // root without also holding the active key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::PostQuantumRootRotationRequiresDefaultLane);
+                }
+                let (policy_revision, current_root) = {
+                    let policy = self
+                        .authorization_policies
+                        .get(&tx.sender)
+                        .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?;
+                    policy.validate()?;
+                    (policy.revision(), *policy.post_quantum_root())
+                };
+                new_post_quantum_root.validate()?;
+                // A no-op rotation would waste a revision and needlessly grief
+                // outstanding session keys without changing the root.
+                if *new_post_quantum_root == current_root {
+                    return Err(ChainError::PostQuantumRootRotationToSameRoot);
+                }
+                // The CURRENT root must sign this exact new commitment under the
+                // current revision and nonce. A signature captured for any other
+                // root, nonce, or revision rebuilds a different message and fails.
+                let message = post_quantum_root_rotation_message(
+                    &config.chain_id,
+                    tx.sender,
+                    policy_revision,
+                    tx.nonce,
+                    new_post_quantum_root,
+                )?;
+                if !post_quantum_root_reveal.verify(&current_root, &message)? {
+                    return Err(ChainError::InvalidPostQuantumRootReveal);
+                }
+                // The policy state key was already recorded as a write at the top
+                // of apply, so the rotation conflicts with concurrent spends.
+                let rotated = self
+                    .authorization_policies
+                    .get(&tx.sender)
+                    .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?
+                    .rotate_post_quantum_root(*new_post_quantum_root)?;
+                let new_revision = rotated.revision();
+                self.authorization_policies.insert(tx.sender, rotated);
+                events.push(Event::PostQuantumRootRotated {
+                    owner: tx.sender,
+                    new_revision,
+                    new_post_quantum_root: *new_post_quantum_root,
                 });
             }
             Operation::CreateObject {
@@ -6266,5 +6331,435 @@ mod tests {
             Err(ChainError::AuthorizationKeyMismatch)
         ));
         assert_eq!(state, before);
+    }
+
+    // ----- post-quantum root rotation tests -----
+
+    /// A second process-wide ML-DSA-65 keypair used as the *new* recovery root in
+    /// root-rotation tests (the first keypair is the current committed root).
+    fn pq_keypair_b() -> &'static (MlDsa65PublicKey, MlDsa65SecretKey) {
+        static KEYPAIR_B: OnceLock<(MlDsa65PublicKey, MlDsa65SecretKey)> = OnceLock::new();
+        KEYPAIR_B.get_or_init(|| ml_dsa65_keygen().expect("ml-dsa-65 keygen b"))
+    }
+
+    /// The new post-quantum root committing to keypair B.
+    fn new_root_b() -> PostQuantumRoot {
+        PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &pq_keypair_b().0.to_bytes())
+            .unwrap()
+    }
+
+    /// A reveal whose public key and signature come from `keypair`, over exactly
+    /// `message`. Used to sign with either the current root (A) or a candidate
+    /// new root (B / a stranger).
+    fn reveal_with_keypair(
+        keypair: &(MlDsa65PublicKey, MlDsa65SecretKey),
+        message: &[u8],
+    ) -> PostQuantumRootReveal {
+        PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: keypair.0.to_bytes(),
+            signature: keypair.1.sign(message, b"").unwrap(),
+        }
+    }
+
+    /// A root-rotation reveal: the CURRENT root (keypair A) signs the rotation to
+    /// `new_root` at `nonce` under revision 1, matching what the state machine
+    /// rebuilds and verifies.
+    fn root_rotation_reveal(
+        owner: Address,
+        nonce: u64,
+        new_root: &PostQuantumRoot,
+    ) -> PostQuantumRootReveal {
+        let message = crate::post_quantum_root_rotation_message(
+            &ChainId::devnet(),
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            new_root,
+        )
+        .unwrap();
+        reveal_over_message(&message)
+    }
+
+    /// Builds a default-lane root-rotation transaction signed by the current
+    /// active key (the AccountKey authorization path).
+    fn rotate_root_tx(
+        owner: &Keypair,
+        nonce: u64,
+        new_root: PostQuantumRoot,
+        reveal: PostQuantumRootReveal,
+    ) -> Transaction {
+        Transaction::for_operation_with_policy(
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root: new_root,
+                post_quantum_root_reveal: reveal,
+            },
+            small_fee_with_units(25_000),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_replaces_the_root_and_preserves_the_active_key() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        // A session key installed under revision 1 must die on any policy bump.
+        let session = Keypair::from_seed([9u8; 32]);
+        let session_id = SessionKeyId::derive(&session.public_key());
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+        assert!(state
+            .session_keys
+            .contains_key(&(alice.address(), session_id)));
+
+        let new_root = new_root_b();
+        let before_root = state.state_root().unwrap();
+        let rotate = rotate_root_tx(
+            &alice,
+            2,
+            new_root,
+            root_rotation_reveal(alice.address(), 2, &new_root),
+        );
+        state.execute_transaction(&rotate, &config).unwrap();
+
+        let policy = state.authorization_policies.get(&alice.address()).unwrap();
+        assert_eq!(*policy.post_quantum_root(), new_root);
+        // The everyday signing key is untouched by a root rotation.
+        assert_eq!(policy.active_transaction_key(), &alice.public_key());
+        assert_eq!(policy.revision(), AuthorizationPolicyRevision::new(2));
+        assert_ne!(state.state_root().unwrap(), before_root);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // The session key installed under revision 1 can no longer be used.
+        let session_tx = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            _bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        assert!(matches!(
+            state.execute_transaction(&session_tx, &config),
+            Err(ChainError::AuthorizationPolicyRevisionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_rejects_rotating_to_the_same_root() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let same_root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &pq_public_key()).unwrap();
+        let rotate = rotate_root_tx(
+            &alice,
+            1,
+            same_root,
+            root_rotation_reveal(alice.address(), 1, &same_root),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&rotate, &config),
+            Err(ChainError::PostQuantumRootRotationToSameRoot)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_requires_default_lane() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let lane = AuthorizationLaneId::new(Hash256([0x55; 32]));
+        let open = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            small_fee_with_units(10_000),
+        )
+        .unwrap();
+        state.execute_transaction(&open, &config).unwrap();
+
+        let new_root = new_root_b();
+        let operation = Operation::RotatePostQuantumRoot {
+            new_post_quantum_root: new_root,
+            // Rejected by the default-lane guard before the reveal is verified.
+            post_quantum_root_reveal: unverified_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), lane)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            lane,
+            AuthorizationPolicyRevision::new(1),
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::PostQuantumRootRotationRequiresDefaultLane)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_requires_an_installed_policy() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let new_root = new_root_b();
+        // No policy installed: sign with the address-deriving key at the legacy
+        // revision so authorization passes and the arm's policy guard fires.
+        let operation = Operation::RotatePostQuantumRoot {
+            new_post_quantum_root: new_root,
+            post_quantum_root_reveal: unverified_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), AuthorizationLaneId::DEFAULT)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            LEGACY_AUTHORIZATION_POLICY_REVISION,
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_rejects_a_non_active_envelope_signer() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let new_root = new_root_b();
+        let stranger = Keypair::from_seed([44u8; 32]);
+        // A non-active Ed25519 key signs the envelope. Unlike active-key rotation,
+        // root rotation has no recovery signer path, so this is just an ordinary
+        // authorization failure.
+        let operation = Operation::RotatePostQuantumRoot {
+            new_post_quantum_root: new_root,
+            post_quantum_root_reveal: root_rotation_reveal(alice.address(), 1, &new_root),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), AuthorizationLaneId::DEFAULT)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            stranger.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&stranger).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    /// The gate must reject any reveal that is not a real ML-DSA signature by the
+    /// *current* committed root over this exact root rotation. Every binding axis
+    /// and forgery is checked, each leaving state unchanged.
+    #[test]
+    fn post_quantum_root_rotation_rejects_misbound_or_forged_current_root_signature() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let new_root = new_root_b();
+        let before = state.clone();
+
+        // (a) Signed over a different new root.
+        let other_root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, b"a third root").unwrap();
+        let tx_a = rotate_root_tx(
+            &alice,
+            1,
+            new_root,
+            root_rotation_reveal(alice.address(), 1, &other_root),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_a, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (b) Signed for a different nonce.
+        let tx_b = rotate_root_tx(
+            &alice,
+            1,
+            new_root,
+            root_rotation_reveal(alice.address(), 2, &new_root),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_b, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (c) Signed for a different owner.
+        let stranger = Keypair::from_seed([44u8; 32]);
+        let wrong_owner_msg = crate::post_quantum_root_rotation_message(
+            &ChainId::devnet(),
+            stranger.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_root,
+        )
+        .unwrap();
+        let tx_c = rotate_root_tx(&alice, 1, new_root, reveal_over_message(&wrong_owner_msg));
+        assert!(matches!(
+            state.execute_transaction(&tx_c, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (d) Signed for a different chain.
+        let wrong_chain_msg = crate::post_quantum_root_rotation_message(
+            &ChainId::new("webc-testnet-9").unwrap(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_root,
+        )
+        .unwrap();
+        let tx_d = rotate_root_tx(&alice, 1, new_root, reveal_over_message(&wrong_chain_msg));
+        assert!(matches!(
+            state.execute_transaction(&tx_d, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (e) The current root's public key but a garbage signature.
+        let garbage = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: pq_public_key(),
+            signature: vec![0x7u8; ML_DSA_65_SIGNATURE_LEN],
+        };
+        let tx_e = rotate_root_tx(&alice, 1, new_root, garbage);
+        assert!(matches!(
+            state.execute_transaction(&tx_e, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (f) Signed by the NEW root instead of the current one: the current root
+        // must authorize its own replacement, so the future root cannot.
+        let correct_msg = crate::post_quantum_root_rotation_message(
+            &ChainId::devnet(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_root,
+        )
+        .unwrap();
+        let signed_by_new = reveal_with_keypair(pq_keypair_b(), &correct_msg);
+        let tx_f = rotate_root_tx(&alice, 1, new_root, signed_by_new);
+        assert!(matches!(
+            state.execute_transaction(&tx_f, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn after_root_rotation_the_new_root_holds_authority_and_the_old_root_does_not() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        // Rotate the root from A to B (envelope signed by the active key).
+        let new_root = new_root_b();
+        let rotate = rotate_root_tx(
+            &alice,
+            1,
+            new_root,
+            root_rotation_reveal(alice.address(), 1, &new_root),
+        );
+        state.execute_transaction(&rotate, &config).unwrap();
+        assert_eq!(
+            *state
+                .authorization_policies
+                .get(&alice.address())
+                .unwrap()
+                .post_quantum_root(),
+            new_root
+        );
+
+        // Now attempt an active-key rotation at the new revision 2. The rotation
+        // message binds revision 2; the active key (alice) signs the envelope.
+        let new_ed = Keypair::from_seed([50u8; 32]);
+        let msg = crate::active_key_rotation_message(
+            &ChainId::devnet(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(2),
+            2,
+            &new_ed.public_key(),
+        )
+        .unwrap();
+
+        // The OLD root (A) can no longer authorize: the commitment now binds B.
+        let signed_by_old = reveal_over_message(&msg);
+        let operation_old = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_ed.public_key(),
+            post_quantum_root_reveal: signed_by_old,
+        };
+        let old_tx = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(2),
+            2,
+            operation_old,
+            small_fee_with_units(25_000),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&old_tx, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // The NEW root (B) now authorizes the same active-key rotation.
+        let signed_by_new = reveal_with_keypair(pq_keypair_b(), &msg);
+        let operation_new = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_ed.public_key(),
+            post_quantum_root_reveal: signed_by_new,
+        };
+        let new_tx = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(2),
+            2,
+            operation_new,
+            small_fee_with_units(25_000),
+        )
+        .unwrap();
+        state.execute_transaction(&new_tx, &config).unwrap();
+        let policy = state.authorization_policies.get(&alice.address()).unwrap();
+        assert_eq!(policy.active_transaction_key(), &new_ed.public_key());
+        assert_eq!(policy.revision(), AuthorizationPolicyRevision::new(3));
+        // The recovery root is still B after the active-key rotation.
+        assert_eq!(*policy.post_quantum_root(), new_root);
+        assert!(state.supply_invariant_report().unwrap().balanced);
     }
 }

@@ -290,6 +290,35 @@ impl AccountAuthorizationPolicy {
         }
     }
 
+    /// Produces the policy after rotating the post-quantum recovery root.
+    ///
+    /// The revision advances by one (invalidating every session key bound to the
+    /// old revision) and the active transaction key is preserved unchanged. Use
+    /// this to replace a recovery root that may be weak or compromised without
+    /// disturbing the everyday signing key. The caller authorizes it with a
+    /// signature by the *current* root over the exact new commitment.
+    pub fn rotate_post_quantum_root(
+        &self,
+        new_post_quantum_root: PostQuantumRoot,
+    ) -> Result<Self, ChainError> {
+        new_post_quantum_root.validate()?;
+        match self {
+            Self::V1(policy) => {
+                let revision = policy
+                    .revision
+                    .checked_next()
+                    .ok_or(ChainError::InvalidAuthorizationPolicyRevision)?;
+                let rotated = Self::V1(AccountAuthorizationPolicyV1 {
+                    revision,
+                    active_transaction_key: policy.active_transaction_key,
+                    post_quantum_root: new_post_quantum_root,
+                });
+                rotated.validate()?;
+                Ok(rotated)
+            }
+        }
+    }
+
     /// Returns the revision every transaction authorized by this policy signs.
     pub const fn revision(&self) -> AuthorizationPolicyRevision {
         match self {
@@ -389,6 +418,48 @@ pub fn active_key_rotation_message(
         policy_revision,
         nonce,
         new_active_transaction_key,
+    })
+}
+
+/// Domain tag separating post-quantum root rotation signatures from every other
+/// root-authorized action.
+///
+/// The tag is embedded in the signed message, so a signature by the current
+/// root prepared to rotate the root can never be replayed as an active-key
+/// rotation or a session-key action, and vice versa.
+pub const POST_QUANTUM_ROOT_ROTATION_DOMAIN: &str = "WEBC_POST_QUANTUM_ROOT_ROTATION_V1";
+
+/// Canonical bytes the *current* post-quantum root must sign to authorize one
+/// exact recovery-root rotation.
+///
+/// The message binds the domain, chain id, owning account, the current policy
+/// revision, the account nonce, and the exact new root commitment. A signature
+/// captured for this rotation therefore cannot move to another root, nonce,
+/// account, chain, or post-rotation revision. Both the signer (recovery tool)
+/// and the verifier in `state` must build this with the identical function.
+pub fn post_quantum_root_rotation_message(
+    chain_id: &ChainId,
+    owner: Address,
+    policy_revision: AuthorizationPolicyRevision,
+    nonce: u64,
+    new_post_quantum_root: &PostQuantumRoot,
+) -> Result<Vec<u8>, ChainError> {
+    #[derive(Serialize)]
+    struct RootRotationMessage<'a> {
+        domain: &'a str,
+        chain_id: &'a ChainId,
+        owner: Address,
+        policy_revision: AuthorizationPolicyRevision,
+        nonce: u64,
+        new_post_quantum_root: &'a PostQuantumRoot,
+    }
+    crate::canonical::canonical_json_bytes(&RootRotationMessage {
+        domain: POST_QUANTUM_ROOT_ROTATION_DOMAIN,
+        chain_id,
+        owner,
+        policy_revision,
+        nonce,
+        new_post_quantum_root,
     })
 }
 

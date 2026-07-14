@@ -151,6 +151,22 @@ pub enum Operation {
         /// new key), proving control of the account's recovery root.
         post_quantum_root_reveal: PostQuantumRootReveal,
     },
+    /// Rotates the account's post-quantum recovery root (root recovery).
+    ///
+    /// Critical action: requires the default lane, an installed policy, and a
+    /// signature by the *current* post-quantum root over the exact new root
+    /// commitment. The everyday active transaction key is preserved; the
+    /// revision advances, invalidating outstanding session keys. Use it to
+    /// replace a recovery root that may be weak or compromised. The transaction
+    /// envelope is signed by the current active key, so replacing the root
+    /// requires control of both the current root and the active key.
+    RotatePostQuantumRoot {
+        /// New committed post-quantum recovery root.
+        new_post_quantum_root: PostQuantumRoot,
+        /// Signature by the CURRENT root over the exact rotation, proving control
+        /// of the recovery root being replaced.
+        post_quantum_root_reveal: PostQuantumRootReveal,
+    },
     /// Creates revision one of an address-owned application object.
     CreateObject {
         /// Caller-chosen collision-resistant object identity.
@@ -284,9 +300,9 @@ impl Operation {
     pub fn required_units(&self) -> u64 {
         match self {
             Self::Transfer { .. } => 500,
-            Self::InstallAuthorizationPolicy { .. } | Self::RotateActiveTransactionKey { .. } => {
-                25_000
-            }
+            Self::InstallAuthorizationPolicy { .. }
+            | Self::RotateActiveTransactionKey { .. }
+            | Self::RotatePostQuantumRoot { .. } => 25_000,
             Self::InstallSessionKey { .. } | Self::RevokeSessionKey { .. } => 15_000,
             Self::OpenAuthorizationLane { .. } | Self::FundAuthorizationLane { .. } => 10_000,
             Self::CreateObject { .. } | Self::MutateObject { .. } | Self::TransferObject { .. } => {
@@ -346,10 +362,11 @@ impl Operation {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::session_key(sender, *session_key));
             }
-            Self::RotateActiveTransactionKey { .. } => {
-                // Rotation writes the account (nonce/fees) and the policy record
-                // it replaces. It intentionally touches no session-key records:
-                // the revision bump alone invalidates them lazily at use time.
+            Self::RotateActiveTransactionKey { .. } | Self::RotatePostQuantumRoot { .. } => {
+                // Both rotations write the account (nonce/fees) and the policy
+                // record they replace. They intentionally touch no session-key
+                // records: the revision bump alone invalidates them lazily at use
+                // time.
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::authorization_policy(sender));
             }
@@ -483,7 +500,9 @@ impl Operation {
         }
         if !matches!(
             self,
-            Self::InstallAuthorizationPolicy { .. } | Self::RotateActiveTransactionKey { .. }
+            Self::InstallAuthorizationPolicy { .. }
+                | Self::RotateActiveTransactionKey { .. }
+                | Self::RotatePostQuantumRoot { .. }
         ) {
             push_unique_key(&mut read_only, StateKey::authorization_policy(sender));
         }
