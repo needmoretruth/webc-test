@@ -132,9 +132,10 @@ because MSVC Build Tools are not installed. This is not the verified project
 path; use the pinned GNU toolchain and checksum-verified WinLibs compiler recorded
 in Phase 0.
 
-On 2026-07-14, after adding constrained session keys, the pinned Rust `1.96.0`
-GNU toolchain (on Linux for this session) passed `cargo fmt --check`, strict
-workspace Clippy, 98 unit tests, documentation with warnings denied, and the node
+On 2026-07-14, after adding constrained session keys and the ML-DSA-65
+root-signature gate, the pinned Rust `1.96.0` GNU toolchain (on Linux for this
+session) passed `cargo fmt --check`, strict workspace Clippy, 115 unit tests (102
+`webc-chain` + 13 `webc-crypto`), documentation with warnings denied, and the node
 demo. Both TypeScript packages build. One pre-existing browser end-to-end test
 (`wallet-service.test.ts`) fails only on this host's Node 22 because it requires
 the verified Node 24 WebCrypto behaviour; it is unrelated to the session-key
@@ -206,14 +207,20 @@ machine, following `docs/session-keys-implementation-plan.md`:
   `SessionKeyConstraints` (bound lane, allowed operations, per-use and cumulative
   amount and fee budgets, relative lifetime), the `SessionKey` record, and
   `SessionKeyConfig` (max lifetime epochs, max keys per account);
-- `PostQuantumRoot` gained a domain-separated `commit`/`from_public_key`, and a
-  new `PostQuantumRootReveal` proves knowledge of the committed root before a
-  critical action. This is a commitment reveal, not yet an ML-DSA signature;
+- `PostQuantumRoot` gained a domain-separated `commit`/`from_public_key`, and
+  `PostQuantumRootReveal` now carries a public key **and an ML-DSA-65 signature**;
+  its `verify(root, message)` binds the key to the stored commitment and then
+  verifies the signature over the exact action via the replaceable
+  `webc-crypto::mldsa` boundary (pinned `fips204` ML-DSA-65). Knowing the (public)
+  root key is no longer enough — the root secret must sign the request;
 - `StateKeyKind::SessionKey`, a `session_key_root` in the state commitment (bumped
   to `WEBC_STATE_COMMITMENT_V6`), and `ChainState.session_keys` store and commit
   the records; the Rust/TypeScript state-key wire vector was updated together;
 - `Operation::InstallSessionKey`/`RevokeSessionKey` are critical actions gated to
-  the default lane, an installed policy, and a matching post-quantum-root reveal;
+  the default lane, an installed policy, and a valid ML-DSA-65 root **signature**
+  over `session_key_authorization_message` (`WEBC_SESSION_KEY_AUTHORIZATION_V1`),
+  which binds the chain id, owner, policy revision, nonce, and exact action so a
+  captured signature cannot be replayed to another action, nonce, or revision;
 - `verify_transaction_authorization` accepts a registered, policy-current,
   lane-bound session key in place of the active key, and execution enforces
   expiry (by epoch, never wall-clock), the transfers-only allow-list, per-use and
@@ -222,18 +229,26 @@ machine, following `docs/session-keys-implementation-plan.md`:
 - session keys hold no funds, so supply reconciliation is unchanged; a rotation
   (policy-revision change) invalidates outstanding keys; revocation is immediate.
 
-Twenty Rust tests cover the lifecycle, per-use/budget/fee caps, the cumulative
-fee budget bounding a compromised key, expiry boundaries, disallowed operations,
-lane binding and non-default-lane transfers, revision invalidation, fail-closed
-install/revoke paths, the per-account cap, serialization restart, and a
-randomized spend-sequence property test. An adversarial review of the diff
-raised two medium findings (unbounded fee drain; non-default-lane transfers
-failing their access-list check) — both were fixed and covered by new tests.
+The session-key Rust test matrix (in `state.rs` and `session_key.rs`) plus a
+focused reveal-verification test and seven `webc-crypto::mldsa` tests cover the
+lifecycle, per-use/budget/fee caps, the cumulative fee budget bounding a
+compromised key, expiry boundaries, disallowed operations, lane binding and
+non-default-lane transfers, revision invalidation, fail-closed install/revoke
+paths, the per-account cap, serialization restart, a randomized spend-sequence
+property test, and the ML-DSA root-signature gate. The signature-gate negatives
+reject wrong action, wrong nonce, wrong key, and garbage signature, and — added
+after an adversarial review found the binding was untested — a signature that
+disagrees with the submitted transaction on constraints, owner, or chain id, all
+with atomic rollback. Earlier adversarial reviews also fixed two medium findings
+(unbounded fee drain; non-default-lane transfers failing their access-list check).
 
-Still incomplete for this gate: the ML-DSA root-*signature* gate (reveal is
-commitment-only today), optional epoch-boundary expiry pruning, benchmarks, and
+The post-quantum root **signature** gate (step 6) is now implemented behind the
+replaceable `webc-crypto::mldsa` boundary. ML-DSA-65 is a named devnet candidate,
+not a benchmarked or audited post-quantum-security claim, and the path stays
+disabled for real funds. Still incomplete for this gate: optional epoch-boundary
+expiry pruning, benchmarks (session-key and ML-DSA verify/sign vs Ed25519), and
 the browser/SDK session-key surface (subkey generation, install/session signing,
-expiry display, cross-language operation fixtures).
+expiry display, cross-language operation and reveal fixtures).
 
 ## Reusable prototype pieces
 
@@ -352,12 +367,13 @@ of floating-point canonical signing input.
 Phase 2's schema, shared-vector, snake-case wire, SDK-entry-point, independent
 nonce-lane, standard mnemonic/Ed25519 derivation, authenticated encrypted
 keystore, and isolated trusted-popup request/confirmation foundations now exist.
-The versioned on-chain account authorization policy and its constrained
-session-key portion are now implemented (see the Phase 2 section above and
+The versioned on-chain account authorization policy, its constrained session-key
+portion, and the ML-DSA-65 root-signature gate on install/revoke are now
+implemented (see the Phase 2 section above and
 `docs/session-keys-implementation-plan.md`). Recovery, rotation, and revocation
-of the primary key, plus the ML-DSA root-signature gate and the browser/SDK
-session-key surface, remain. `docs/continuation-guide.md` holds the exact
-remaining sequence.
+of the primary key, optional expiry pruning, session-key and ML-DSA benchmarks,
+and the browser/SDK session-key surface remain. `docs/continuation-guide.md` and
+`docs/session-keys-next-steps.md` hold the exact remaining sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.

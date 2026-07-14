@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 bs58.workspace = true
 ed25519-dalek.workspace = true
+fips204.workspace = true
 hex.workspace = true
 rand_core.workspace = true
 serde.workspace = true

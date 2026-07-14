@@ -36,6 +36,7 @@ pub use authorization_policy::{
     PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
     INITIAL_AUTHORIZATION_POLICY_REVISION, LEGACY_AUTHORIZATION_POLICY_REVISION,
     MAX_AUTHORIZATION_POLICY_REVISION, MAX_POST_QUANTUM_PUBLIC_KEY_BYTES,
+    MAX_POST_QUANTUM_SIGNATURE_BYTES,
 };
 pub use block::{Block, BlockHeader};
 pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildInput};
@@ -54,7 +55,9 @@ pub use protocol::{
 };
 pub use scheduler::parallel_batches;
 pub use session_key::{
-    SessionAllowedOperations, SessionKey, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
+    session_key_authorization_message, SessionAllowedOperations, SessionKey,
+    SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
+    SESSION_KEY_AUTHORIZATION_DOMAIN,
 };
 pub use slashing::{SlashingEvidence, SlashingOutcome, SlashingPolicy};
 pub use staking::{

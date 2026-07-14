@@ -71,18 +71,24 @@ Resume with the first incomplete item in this order:
 2. Constrained session-key state and tests are **implemented** for the
    single-node state machine (see `docs/session-keys-implementation-plan.md` and
    the Phase 2 section of `docs/implementation-status.md`): install/revoke gated
-   by the post-quantum-root reveal, epoch expiry, per-use and cumulative amount
-   and fee budgets, lane binding, rotation invalidation, and 20 Rust tests.
-3. Remaining for this gate, in order. `docs/session-keys-next-steps.md` holds the
-   detailed, actionable resume plan for each (crate, files, message binding,
-   tests); start there.
-   - the ML-DSA root-**signature** gate, replacing today's commitment-only reveal
-     on `InstallSessionKey`/`RevokeSessionKey` (add the `fips204` ML-DSA-65 crate,
-     confirmed fetchable; this is the highest-value remaining protocol piece);
-   - optional epoch-boundary pruning of expired session keys;
-   - session-key and strict-post-quantum benchmarks before any policy claim;
+   by a real ML-DSA-65 post-quantum-root **signature** (step 6), epoch expiry,
+   per-use and cumulative amount and fee budgets, lane binding, rotation
+   invalidation, and the full session-key + `mldsa` Rust test matrix.
+3. The ML-DSA root-**signature** gate on `InstallSessionKey`/`RevokeSessionKey` is
+   now **implemented** (step 6): the pinned `fips204` ML-DSA-65 crate sits behind
+   the replaceable `webc-crypto::mldsa` boundary, `PostQuantumRootReveal` carries a
+   signature verified over `session_key_authorization_message`
+   (`WEBC_SESSION_KEY_AUTHORIZATION_V1`, binding chain id, owner, policy revision,
+   nonce, and action), and adversarial tests cover wrong-action/nonce/key and
+   garbage signatures. It is devnet-only: ML-DSA-65 is a named candidate, not a
+   benchmarked or audited security claim.
+4. Remaining for this gate, in order. `docs/session-keys-next-steps.md` holds the
+   detailed, actionable resume plan for each; start there.
+   - optional epoch-boundary pruning of expired session keys (next);
+   - session-key and ML-DSA (verify/sign vs Ed25519) benchmarks before any policy
+     claim;
    - the browser/SDK session-key surface (subkey generation, install and session
-     signing, expiry display, and cross-language operation fixtures);
+     signing, expiry display, and cross-language operation and reveal fixtures);
    - (sibling, outside the session-key plan) primary-key recovery and rotation
      operations; session keys already invalidate on a policy-revision change, so
      wire that revision bump through rotation.
