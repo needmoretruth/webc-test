@@ -1125,6 +1125,58 @@ mod tests {
     }
 
     #[test]
+    fn session_and_rotation_operations_have_a_stable_cross_language_wire_vector() {
+        // Deterministic placeholder bytes make this a cross-language vector: the
+        // TypeScript SDK builds the same four operations and must hash to the same
+        // value. Real signatures are unnecessary — only the canonical JSON shape
+        // and field naming are under test. If this hash changes, the SDK vector in
+        // `sdk/webc-js/src/transaction.test.ts` MUST be updated to match.
+        let reveal = PostQuantumRootReveal {
+            scheme: crate::PostQuantumScheme::MlDsa65,
+            public_key: vec![0x33; 1952],
+            signature: vec![0x44; 3309],
+        };
+        let constraints = SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: crate::SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_units(5),
+            total_amount_budget: Amount::from_units(20),
+            max_fee_per_use: Amount::from_units(1),
+            total_fee_budget: Amount::from_units(5),
+            lifetime_epochs: 60,
+        };
+        let operations = vec![
+            Operation::InstallSessionKey {
+                session_public_key: PublicKeyBytes([0x11; 32]),
+                constraints: constraints.clone(),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RevokeSessionKey {
+                session_key: SessionKeyId::new(Hash256([0x55; 32])),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotateActiveTransactionKey {
+                new_active_transaction_key: PublicKeyBytes([0x66; 32]),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root: PostQuantumRoot::new(
+                    crate::PostQuantumScheme::MlDsa65,
+                    Hash256([0x22; 32]),
+                )
+                .unwrap(),
+                post_quantum_root_reveal: reveal,
+            },
+        ];
+        let bytes = crate::canonical::canonical_json_bytes(&operations)
+            .expect("session/rotation operation vector serializes");
+        assert_eq!(
+            Hash256::digest(bytes).to_hex(),
+            "272f10267381f778bb9dc0d2d81c3aba143081facb9f677216e0e7bb538dbf1d"
+        );
+    }
+
+    #[test]
     fn signed_transaction_wire_vector_round_trips() {
         let sender = Keypair::from_seed([1u8; 32]);
         let recipient = Keypair::from_seed([2u8; 32]);

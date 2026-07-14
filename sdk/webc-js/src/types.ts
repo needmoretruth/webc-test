@@ -27,6 +27,55 @@ export interface PostQuantumRootJson {
   public_key_hash: HexString;
 }
 
+/**
+ * Opaque, non-secret session-key identity: the lowercase-hex SHA-256 of
+ * `"WEBC_SESSION_KEY_ID_V1" || session_public_key`. Derive it with
+ * `deriveSessionKeyIdHex` in `transaction.ts`.
+ */
+export type SessionKeyIdJson = HexString;
+
+/** Operation kinds a session key may authorize. v1 exposes transfers only. */
+export interface SessionAllowedOperationsJson {
+  /** Whether native `Transfer` is permitted (the only v1 capability). */
+  transfer: boolean;
+}
+
+/**
+ * Immutable constraint grant fixed when a session key is installed. Amounts are
+ * exact native base units encoded as decimal strings, matching Rust `Amount`.
+ */
+export interface SessionKeyConstraintsJson {
+  /** Lane the key is bound to (or the all-zero default lane). */
+  authorization_lane: AuthorizationLaneIdJson;
+  /** Operation kinds the key may authorize. */
+  allowed_operations: SessionAllowedOperationsJson;
+  /** Maximum native principal per session-signed transaction, base units. */
+  max_amount_per_use: string;
+  /** Maximum cumulative native principal over the key's life, base units. */
+  total_amount_budget: string;
+  /** Maximum fee authorized on one transaction, base units. */
+  max_fee_per_use: string;
+  /** Maximum cumulative fee over the key's life, base units. */
+  total_fee_budget: string;
+  /** Requested lifetime in consensus epochs from the install epoch. */
+  lifetime_epochs: number;
+}
+
+/**
+ * Post-quantum root signature authorizing one exact critical action (session-key
+ * install/revoke, active-key rotation, or root rotation). The public key is
+ * checked against the account's stored commitment and the signature is verified
+ * over the exact action, so knowing the public root alone is not enough.
+ */
+export interface PostQuantumRootRevealJson {
+  /** NIST FIPS 204 parameter set the key and signature are interpreted under. */
+  scheme: "MlDsa65";
+  /** Exact encoded ML-DSA public key bytes, lowercase hex. */
+  public_key: HexString;
+  /** ML-DSA signature over the authorization message, lowercase hex. */
+  signature: HexString;
+}
+
 /** Fee bid submitted with every transaction. All integers; no floats. */
 export interface FeeBid {
   gasLimit: number;
@@ -266,7 +315,32 @@ export type OperationJson =
       };
     }
   | { BridgeMint: { message: BridgeMessageJson } }
-  | { BridgeRelease: { message: BridgeMessageJson } };
+  | { BridgeRelease: { message: BridgeMessageJson } }
+  | {
+      InstallSessionKey: {
+        session_public_key: HexString;
+        constraints: SessionKeyConstraintsJson;
+        post_quantum_root_reveal: PostQuantumRootRevealJson;
+      };
+    }
+  | {
+      RevokeSessionKey: {
+        session_key: SessionKeyIdJson;
+        post_quantum_root_reveal: PostQuantumRootRevealJson;
+      };
+    }
+  | {
+      RotateActiveTransactionKey: {
+        new_active_transaction_key: HexString;
+        post_quantum_root_reveal: PostQuantumRootRevealJson;
+      };
+    }
+  | {
+      RotatePostQuantumRoot: {
+        new_post_quantum_root: PostQuantumRootJson;
+        post_quantum_root_reveal: PostQuantumRootRevealJson;
+      };
+    };
 
 /** External chain identifier; matches the Rust `ExternalChain` enum. */
 export type ExternalChainJson = "Webc" | "Ethereum" | "Solana";
