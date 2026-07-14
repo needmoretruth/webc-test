@@ -32,11 +32,12 @@ pub use account::Account;
 pub use amount::{Amount, WEBC_DECIMALS, WEBC_UNIT};
 pub use authorization::AuthorizationLane;
 pub use authorization_policy::{
-    active_key_rotation_message, AccountAuthorizationPolicy, AccountAuthorizationPolicyV1,
-    AuthorizationPolicyRevision, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
-    ACTIVE_KEY_ROTATION_DOMAIN, INITIAL_AUTHORIZATION_POLICY_REVISION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_AUTHORIZATION_POLICY_REVISION,
-    MAX_POST_QUANTUM_PUBLIC_KEY_BYTES, MAX_POST_QUANTUM_SIGNATURE_BYTES,
+    active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
+    AccountAuthorizationPolicyV1, AuthorizationPolicyRevision, PostQuantumRoot,
+    PostQuantumRootReveal, PostQuantumScheme, ACTIVE_KEY_ROTATION_DOMAIN,
+    INITIAL_AUTHORIZATION_POLICY_REVISION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    MAX_AUTHORIZATION_POLICY_REVISION, MAX_POST_QUANTUM_PUBLIC_KEY_BYTES,
+    MAX_POST_QUANTUM_SIGNATURE_BYTES, POST_QUANTUM_ROOT_ROTATION_DOMAIN,
 };
 pub use block::{Block, BlockHeader};
 pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildInput};
@@ -274,6 +275,12 @@ pub enum ChainError {
     ActiveKeyRotationRequiresInstalledPolicy,
     #[error("active-key rotation must change the active transaction key")]
     ActiveKeyRotationToSameKey,
+    #[error("post-quantum root rotation must use the default lane")]
+    PostQuantumRootRotationRequiresDefaultLane,
+    #[error("post-quantum root rotation requires an installed policy with a post-quantum root")]
+    PostQuantumRootRotationRequiresInstalledPolicy,
+    #[error("post-quantum root rotation must change the committed recovery root")]
+    PostQuantumRootRotationToSameRoot,
 }
 
 impl From<bincode::Error> for ChainError {
