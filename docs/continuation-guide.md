@@ -73,16 +73,19 @@ Resume with the first incomplete item in this order:
    the Phase 2 section of `docs/implementation-status.md`): install/revoke gated
    by the post-quantum-root reveal, epoch expiry, per-use and cumulative amount
    and fee budgets, lane binding, rotation invalidation, and 20 Rust tests.
-3. Remaining for this gate, in order:
-   - primary-key recovery and rotation operations (session keys already invalidate
-     on a policy-revision change, so wire that revision bump through rotation);
+3. Remaining for this gate, in order. `docs/session-keys-next-steps.md` holds the
+   detailed, actionable resume plan for each (crate, files, message binding,
+   tests); start there.
    - the ML-DSA root-**signature** gate, replacing today's commitment-only reveal
-     on `InstallSessionKey`/`RevokeSessionKey` (needs a reviewed post-quantum
-     crate; none is in the workspace yet);
+     on `InstallSessionKey`/`RevokeSessionKey` (add the `fips204` ML-DSA-65 crate,
+     confirmed fetchable; this is the highest-value remaining protocol piece);
    - optional epoch-boundary pruning of expired session keys;
+   - session-key and strict-post-quantum benchmarks before any policy claim;
    - the browser/SDK session-key surface (subkey generation, install and session
      signing, expiry display, and cross-language operation fixtures);
-   - session-key and strict-post-quantum benchmarks before any policy claim.
+   - (sibling, outside the session-key plan) primary-key recovery and rotation
+     operations; session keys already invalidate on a policy-revision change, so
+     wire that revision bump through rotation.
 
 Do not start RPC, networking, a public VM, ZK, or a real bridge before the Phase
 2 wallet wire and secret-isolation gates pass.
