@@ -94,16 +94,18 @@ from-scratch recipe that used to live here has been removed now that the work ha
 landed; the implementation is in `crates/webc-chain/src/{state,transaction,
 authorization_policy}.rs`.
 
-### Next sibling — rotate the post-quantum root itself
-`RotatePostQuantumRoot { new_post_quantum_root, post_quantum_root_reveal }` —
-rotate the recovery root, signed by the **current** root over the new commitment;
-new domain `WEBC_POST_QUANTUM_ROOT_ROTATION_V1`. Deferred from the active-key
-change to keep it small. Mirror the `RotateActiveTransactionKey` shape: a new
-message builder, an operation variant, `required_units` = 25_000, the same
-default-lane + installed-policy gate, an apply arm that verifies the reveal
-against the *current* root then swaps in the new root (preserving the active
-key), and an adversarial test matrix (wrong new root / nonce / owner / chain /
-forged, same-root rejection, non-default lane, missing policy).
+### Sibling — rotate the post-quantum root itself — DONE
+`RotatePostQuantumRoot { new_post_quantum_root, post_quantum_root_reveal }` is
+implemented. It replaces the committed recovery root while preserving the active
+Ed25519 key, gated by the default lane, an installed policy, and a signature by
+the **current** root over `post_quantum_root_rotation_message`
+(`WEBC_POST_QUANTUM_ROOT_ROTATION_V1`). The envelope is signed by the current
+active key, so replacing the root needs both the current root and the active
+key. Rotation bumps the revision (invalidating session keys) and rejects a
+same-root no-op. Seven adversarial tests pass, including an end-to-end test
+proving the new root gains authority while the old root loses it. With
+`RotateActiveTransactionKey`, both halves of the policy can now be recovered
+independently.
 
 ## Working style (standing user instructions for this work)
 - Only stop for decisions that are genuinely the user's (confirmed monetary

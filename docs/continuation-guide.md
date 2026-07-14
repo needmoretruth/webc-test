@@ -94,10 +94,11 @@ Resume with the first incomplete item in this order:
      replaces the active key (recovery works via a new-key-signed envelope plus
      the root signature), bumps the policy revision (invalidating session keys),
      and preserves the recovery root; full adversarial tests pass.
-   - (next sibling) rotating the post-quantum root itself
-     (`RotatePostQuantumRoot`, signed by the current root; domain
-     `WEBC_POST_QUANTUM_ROOT_ROTATION_V1`) — not started. See
-     `docs/session-keys-next-steps.md`.
+   - rotating the post-quantum root itself (`RotatePostQuantumRoot`, signed by
+     the current root; domain `WEBC_POST_QUANTUM_ROOT_ROTATION_V1`) —
+     **implemented**. Preserves the active key, bumps the revision, and requires
+     both the current root and the active key. With `RotateActiveTransactionKey`,
+     both halves of the policy can be recovered independently.
 
 Do not start RPC, networking, a public VM, ZK, or a real bridge before the Phase
 2 wallet wire and secret-isolation gates pass.

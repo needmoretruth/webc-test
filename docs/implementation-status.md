@@ -270,6 +270,20 @@ binding axis, all with atomic rollback. Session keys can never rotate: a session
 signer is neither the active key nor the proposed new key, so authorization
 rejects it before execution.
 
+The **recovery root itself** can also be rotated.
+`Operation::RotatePostQuantumRoot` replaces the committed post-quantum root while
+preserving the active Ed25519 key, gated by the default lane, an installed
+policy, and a signature by the **current** root over
+`post_quantum_root_rotation_message` (`WEBC_POST_QUANTUM_ROOT_ROTATION_V1`,
+binding chain id, owner, current revision, nonce, and the exact new root). The
+envelope is signed by the current active key, so replacing the root requires both
+the current root and the active key; a stolen root alone cannot rotate it.
+Rotation bumps the revision (invalidating session keys) and rejects a same-root
+no-op. Seven adversarial tests — including an end-to-end test that the new root
+gains authority while the old root loses it — pass with atomic rollback. Both
+halves of the authorization policy (active key and recovery root) can now be
+recovered independently.
+
 ## Reusable prototype pieces
 
 ### `webc-crypto`
@@ -391,10 +405,11 @@ The versioned on-chain account authorization policy, its constrained session-key
 portion, and the ML-DSA-65 root-signature gate on install/revoke are now
 implemented (see the Phase 2 section above and
 `docs/session-keys-implementation-plan.md`). Primary-key recovery and rotation
-(root-gated `RotateActiveTransactionKey`) is now implemented too. Optional expiry
-pruning, session-key and ML-DSA benchmarks, the browser/SDK session-key surface,
-and rotating the post-quantum root itself remain. `docs/continuation-guide.md`
-and `docs/session-keys-next-steps.md` hold the exact remaining sequence.
+(`RotateActiveTransactionKey`) and recovery-root rotation
+(`RotatePostQuantumRoot`) are now implemented too. Optional expiry pruning,
+session-key and ML-DSA benchmarks, and the browser/SDK session-key surface
+remain. `docs/continuation-guide.md` and `docs/session-keys-next-steps.md` hold
+the exact remaining sequence.
 
 RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
 real-fund bridge work remain disabled until their later gates.
