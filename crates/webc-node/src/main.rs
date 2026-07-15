@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use webc_chain::{
@@ -5,6 +8,8 @@ use webc_chain::{
     GenesisConfig, Operation, Transaction,
 };
 use webc_crypto::{Hash256, Keypair, PublicKeyBytes};
+use webc_node::{AppState, FaucetConfig, MempoolConfig, Node, NodeService, NodeServiceOptions};
+use webc_storage::RedbKvStore;
 
 #[derive(Parser)]
 #[command(name = "webc-node")]
@@ -28,6 +33,15 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         iterations: u32,
     },
+    /// Run a restartable devnet node serving the HTTP/WebSocket developer API.
+    Run {
+        /// Directory holding the durable redb database (created if absent).
+        #[arg(long, default_value = "./webc-data")]
+        data_dir: PathBuf,
+        /// Address to bind the HTTP/WebSocket API to.
+        #[arg(long, default_value = "127.0.0.1:8645")]
+        listen: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -37,7 +51,83 @@ fn main() -> Result<()> {
         Command::GenesisTemplate => genesis_template(),
         Command::Demo => demo(),
         Command::Bench { iterations } => bench(iterations),
+        Command::Run { data_dir, listen } => run(data_dir, listen),
     }
+}
+
+/// Milliseconds since the Unix epoch, read only at the node orchestration
+/// boundary (never inside a deterministic state transition).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Runs a single-proposer devnet node backed by durable redb storage.
+///
+/// The node recovers its latest committed state from `data_dir` on start (or
+/// initializes a devnet genesis on first run), serves the versioned HTTP/WebSocket
+/// API, and auto-seals a block every two seconds (the devnet block target) when
+/// the mempool has pending transactions. The faucet identity is a fixed devnet
+/// seed and its funds are valueless test units.
+fn run(data_dir: PathBuf, listen: String) -> Result<()> {
+    std::fs::create_dir_all(&data_dir)?;
+
+    // Fixed devnet faucet identity. Devnet only; these units carry no value.
+    let faucet = Keypair::from_seed([7u8; 32]);
+    let genesis = GenesisConfig {
+        chain: ChainConfig::default(),
+        accounts: vec![GenesisAccount {
+            address: faucet.address(),
+            balance: Amount::from_webc(1_000_000),
+        }],
+        validators: Vec::new(),
+    };
+
+    let store = RedbKvStore::open(data_dir.join("chain.redb"))?;
+    let node = Node::open(store, &genesis)?;
+    let service = NodeService::new(
+        node,
+        NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: Some(FaucetConfig {
+                keypair: Keypair::from_seed([7u8; 32]),
+                drip_amount: Amount::from_webc(100),
+                cooldown_ms: 10_000,
+                max_recipient_balance: Amount::from_webc(1_000),
+            }),
+            proposer: faucet.address(),
+        },
+    );
+    let state = AppState::new(service);
+
+    println!("WEBC devnet node");
+    println!("  data dir:       {}", data_dir.display());
+    println!("  faucet address: {}", faucet.address());
+    println!("  API base:       http://{listen}/v1");
+    println!("  health:         http://{listen}/v1/health");
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&listen).await?;
+
+        // Auto-seal pending transactions on the devnet block cadence so submitted
+        // transactions reach finality without a manual seal call.
+        let sealer = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                ticker.tick().await;
+                if let Ok(Some(_)) = sealer.service().seal_block(now_ms()) {
+                    sealer.publish_tip();
+                }
+            }
+        });
+
+        webc_node::serve(listener, state).await?;
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 /// Prints an indicative signature micro-benchmark.
