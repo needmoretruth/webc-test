@@ -9,10 +9,14 @@
 //! Modules:
 //! - [`node`]: the [`Node`] runtime — block production, atomic commit, and
 //!   startup recovery.
+//! - [`mempool`]: pending-transaction admission, expiry, replacement-by-fee, and
+//!   fee-prioritized nonce-ordered block selection.
 //!
-//! Networking, mempool, and API surfaces are added as separate modules so
-//! consensus/storage logic stays independent of them.
+//! Networking and API surfaces are added as separate modules so consensus and
+//! storage logic stay independent of them.
 
+pub mod mempool;
 pub mod node;
 
+pub use mempool::{InsertOutcome, Mempool, MempoolConfig, MempoolError};
 pub use node::{Node, NodeError};
