@@ -14,11 +14,13 @@ safe round changes (`webc-chain::ConsensusMachine`), and objective equivocation
 detection — proven by deterministic tests (multi-validator convergence, a round
 change under a silent proposer, and the lock-safety property). The async
 `ConsensusDriver` that runs the machine over real `webc-net` TCP is done too,
-proven by a loopback test where three validator nodes finalize the same chain,
-and the driver feeds its mempool into proposals (a gossiped transfer is finalized
-by all nodes). What remains in Phase 4 A-3 is a state-sync protocol to catch up a
-lagging or joining node. This marker records progress and does not weaken any
-acceptance criterion below.
+the driver feeds its mempool into proposals, and certificate-verified state sync
+lets a late-joining node catch up — proven by loopback tests (three validators
+finalize one chain, a gossiped transfer is finalized by all, a late node catches
+up via sync). Phase 4's consensus mechanism is complete; the honest remainder is
+validation (a reference finality-timing number, an evidence-slashes end-to-end
+test, and a multi-node Byzantine test). This marker records progress and does not
+weaken any acceptance criterion below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
 
@@ -493,13 +495,19 @@ active**. A-1, the A-2 consensus core, and the A-3 deterministic core are done:
    commit) — proven by a test where a gossiped transfer is finalized by all
    nodes — done.
 
-The remaining Phase 4 A-3 work:
+9. certificate-verified state sync (per-height certificate persistence,
+   BlockRequest/BlockResponse wire messages, and a unified live-or-sync per-height
+   loop) lets a late-joining node catch up — proven by a loopback test — done.
 
-9. implement a state-sync protocol so a lagging or joining node fetches finalized
-   blocks and their certificates from a checkpoint and imports them without
-   replaying all history (needs per-height certificate persistence and
-   block-request/response wire messages);
-10. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
+The honest remaining Phase 4 work is validation, not mechanism:
+
+10. publish a reference-machine finality-timing number (cannot be produced in this
+    cloud container);
+11. add an end-to-end test that a proposed block's embedded double-vote evidence
+    slashes exactly once;
+12. add a multi-node Byzantine test that <1/3 power cannot finalize conflicting
+    blocks (the lock-safety property is unit-tested today);
+13. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
     every completed item.
 
 Only after consensus is stable should the contract runtime, the WEBC high-level
