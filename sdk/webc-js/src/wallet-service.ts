@@ -68,6 +68,13 @@ export interface TrustedWalletServiceOptions {
   readonly expectedSource: WalletMessageSource;
   /** Trusted UI decision invoked for grants and every transaction. */
   readonly confirm: WalletConfirmationHandler;
+  /**
+   * Installed on-chain authorization policy revision for this account, known to
+   * the trusted wallet application. It is returned to a connecting origin so the
+   * host builds transfers under the current revision. Defaults to zero (legacy
+   * migration policy). Must be a non-negative safe integer.
+   */
+  readonly authorizationPolicyRevision?: number;
 }
 
 interface PermissionGrant {
@@ -92,6 +99,7 @@ export class TrustedWalletService {
   readonly #chainId: string;
   readonly #expectedSource: WalletMessageSource;
   readonly #confirm: WalletConfirmationHandler;
+  readonly #authorizationPolicyRevision: number;
   readonly #grants = new Map<string, PermissionGrant>();
   readonly #replayIds = new Map<string, true>();
   #queue: Promise<void> = Promise.resolve();
@@ -101,10 +109,15 @@ export class TrustedWalletService {
       CURRENT_TRANSACTION_PROTOCOL_VERSION,
       options.chainId,
     );
+    const revision = options.authorizationPolicyRevision ?? 0;
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new Error("authorization policy revision must be a non-negative safe integer");
+    }
     this.#wallet = options.wallet;
     this.#chainId = options.chainId;
     this.#expectedSource = options.expectedSource;
     this.#confirm = options.confirm;
+    this.#authorizationPolicyRevision = revision;
   }
 
   /** Enqueues one browser message and posts at most one exact-origin response. */
@@ -208,6 +221,7 @@ export class TrustedWalletService {
         address: this.#wallet.address,
         public_key: bytesToHex(this.#wallet.publicKey),
         authorization_lane: authorizationLane,
+        authorization_policy_revision: this.#authorizationPolicyRevision,
         session_id: sessionId,
         scopes: request.params.scopes,
         limits: request.params.limits,
