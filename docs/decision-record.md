@@ -96,11 +96,10 @@ This file is the authoritative short record of decisions made with the project o
 - No USD-denominated fee guarantee is possible without trusting an external price feed.
 - Exact base-unit prices are technical parameters to set through benchmarks and devnet load tests.
 - Sites and applications may sponsor user fees through a constrained paymaster-style mechanism.
-- Sponsors must be able to set per-user, per-application, per-operation, and daily limits.
+- Sponsors set eligibility (for example authenticated users, or users with a site account) and hard caps: per-user, per-application, per-operation, and daily limits — for example a per-user daily limit such as one dollar equivalent. Sponsorship is never open-ended; the protocol enforces the caps so a site cannot be drained.
+- Reputation- or domain-based automatic fee discounts are deferred. They invite Sybil, gaming, and centralization problems (who decides which domain is "good"). The same goal — cheaper or free usage for a site's users — is met safely through the capped sponsorship above.
 - Token/NFT creation, persistent storage, and contract deployment cost more than a simple transfer.
 - Priority fees must not allow one application to monopolize unrelated localized execution lanes.
-- Sponsorship policies must be bounded, never open-ended: a sponsor sets eligibility (for example authenticated users or users with a site account) and hard caps (for example a per-user daily limit such as one dollar equivalent), and the protocol enforces the cap so a site cannot be drained.
-- Reputation- or domain-based automatic fee discounts are deferred. They invite Sybil, gaming, and centralization problems (who decides which domain is "good"). The same goal — cheaper or free usage for a site's users — is met safely through capped, policy-based sponsorship above.
 
 ## Browser wallet and website security
 
@@ -141,6 +140,7 @@ This file is the authoritative short record of decisions made with the project o
 - The smart-contract execution foundation is chosen: deterministic, restricted WebAssembly, with Rust as the first authoring language compiled to WASM. This is the safety/speed engine, not the language most developers write by hand.
 - Above that foundation WEBC provides its own high-level contract language and framework, designed to be easy and intuitive for humans and AI. It is implemented as a safe authoring layer that lowers (transpiles) to the audited Rust framework and its components; it does not add a second from-scratch VM or a hand-written compiler backend, so it inherits Rust/WASM safety, determinism, and performance. WEBC builds the language front end (parser + lowering), and reuses the Rust/LLVM toolchain for the hard optimization/codegen work.
 - The earlier caution against "inventing a new language" refers to a new low-level VM or an independent compiler backend, which WEBC does not build. A high-level authoring language that lowers to the audited Rust layer is explicitly wanted.
+- Design leanings for that language, recorded to guide the future design (the final surface syntax is the administrator's decision, made when the language is designed): optimize for AI to write and to read, and ship AI-oriented language documentation, while staying easy for human developers; compiled, not interpreted (do not follow Python's interpreted model); take ergonomic cues from Go and from the Solana/Sui contract languages (the Rust/Move family) rather than from Solidity; ease of writing matters, but never at the cost of clean, optimized, fast output.
 - Move VM and EVM/Solidity are not the native WEBC runtime. Ethereum/Solana compatibility is delivered through bridges (see the bridge section), not by executing their bytecode natively.
 - AI-native development is a design goal: the language, framework, and documentation are machine-readable and composable so an AI agent can read a component catalog and assemble a contract from documented, audited building blocks. The same catalog serves human-only and human-with-AI developers.
 - Contract quality is protected by tooling, not left to developer discipline. To keep contracts from becoming unmaintainable "spaghetti"/"god contracts": an opinionated, uniform contract structure; small composable components instead of monoliths; a dedicated contract linter/analyzer (a WEBC clippy) that flags long functions, missing access declarations, and unsafe patterns; and a pre-deploy review step (including automated/AI review) run before deployment.
@@ -199,7 +199,7 @@ These are technical gates, not questions the project owner must answer now:
 - exact block unit/byte limits at each devnet stage;
 - exact initial fee-per-unit constants;
 - validator committee size and selection algorithm;
-- the WEBC high-level authoring language's exact surface syntax and name (the Rust->WASM execution foundation and the decision to provide a high-level language that lowers to the audited Rust layer are settled; only the language's look-and-feel and naming remain open, to be chosen when the language is designed);
+- the WEBC high-level authoring language's exact surface syntax, and the two separate names for the language and for the framework (the Rust->WASM execution foundation and the decision to provide a high-level language that lowers to the audited Rust layer are settled, and the design leanings are recorded under "Smart contracts and web integration"; the look-and-feel and both names are the administrator's decision, made when the language is designed);
 - exact native-oracle economic parameters (reporter stake size, aggregation window, slash severity);
 - final ZK/STARK backend;
 - strict post-quantum-per-transaction versus post-quantum-root plus limited session-key policy;
