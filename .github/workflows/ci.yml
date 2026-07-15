@@ -1,7 +1,12 @@
 name: CI
 
+# Runs on pull requests and on pushes to the default branch only. Intermediate
+# pushes to feature/working branches do NOT trigger CI, which keeps the merge
+# gate useful while avoiding a run (and a failure email) on every work-in-progress
+# push. Merges are still gated because every PR runs the full matrix.
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
