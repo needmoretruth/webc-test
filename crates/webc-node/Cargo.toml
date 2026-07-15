@@ -19,6 +19,13 @@ webc-chain = { path = "../webc-chain" }
 webc-crypto = { path = "../webc-crypto" }
 webc-storage = { path = "../webc-storage" }
 thiserror.workspace = true
+hex.workspace = true
+# HTTP/WebSocket developer API. axum (MIT) + tokio (MIT) are Apache-2.0-compatible.
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
