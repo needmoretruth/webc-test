@@ -44,7 +44,7 @@ pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildI
 pub use bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 pub use consensus::{
     detect_double_votes, DoubleVoteEvidence, SignedVote, ValidatorPower, ValidatorSet, Vote,
-    VoteType, CONSENSUS_VOTE_DOMAIN,
+    VoteType, CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
 pub use fees::{split_fee, FeeBreakdown, FeePolicy};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
