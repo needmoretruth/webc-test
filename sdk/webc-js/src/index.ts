@@ -12,6 +12,7 @@ export * from "./block.js";
 export * from "./canonical.js";
 export * from "./hex.js";
 export * from "./keystore.js";
+export * from "./permission-store.js";
 export * from "./protocol-hash.js";
 export * from "./session-key.js";
 export * from "./transaction.js";
