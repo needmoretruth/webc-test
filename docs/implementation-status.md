@@ -229,9 +229,16 @@ implemented in the SDK:
   before signing — automatic lane setup without re-deriving or re-approving the
   lane). The service persists the full grant set after every connect, spend, and
   revoke inside its serial queue (no race), carries cumulative spend across
-  reconnects (only an explicit revoke clears a grant, closing a budget-reset
-  abuse), and rolls back the mutation on any durable-write failure so in-memory
-  and durable state never disagree in the dangerous (under-count) direction.
+  reconnects (only an explicit user-confirmed revoke clears a grant, closing a
+  budget-reset abuse), and rolls back the mutation on any durable-write failure so
+  in-memory and durable state never disagree in the dangerous (under-count)
+  direction. An isolated adversarial review confirmed those invariants and found
+  two issues, both fixed: `restoredGrants` is now re-validated in the service
+  constructor (a hostile negative `spent_amount` can no longer widen the cap), and
+  `revoke` now requires user confirmation (a silent host revoke can no longer be
+  paired with a reconnect to reset the budget). A remaining known limitation,
+  outside the cross-origin host model, is that the store has no anti-rollback
+  counter against an attacker who can overwrite the wallet origin's own storage.
 - A pre-existing host-client schema bug was fixed in the same area: the wallet
   connection result and signed-transaction result parsers omitted
   `authorization_policy_revision`, so the well-formed service responses were
