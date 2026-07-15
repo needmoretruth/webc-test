@@ -142,6 +142,16 @@ the verified Node 24 WebCrypto behaviour; it is unrelated to the session-key
 change and fails identically without it. The cross-language state-key wire vector
 passes on both Rust and TypeScript with its updated digest.
 
+On 2026-07-15 (this cloud environment, Node 22), after adding durable encrypted
+permission storage and automatic lane setup, both TypeScript packages build and
+the SDK suite passes 55/55 with the widget suite at 3/3; the Markdown-link and
+package-entry checks pass. The previously reported single failing
+`wallet-service.test.ts` case was not a Node 22 issue: it was a real host-client
+schema bug (the connection and signed-transaction result parsers omitted
+`authorization_policy_revision`), now fixed, so the end-to-end exchange passes on
+Node 22. No Rust files changed in this pass, so the Rust gate is unaffected from
+the prior green run (133 tests).
+
 ## Phase 2 work in progress
 
 Completed and verified:
@@ -196,10 +206,43 @@ Completed and verified:
   blind-display injection, DOM injection, same-origin widget, and full
   host/service exchange tests pass.
 
-Still incomplete: persistent encrypted permission storage and automatic lane
-setup. (Versioned on-chain authorization policy, on-chain recovery/rotation,
-session-key revocation and constraints, and the ML-DSA-65 signature gate are now
-implemented for the single-node state machine — see below.)
+Persistent encrypted permission storage and automatic lane setup are now
+implemented in the SDK:
+
+- `permission-store.ts` is an authenticated encrypted-at-rest store (v1) for the
+  trusted wallet's per-origin grants — assigned lane, scopes, spend limits, and
+  cumulative `spent_amount`. It reuses the audited keystore pattern: AES-256-GCM
+  under an Argon2id key (OWASP 19 MiB / t=2 / p=1) through the shared
+  `argon2.ts` serialization gate, fresh salt/IV per export, and a strict bounded
+  schema (max 256 grants, secure-origin-only, 32-byte lane, limits validated by
+  `parseSpendLimits`, `spent_amount` never above the grant's own cumulative cap,
+  de-duplicated and sorted by origin). The store is bound to one wallet identity
+  (address + Ed25519 public key) as AES-GCM additional data, so one wallet's
+  store cannot load as another's (`IDENTITY_MISMATCH`), and any tamper shares one
+  `AUTHENTICATION_FAILED` code with a wrong password. `openPermissionStore`
+  derives the KDF key once and keeps it as a non-extractable WebCrypto key,
+  returning a `save` port that re-encrypts with only a fresh IV, so persisting
+  after every spend costs no repeated Argon2.
+- `TrustedWalletService` now takes an optional `persistence` port and
+  `restoredGrants`. Restored grants rehydrate as dormant (lane + cumulative spend
+  survive a restart, but the live session is empty so an origin must reconnect
+  before signing — automatic lane setup without re-deriving or re-approving the
+  lane). The service persists the full grant set after every connect, spend, and
+  revoke inside its serial queue (no race), carries cumulative spend across
+  reconnects (only an explicit revoke clears a grant, closing a budget-reset
+  abuse), and rolls back the mutation on any durable-write failure so in-memory
+  and durable state never disagree in the dangerous (under-count) direction.
+- A pre-existing host-client schema bug was fixed in the same area: the wallet
+  connection result and signed-transaction result parsers omitted
+  `authorization_policy_revision`, so the well-formed service responses were
+  rejected on a key-count mismatch and the end-to-end exchange failed on every
+  Node version (previously misattributed to a Node 22 WebCrypto gap). The field
+  is now returned by the service (from a validated `authorizationPolicyRevision`
+  option) and accepted by both parsers.
+
+(Versioned on-chain authorization policy, on-chain recovery/rotation, session-key
+revocation and constraints, and the ML-DSA-65 signature gate are implemented for
+the single-node state machine — see below.)
 
 Constrained on-chain session keys are now implemented for the single-node state
 machine, following `docs/session-keys-implementation-plan.md`:
@@ -367,9 +410,10 @@ isolation, standard recovery/keystore behavior, and authorization policy remain.
 - Rust/TypeScript wire naming is snake_case and executable shared hashes cover
   every native operation and V1 state key. The SDK verifies and hashes a full
   Rust-signed transaction byte-for-byte.
-- Recovery words, encrypted export, isolated transfer signing, and origin display
-  are implemented foundations. Post-quantum root authorization, durable
-  permissions, broader operation confirmations, and session restrictions remain.
+- Recovery words, encrypted export, isolated transfer signing, origin display,
+  and durable encrypted per-origin permission storage with automatic lane setup
+  are implemented foundations. Broader operation confirmations (beyond native
+  transfers) and in-browser production of the ML-DSA root reveal remain.
 
 ### Contracts, proofs, and tokens
 
@@ -414,11 +458,20 @@ epoch-based expiry display), with cross-language fixtures pinning byte-parity fo
 the four operations and the id derivation. A `webc-node bench` command gives an
 indicative (non-reference, not-a-claim) ML-DSA-65 vs Ed25519 signature comparison;
 reference-machine numbers and an end-to-end session-key vs Ed25519-transfer
-benchmark are the only remaining session-key item. `docs/continuation-guide.md`
-and `docs/session-keys-next-steps.md` hold the exact remaining sequence.
+benchmark are the only remaining session-key item.
 
-RPC and networking remain Phase 3/4 work. Public contract VM, ZK expansion, and
-real-fund bridge work remain disabled until their later gates.
+Durable encrypted per-origin permission storage (`permission-store.ts`) and
+automatic authorization-lane setup in `TrustedWalletService` are now implemented
+(see the Phase 2 section above), which were the last outstanding Phase 2
+wallet-wire/secret-isolation gate. With those and the session-key gate landed,
+Phase 2's acceptance conditions are met except for the reference-machine
+benchmark numbers. `docs/continuation-guide.md` and
+`docs/session-keys-next-steps.md` hold the exact remaining sequence.
+
+The next milestone is Phase 3 (local restartable node, storage traits, crash-safe
+commits, and HTTP/WebSocket developer APIs) in `docs/development-plan.md`. RPC and
+networking are Phase 3/4 work. Public contract VM, ZK expansion, and real-fund
+bridge work remain disabled until their later gates.
 
 ## Documentation completed in this pass
 

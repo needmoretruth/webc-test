@@ -352,9 +352,18 @@ and an indicative `webc-node bench`. The only remaining session-key item is
 reference-machine benchmark numbers (this cloud container is not a reference
 machine). See `docs/session-keys-next-steps.md`.
 
-Do not skip directly to RPC, P2P, contract runtime, ZK, or real bridges before
-the remaining Phase 2 wallet-wire and secret-isolation acceptance gates pass
-(persistent encrypted permission storage and automatic lane setup remain).
+Durable encrypted per-origin wallet **permission storage** and **automatic
+authorization-lane setup** are now implemented too (`sdk/webc-js/src/permission-store.ts`
+and the `persistence`/`restoredGrants` wiring in `wallet-service.ts`), which was
+the last outstanding Phase 2 wallet-wire/secret-isolation gate. With the
+session-key gate, Phase 2's acceptance conditions are met except reference-machine
+benchmarks.
+
+The next milestone is **Phase 3** in `docs/development-plan.md`: a local
+restartable node with storage traits (defined before any database backend is
+chosen), crash-safe transactional commits and startup recovery, and HTTP/WebSocket
+developer APIs. Do not skip to P2P, contract runtime, ZK, or real bridges before
+their own gates.
 
 ## User decisions still required later
 
