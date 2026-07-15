@@ -166,10 +166,10 @@ height 1 from the persisted redb store.
 Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
 consensus core**, **A-3 robustness**. A-1, the A-2 consensus core, and most of A-3
 are complete: received-block validation, the multi-round Tendermint machine with
-locking and round changes, equivocation detection, and the async consensus driver
-(proven by a loopback test where three validator nodes finalize the same chain).
-What remains in A-3 is a state-sync protocol (catch up a lagging/joining node) and
-mempool-fed proposals.
+locking and round changes, equivocation detection, the async consensus driver, and
+mempool-fed proposals (proven by loopback tests where three validator nodes
+finalize the same chain and a gossiped transfer is finalized by all of them). What
+remains in A-3 is a state-sync protocol to catch up a lagging/joining node.
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
 
@@ -324,17 +324,27 @@ The safety-critical, deterministic parts of A-3 are implemented and gate-verifie
   blocks at the same heights over the real authenticated transport, stable across
   repeated runs.
 
-What remains in A-3: (1) a **state-sync protocol** so a lagging or newly-joining
+- **Mempool-fed proposals** — the driver carries a mempool: it admits gossiped
+  transactions, proposes fee-priority nonce-ordered transactions under the block
+  unit budget (`Mempool::select_block`), and prunes included/stale transactions
+  after each commit. `CommitInfo.tx_count` lets an observer see a block carried
+  transactions. Integration test: a transfer gossiped into the 3-node network is
+  admitted by every mempool and included by a proposer in a block all three nodes
+  finalize at the same height with agreeing tips.
+
+What remains in A-3 is a **state-sync protocol** so a lagging or newly-joining
 node fetches finalized blocks plus their certificates from a checkpoint and
 imports them (`import_block` already validates and commits) without replaying all
 history — the driver keeps lockstep nodes in sync but cannot catch up a node that
 fell behind, since a gossiped `Certificate` carries a block hash but not the
-block; and (2) **mempool-fed proposals** (the driver proposes empty blocks today).
-Fork choice is largely covered by the finality-certificate design (a node follows
-the certified chain and commits only finalized blocks); objective double-vote
-evidence is detected by the machine, embedded in proposals by the driver, and
-applied by the existing slashing path — that loop is closed in code, pending a
-test that a proposed block's embedded evidence actually slashes.
+block. This needs persisting the finality certificate per height (a new store
+table plus `ChainStore` methods, written at commit time when the driver holds the
+certificate) and block-request/response wire messages. Fork choice is largely
+covered by the finality-certificate design (a node follows the certified chain and
+commits only finalized blocks); objective double-vote evidence is detected by the
+machine, embedded in proposals by the driver, and applied by the existing slashing
+path — that loop is closed in code, pending a test that a proposed block's embedded
+evidence actually slashes.
 
 ## Phase 3: local restartable node, storage, and developer APIs
 

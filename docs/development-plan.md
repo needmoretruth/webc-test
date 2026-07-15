@@ -14,10 +14,11 @@ safe round changes (`webc-chain::ConsensusMachine`), and objective equivocation
 detection — proven by deterministic tests (multi-validator convergence, a round
 change under a silent proposer, and the lock-safety property). The async
 `ConsensusDriver` that runs the machine over real `webc-net` TCP is done too,
-proven by a loopback test where three validator nodes finalize the same chain.
-What remains in Phase 4 A-3 is a state-sync protocol (catch up a lagging/joining
-node) and mempool-fed proposals. This marker records progress and does not weaken
-any acceptance criterion below.
+proven by a loopback test where three validator nodes finalize the same chain,
+and the driver feeds its mempool into proposals (a gossiped transfer is finalized
+by all nodes). What remains in Phase 4 A-3 is a state-sync protocol to catch up a
+lagging or joining node. This marker records progress and does not weaken any
+acceptance criterion below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
 
@@ -487,12 +488,17 @@ active**. A-1, the A-2 consensus core, and the A-3 deterministic core are done:
    evidence into the next block — proven by a loopback test where three validator
    nodes converge on one finalized chain — done.
 
+8. the driver feeds its mempool into proposed blocks (admits gossiped
+   transactions, selects fee-priority nonce-ordered transactions, prunes after
+   commit) — proven by a test where a gossiped transfer is finalized by all
+   nodes — done.
+
 The remaining Phase 4 A-3 work:
 
-8. implement a state-sync protocol so a lagging or joining node fetches finalized
+9. implement a state-sync protocol so a lagging or joining node fetches finalized
    blocks and their certificates from a checkpoint and imports them without
-   replaying all history;
-9. feed the mempool into proposed blocks (the driver proposes empty blocks today);
+   replaying all history (needs per-height certificate persistence and
+   block-request/response wire messages);
 10. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
     every completed item.
 
