@@ -458,6 +458,83 @@ describe("trusted wallet service persistence", () => {
     expect(saved[0]?.spent_amount).toBe("1000000000000");
   });
 
+  it("re-validates restoredGrants and rejects a budget-widening negative spend", async () => {
+    // A caller that bypasses the store and hands the constructor a hostile grant
+    // with a negative cumulative spend must be rejected, not trusted: otherwise
+    // `spentAmount` would go negative and widen the effective cumulative cap.
+    const hostile: PersistedPermissionGrant[] = [
+      {
+        origin: HOST_ORIGIN,
+        authorization_lane: "a".repeat(64),
+        scopes: ["sign_native_transfer"],
+        limits: LIMITS,
+        spent_amount: "-100",
+      },
+    ];
+    expect(
+      () =>
+        new TrustedWalletService({
+          wallet,
+          chainId: CHAIN_ID,
+          expectedSource: new CapturingSource(),
+          confirm: async () => true,
+          restoredGrants: hostile,
+        }),
+    ).toThrow();
+  });
+
+  it("requires user confirmation to revoke, preserving spend when rejected", async () => {
+    const source = new CapturingSource();
+    let confirmRevoke = false;
+    const service = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source,
+      confirm: async (confirmation) =>
+        confirmation.kind === "revoke" ? confirmRevoke : true,
+    });
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: connectRequest(requestId("1")),
+    });
+    const { lane, sessionId } = lastConnection(source);
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: transferRequest(requestId("2"), lane, sessionId, 0, "2000000000000"),
+    });
+    expect(source.messages.at(-1)?.response.ok).toBe(true);
+
+    // A host-driven revoke the user rejects must not clear the grant.
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: {
+        channel: WALLET_MESSAGE_CHANNEL,
+        version: WALLET_MESSAGE_VERSION,
+        request_id: requestId("3"),
+        method: "revoke",
+        params: {},
+      },
+    });
+    const rejected = source.messages.at(-1)?.response;
+    expect(rejected?.ok).toBe(false);
+    if (rejected && !rejected.ok) expect(rejected.error.code).toBe("USER_REJECTED");
+
+    // The grant (and its 2 WEBC spend) survives: a further 1 WEBC transfer that
+    // would exceed the 2.5 WEBC cumulative cap is still rejected as over-limit,
+    // proving the spend was not reset by the rejected revoke.
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: transferRequest(requestId("4"), lane, sessionId, 1, "1000000000000"),
+    });
+    const overLimit = source.messages.at(-1)?.response;
+    expect(overLimit?.ok).toBe(false);
+    if (overLimit && !overLimit.ok) expect(overLimit.error.code).toBe("LIMIT_EXCEEDED");
+  });
+
   it("keeps a restored grant dormant until the origin reconnects", async () => {
     const restored: PersistedPermissionGrant[] = [
       {

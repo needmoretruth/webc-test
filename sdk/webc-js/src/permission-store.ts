@@ -18,10 +18,17 @@
  *   another's, and a tampered store fails authentication rather than silently
  *   granting altered limits or lanes.
  * - The cumulative `spent_amount` persists across reconnects. Only an explicit
- *   revoke removes a grant, so a hostile host cannot reset a spend budget by
- *   reconnecting.
+ *   user-confirmed revoke removes a grant, so a hostile host cannot reset a spend
+ *   budget by reconnecting.
  *
  * Every untrusted field is bounded and validated before allocation or KDF work.
+ *
+ * Known limitation (out of the cross-origin host threat model): this format has
+ * no monotonic anti-rollback counter, so an attacker who can overwrite the
+ * wallet origin's own storage could restore an older, genuinely authenticated
+ * snapshot to reset the spend budget. Defending that requires trusted state
+ * outside the store the attacker controls and is deferred; the browser host
+ * (dApp) has no path to the wallet origin's storage and cannot do this.
  */
 
 import { deriveArgon2idKey } from "./argon2.js";
@@ -288,6 +295,19 @@ export async function openPermissionStore(options: {
     },
   };
   return { records, port };
+}
+
+/**
+ * Validates and normalizes an untrusted grant set (bounds, secure origins, valid
+ * lane, limits, `spent_amount` within the grant's own cap, no duplicates),
+ * returning the grants sorted by origin. Throws `PermissionStoreError` on any
+ * violation. Callers that accept grants from anywhere other than
+ * `decryptPermissionStore` must run this before trusting them.
+ */
+export function validatePermissionGrants(
+  records: readonly PersistedPermissionGrant[],
+): PersistedPermissionGrant[] {
+  return validateGrantSet(records);
 }
 
 /** Serializes a validated store with deterministic key ordering. */
