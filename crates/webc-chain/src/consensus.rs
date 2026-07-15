@@ -1,7 +1,8 @@
 //! Consensus vote and stake-snapshot primitives.
 //!
-//! This module owns deterministic voting-power calculations and conflict
-//! detection. It does not perform networking, persistence, or block execution.
+//! This module owns deterministic voting-power calculations, the deterministic
+//! stake-weighted leader schedule, and conflict detection. It does not perform
+//! networking, persistence, or block execution.
 //! Vote payloads are signed over an explicit domain, protocol version, and chain
 //! ID. This module verifies cryptographic authenticity but does not implement
 //! networking, committee membership, finality rounds, or durable vote storage.
@@ -13,6 +14,9 @@ use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, S
 
 /// Domain separator for version-1 consensus vote signatures.
 pub const CONSENSUS_VOTE_DOMAIN: &str = "WEBC_CONSENSUS_VOTE_V1";
+
+/// Domain separator for the version-1 deterministic leader schedule.
+pub const LEADER_SCHEDULE_DOMAIN: &str = "WEBC_LEADER_SCHEDULE_V1";
 
 /// Voting power assigned to one validator for BFT consensus.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +74,49 @@ impl ValidatorSet {
             validators,
             total_power,
         })
+    }
+
+    /// Deterministically selects the block proposer for a height and round,
+    /// weighted by each validator's snapshot voting power.
+    ///
+    /// This is consensus-critical: every honest node must compute the identical
+    /// proposer from the same snapshot. It therefore reads no clock and draws its
+    /// only randomness from a domain-separated hash of `(height, round)`. A
+    /// validator with more stake is proportionally more likely to be chosen, and
+    /// the round input lets a stuck height rotate to a different proposer.
+    ///
+    /// Returns `None` only for an empty or zero-power set. The committee for this
+    /// prototype is the whole active validator set; stake-weighted sub-committee
+    /// sampling for very large sets is a later refinement.
+    pub fn proposer_for(&self, height: u64, round: u32) -> Option<Address> {
+        if self.validators.is_empty() || self.total_power.is_zero() {
+            return None;
+        }
+        // Draw a value in `[0, total_power)`. Sixteen bytes of the hash form a
+        // u128, matching the base-unit width of voting power.
+        let seed = Hash256::digest_many([
+            LEADER_SCHEDULE_DOMAIN.as_bytes(),
+            &height.to_le_bytes(),
+            &round.to_le_bytes(),
+        ]);
+        let draw_source = u128::from_le_bytes(
+            seed.0[..16]
+                .try_into()
+                .expect("16 bytes fit a u128 from a 32-byte hash"),
+        );
+        let draw = draw_source % self.total_power.0;
+        // Walk validators in their deterministic address order, accumulating
+        // power until the running total passes the drawn point.
+        let mut cumulative: u128 = 0;
+        for entry in self.validators.values() {
+            cumulative = cumulative.saturating_add(entry.power.0);
+            if draw < cumulative {
+                return Some(entry.validator);
+            }
+        }
+        // Unreachable while `total_power` equals the summed powers, but fall back
+        // deterministically to the last validator rather than returning `None`.
+        self.validators.values().last().map(|entry| entry.validator)
     }
 
     /// Returns snapshot voting power, or zero when the validator is absent.
@@ -299,6 +346,101 @@ mod tests {
             VoteType::Precommit,
             block
         ));
+    }
+
+    fn set_with_powers(powers: &[(Address, u128)]) -> ValidatorSet {
+        let mut validators = BTreeMap::new();
+        let mut total = 0u128;
+        for (address, power) in powers {
+            total += *power;
+            validators.insert(
+                *address,
+                ValidatorPower {
+                    validator: *address,
+                    power: Amount::from_units(*power),
+                },
+            );
+        }
+        ValidatorSet {
+            validators,
+            total_power: Amount::from_units(total),
+        }
+    }
+
+    #[test]
+    fn proposer_is_deterministic_and_within_the_set() {
+        let a = Keypair::from_seed([1u8; 32]).address();
+        let b = Keypair::from_seed([2u8; 32]).address();
+        let c = Keypair::from_seed([3u8; 32]).address();
+        let set = set_with_powers(&[(a, 1), (b, 1), (c, 1)]);
+
+        for height in 0..25u64 {
+            for round in 0..4u32 {
+                let first = set.proposer_for(height, round).unwrap();
+                // Identical inputs always yield the identical proposer.
+                assert_eq!(set.proposer_for(height, round), Some(first));
+                // The chosen proposer is always a member of the set.
+                assert!([a, b, c].contains(&first));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_or_zero_power_set_has_no_proposer() {
+        let empty = ValidatorSet {
+            validators: BTreeMap::new(),
+            total_power: Amount::ZERO,
+        };
+        assert_eq!(empty.proposer_for(0, 0), None);
+
+        let a = Keypair::from_seed([1u8; 32]).address();
+        let zero = set_with_powers(&[(a, 0)]);
+        assert_eq!(zero.proposer_for(0, 0), None);
+    }
+
+    #[test]
+    fn single_validator_always_proposes() {
+        let only = Keypair::from_seed([5u8; 32]).address();
+        let set = set_with_powers(&[(only, 42)]);
+        for height in 0..10u64 {
+            assert_eq!(set.proposer_for(height, 0), Some(only));
+        }
+    }
+
+    #[test]
+    fn proposer_selection_is_stake_weighted() {
+        // A validator with ~9x the stake should be proposer far more often.
+        let heavy = Keypair::from_seed([10u8; 32]).address();
+        let light = Keypair::from_seed([11u8; 32]).address();
+        let set = set_with_powers(&[(heavy, 90), (light, 10)]);
+
+        let mut heavy_count = 0u32;
+        let samples = 1_000u64;
+        for height in 0..samples {
+            if set.proposer_for(height, 0) == Some(heavy) {
+                heavy_count += 1;
+            }
+        }
+        // Expect roughly 900/1000; assert a wide band to stay robust while still
+        // proving weighting works (a fair coin would land near 500).
+        assert!(
+            (820..=960).contains(&heavy_count),
+            "heavy validator won {heavy_count}/1000, expected ~900"
+        );
+    }
+
+    #[test]
+    fn round_change_can_rotate_the_proposer() {
+        // Across rounds at one height, more than one distinct proposer appears in
+        // a balanced set, so a stuck round can hand off to someone else.
+        let a = Keypair::from_seed([1u8; 32]).address();
+        let b = Keypair::from_seed([2u8; 32]).address();
+        let c = Keypair::from_seed([3u8; 32]).address();
+        let set = set_with_powers(&[(a, 1), (b, 1), (c, 1)]);
+        let distinct: BTreeSet<Address> = (0..12u32)
+            .filter_map(|round| set.proposer_for(7, round))
+            .collect();
+        assert!(distinct.len() >= 2, "rounds never rotated the proposer");
     }
 
     #[test]
