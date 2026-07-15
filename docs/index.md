@@ -40,8 +40,17 @@ They cannot override confirmed product or economic policy in
 
 ## Current next action
 
-Phase 0 and Phase 1 are complete, and Phase 2 is active. Use `continuation-guide.md` for the
-verified checkpoint and exact first unfinished task; do not restart completed
-amount, inflation, genesis, block-atomicity, staking-ratio, or access-enforcement
-work. Complete wallet derivation, encrypted storage, and browser isolation before
-RPC and networking.
+Phase 0 and Phase 1 are complete, and Phase 2 is active. The versioned
+authorization + constrained session-key gate is now **complete** (ML-DSA-65
+root-signature gate, session keys with budgets/lane/expiry+pruning, active-key and
+recovery-root rotation, the browser/SDK surface, and an indicative benchmark); the
+only session-key remainder is reference-machine benchmark numbers. Use
+`continuation-guide.md` for the verified checkpoint and exact next task, and do not
+restart completed amount, inflation, genesis, block-atomicity, staking-ratio,
+access-enforcement, or session-key work. Next Phase 2 items: persistent encrypted
+wallet permission storage and automatic authorization-lane setup, before RPC and
+networking.
+
+This project runs in an ephemeral cloud container: the GitHub repo is the source
+of truth, so commit and push every step. `target/`, `node_modules/`, and `dist/`
+are git-ignored but regenerable from the committed lock files and toolchain pins.

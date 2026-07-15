@@ -53,58 +53,56 @@ Completed Phase 1 work, in implementation order:
 
 The current code remains prototype-only and unsafe for real funds.
 
-The 2026-07-13 continuation gate passed with the pinned GNU Rust toolchain:
-`cargo fmt --check`, strict workspace Clippy, 77 Rust unit tests, Rust
-documentation with warnings denied, and `webc-node demo`. Node.js 24.18.0 and
-pnpm 11.7.0 passed both TypeScript builds, all 40 TypeScript tests, the emitted
-ESM package-entry smoke test, and the local Markdown-link check. On this Windows host, explicitly use
-`cargo +1.96.0-x86_64-pc-windows-gnu`; the default MSVC target has no installed
-`link.exe` and is not the verified repository toolchain.
+This project runs in an ephemeral cloud container; the GitHub repository is the
+single source of truth. Always push to the designated branch mid-work and before
+ending, and never leave valuable work only on local disk. `target/`,
+`node_modules/`, and `dist/` are intentionally git-ignored but fully regenerable
+because `Cargo.lock`, `pnpm-lock.yaml`, `rust-toolchain.toml`, and `.node-version`
+are committed (`cargo build`, `pnpm install`).
+
+Latest verified gate (2026-07-15, this cloud environment): `cargo fmt --check`,
+strict workspace Clippy (`-D warnings`), 133 Rust tests (120 `webc-chain` + 13
+`webc-crypto`), rustdoc with warnings denied, and `webc-node demo`. The
+TypeScript SDK builds and passes 44 of 45 tests — the one failure is the
+pre-existing `wallet-service.test.ts` case on Node 22 (the repo targets Node 24,
+per `.node-version`), unrelated to protocol work. The Markdown-link check passes.
+Historical note: on a Windows GNU host use `cargo +1.96.0-x86_64-pc-windows-gnu`
+(the MSVC target lacks `link.exe`); the cloud Linux toolchain needs no override.
 
 ## Exact next work
 
-Resume with the first incomplete item in this order:
+The versioned on-chain authorization + constrained session-key gate is
+**complete**. Do not redo any of it. What shipped (see
+`docs/session-keys-implementation-plan.md`, `docs/session-keys-next-steps.md`, and
+the Phase 2 section of `docs/implementation-status.md`):
 
-1. Add versioned account authorization policies and the post-quantum root field,
-   then benchmark the ML-DSA candidate before enabling any claim. (Policy + root
-   field are implemented; ML-DSA benchmarking remains.)
-2. Constrained session-key state and tests are **implemented** for the
-   single-node state machine (see `docs/session-keys-implementation-plan.md` and
-   the Phase 2 section of `docs/implementation-status.md`): install/revoke gated
-   by a real ML-DSA-65 post-quantum-root **signature** (step 6), epoch expiry,
-   per-use and cumulative amount and fee budgets, lane binding, rotation
-   invalidation, and the full session-key + `mldsa` Rust test matrix.
-3. The ML-DSA root-**signature** gate on `InstallSessionKey`/`RevokeSessionKey` is
-   now **implemented** (step 6): the pinned `fips204` ML-DSA-65 crate sits behind
-   the replaceable `webc-crypto::mldsa` boundary, `PostQuantumRootReveal` carries a
-   signature verified over `session_key_authorization_message`
-   (`WEBC_SESSION_KEY_AUTHORIZATION_V1`, binding chain id, owner, policy revision,
-   nonce, and action), and adversarial tests cover wrong-action/nonce/key and
-   garbage signatures. It is devnet-only: ML-DSA-65 is a named candidate, not a
-   benchmarked or audited security claim.
-4. Remaining for this gate, in order. `docs/session-keys-next-steps.md` holds the
-   detailed, actionable resume plan for each; start there.
-   - epoch-boundary pruning of expired session keys — **implemented** (a
-     deterministic, restart-stable `finish_epoch` sweep);
-   - session-key and ML-DSA (verify/sign vs Ed25519) benchmarks before any policy
-     claim;
-   - the browser/SDK session-key surface (subkey generation, install and session
-     signing, expiry display, and cross-language operation and reveal fixtures) —
-     **implemented**; only benchmarks remain, deferred until a reference machine
-     is available;
-   - (sibling, outside the session-key plan) primary-key recovery and rotation
-     operations — **implemented**. Root-gated `RotateActiveTransactionKey`
-     replaces the active key (recovery works via a new-key-signed envelope plus
-     the root signature), bumps the policy revision (invalidating session keys),
-     and preserves the recovery root; full adversarial tests pass.
-   - rotating the post-quantum root itself (`RotatePostQuantumRoot`, signed by
-     the current root; domain `WEBC_POST_QUANTUM_ROOT_ROTATION_V1`) —
-     **implemented**. Preserves the active key, bumps the revision, and requires
-     both the current root and the active key. With `RotateActiveTransactionKey`,
-     both halves of the policy can be recovered independently.
+- Versioned account authorization policy with a post-quantum recovery-root field.
+- A real ML-DSA-65 root-**signature** gate (pinned `fips204` behind the
+  replaceable `webc-crypto::mldsa` boundary) on session-key install/revoke, over
+  `session_key_authorization_message` (`WEBC_SESSION_KEY_AUTHORIZATION_V1`, binding
+  chain id, owner, policy revision, nonce, and action).
+- Constrained session keys: per-use and cumulative amount and fee budgets, lane
+  binding, epoch expiry with a deterministic epoch-boundary pruning sweep, and
+  rotation invalidation.
+- Primary active-key recovery/rotation (`RotateActiveTransactionKey`, recovery via
+  a new-key-signed envelope + root signature) and recovery-root rotation
+  (`RotatePostQuantumRoot`, current-root signature + active-key envelope). Both
+  halves of the policy can be recovered independently; both had a clean isolated
+  adversarial review.
+- Browser/SDK surface: operation constructors, access lists, `deriveSessionKeyIdHex`,
+  session-subkey generation, and epoch-based expiry display, with cross-language
+  byte-parity fixtures.
+- `webc-node bench` for an indicative (non-reference) ML-DSA-65 vs Ed25519 timing.
 
-Do not start RPC, networking, a public VM, ZK, or a real bridge before the Phase
-2 wallet wire and secret-isolation gates pass.
+The single remaining session-key item: **reference-machine benchmark numbers**
+(session-key vs Ed25519 transfer end to end, and ML-DSA verify/sign vs Ed25519),
+which this cloud container cannot produce honestly. Publish reference numbers
+before any performance claim.
+
+Next Phase 2 items before RPC/networking (per `development-plan.md`): persistent
+encrypted wallet **permission storage** and **automatic authorization-lane setup**
+in the SDK. Do not start RPC, networking, a public VM, ZK, or a real bridge before
+those wallet-wire and secret-isolation gates pass.
 
 ## Working rules
 

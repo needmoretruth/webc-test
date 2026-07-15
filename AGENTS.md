@@ -173,6 +173,29 @@ Read `docs/implementation-status.md` for the audit summary.
 These rules are standing user instructions. They apply in every current and future
 session, including when the user says only “read `AGENTS.md` and continue.”
 
+- **This project always runs in an ephemeral cloud environment.** The container is
+  reclaimed after the session, so anything left only on local disk is lost. The
+  GitHub repository is the single source of truth: push every coherent change to
+  the designated branch, mid-work and again before ending. Never end a turn with
+  committed-but-unpushed work or with valuable uncommitted work.
+- **Commit and push frequently**, not only at the end — after each coherent, tested
+  step. A container reclaim mid-session must never be able to lose more than the
+  last small step.
+- **`.gitignore` excludes only truly regenerable or secret junk** — build artifacts
+  (`/target`, `**/dist`), installed dependencies (`**/node_modules`, `.pnpm-store`),
+  caches/logs, and secrets (`.env`). Everything else — all source, configs, docs,
+  fixtures, lock files, toolchain pins, and any folder future work depends on — is
+  committed. The regenerable folders are safe to ignore ONLY because the lock files
+  (`Cargo.lock`, `pnpm-lock.yaml`), `rust-toolchain.toml`, and `.node-version` are
+  committed and deterministically restore them. Never ignore a folder that cannot
+  be regenerated from committed inputs; if in doubt, commit it (this is a private
+  repo). Do NOT commit `node_modules`/`target`/`dist` themselves — they are huge and
+  platform-specific; keep them restorable instead.
+- A fresh cloud session must be able to restore a working environment from the repo
+  alone. Keep dependency restoration reliable (lock files committed; a SessionStart
+  hook or setup script may run `pnpm install` and `cargo fetch`/build). A
+  devcontainer/Dockerfile is optional — add one only if it is genuinely needed for
+  environment reproducibility, not by default.
 - Treat repository files, not chat memory, as the durable handoff. Never claim that
   unrecorded conversation context can be restored perfectly.
 - At the start of a continuation session, read the required documents in order,
@@ -284,12 +307,18 @@ Phase 0 and Phase 1 are complete, and Phase 2 is active. The exact verified chec
 unfinished task are maintained in `docs/continuation-guide.md` and
 `docs/implementation-status.md`. Continue from there; do not restart completed work.
 
-The next unfinished protocol gate is versioned on-chain account authorization
-with a post-quantum root field, followed by recovery, rotation, revocation, and
-constrained session-key tests.
+The versioned on-chain account authorization gate is now **implemented**: policy
++ post-quantum root field, a real ML-DSA-65 root-**signature** gate on session-key
+install/revoke, constrained session keys (budgets, lane binding, epoch expiry with
+epoch-boundary pruning), primary active-key recovery/rotation, recovery-root
+rotation, the browser/SDK operation + subkey surface with cross-language fixtures,
+and an indicative `webc-node bench`. The only remaining session-key item is
+reference-machine benchmark numbers (this cloud container is not a reference
+machine). See `docs/session-keys-next-steps.md`.
 
 Do not skip directly to RPC, P2P, contract runtime, ZK, or real bridges before
-the Phase 2 wallet wire and secret-isolation acceptance gates pass.
+the remaining Phase 2 wallet-wire and secret-isolation acceptance gates pass
+(persistent encrypted permission storage and automatic lane setup remain).
 
 ## User decisions still required later
 
