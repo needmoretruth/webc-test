@@ -1341,6 +1341,7 @@ dependencies = [
  "tower-http",
  "webc-chain",
  "webc-crypto",
+ "webc-net",
  "webc-storage",
 ]
 

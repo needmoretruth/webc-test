@@ -38,6 +38,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::broadcast;
+use webc_net::{NetMessage, NetworkHandle};
 
 use webc_chain::{Block, ObjectId, Transaction};
 use webc_crypto::{Address, Hash256};
@@ -69,6 +70,9 @@ pub struct AppState<K: KvStore> {
 struct AppInner<K: KvStore> {
     service: NodeService<K>,
     block_events: broadcast::Sender<BlockEvent>,
+    /// Present when the node participates in a peer-to-peer network. Locally
+    /// submitted transactions are gossiped through it; `None` runs standalone.
+    network: Option<NetworkHandle>,
 }
 
 impl<K: KvStore> Clone for AppState<K> {
@@ -81,12 +85,24 @@ impl<K: KvStore> Clone for AppState<K> {
 
 impl<K: KvStore> AppState<K> {
     /// Wraps a service and creates the block-event broadcast channel.
+    ///
+    /// The node runs standalone (no gossip). Use [`Self::with_network`] to
+    /// attach a peer-to-peer network handle.
     pub fn new(service: NodeService<K>) -> Self {
+        Self::with_network(service, None)
+    }
+
+    /// Wraps a service with an optional peer-to-peer network handle.
+    ///
+    /// When a handle is present, transactions submitted to this node are
+    /// gossiped to peers so they reach every mempool.
+    pub fn with_network(service: NodeService<K>, network: Option<NetworkHandle>) -> Self {
         let (block_events, _) = broadcast::channel(BLOCK_EVENT_CAPACITY);
         Self {
             inner: Arc::new(AppInner {
                 service,
                 block_events,
+                network,
             }),
         }
     }
@@ -94,6 +110,25 @@ impl<K: KvStore> AppState<K> {
     /// The underlying service (for direct queries and tests).
     pub fn service(&self) -> &NodeService<K> {
         &self.inner.service
+    }
+
+    /// Submits a transaction locally and gossips it to peers on success.
+    ///
+    /// The transaction is validated and admitted by the service first; only a
+    /// newly accepted transaction is broadcast, so a rejected or duplicate
+    /// submission never floods the network.
+    pub fn submit_transaction(
+        &self,
+        tx: Transaction,
+        now_ms: u64,
+    ) -> Result<SubmitReceipt, ApiError> {
+        let gossip_copy = tx.clone();
+        let receipt = self.inner.service.submit_transaction(tx, now_ms)?;
+        if let Some(network) = &self.inner.network {
+            // Best-effort: a stopped worker must not fail a valid submission.
+            let _ = network.broadcast(NetMessage::Transaction(Box::new(gossip_copy)));
+        }
+        Ok(receipt)
     }
 
     /// Subscribes to block events (used by WebSocket handlers and tests).
@@ -117,7 +152,7 @@ impl<K: KvStore> AppState<K> {
 }
 
 /// Milliseconds since the Unix epoch, read at the transport boundary only.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -255,7 +290,8 @@ async fn submit_transaction<K: KvStore>(
     State(state): State<AppState<K>>,
     Json(tx): Json<Transaction>,
 ) -> Result<Json<SubmitReceipt>, ApiRejection> {
-    Ok(Json(state.service().submit_transaction(tx, now_ms())?))
+    // Route through AppState so a locally accepted transaction is also gossiped.
+    Ok(Json(state.submit_transaction(tx, now_ms())?))
 }
 
 async fn seal_block<K: KvStore>(
