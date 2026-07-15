@@ -17,6 +17,8 @@
 
 pub mod mempool;
 pub mod node;
+pub mod service;
 
 pub use mempool::{InsertOutcome, Mempool, MempoolConfig, MempoolError};
 pub use node::{Node, NodeError};
+pub use service::{ApiError, FaucetConfig, NodeService, NodeServiceOptions, API_VERSION};
