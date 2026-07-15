@@ -16,3 +16,15 @@ webc-crypto = { path = "../webc-crypto" }
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true
+# Async transport plumbing. All MIT-licensed (Apache-2.0-compatible): tokio for
+# the runtime/sockets, tokio-util for the length-delimited frame codec,
+# futures-util for Sink/Stream combinators, bytes for zero-copy frame buffers.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+bytes = "1"
+# OS randomness for fresh handshake challenges (reused workspace pin).
+rand_core = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }

@@ -9,24 +9,12 @@
 //! mature length-delimited codec at the transport layer; this module only
 //! defines what a single frame's bytes mean.
 
-use bincode::Options;
 use serde::{Deserialize, Serialize};
 use webc_chain::Transaction;
 use webc_crypto::Hash256;
 
+use crate::codec::{decode as decode_frame, encode as encode_frame};
 use crate::error::NetError;
-
-/// Shared bincode configuration for every WEBC frame.
-///
-/// Fixed-int encoding keeps the magic and version at stable byte offsets so
-/// [`decode_message`] can reject an incompatible frame without deserializing the
-/// payload, and rejecting trailing bytes forces a frame to consume exactly its
-/// bytes. Both encode and decode must use this identical configuration.
-fn frame_codec() -> impl Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
-}
 
 /// Fixed four-byte tag beginning every WEBC network frame.
 pub const NET_PROTOCOL_MAGIC: [u8; 4] = *b"WEBC";
@@ -70,7 +58,7 @@ pub fn encode_message(message: &NetMessage) -> Result<Vec<u8>, NetError> {
         version: NET_PROTOCOL_VERSION,
         payload: message.clone(),
     };
-    let bytes = frame_codec().serialize(&envelope)?;
+    let bytes = encode_frame(&envelope)?;
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(NetError::FrameTooLarge {
             maximum: MAX_FRAME_BYTES,
@@ -99,8 +87,8 @@ pub fn decode_message(bytes: &[u8]) -> Result<NetMessage, NetError> {
     if version != NET_PROTOCOL_VERSION {
         return Err(NetError::UnsupportedVersion { actual: version });
     }
-    // frame_codec rejects trailing bytes: a frame must consume exactly its bytes.
-    let envelope: Envelope = frame_codec().deserialize(bytes)?;
+    // The shared codec rejects trailing bytes: a frame consumes exactly its bytes.
+    let envelope: Envelope = decode_frame(bytes)?;
     Ok(envelope.payload)
 }
 
