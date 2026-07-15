@@ -19,6 +19,7 @@ pub mod hex_bytes;
 pub mod inflation;
 pub mod object;
 pub mod protocol;
+pub mod round;
 pub mod scheduler;
 pub mod session_key;
 pub mod slashing;
@@ -43,8 +44,9 @@ pub use block::{Block, BlockHeader};
 pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildInput};
 pub use bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 pub use consensus::{
-    detect_double_votes, DoubleVoteEvidence, SignedVote, ValidatorPower, ValidatorSet, Vote,
-    VoteType, CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
+    detect_double_votes, DoubleVoteEvidence, FinalityCertificate, Proposal, SignedProposal,
+    SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
+    CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
 pub use fees::{split_fee, FeeBreakdown, FeePolicy};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
@@ -54,6 +56,7 @@ pub use protocol::{
     AuthorizationLaneId, BaseUnits, BlockHeight, ChainId, ChainIdError, Epoch, Nonce,
     ProtocolVersion, ValidatorId, CURRENT_PROTOCOL_VERSION,
 };
+pub use round::{ConsensusAction, ConsensusMessage, RoundState, Step, ValidatorIdentity};
 pub use scheduler::parallel_batches;
 pub use session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
@@ -281,6 +284,22 @@ pub enum ChainError {
     PostQuantumRootRotationRequiresInstalledPolicy,
     #[error("post-quantum root rotation must change the committed recovery root")]
     PostQuantumRootRotationToSameRoot,
+    #[error(
+        "consensus message chain ID or protocol version does not match the local configuration"
+    )]
+    ConsensusConfigMismatch,
+    #[error("consensus message does not match the expected height or round")]
+    ConsensusHeightRoundMismatch,
+    #[error("consensus proposal was not signed by the scheduled leader for this height and round")]
+    ConsensusProposalNotFromLeader,
+    #[error("consensus proposal block hash does not match its carried block")]
+    ConsensusProposalBlockMismatch,
+    #[error("consensus message came from a validator absent from the height's snapshot")]
+    ConsensusValidatorNotInSet,
+    #[error("consensus message signature is invalid for the registered consensus key")]
+    ConsensusSignatureInvalid,
+    #[error("finality certificate does not carry strictly more than two-thirds precommit power")]
+    FinalityQuorumNotReached,
 }
 
 impl From<bincode::Error> for ChainError {
