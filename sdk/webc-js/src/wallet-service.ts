@@ -9,6 +9,10 @@
  */
 
 import { bytesToHex, concatBytes, toArrayBuffer } from "./hex.js";
+import type {
+  PermissionPersistencePort,
+  PersistedPermissionGrant,
+} from "./permission-store.js";
 import {
   CURRENT_TRANSACTION_PROTOCOL_VERSION,
   signTransaction,
@@ -75,13 +79,26 @@ export interface TrustedWalletServiceOptions {
    * migration policy). Must be a non-negative safe integer.
    */
   readonly authorizationPolicyRevision?: number;
+  /**
+   * Grants restored from a decrypted permission store, rehydrated as dormant
+   * (no live session) so their cumulative spend and lane survive a wallet
+   * restart. An origin must reconnect to obtain a live session before signing.
+   */
+  readonly restoredGrants?: readonly PersistedPermissionGrant[];
+  /**
+   * Durable backing for grant changes. When present, the service persists the
+   * full grant set after every connect, spend, and revoke, inside its serial
+   * queue so persistence cannot race. Omit for an in-memory-only service.
+   */
+  readonly persistence?: PermissionPersistencePort;
 }
 
 interface PermissionGrant {
   readonly limitsJson: WalletSpendLimitsJson;
   readonly limits: ParsedSpendLimits;
   readonly authorizationLane: string;
-  readonly sessionId: string;
+  /** Live connection session; empty string means a dormant restored grant. */
+  sessionId: string;
   spentAmount: bigint;
   nextSequence: number;
 }
@@ -90,9 +107,11 @@ interface PermissionGrant {
  * Stateful trusted wallet service with replay and permission protection.
  *
  * A service instance is bound to one parent/opener window but may grant several
- * HTTPS origins if that source navigates. Grants remain per-origin and in-memory
- * until encrypted permission persistence is designed. Calling `handleMessage`
- * is safe concurrently; requests are queued in arrival order.
+ * HTTPS origins if that source navigates. When constructed with a `persistence`
+ * port the per-origin grants (lane, limits, cumulative spend) are durable across
+ * wallet restarts; without it they are in-memory only. Calling `handleMessage`
+ * is safe concurrently; requests are queued in arrival order, and persistence
+ * writes run inside that same serial queue so they cannot race.
  */
 export class TrustedWalletService {
   readonly #wallet: WebcWallet;
@@ -100,6 +119,7 @@ export class TrustedWalletService {
   readonly #expectedSource: WalletMessageSource;
   readonly #confirm: WalletConfirmationHandler;
   readonly #authorizationPolicyRevision: number;
+  readonly #persistence: PermissionPersistencePort | undefined;
   readonly #grants = new Map<string, PermissionGrant>();
   readonly #replayIds = new Map<string, true>();
   #queue: Promise<void> = Promise.resolve();
@@ -118,6 +138,43 @@ export class TrustedWalletService {
     this.#expectedSource = options.expectedSource;
     this.#confirm = options.confirm;
     this.#authorizationPolicyRevision = revision;
+    this.#persistence = options.persistence;
+    this.#rehydrate(options.restoredGrants ?? []);
+  }
+
+  // Restores persisted grants as dormant: cumulative spend and the assigned lane
+  // survive, but the live session is empty so an origin must reconnect (which
+  // issues a fresh session id) before it can sign. A restored grant that repeats
+  // an origin keeps the first entry.
+  #rehydrate(restored: readonly PersistedPermissionGrant[]): void {
+    for (const record of restored) {
+      if (this.#grants.has(record.origin)) continue;
+      this.#grants.set(record.origin, {
+        limitsJson: record.limits,
+        limits: parseSpendLimits(record.limits),
+        authorizationLane: record.authorization_lane,
+        sessionId: "",
+        spentAmount: BigInt(record.spent_amount),
+        nextSequence: 0,
+      });
+    }
+  }
+
+  // Snapshots every grant into its durable, canonical persisted form.
+  #snapshot(): PersistedPermissionGrant[] {
+    return [...this.#grants.entries()].map(([origin, grant]) => ({
+      origin,
+      authorization_lane: grant.authorizationLane,
+      scopes: ["sign_native_transfer"],
+      limits: grant.limitsJson,
+      spent_amount: grant.spentAmount.toString(10),
+    }));
+  }
+
+  #persist(): Promise<void> {
+    return this.#persistence
+      ? this.#persistence.save(this.#snapshot())
+      : Promise.resolve();
   }
 
   /** Enqueues one browser message and posts at most one exact-origin response. */
@@ -206,17 +263,25 @@ export class TrustedWalletService {
         limits: request.params.limits,
       });
       if (!approved) throw serviceError("USER_REJECTED", "user rejected connection");
-      const authorizationLane = await deriveOriginAuthorizationLane(this.#wallet, origin);
+      const previous = this.#grants.get(origin);
+      // The lane is deterministic per origin, so an existing grant's lane is
+      // reused without another signature. Cumulative spend carries over across a
+      // reconnect so a hostile host cannot reset a spend budget by reconnecting;
+      // only an explicit revoke clears it. A fresh session id is always issued.
+      const authorizationLane =
+        previous?.authorizationLane ??
+        (await deriveOriginAuthorizationLane(this.#wallet, origin));
       const sessionId = createWalletRequestId();
       const grant: PermissionGrant = {
         limitsJson: request.params.limits,
         limits: parseSpendLimits(request.params.limits),
         authorizationLane,
         sessionId,
-        spentAmount: 0n,
+        spentAmount: previous?.spentAmount ?? 0n,
         nextSequence: 0,
       };
       this.#grants.set(origin, grant);
+      await this.#persistOrRollback(origin, previous);
       return {
         address: this.#wallet.address,
         public_key: bytesToHex(this.#wallet.publicKey),
@@ -229,7 +294,10 @@ export class TrustedWalletService {
     }
 
     if (request.method === "revoke") {
+      const previous = this.#grants.get(origin);
+      if (!previous) return { revoked: true };
       this.#grants.delete(origin);
+      await this.#persistOrRollback(origin, previous);
       return { revoked: true };
     }
 
@@ -283,9 +351,44 @@ export class TrustedWalletService {
       request.params.protocol_version,
       request.params.authorization_policy_revision,
     );
+    // Advance spend and sequence, then persist durably before returning. If the
+    // durable write fails, roll both back and drop the signature (it is never
+    // posted), so in-memory and durable state stay identical: either the spend
+    // is recorded and the transaction returned, or neither happens.
+    const priorSpent = grant.spentAmount;
+    const priorSequence = grant.nextSequence;
     grant.spentAmount = nextSpent;
     grant.nextSequence += 1;
+    try {
+      await this.#persist();
+    } catch {
+      grant.spentAmount = priorSpent;
+      grant.nextSequence = priorSequence;
+      throw serviceError(
+        "INTERNAL_ERROR",
+        "could not durably record the wallet spend",
+      );
+    }
     return signed;
+  }
+
+  // Persists after a grant mutation. On failure, restores the exact prior grant
+  // (or removes a newly created one) and raises a typed error, so a failed write
+  // never leaves durable and in-memory state disagreeing.
+  async #persistOrRollback(
+    origin: string,
+    previous: PermissionGrant | undefined,
+  ): Promise<void> {
+    try {
+      await this.#persist();
+    } catch {
+      if (previous) this.#grants.set(origin, previous);
+      else this.#grants.delete(origin);
+      throw serviceError(
+        "INTERNAL_ERROR",
+        "could not durably record the wallet permission change",
+      );
+    }
   }
 
   #rememberReplay(key: string): void {
