@@ -4,6 +4,7 @@ members = [
     "crates/webc-crypto",
     "crates/webc-chain",
     "crates/webc-storage",
+    "crates/webc-net",
     "crates/webc-node",
 ]
 

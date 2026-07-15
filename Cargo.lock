@@ -1294,6 +1294,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "webc-net"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "thiserror 1.0.69",
+ "webc-chain",
+ "webc-crypto",
+]
+
+[[package]]
 name = "webc-node"
 version = "0.1.0"
 dependencies = [
