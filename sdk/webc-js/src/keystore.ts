@@ -8,7 +8,7 @@
  * metadata is bound as additional data so it cannot be swapped independently.
  */
 
-import { argon2idAsync } from "@noble/hashes/argon2.js";
+import { deriveArgon2idKey } from "./argon2.js";
 import { addressToBytes } from "./address.js";
 import { canonicalJson, canonicalJsonBytes } from "./canonical.js";
 import { bytesToHex, hexToBytes, toArrayBuffer } from "./hex.js";
@@ -555,33 +555,19 @@ function hasUnpairedSurrogate(value: string): boolean {
   return false;
 }
 
-let previousKdf = Promise.resolve();
-
 async function deriveEncryptionKey(
   password: Uint8Array,
   salt: Uint8Array,
 ): Promise<Uint8Array> {
-  // noble's async Argon2 uses a shared scratch block. Serialize calls so two
-  // concurrent wallet requests cannot interleave and corrupt derived results.
-  const waitFor = previousKdf;
-  let release: (() => void) | undefined;
-  previousKdf = new Promise<void>((resolve) => {
-    release = resolve;
+  // Serialized through the shared Argon2id gate so a concurrent keystore unlock
+  // and permission-store save cannot interleave on noble's shared scratch block.
+  return deriveArgon2idKey(password, salt, {
+    memoryKib: KEYSTORE_ARGON2_MEMORY_KIB,
+    iterations: KEYSTORE_ARGON2_ITERATIONS,
+    parallelism: KEYSTORE_ARGON2_PARALLELISM,
+    dkLen: AES_KEY_BYTES,
+    maxMemoryBytes: ARGON2_MAX_MEMORY_BYTES,
   });
-  await waitFor;
-  try {
-    return await argon2idAsync(password, salt, {
-      m: KEYSTORE_ARGON2_MEMORY_KIB,
-      t: KEYSTORE_ARGON2_ITERATIONS,
-      p: KEYSTORE_ARGON2_PARALLELISM,
-      version: 0x13,
-      dkLen: AES_KEY_BYTES,
-      maxmem: ARGON2_MAX_MEMORY_BYTES,
-      asyncTick: 10,
-    });
-  } finally {
-    release?.();
-  }
 }
 
 async function importAesKey(
