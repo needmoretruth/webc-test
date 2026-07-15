@@ -6,7 +6,7 @@
 //! Boundaries: holds all data in process memory; nothing survives a restart. It
 //! still honors atomicity (a `commit` either fully applies or, on the single
 //! validation failure path, changes nothing) so code tested against it behaves
-//! identically against the durable file backend.
+//! identically against the durable redb backend.
 //!
 //! Ordering: each table is a `BTreeMap<Vec<u8>, _>`, whose iteration is ascending
 //! lexicographic byte order — exactly the order [`KvStore`] requires.
