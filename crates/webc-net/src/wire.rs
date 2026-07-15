@@ -189,6 +189,7 @@ mod tests {
             webc_chain::ChainId::devnet(),
             1,
             0,
+            None,
             sample_block(leader.address()),
             leader.address(),
             &leader,
