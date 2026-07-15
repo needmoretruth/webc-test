@@ -29,8 +29,12 @@ Use simple Korean when speaking to the user, address them as 관리자 (administ
 
 Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
 is in progress — stage A-1 (networking plumbing) and the A-2 consensus core are
-done; stage A-3 (robustness) and the async network driver are next** (see "Exact
-next work"). Always use `git log` to discover the current branch tip;
+done, and stage A-3 has landed its deterministic core: received-block validation
+(`Node::import_block`), a full multi-round Tendermint machine with locking and
+safe round changes (`webc-chain::ConsensusMachine`), and objective equivocation
+detection. What remains in A-3 is the async network driver that runs the machine
+over real TCP and a state-sync protocol** (see "Exact next work"). Always use
+`git log` to discover the current branch tip;
 the checkpoint list below names implementation history, not an instruction to
 reset or return to an older commit. (The prototype remains unsafe for real funds,
 and reference-machine benchmark numbers are still owed before any performance
@@ -221,34 +225,52 @@ bootstrap list; peer scoring/rate-limiting on repeated rejects.
   (`WEBC_CONSENSUS_PROPOSAL_V1`, leader-only, block-hash-bound) and
   `FinalityCertificate` (aggregate precommits, unique snapshot members, strictly
   `>2/3` power) with `build` and an independent `verify`.
-- `webc-chain::round` — a pure, clock-free `RoundState` state machine for one
-  height/round driving propose -> prevote -> precommit -> commit. It verifies
-  every proposal/vote against the snapshot, counts each validator once per step
-  (first vote wins, so a later equivocation cannot shift the tally), and
-  finalizes only when it holds the block and precommit quorum is proven.
+- `webc-chain::round` — the consensus state machine. It began (A-2) as a
+  single-round engine and is now (A-3) a full single-height, multi-round
+  `ConsensusMachine` following Tendermint (arXiv:1807.04938, Algorithm 1):
+  propose -> prevote -> precommit with safe round changes. It verifies every
+  proposal/vote against the snapshot; a validator **locks** a value on precommit
+  and thereafter only prevotes that value or nil (so honest nodes never prevote
+  two blocks and two blocks can never both reach quorum); proposals carry a
+  signed proof-of-lock `valid_round` for safe re-proposal (rule 28); three
+  timeouts are surfaced as `ScheduleTimeout` actions and fed back as `Timeout`
+  events (the machine reads no clock); `f+1` catch-up jumps a lagging node
+  forward. Nil votes use the reserved all-zero sentinel hash (no wire change).
   Observers (`identity = None`) follow finality without voting. It emits
-  `ConsensusAction`s (broadcast / commit) for a driver to carry out; it does no
-  I/O itself.
+  `ConsensusAction`s (broadcast / schedule-timeout / need-block / commit /
+  equivocation) for a driver to carry out; it does no I/O itself.
 - `webc-net::wire` — `NetMessage` gained `Proposal`, `Vote`, and `Certificate`.
-- `webc-node::node` — `produce_block` now populates the per-epoch
+- `webc-node::node` — `produce_block` populates the per-epoch
   `Table::ValidatorSets` snapshot at each epoch's first block (previously wired
-  but unpopulated). With no active validators the snapshot is an empty set.
-- A deterministic 3-validator convergence test (`round::tests`) drives the
-  engines over an in-memory bus and proves all reach the identical finalized
-  block and a verifying certificate.
+  but unpopulated). `Node::import_block` validates a received block by
+  re-executing it (`webc-chain::apply_block` requires the recomputed header and
+  receipts to match) and commits it through the store, which enforces height
+  contiguity, parent linkage, and `state_root` — the receiving side of networked
+  consensus and the basis for state sync.
+- Deterministic tests prove: happy-path multi-validator convergence; a round
+  change when the round-0 proposer is silent (all responsive nodes finalize the
+  same block at a later round with a verifying certificate); the lock-safety
+  property (a node locked on X never prevotes a conflicting Y); block import
+  round-trip and tamper/gap rejection; and equivocation evidence that satisfies
+  the existing slashing path.
 
 A-2.1 (the `WEBC_LEADER_SCHEDULE_V1` stake-weighted leader schedule) remains as
 before. `Vote`/`SignedVote`/`VoteType`/quorum math/`detect_double_votes` are the
 primitives the above build on.
 
-**The next milestone is Phase 4 A-3 plus the async network driver.** The round
-engine is pure and driver-agnostic; what is missing is the async shell in
-`webc-node` that runs it over real `webc-net` TCP (routing gossiped
-Proposal/Vote/Certificate into the engine — the gossip pump currently ignores
-them by design) so 2-4 separate processes converge, plus A-3 robustness:
-timeouts/round-change (the engine is single-round today, so a stalled proposer
-stalls the height), fork choice, state sync for a joining node, and wiring
-objective double-vote/invalid-proposal evidence into the existing slashing path.
+**What remains in Phase 4 A-3 is integration, not consensus theory.** The machine
+is pure and driver-agnostic; missing is (1) the async driver in `webc-node` that
+runs a `ConsensusMachine` per height over real `webc-net` TCP — building a
+candidate block on `NeedProposalBlock`, arming real timers on `ScheduleTimeout`,
+routing gossiped Proposal/Vote/Certificate into the machine (the gossip pump
+currently ignores them by design), committing on `Commit` via `import_block`, and
+including gossiped `Equivocation` evidence in the next proposed block — so 2-4
+separate processes converge; and (2) a state-sync protocol so a joining node
+fetches finalized blocks plus their certificates from a checkpoint and imports
+them without replaying all history. Fork choice is largely covered by the
+finality-certificate design (a node follows the certified chain and commits only
+finalized blocks); the double-vote slashing *application* path already exists, so
+only its wiring into produced blocks (part of the driver) is left.
 
 Public contract runtime, the WEBC high-level language and tooling, the native
 oracle, ZK expansion, the web/game platform, and real-fund bridge work stay
