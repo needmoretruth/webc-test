@@ -15,17 +15,20 @@
 //!   `redb` embedded ACID database (MIT OR Apache-2.0). Per WEBC's reuse rule we
 //!   adapt a proven database behind the seam rather than hand-rolling a
 //!   write-ahead log and recovery.
-//! - A typed `ChainStore` (typed block/state/tip persistence with atomic
-//!   per-block commits) builds on `KvStore` and is added in a later step.
+//! - `chainstore`: the typed [`ChainStore`] — block/state/tip persistence with
+//!   atomic per-block commits and startup consistency checks — built on any
+//!   `KvStore`, so it runs identically on both backends.
 //!
 //! Everything here is deterministic given its inputs and never panics on damaged
 //! stored bytes: corruption is returned as [`StorageError::Corruption`].
 
+mod chainstore;
 mod error;
 mod kv;
 mod memory;
 mod redb_store;
 
+pub use chainstore::{BlockCommit, ChainStore, ChainTip, CHAIN_STORE_SCHEMA_VERSION};
 pub use error::StorageError;
 pub use kv::{KvEntry, KvStore, Table, WriteBatch, WriteOp};
 pub use memory::MemoryKvStore;
