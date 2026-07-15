@@ -13,11 +13,12 @@
 //! This driver is deliberately thin glue: every consensus-safety property is a
 //! property of the machine, not of this file.
 //!
-//! Scope (Phase 4 A-3): the driver proposes empty blocks (mempool-fed proposals
-//! are a follow-up), broadcasts and consumes proposals/votes, and includes any
-//! gossiped equivocation evidence in the blocks it proposes. Certificates are not
-//! yet used to fast-commit a lagging node — that is the job of the separate
-//! state-sync path, since a certificate carries a block hash but not the block.
+//! Scope (Phase 4 A-3): the driver admits gossiped transactions into a mempool
+//! and includes fee-priority, nonce-ordered transactions in the blocks it
+//! proposes, along with any gossiped equivocation evidence. It broadcasts and
+//! consumes proposals and votes. Certificates are not yet used to fast-commit a
+//! lagging node — that is the job of the separate state-sync path, since a
+//! certificate carries a block hash but not the block.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -32,6 +33,7 @@ use webc_net::{InboundMessage, NetMessage, NetworkHandle};
 use webc_storage::KvStore;
 
 use crate::http::now_ms;
+use crate::mempool::{Mempool, MempoolConfig};
 use crate::node::Node;
 
 /// How long the driver waits in each step before firing the matching timeout.
@@ -73,6 +75,8 @@ pub struct CommitInfo {
     pub height: u64,
     /// The new tip block hash.
     pub tip: Option<Hash256>,
+    /// Number of transactions in the committed block.
+    pub tx_count: usize,
 }
 
 /// A single consensus node: a [`Node`] driven by a [`ConsensusMachine`] over a
@@ -87,6 +91,8 @@ pub struct ConsensusDriver<K: KvStore> {
     consensus_seed: Option<[u8; 32]>,
     consensus_address: Option<Address>,
     timeouts: DriverTimeouts,
+    /// Pending transactions to include when this node proposes; fed by gossip.
+    mempool: Mempool,
     /// Objective equivocation evidence gathered from gossip, to embed in the next
     /// block this node proposes.
     pending_evidence: Vec<SlashingEvidence>,
@@ -101,6 +107,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         network: NetworkHandle,
         consensus_seed: Option<[u8; 32]>,
         timeouts: DriverTimeouts,
+        mempool_config: MempoolConfig,
     ) -> Self {
         let consensus_address = consensus_seed.map(|seed| Keypair::from_seed(seed).address());
         Self {
@@ -109,16 +116,17 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             consensus_seed,
             consensus_address,
             timeouts,
+            mempool: Mempool::new(mempool_config),
             pending_evidence: Vec::new(),
         }
     }
 
     /// Runs the consensus loop until the inbound network channel closes.
     ///
-    /// `inbound` delivers gossiped messages (the driver routes transactions to no
-    /// mempool in this phase and feeds consensus messages to the machine).
-    /// `commit_tx`, if present, receives a [`CommitInfo`] on every committed
-    /// height, letting a supervisor or test observe progress.
+    /// `inbound` delivers gossiped messages (the driver admits transactions into
+    /// its mempool and feeds consensus messages to the machine). `commit_tx`, if
+    /// present, receives a [`CommitInfo`] on every committed height, letting a
+    /// supervisor or test observe progress.
     pub async fn run(
         mut self,
         mut inbound: mpsc::Receiver<InboundMessage>,
@@ -173,15 +181,20 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             }
 
             if let Some(block) = decided {
+                let tx_count = block.transactions.len();
                 // Commit the finalized block. Every node, including the proposer,
                 // re-validates via import_block before committing.
                 if self.node.import_block(block).is_err() {
                     return;
                 }
+                // Drop now-included or stale transactions from the mempool.
+                self.mempool.remove_obsolete(self.node.state());
+                self.mempool.prune_expired(now_ms());
                 if let Some(sender) = &commit_tx {
                     let info = CommitInfo {
                         height,
                         tip: self.node.tip_hash(),
+                        tx_count,
                     };
                     let _ = sender.send(info).await;
                 }
@@ -212,8 +225,15 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         decided: &mut Option<webc_chain::Block>,
     ) {
         let event = match message.message {
-            // Transactions are not consumed by this phase's driver.
-            NetMessage::Transaction(_) => return,
+            // Admit gossiped transactions so this node can include them when it
+            // proposes. Admission failures (unknown sender, bad nonce, duplicate)
+            // are expected and dropped.
+            NetMessage::Transaction(tx) => {
+                let _ = self
+                    .mempool
+                    .insert(*tx, self.node.state(), self.node.config(), now_ms());
+                return;
+            }
             NetMessage::Proposal(proposal) => {
                 ConsensusEvent::Message(ConsensusMessage::Proposal(proposal))
             }
@@ -257,8 +277,17 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                         continue;
                     };
                     let evidence = std::mem::take(&mut self.pending_evidence);
+                    // Select fee-priority, nonce-contiguous transactions under the
+                    // block unit budget from the mempool.
+                    let max_units = self.node.config().fee_policy.max_block_units;
+                    let transactions = self.mempool.select_block(
+                        self.node.state(),
+                        self.node.config(),
+                        max_units,
+                        now_ms(),
+                    );
                     match self.node.build_candidate(
-                        Vec::new(),
+                        transactions,
                         evidence.clone(),
                         proposer,
                         now_ms(),
