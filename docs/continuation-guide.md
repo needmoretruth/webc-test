@@ -60,17 +60,22 @@ ending, and never leave valuable work only on local disk. `target/`,
 because `Cargo.lock`, `pnpm-lock.yaml`, `rust-toolchain.toml`, and `.node-version`
 are committed (`cargo build`, `pnpm install`).
 
-Latest verified gate: the Rust side (2026-07-15 prior run, this cloud
-environment) passed `cargo fmt --check`, strict workspace Clippy (`-D warnings`),
-133 Rust tests (120 `webc-chain` + 13 `webc-crypto`), rustdoc with warnings
-denied, and `webc-node demo`; the permission-storage pass changed no Rust files,
-so that gate is unaffected. The TypeScript SDK (2026-07-15, Node 22) builds and
-passes 57/57 tests, the widget suite 3/3, plus the package-entry and
-Markdown-link checks. The previously reported single SDK failure was a real
-host-client schema bug (missing `authorization_policy_revision`), now fixed — not
-a Node 22 WebCrypto gap; the suite is green on Node 22. Historical note: on a
+Latest verified gate: the Rust side (2026-07-15, this cloud environment) passed
+`cargo fmt --check`, strict workspace Clippy (`-D warnings`), **176 Rust tests
+(120 `webc-chain` + 13 `webc-crypto` + 20 `webc-storage` + 23 `webc-node`)**,
+rustdoc with warnings denied, and `webc-node demo`. The `webc-node run` devnet
+node was smoke-tested end to end (health, faucet drip to a fresh wallet, block
+and fee queries, and kill/restart recovery from the persisted redb store). The
+TypeScript SDK (2026-07-15, Node 22) builds and passes 57/57 tests, the widget
+suite 3/3, plus the package-entry and Markdown-link checks. Historical note: on a
 Windows GNU host use `cargo +1.96.0-x86_64-pc-windows-gnu` (the MSVC target lacks
 `link.exe`); the cloud Linux toolchain needs no override.
+
+Reuse-over-reinvention is now a standing rule in `AGENTS.md`: prefer mature,
+license-compatible crates (Apache-2.0-compatible only) for commodity plumbing;
+write and own WEBC's protocol/economic logic, the swappable seams, and
+cross-language canonical encoding. Phase 3 storage is redb (embedded ACID DB,
+MIT OR Apache-2.0) behind the `KvStore` seam; the API is axum/tokio (MIT).
 
 ## Exact next work
 
@@ -124,12 +129,40 @@ Phase 2 wallet-wire/secret-isolation gate). Do not redo them. What shipped:
   issue). SDK suite is now 57/57.
 
 With this, Phase 2's acceptance conditions are met except reference-machine
-benchmarks. The next milestone is **Phase 3** in `docs/development-plan.md`: a
-local restartable node with storage traits, crash-safe transactional commits and
-startup recovery, and HTTP/WebSocket developer APIs (health, account/object
-queries, proofs, blocks, tx submission, subscriptions, fees, devnet faucet).
-Define storage traits before choosing a database backend. Public contract VM, ZK
-expansion, and real-fund bridge work stay disabled until their later gates.
+benchmarks.
+
+**Phase 3 is largely complete on the Rust node side.** What shipped (do not redo):
+
+- `crates/webc-storage`: the `KvStore` seam (atomic, durable, ordered KV;
+  `WriteBatch`, `Table` namespaces, typed `StorageError` with corruption as a
+  reported outcome), an in-memory backend, and a durable crash-safe `RedbKvStore`
+  built on the redb embedded ACID database (MIT OR Apache-2.0) — reused, not a
+  hand-rolled WAL. A typed `ChainStore` maps blocks/latest-state/tip to the seam
+  with one atomic per-block commit and startup consistency checks. 20 tests.
+- `crates/webc-node` (now lib+bin):
+  - `node.rs` — a restartable single-proposer `Node`: recovers latest state or
+    initializes genesis, produces blocks via the existing `build_block` against a
+    clone and commits atomically (memory and disk never disagree).
+  - `mempool.rs` — admission (signature, chain id, per-lane nonce bounds, fee
+    floor, best-effort affordability), replacement-by-fee, TTL expiry, and
+    fee-priority nonce-contiguous block selection under a unit budget.
+  - `service.rs` — a transport-independent `NodeService`: health, fees, account
+    (+Merkle proof), object, block-by-height/hash, submit, seal, and a devnet
+    faucet (rate-limited, refuses already-funded, valueless-labeled).
+  - `http.rs` — axum/tokio (MIT) HTTP + WebSocket transport under `/v1` with a
+    request-body limit and a new-block subscription.
+  - `main.rs` `run` — launches a redb-backed devnet node, auto-sealing every 2s,
+    smoke-tested incl. kill/restart recovery.
+
+**The remaining Phase 3 item is the browser side:** a TypeScript SDK HTTP/WS
+client for this API (in `sdk/webc-js`) and a small reference demo site that
+creates a wallet, calls the faucet, verifies an account proof, submits a
+transfer, and watches finality over the WebSocket. Do that next to close Phase 3,
+then move to **Phase 4** (networking + signed BFT consensus) in
+`docs/development-plan.md`. Public contract VM, ZK expansion, and real-fund bridge
+work stay disabled until their later gates. Validator-set snapshot storage is
+wired (`Table::ValidatorSets`, `BlockCommit.validator_set`) but not yet populated
+— it activates with consensus in Phase 4.
 
 ## Working rules
 

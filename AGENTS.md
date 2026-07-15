@@ -403,11 +403,21 @@ the last outstanding Phase 2 wallet-wire/secret-isolation gate. With the
 session-key gate, Phase 2's acceptance conditions are met except reference-machine
 benchmarks.
 
-The next milestone is **Phase 3** in `docs/development-plan.md`: a local
-restartable node with storage traits (defined before any database backend is
-chosen), crash-safe transactional commits and startup recovery, and HTTP/WebSocket
-developer APIs. Do not skip to P2P, contract runtime, ZK, or real bridges before
-their own gates.
+**Phase 3 is largely complete on the Rust node side** (`crates/webc-storage` +
+`crates/webc-node`): the `KvStore` storage seam with an in-memory backend and a
+durable crash-safe `RedbKvStore` (redb, reused not hand-rolled), a typed
+`ChainStore` with atomic per-block commits and startup consistency checks, a
+restartable single-proposer `Node`, a validating fee-priority `Mempool`, a
+transport-independent `NodeService`, an axum/tokio HTTP+WebSocket API under `/v1`
+with a devnet faucet, and a `webc-node run` command (redb-backed, auto-sealing,
+restart-recovery smoke-tested). Rust gate: 176 tests.
+
+The remaining Phase 3 item is the **browser side**: a TypeScript SDK HTTP/WS
+client for this API and a small reference demo site (create wallet → faucet →
+verify proof → submit transfer → watch finality). Do that to close Phase 3, then
+move to **Phase 4** (networking + signed BFT consensus). Do not skip to contract
+runtime, ZK, or real bridges before their own gates. See
+`docs/continuation-guide.md` for the exact next step.
 
 ## User decisions still required later
 
