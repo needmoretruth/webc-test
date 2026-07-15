@@ -325,7 +325,11 @@ where
     K: KvStore + Send + Sync + 'static,
 {
     let _ = API_VERSION;
-    axum::serve(listener, router(state)).await
+    // Permissive CORS is applied only at the real serving boundary (never in the
+    // test router). This is a devnet developer API with no value at risk; a
+    // browser demo served from any origin must be able to call it.
+    let app = router(state).layer(tower_http::cors::CorsLayer::permissive());
+    axum::serve(listener, app).await
 }
 
 #[cfg(test)]
