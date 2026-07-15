@@ -5,14 +5,16 @@ Date: 2026-07-15
 
 Implementation checkpoint: Phases 0-3 passed their repository gates; Phase 4
 (networking and signed BFT consensus) is active. Phase 4 A-1 (authenticated P2P
-networking and transaction gossip) and the A-2 consensus core are done: the
-deterministic stake-weighted leader schedule (A-2.1), the signed proposal and
-prevote/precommit round state machine, the self-verifying finality certificate,
-the Proposal/Vote/Certificate wire messages, and the per-epoch validator-set
-snapshot writer, proven by a deterministic multi-validator convergence test.
-What remains in Phase 4 is A-3 robustness (timeouts/round-change, fork choice,
-state sync, evidence wired to slashing) and the async network driver that runs
-the round state machine over real TCP. This marker records progress and does not
+networking and transaction gossip), the A-2 consensus core, and the A-3
+deterministic core are done: the stake-weighted leader schedule, the
+Proposal/Vote/Certificate wire messages, the per-epoch validator-set snapshot
+writer, a self-verifying finality certificate, received-block validation
+(`Node::import_block`), a full multi-round Tendermint machine with locking and
+safe round changes (`webc-chain::ConsensusMachine`), and objective equivocation
+detection — proven by deterministic tests (multi-validator convergence, a round
+change under a silent proposer, and the lock-safety property). What remains in
+Phase 4 A-3 is integration: the async network driver that runs the machine over
+real TCP and a state-sync protocol. This marker records progress and does not
 weaken any acceptance criterion below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
@@ -461,27 +463,31 @@ Real-fund bridges are a post-mainnet or separately gated launch.
 ## Immediate next implementation milestone
 
 Phases 0-3 are complete and **Phase 4 (networking and signed BFT consensus) is
-active**. A-1 (authenticated P2P networking and transaction gossip) and the A-2
-consensus core are done:
+active**. A-1, the A-2 consensus core, and the A-3 deterministic core are done:
 
-1. the network message set now carries Proposal, Vote, and Certificate — done;
+1. the network message set carries Proposal, Vote, and Certificate — done;
 2. the per-epoch validator-set stake snapshot writer is populated — done;
-3. the signed prevote/precommit round state machine (propose -> prevote ->
-   precommit -> commit) exists as a pure, deterministic `webc-chain::round`
-   engine — done;
-4. the self-verifying finality certificate (aggregate precommits, snapshot
-   membership, strictly >2/3 power) is implemented — done;
-5. convergence is proven by a deterministic multi-validator test driving the
-   engines over an in-memory bus to one finalized block and certificate — done
-   at the state-machine level.
+3. the finality certificate (aggregate precommits, snapshot membership, strictly
+   >2/3 power) is self-verifying — done;
+4. `Node::import_block` validates a received block by re-execution and commits it
+   through the store — done;
+5. the consensus state machine is a full multi-round Tendermint `ConsensusMachine`
+   with locking, proof-of-lock re-proposal, three timeouts, and `f+1` catch-up —
+   done; proven by deterministic tests for convergence, round change under a
+   silent proposer, and lock safety;
+6. objective equivocation detection surfaces double-vote evidence for the existing
+   slashing path — done.
 
-The remaining Phase 4 work is A-3 robustness plus the async driver:
+The remaining Phase 4 A-3 work is integration:
 
-6. build the async network driver that runs the round engine over real TCP
-   (`webc-net`), so 2-4 separate processes converge on one finalized chain;
-7. Phase 4 A-3 robustness: timeouts/round-change, fork choice, state sync, and
-   objective double-vote/invalid-proposal evidence wired into slashing;
-8. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
+7. build the async network driver that runs a `ConsensusMachine` per height over
+   real TCP (`webc-net`) — build a candidate block on `NeedProposalBlock`, arm
+   real timers on `ScheduleTimeout`, route gossiped consensus messages into the
+   machine, commit on `Commit` via `import_block`, and include gossiped evidence
+   in the next block — so 2-4 separate processes converge on one finalized chain;
+8. implement a state-sync protocol so a joining node fetches finalized blocks and
+   certificates from a checkpoint and imports them without replaying all history;
+9. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
    every completed item.
 
 Only after consensus is stable should the contract runtime, the WEBC high-level

@@ -164,8 +164,11 @@ height 1 from the persisted redb store.
 ## Phase 4: networking and signed consensus (in progress)
 
 Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
-consensus core**, **A-3 robustness**. A-1 and the A-2 consensus core are
-complete; A-3 and the async network driver are next.
+consensus core**, **A-3 robustness**. A-1, the A-2 consensus core, and the A-3
+deterministic core (received-block validation, the multi-round Tendermint machine
+with locking and round changes, and equivocation detection) are complete. What
+remains in A-3 is integration: the async network driver that runs the machine
+over real TCP, and a state-sync protocol.
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
 
@@ -270,12 +273,54 @@ rustdoc with warnings denied, and the full workspace test suite (webc-chain 137,
 webc-crypto 13, webc-net 18, webc-node 24, webc-storage 20, plus the gossip
 integration test).
 
-What A-2 deliberately does not include (it is A-3): the async network driver that
-runs the round engine over real `webc-net` TCP so separate processes converge
-(the gossip pump currently ignores gossiped consensus messages by design, since
-no driver consumes them yet); timeouts and round changes; fork choice; state sync
-for a joining node; and wiring objective double-vote/invalid-proposal evidence
-into the existing slashing path.
+### Phase 4 A-3: robustness — deterministic core complete, integration remaining
+
+The safety-critical, deterministic parts of A-3 are implemented and gate-verified.
+
+- **Received-block validation** — `webc-chain::apply_block` re-executes a block
+  another node produced (its own transactions and header metadata) and requires
+  the locally recomputed header and receipts to equal the received ones; because
+  the header commits every root and the block fee, any forged root, altered
+  transaction set, or wrong fee is rejected, all on a clone so a rejected block
+  leaves state untouched. `webc-node::Node::import_block` wraps it and commits
+  through the store, which independently enforces height contiguity, parent
+  linkage, and `state_root`. This is the receiving side of networked consensus and
+  the basis for state sync. Tested: producer/follower import round-trip to the
+  same state root, tampered-header rejection with untouched state, and gapped
+  import rejection.
+- **Multi-round consensus** — the A-2 single-round engine became a full
+  single-height, multi-round `ConsensusMachine` following Tendermint
+  (arXiv:1807.04938, Algorithm 1). A validator locks a value when it precommits
+  and thereafter only prevotes that value or nil, so honest nodes never prevote
+  two blocks and two blocks can never both reach a precommit quorum. Proposals
+  carry a signed proof-of-lock `valid_round` for safe re-proposal (rule 28).
+  Three timeouts (propose/prevote/precommit) are surfaced as `ScheduleTimeout`
+  actions and fed back as `Timeout` events, so the machine reads no clock; `f+1`
+  catch-up (rule 55) advances a lagging node. Nil votes use the reserved all-zero
+  sentinel hash, so no vote wire format or cross-language fixture changed. Tested
+  deterministically: happy-path multi-validator convergence; a round change when
+  the round-0 proposer is silent (all responsive nodes finalize the same block at
+  a later round with a verifying certificate); and the lock-safety property (a
+  node locked on X never prevotes a conflicting Y after a round change).
+- **Objective equivocation detection** — the machine emits
+  `ConsensusAction::Equivocation` the first time a validator signs two conflicting
+  votes in one round/step; both votes are already snapshot-verified, so the
+  `DoubleVoteEvidence` plugs straight into the existing verified
+  `SlashingEvidence::DoubleVote` path (whose application was already implemented in
+  Phase 1). Tested against `SlashingEvidence::verify`.
+
+What remains in A-3 is integration, not consensus theory: (1) the async network
+driver in `webc-node` that runs a `ConsensusMachine` per height over real
+`webc-net` TCP — building a candidate block on `NeedProposalBlock`, arming real
+timers on `ScheduleTimeout`, routing gossiped Proposal/Vote/Certificate into the
+machine (the gossip pump ignores them today by design), committing on `Commit`
+via `import_block`, and including gossiped equivocation evidence in the next
+proposed block — so 2-4 separate processes converge; and (2) a state-sync protocol
+so a joining node fetches finalized blocks and certificates from a checkpoint and
+imports them without replaying all history. Fork choice is largely covered by the
+finality-certificate design (a node follows the certified chain and commits only
+finalized blocks); the double-vote slashing application path already exists, so
+only its wiring into produced blocks (part of the driver) is left.
 
 ## Phase 3: local restartable node, storage, and developer APIs
 
