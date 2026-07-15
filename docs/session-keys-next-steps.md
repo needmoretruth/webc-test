@@ -16,11 +16,12 @@ file is.
   `claude/docs-session-keys-plan-ppk0dl`): `PostQuantumRootReveal` now carries a
   signature and verifies it under the committed root over the exact action. See
   "Step 6 — DONE" below for exactly what shipped.
-- **Gates last green**: `cargo fmt --check`, strict clippy, 115 Rust tests (102
-  `webc-chain` + 13 `webc-crypto`), rustdoc (warnings denied), node demo; both TS
-  packages build; cross-language state-key vector passes. One pre-existing TS test
-  (`wallet-service.test.ts`) fails only on Node 22 (repo wants Node 24) —
-  unrelated to this work.
+- **Gates last green**: Rust — `cargo fmt --check`, strict clippy, 133 Rust tests
+  (120 `webc-chain` + 13 `webc-crypto`), rustdoc (warnings denied), node demo;
+  cross-language state-key vector passes. TypeScript (Node 22) — both packages
+  build, SDK suite 55/55, widget 3/3, package-entry + Markdown-link checks pass.
+  The formerly "Node 22-only" `wallet-service.test.ts` failure was a real
+  host-client schema bug (missing `authorization_policy_revision`), now fixed.
 - **Working tree is clean** after each committed step.
 
 ## Remaining plan steps (do in this order, commit + push after each)
@@ -123,6 +124,24 @@ keys) and preserves the recovery root. Eight adversarial tests pass. The
 from-scratch recipe that used to live here has been removed now that the work has
 landed; the implementation is in `crates/webc-chain/src/{state,transaction,
 authorization_policy}.rs`.
+
+### Sibling (Phase 2 wallet gate) — durable permission storage + auto lane — DONE
+Persistent encrypted per-origin permission storage and automatic
+authorization-lane setup landed in the SDK, the last outstanding Phase 2
+wallet-wire/secret-isolation gate:
+- `sdk/webc-js/src/permission-store.ts` — encrypted-at-rest grant store v1
+  (AES-256-GCM under Argon2id via the shared `argon2.ts` gate), identity-bound as
+  AES-GCM additional data, strict bounded schema, key-caching `openPermissionStore`
+  port so per-spend saves need no repeated KDF.
+- `TrustedWalletService` gains `persistence` + `restoredGrants`: dormant restore
+  (lane + cumulative spend survive a restart; reconnect required before signing),
+  persist after every connect/spend/revoke inside the serial queue, cumulative
+  spend carried across reconnects (only revoke clears a grant), and transactional
+  rollback on durable-write failure.
+- Also fixed a real host-client schema bug in the same area (connection and
+  signed-transaction result parsers omitted `authorization_policy_revision`),
+  which had failed the end-to-end exchange on every Node version — not a Node 22
+  issue. SDK suite is now 55/55.
 
 ### Sibling — rotate the post-quantum root itself — DONE
 `RotatePostQuantumRoot { new_post_quantum_root, post_quantum_root_reveal }` is

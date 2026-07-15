@@ -60,14 +60,17 @@ ending, and never leave valuable work only on local disk. `target/`,
 because `Cargo.lock`, `pnpm-lock.yaml`, `rust-toolchain.toml`, and `.node-version`
 are committed (`cargo build`, `pnpm install`).
 
-Latest verified gate (2026-07-15, this cloud environment): `cargo fmt --check`,
-strict workspace Clippy (`-D warnings`), 133 Rust tests (120 `webc-chain` + 13
-`webc-crypto`), rustdoc with warnings denied, and `webc-node demo`. The
-TypeScript SDK builds and passes 44 of 45 tests — the one failure is the
-pre-existing `wallet-service.test.ts` case on Node 22 (the repo targets Node 24,
-per `.node-version`), unrelated to protocol work. The Markdown-link check passes.
-Historical note: on a Windows GNU host use `cargo +1.96.0-x86_64-pc-windows-gnu`
-(the MSVC target lacks `link.exe`); the cloud Linux toolchain needs no override.
+Latest verified gate: the Rust side (2026-07-15 prior run, this cloud
+environment) passed `cargo fmt --check`, strict workspace Clippy (`-D warnings`),
+133 Rust tests (120 `webc-chain` + 13 `webc-crypto`), rustdoc with warnings
+denied, and `webc-node demo`; the permission-storage pass changed no Rust files,
+so that gate is unaffected. The TypeScript SDK (2026-07-15, Node 22) builds and
+passes 55/55 tests, the widget suite 3/3, plus the package-entry and
+Markdown-link checks. The previously reported single SDK failure was a real
+host-client schema bug (missing `authorization_policy_revision`), now fixed — not
+a Node 22 WebCrypto gap; the suite is green on Node 22. Historical note: on a
+Windows GNU host use `cargo +1.96.0-x86_64-pc-windows-gnu` (the MSVC target lacks
+`link.exe`); the cloud Linux toolchain needs no override.
 
 ## Exact next work
 
@@ -99,10 +102,34 @@ The single remaining session-key item: **reference-machine benchmark numbers**
 which this cloud container cannot produce honestly. Publish reference numbers
 before any performance claim.
 
-Next Phase 2 items before RPC/networking (per `development-plan.md`): persistent
-encrypted wallet **permission storage** and **automatic authorization-lane setup**
-in the SDK. Do not start RPC, networking, a public VM, ZK, or a real bridge before
-those wallet-wire and secret-isolation gates pass.
+Persistent encrypted wallet **permission storage** and **automatic
+authorization-lane setup** are now **complete** in the SDK (the last outstanding
+Phase 2 wallet-wire/secret-isolation gate). Do not redo them. What shipped:
+
+- `sdk/webc-js/src/permission-store.ts`: an authenticated encrypted-at-rest store
+  (v1) for per-origin grants (lane, scopes, limits, cumulative `spent_amount`),
+  AES-256-GCM under an Argon2id key through the shared `argon2.ts` gate, bound to
+  the wallet identity as AES-GCM additional data, with a strict bounded schema
+  and a key-caching `openPermissionStore` port so per-spend saves need no
+  repeated KDF.
+- `TrustedWalletService` (`sdk/webc-js/src/wallet-service.ts`) gains optional
+  `persistence` and `restoredGrants`: it restores dormant grants (lane + spend
+  survive a restart; reconnect required before signing), persists after every
+  connect/spend/revoke inside its serial queue, carries cumulative spend across
+  reconnects (only revoke clears a grant), and rolls back on any durable-write
+  failure so state never disagrees in the under-count direction.
+- Fixed a real host-client schema bug found here: the connection and
+  signed-transaction result parsers omitted `authorization_policy_revision`,
+  which had failed the end-to-end exchange on every Node version (not a Node 22
+  issue). SDK suite is now 55/55.
+
+With this, Phase 2's acceptance conditions are met except reference-machine
+benchmarks. The next milestone is **Phase 3** in `docs/development-plan.md`: a
+local restartable node with storage traits, crash-safe transactional commits and
+startup recovery, and HTTP/WebSocket developer APIs (health, account/object
+queries, proofs, blocks, tx submission, subscriptions, fees, devnet faucet).
+Define storage traits before choosing a database backend. Public contract VM, ZK
+expansion, and real-fund bridge work stay disabled until their later gates.
 
 ## Working rules
 
