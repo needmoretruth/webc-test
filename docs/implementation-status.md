@@ -161,6 +161,78 @@ demo. The `webc-node run` devnet node was smoke-tested end to end: `GET
 with the no-value disclaimer, block/fee queries, and a kill/restart that recovered
 height 1 from the persisted redb store.
 
+## Phase 4: networking and signed consensus (in progress)
+
+Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
+consensus core**, **A-3 robustness**. A-1 is complete; A-2 is next.
+
+### Phase 4 A-1: peer-to-peer networking plumbing — complete
+
+A new crate, **`crates/webc-net`**, is the swappable transport seam between the
+deterministic protocol core and the network. Following the reuse-over-reinvention
+rule, it reuses mature MIT crates for commodity plumbing (tokio sockets,
+tokio-util length-delimited framing) and owns only the WEBC-specific protocol
+pieces. All pure crates (`webc-chain`, `webc-crypto`, `webc-storage`) stay fully
+synchronous; async lives only in `webc-net` and `webc-node`.
+
+- **`wire.rs`** — the gossip message set (`NetMessage`, carrying a `Transaction`
+  in A-1; proposals/votes/certs are added in A-2) inside a self-describing
+  envelope with a fixed magic and a wire-protocol version. Decoding rejects
+  foreign magic, an unsupported version, oversize payloads, and trailing bytes
+  before trusting a peer-controlled payload; fixed-int bincode (shared `codec.rs`)
+  keeps the magic and version at stable offsets for a cheap pre-deserialize
+  reject. `message_id` gives each frame a content identity for loop suppression.
+- **`handshake.rs`** — mutual challenge/response peer authentication over Ed25519
+  identity keys (reusing `webc-crypto`; only the signature primitive is reused).
+  Each side sends a fresh random challenge and must return a signature over the
+  *counterparty's* challenge, so a recorded handshake cannot be replayed to
+  impersonate a peer. The handshake pins the chain id and wire version. `PeerId`
+  names a node and is distinct from any account or consensus key. Channel
+  encryption is deliberately deferred: gossiped data is public and every
+  consensus-weighted message is independently signed, so authenticated plaintext
+  framing is sufficient for devnet.
+- **`transport.rs`** — authenticated TCP dial/listen behind a cloneable
+  `NetworkHandle`, in an actor pattern where a single background worker owns the
+  peer table (no shared-state locking). A static bootstrap-peer list is dialed
+  with capped exponential-backoff reconnect; the symmetric handshake runs
+  identically on both inbound and outbound sides and rejects self-peering and
+  cross-chain peers. Gossip is best-effort flooding with a bounded FIFO
+  seen-frame cache, so a message is delivered once and never loops; per-peer
+  bounded queues drop frames for a slow peer rather than stalling the worker.
+
+The node integrates the network in **`crates/webc-node`**:
+
+- `NodeService::admit_network_transaction` — a tolerant admission path for
+  gossiped transactions that classifies the outcome (`NetworkAdmission`) instead
+  of erroring, since peers legitimately re-send known transactions.
+- `AppState::with_network` + `AppState::submit_transaction` — a locally submitted
+  transaction is validated and admitted first, then gossiped **only** if newly
+  accepted, so a rejected or duplicate submission never floods the network.
+  Standalone nodes (no network handle) behave exactly as before.
+- `run_gossip_pump` — drains inbound gossip into the mempool. Because the
+  transport already re-floods a newly-seen frame to a node's other peers, the
+  pump only absorbs into the local mempool; it does not re-broadcast.
+- `webc-node run --p2p-listen <addr> --peer <addr>...` — joins the gossip network
+  with a fresh per-process network identity; without those flags the node runs
+  standalone as before.
+
+Verified: `cargo fmt --check`, strict workspace Clippy (`-D warnings`), rustdoc
+with warnings denied, and **192 Rust tests** (120 `webc-chain` + 13
+`webc-crypto` + 20 `webc-storage` + 15 `webc-net` + 23 `webc-node` + 1 gossip
+integration test). The integration test propagates a transfer submitted to node A
+into node B's mempool over real authenticated loopback TCP.
+
+Deferred within A-1 (not required for its milestone): channel encryption, richer
+peer discovery beyond a static bootstrap list, and peer scoring/rate-limiting on
+repeated rejections. These are hardening or later-stage items.
+
+A-2 will extend `NetMessage` with proposals/votes/finality certificates, build a
+deterministic leader schedule over a persisted stake snapshot (the
+`Table::ValidatorSets` writer path, wired but unpopulated since Phase 3,
+activates here), and add signed prevote/precommit producing a finality
+certificate verified against committee membership and voting power. The vote
+primitives already exist in `webc-chain::consensus`.
+
 ## Phase 3: local restartable node, storage, and developer APIs
 
 **Complete.** A standing "reuse over reinvention" rule was added to `AGENTS.md`:

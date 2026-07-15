@@ -417,9 +417,24 @@ a typed HTTP/WS client for `/v1`) and `sdk/webc-js/demo/index.html` (a static
 reference site: create wallet → faucet → proof → signed transfer → live finality
 over WebSocket). Verified end to end against a running node.
 
-**Phase 3 is complete.** The next milestone is **Phase 4** (networking + signed
-BFT consensus) in `docs/development-plan.md`. Do not skip to contract runtime, ZK,
-or real bridges before their own gates. The only broad open item across phases is
+**Phase 3 is complete. Phase 4 (networking + signed BFT consensus) is in
+progress**, split into three stages: A-1 networking plumbing, A-2 signed BFT
+consensus core, A-3 robustness.
+
+**Phase 4 A-1 is complete**: a new `crates/webc-net` crate (the swappable
+transport seam) with the WEBC gossip wire format, mutual challenge/response peer
+authentication over Ed25519 identity keys, and authenticated TCP flood gossip
+behind a `NetworkHandle` (reusing tokio + tokio-util framing, owning the protocol
+pieces), plus node glue (`admit_network_transaction`, `AppState::with_network`,
+`run_gossip_pump`, and `webc-node run --p2p-listen/--peer`). A transaction
+submitted to one node reaches every peer's mempool. Rust gate: 192 tests.
+
+**The next step is Phase 4 A-2 (signed BFT consensus core)** in
+`docs/development-plan.md`: extend `NetMessage` with proposals/votes/certs, a
+deterministic leader schedule over a persisted stake snapshot (activating the
+already-wired `Table::ValidatorSets` writer), and signed prevote/precommit
+producing a finality certificate. Do not skip to contract runtime, ZK, or real
+bridges before their own gates. The only broad open item across phases is
 reference-machine benchmark numbers (this cloud container cannot produce them
 honestly). See `docs/continuation-guide.md` for the exact next step.
 

@@ -26,7 +26,8 @@ Use simple Korean when speaking to the user. Explain unavoidable technical terms
 ## Current verified checkpoint
 
 Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
-is the next milestone**. Always use `git log` to discover the current branch tip;
+is in progress — stage A-1 (networking plumbing) is done, A-2 (consensus core)
+is next** (see "Exact next work"). Always use `git log` to discover the current branch tip;
 the checkpoint list below names implementation history, not an instruction to
 reset or return to an older commit. (The prototype remains unsafe for real funds,
 and reference-machine benchmark numbers are still owed before any performance
@@ -64,11 +65,12 @@ because `Cargo.lock`, `pnpm-lock.yaml`, `rust-toolchain.toml`, and `.node-versio
 are committed (`cargo build`, `pnpm install`).
 
 Latest verified gate: the Rust side (2026-07-15, this cloud environment) passed
-`cargo fmt --check`, strict workspace Clippy (`-D warnings`), **176 Rust tests
-(120 `webc-chain` + 13 `webc-crypto` + 20 `webc-storage` + 23 `webc-node`)**,
-rustdoc with warnings denied, and `webc-node demo`. The `webc-node run` devnet
-node was smoke-tested end to end (health, faucet drip to a fresh wallet, block
-and fee queries, and kill/restart recovery from the persisted redb store). The
+`cargo fmt --check`, strict workspace Clippy (`-D warnings`), **192 Rust tests
+(120 `webc-chain` + 13 `webc-crypto` + 20 `webc-storage` + 15 `webc-net` +
+23 `webc-node` + 1 gossip integration test)**, rustdoc with warnings denied, and
+`webc-node demo`. The `webc-node run` devnet node was smoke-tested end to end
+(health, faucet drip to a fresh wallet, block and fee queries, and kill/restart
+recovery from the persisted redb store). The
 TypeScript SDK (2026-07-15, Node 22) builds and passes 69/69 tests, the widget
 suite 3/3, plus the package-entry and Markdown-link checks. Historical note: on a
 Windows GNU host use `cargo +1.96.0-x86_64-pc-windows-gnu` (the MSVC target lacks
@@ -170,13 +172,55 @@ and the recipient is funded after the 2s auto-seal.
 
 **Phase 3 is therefore complete** (all acceptance conditions met; the only broad
 open item across phases remains reference-machine benchmark numbers, which this
-cloud container cannot produce honestly). The next milestone is **Phase 4**
-(networking + signed BFT consensus) in `docs/development-plan.md`: authenticated
-peers and discovery, gossip, a deterministic leader schedule and stake snapshots,
-signed prevote/precommit with rotating stake-weighted committees, fork choice and
-lock rules, state sync, and objective double-vote/invalid-proposal evidence.
-Validator-set snapshot storage is already wired (`Table::ValidatorSets`,
-`BlockCommit.validator_set`) but unpopulated — it activates with consensus.
+cloud container cannot produce honestly).
+
+**Phase 4 is in progress, split into three stages: A-1 (networking plumbing),
+A-2 (signed BFT consensus core), A-3 (robustness).**
+
+**Phase 4 A-1 (P2P networking plumbing) is complete** (do not redo). What shipped
+is the new `crates/webc-net` crate — the swappable transport seam — plus the node
+glue:
+
+- `wire.rs`: the WEBC-owned gossip message set (`NetMessage::Transaction`), a
+  self-describing envelope with a fixed magic + wire version, encode/decode that
+  rejects foreign magic / unsupported version / oversize / trailing bytes, and a
+  `message_id` for gossip loop suppression. Fixed-int bincode keeps magic/version
+  at stable offsets (shared `codec.rs`).
+- `handshake.rs`: mutual challenge/response peer authentication over Ed25519
+  identity keys (reusing `webc-crypto`), each proof bound to the verifier's fresh
+  challenge so a recorded handshake cannot be replayed. Pins chain id + wire
+  version. `PeerId` names a node, distinct from account/consensus keys.
+- `transport.rs`: authenticated TCP dial/listen behind a cloneable
+  `NetworkHandle` (actor-pattern worker owns the peer table, no locking). Static
+  bootstrap-peer list with capped-backoff reconnect; symmetric handshake rejects
+  self-peering and cross-chain peers; flood gossip with a bounded FIFO seen-cache
+  so a frame is delivered once and never loops. Reuses tokio + tokio-util
+  length-delimited codec (both MIT).
+- `webc-node` glue: `NodeService::admit_network_transaction` (tolerant gossip
+  admission), `AppState::with_network` + `AppState::submit_transaction` (gossips
+  only newly accepted local submissions), and `run_gossip_pump` (drains inbound
+  gossip into the mempool; the transport already re-floods, so the pump only
+  absorbs). `webc-node run --p2p-listen <addr> --peer <addr>...` joins the
+  network with a fresh per-process identity; without them the node is standalone.
+- Verified: an integration test propagates a transfer submitted to node A into
+  node B's mempool over real authenticated loopback TCP.
+
+Deliberately deferred to hardening/later: channel encryption (gossiped data is
+public and consensus messages are individually signed, so devnet uses
+authenticated plaintext framing); richer peer discovery beyond a static
+bootstrap list; peer scoring/rate-limiting on repeated rejects.
+
+**The next milestone is Phase 4 A-2 (signed BFT consensus core)** in
+`docs/development-plan.md`: extend `NetMessage` with proposals/votes/certs, a
+deterministic leader schedule over a persisted stake snapshot, signed
+prevote/precommit producing a finality certificate, and committee-membership /
+voting-power verification, converging 2–4 local nodes on one finalized chain.
+The vote primitives already exist in `webc-chain::consensus` (`Vote`,
+`SignedVote`, `VoteType`, quorum math, `detect_double_votes`) and validator-set
+snapshot storage is already wired (`Table::ValidatorSets`,
+`BlockCommit.validator_set`, `ChainStore::validator_set`) but unpopulated — it
+activates in A-2. A-3 then adds timeouts/round-change, fork choice, state sync,
+and wiring objective evidence into the existing slashing path.
 
 Public contract VM, ZK expansion, and real-fund bridge work stay disabled until
 their later gates. Historical state snapshots/deltas beyond the latest are a
