@@ -110,6 +110,51 @@ pub fn build_block(
     Ok(block)
 }
 
+/// Validates a *received* block by re-executing it and commits it to `state`.
+///
+/// Where [`build_block`] constructs a candidate from selected transactions, this
+/// verifies a block another node produced: it re-executes the block's own
+/// transactions and evidence with the block's own header metadata, then requires
+/// the locally recomputed header and receipts to match the received ones exactly.
+/// Because the recomputed header carries `state_root`, `account_root`, `tx_root`,
+/// `receipt_root`, and `base_fee_per_unit`, a single mismatch anywhere — a forged
+/// root, an altered transaction set, a wrong fee — rejects the block. All work
+/// happens on a clone, so a rejected block leaves `state` untouched.
+///
+/// This does not check consensus placement (height linkage, proposer schedule,
+/// finality); the node and consensus layers own those. It answers exactly one
+/// question: does this block's body deterministically produce this block's
+/// header from the current state?
+pub fn apply_block(
+    state: &mut ChainState,
+    config: &ChainConfig,
+    block: &Block,
+) -> Result<(), ChainError> {
+    let input = BlockBuildInput {
+        chain_id: block.header.chain_id.clone(),
+        height: block.header.height,
+        epoch: block.header.epoch,
+        previous_hash: block.header.previous_hash,
+        proposer: block.header.proposer,
+        timestamp_ms: block.header.timestamp_ms,
+    };
+    let mut candidate_state = state.clone();
+    let rebuilt = build_block(
+        &mut candidate_state,
+        config,
+        input,
+        block.transactions.clone(),
+        block.evidence.clone(),
+    )?;
+    // The header commits every root and the block fee, so header equality proves
+    // the re-execution reproduced the proposer's exact state transition.
+    if rebuilt.header != block.header || rebuilt.receipts != block.receipts {
+        return Err(ChainError::ImportedBlockMismatch);
+    }
+    *state = candidate_state;
+    Ok(())
+}
+
 /// Computes the ordered Merkle root of signed transaction identifiers.
 pub fn transaction_root(transactions: &[Transaction]) -> Result<Hash256, ChainError> {
     let leaves = transactions
@@ -287,6 +332,99 @@ mod tests {
             Err(ChainError::BlockBytesExceeded { .. })
         ));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn apply_block_reproduces_the_producers_state() {
+        let config = ChainConfig::default();
+        let alice = Keypair::from_seed([41u8; 32]);
+        let bob = Keypair::from_seed([42u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        // Producer builds a block; its state advances.
+        let mut producer_state = ChainState::from_genesis(&genesis).unwrap();
+        let tx = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::Transfer {
+                to: bob.address(),
+                amount: Amount::from_webc(3),
+            },
+            FeeBid::default(),
+        )
+        .unwrap();
+        let block = build_block(
+            &mut producer_state,
+            &config,
+            build_input(&config, alice.address()),
+            vec![tx],
+            Vec::new(),
+        )
+        .unwrap();
+
+        // A second node imports the received block onto its own genesis state and
+        // ends at the identical state root — no rebuild-from-mempool required.
+        let mut importer_state = ChainState::from_genesis(&genesis).unwrap();
+        apply_block(&mut importer_state, &config, &block).unwrap();
+        assert_eq!(
+            importer_state.state_root().unwrap(),
+            producer_state.state_root().unwrap()
+        );
+        assert_eq!(
+            importer_state.accounts.get(&bob.address()).unwrap().balance,
+            Amount::from_webc(3)
+        );
+    }
+
+    #[test]
+    fn apply_block_rejects_a_tampered_header() {
+        let config = ChainConfig::default();
+        let alice = Keypair::from_seed([51u8; 32]);
+        let bob = Keypair::from_seed([52u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let mut producer_state = ChainState::from_genesis(&genesis).unwrap();
+        let tx = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::Transfer {
+                to: bob.address(),
+                amount: Amount::from_webc(3),
+            },
+            FeeBid::default(),
+        )
+        .unwrap();
+        let mut block = build_block(
+            &mut producer_state,
+            &config,
+            build_input(&config, alice.address()),
+            vec![tx],
+            Vec::new(),
+        )
+        .unwrap();
+        // Forge a false state root; re-execution will not reproduce it.
+        block.header.state_root = Hash256([0xAB; 32]);
+
+        let mut importer_state = ChainState::from_genesis(&genesis).unwrap();
+        let before = importer_state.clone();
+        assert!(matches!(
+            apply_block(&mut importer_state, &config, &block),
+            Err(ChainError::ImportedBlockMismatch)
+        ));
+        // A rejected block leaves the importer's state untouched.
+        assert_eq!(importer_state, before);
     }
 
     #[test]
