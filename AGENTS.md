@@ -131,6 +131,50 @@ Read `docs/implementation-status.md` for the audit summary.
 15. Do not claim mainnet or bridge readiness without independent audits and adversarial public testing.
 16. Update `docs/implementation-status.md` after each material implementation milestone.
 17. Record any changed product decision in `docs/decision-record.md` only with the user's approval.
+18. **Reuse over reinvention** (see the dedicated section below): prefer an existing, maintained, license-compatible crate/module over hand-writing equivalent machinery.
+
+## Reuse over reinvention — standing rule
+
+This is a standing user instruction, not a one-off. It applies in every current and
+future session.
+
+- **Default to reuse.** Before writing non-trivial machinery (a database/WAL, an HTTP
+  or WebSocket server, an async runtime, serialization, hashing, an RNG, a rate
+  limiter, a parser, a data structure, etc.), look for a mature, maintained,
+  well-reviewed crate or existing internal module and use it. Do **not** re-implement
+  what a reputable dependency already does well.
+- **Why this rule exists:** (1) it prevents spaghetti code — bespoke reimplementations
+  accrete edge cases and become unmaintainable; (2) it prevents wasted tokens and
+  effort — re-deriving solved problems burns budget for no gain. Reuse keeps the
+  codebase small, auditable, and cheap to evolve.
+- **License constraint — never contaminate our Apache-2.0.** WEBC is licensed
+  Apache-2.0. Only add dependencies under Apache-2.0-compatible permissive licenses
+  (Apache-2.0, MIT, BSD-2/3-Clause, ISC, Zlib, Unlicense, or dual `MIT OR Apache-2.0`).
+  **Never** add a copyleft or source-available dependency that would relicense or
+  restrict our code: no GPL, LGPL, AGPL, MPL-as-a-forced-copyleft, SSPL, BUSL, or
+  "commons clause" crates in shipped code. Verify the SPDX license field (crates.io /
+  the crate's `Cargo.toml` / its LICENSE files) **before** adding it, and record the
+  license in the commit message or code comment when it is security-critical.
+- **Where writing it ourselves IS correct — the rule never blocks building WEBC's own
+  value.** Reuse the commodity plumbing; build the parts that are ours. Specifically:
+  (a) **WEBC-unique / one-of-a-kind protocol logic** — the actual product: the state
+  transition rules, versioned post-quantum authorization, constrained session keys,
+  the economic/staking/slashing rules, parallel state-access model, bridge protocol,
+  and anything novel to WEBC that no dependency implements. These are the reason the
+  project exists; write and own them. (b) the thin *seam/adapter* that lets a
+  commodity dependency be swapped later (the storage `KvStore` trait, the
+  `webc-crypto` boundary) — deliberate decoupling the plan requires, not reinvention.
+  (c) consensus-critical canonical encoding / domain-separated signing payloads that
+  must be byte-identical across Rust and TypeScript and cannot depend on a library's
+  internal format. (d) cases where every candidate dependency is unmaintained,
+  incompatible-licensed, or pulls in unacceptable risk — record why in a comment.
+- **The test to apply:** is this *commodity plumbing* someone already solved well (a
+  DB, a web server, an async runtime, a codec, a hash) → reuse it; or is it *WEBC's own
+  protocol/economic logic or the glue binding a dependency in* → write and own it. When
+  unsure, prefer reuse for infrastructure and ownership for protocol semantics.
+- **Still apply the security rules to dependencies:** pin versions, prefer maintained
+  and widely-used crates, and keep security-critical ones behind a replaceable
+  boundary. Reuse does not mean trust blindly.
 
 ## Security-first implementation rules
 
