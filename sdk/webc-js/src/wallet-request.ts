@@ -92,6 +92,13 @@ export interface WalletConnectionResult {
   readonly public_key: string;
   /** Deterministic wallet-secret-bound lane assigned only to this origin. */
   readonly authorization_lane: string;
+  /**
+   * Installed on-chain authorization policy revision the wallet is operating
+   * under. The host must echo this exact revision in every signed transfer so a
+   * captured session cannot be replayed across a rotation. Zero means the legacy
+   * migration policy (no installed versioned policy yet).
+   */
+  readonly authorization_policy_revision: number;
   /** Random wallet-issued connection session identifier. */
   readonly session_id: string;
   readonly scopes: readonly WalletPermissionScope[];

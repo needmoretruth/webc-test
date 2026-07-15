@@ -365,6 +365,9 @@ function parseConnectionResult(input: unknown): WalletConnectionResult {
     typeof record.address !== "string" ||
     typeof record.public_key !== "string" ||
     typeof record.authorization_lane !== "string" ||
+    typeof record.authorization_policy_revision !== "number" ||
+    !Number.isSafeInteger(record.authorization_policy_revision) ||
+    record.authorization_policy_revision < 0 ||
     typeof record.session_id !== "string" ||
     !/^[0-9a-f]{64}$/u.test(record.session_id) ||
     !Array.isArray(record.scopes) ||
@@ -393,6 +396,7 @@ function parseConnectionResult(input: unknown): WalletConnectionResult {
     address: record.address,
     public_key: record.public_key,
     authorization_lane: record.authorization_lane,
+    authorization_policy_revision: record.authorization_policy_revision,
     session_id: record.session_id,
     scopes: Object.freeze(["sign_native_transfer"] as const),
     limits: Object.freeze(limits),
@@ -428,6 +432,7 @@ function parseSignedTransactionResult(input: unknown): SignedTransactionJson {
     "sender",
     "public_key",
     "authorization_lane",
+    "authorization_policy_revision",
     "nonce",
     "operation",
     "access_list",
