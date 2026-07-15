@@ -41,7 +41,9 @@ pub use authorization_policy::{
     MAX_POST_QUANTUM_SIGNATURE_BYTES, POST_QUANTUM_ROOT_ROTATION_DOMAIN,
 };
 pub use block::{Block, BlockHeader};
-pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildInput};
+pub use block_builder::{
+    apply_block, build_block, receipt_root, transaction_root, BlockBuildInput,
+};
 pub use bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 pub use consensus::{
     detect_double_votes, DoubleVoteEvidence, FinalityCertificate, Proposal, SignedProposal,
@@ -300,6 +302,8 @@ pub enum ChainError {
     ConsensusSignatureInvalid,
     #[error("finality certificate does not carry strictly more than two-thirds precommit power")]
     FinalityQuorumNotReached,
+    #[error("imported block does not match local re-execution of its transactions")]
+    ImportedBlockMismatch,
 }
 
 impl From<bincode::Error> for ChainError {

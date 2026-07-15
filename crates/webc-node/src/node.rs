@@ -23,8 +23,8 @@
 //! was, so memory and disk never disagree.
 
 use webc_chain::{
-    build_block, Block, BlockBuildInput, ChainConfig, ChainError, ChainState, GenesisConfig,
-    SlashingEvidence, Transaction, ValidatorSet,
+    apply_block, build_block, Block, BlockBuildInput, ChainConfig, ChainError, ChainState,
+    GenesisConfig, SlashingEvidence, Transaction, ValidatorSet,
 };
 use webc_crypto::{Address, Hash256};
 use webc_storage::{BlockCommit, ChainStore, KvStore, StorageError};
@@ -175,6 +175,47 @@ impl<K: KvStore> Node<K> {
         // Storage committed durably; only now adopt the new state.
         self.state = next_state;
         Ok(block)
+    }
+
+    /// Validates and durably commits a block produced by another node.
+    ///
+    /// This is the receiving side of networked consensus and the building block
+    /// of state sync: the node re-executes the received block's body and requires
+    /// it to reproduce the block's header exactly (via [`apply_block`]) before the
+    /// durable store — which independently enforces height contiguity, parent
+    /// linkage, and `state_root` equality — commits it. A forged or mis-linked
+    /// block is rejected with the in-memory and on-disk state left unchanged, so a
+    /// hostile peer cannot corrupt a node by gossiping a bad block.
+    ///
+    /// It performs no consensus checks (proposer schedule, finality); a consensus
+    /// driver commits a block here only after it is finalized by a certificate.
+    pub fn import_block(&mut self, block: Block) -> Result<(), NodeError> {
+        if block.header.chain_id != self.config.chain_id {
+            return Err(NodeError::ChainIdMismatch);
+        }
+
+        // Re-execute against a clone: a mismatch fails before anything is adopted.
+        let mut next_state = self.state.clone();
+        apply_block(&mut next_state, &self.config, &block)?;
+
+        // Snapshot the epoch validator set on the epoch's first committed block,
+        // matching local production so imported and produced chains agree.
+        let epoch = block.header.epoch;
+        let epoch_snapshot = if self.store.validator_set(epoch)?.is_none() {
+            Some(ValidatorSet::from_state(&self.state)?)
+        } else {
+            None
+        };
+
+        // The store rejects a non-contiguous or mis-linked block, so this both
+        // validates placement and commits atomically.
+        self.store.commit_block(BlockCommit {
+            block: &block,
+            state: &next_state,
+            validator_set: epoch_snapshot.as_ref(),
+        })?;
+        self.state = next_state;
+        Ok(())
     }
 }
 
@@ -328,6 +369,107 @@ mod tests {
             .unwrap();
         assert_eq!(block3.header.height, 3);
         assert_eq!(block3.header.previous_hash, tip_after_two.unwrap());
+    }
+
+    #[test]
+    fn imports_a_block_produced_by_another_node() {
+        let (genesis, alice, bob) = test_genesis();
+        let mut producer = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let mut follower = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+
+        // Producer builds two blocks; the follower imports each in order and ends
+        // at the identical tip and balances without rebuilding from a mempool.
+        let b1 = producer
+            .produce_block(
+                vec![transfer(&alice, &bob, 10, 0)],
+                Vec::new(),
+                alice.address(),
+                1_700_000_000_001,
+            )
+            .unwrap();
+        follower.import_block(b1.clone()).unwrap();
+        assert_eq!(follower.height(), 1);
+        assert_eq!(follower.tip_hash(), producer.tip_hash());
+
+        let b2 = producer
+            .produce_block(
+                vec![transfer(&alice, &bob, 5, 1)],
+                Vec::new(),
+                alice.address(),
+                1_700_000_000_002,
+            )
+            .unwrap();
+        follower.import_block(b2).unwrap();
+        assert_eq!(follower.height(), 2);
+        assert_eq!(follower.tip_hash(), producer.tip_hash());
+        assert_eq!(
+            follower
+                .state()
+                .accounts
+                .get(&bob.address())
+                .unwrap()
+                .balance,
+            producer
+                .state()
+                .accounts
+                .get(&bob.address())
+                .unwrap()
+                .balance
+        );
+        // The follower also persisted the epoch-0 snapshot on its first import.
+        assert!(follower.store().validator_set(0).unwrap().is_some());
+    }
+
+    #[test]
+    fn rejects_a_tampered_imported_block() {
+        let (genesis, alice, bob) = test_genesis();
+        let mut producer = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let mut follower = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+
+        let mut block = producer
+            .produce_block(
+                vec![transfer(&alice, &bob, 10, 0)],
+                Vec::new(),
+                alice.address(),
+                1_700_000_000_001,
+            )
+            .unwrap();
+        // Forge the committed state root: re-execution will not reproduce it.
+        block.header.state_root = Hash256([0xAB; 32]);
+
+        assert!(matches!(
+            follower.import_block(block),
+            Err(NodeError::Chain(ChainError::ImportedBlockMismatch))
+        ));
+        // The follower did not advance.
+        assert_eq!(follower.height(), 0);
+    }
+
+    #[test]
+    fn rejects_a_non_contiguous_imported_block() {
+        let (genesis, alice, bob) = test_genesis();
+        let mut producer = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let mut follower = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+
+        producer
+            .produce_block(
+                vec![transfer(&alice, &bob, 10, 0)],
+                Vec::new(),
+                alice.address(),
+                1_700_000_000_001,
+            )
+            .unwrap();
+        // Height-2 block imported before height 1: the store rejects the gap.
+        let b2 = producer
+            .produce_block(
+                vec![transfer(&alice, &bob, 5, 1)],
+                Vec::new(),
+                alice.address(),
+                1_700_000_000_002,
+            )
+            .unwrap();
+        assert!(follower.import_block(b2).is_err());
+        assert_eq!(follower.height(), 0);
     }
 
     #[test]
