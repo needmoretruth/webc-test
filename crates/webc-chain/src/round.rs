@@ -25,10 +25,10 @@
 //!   reaches quorum, and only when the machine actually holds that block.
 
 use crate::{
-    Block, ChainError, ChainId, FinalityCertificate, ProtocolVersion, SignedProposal, SignedVote,
-    ValidatorSet, Vote, VoteType,
+    Block, ChainError, ChainId, DoubleVoteEvidence, FinalityCertificate, ProtocolVersion,
+    SignedProposal, SignedVote, ValidatorSet, Vote, VoteType,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Keypair};
 
 /// The BFT step this node currently occupies within one height/round.
@@ -74,6 +74,10 @@ pub enum ConsensusAction {
         /// The proof that strictly over two thirds precommitted it.
         certificate: Box<FinalityCertificate>,
     },
+    /// A validator equivocated (signed two conflicting votes in one step). The
+    /// driver should include this objective evidence in a future block, where the
+    /// existing verified slashing path penalizes the offender exactly once.
+    Equivocation(Box<DoubleVoteEvidence>),
 }
 
 /// A single-height, single-round BFT state machine over an immutable snapshot.
@@ -95,6 +99,9 @@ pub struct RoundState {
     prevote_cast: bool,
     /// Whether this node has already broadcast its own precommit.
     precommit_cast: bool,
+    /// Validators already reported for equivocation in a step, so each conflict
+    /// is surfaced as evidence at most once.
+    reported_equivocators: BTreeSet<(Address, VoteType)>,
     /// The finality certificate, once the block is committed.
     certificate: Option<FinalityCertificate>,
 }
@@ -124,6 +131,7 @@ impl RoundState {
             precommits: BTreeMap::new(),
             prevote_cast: false,
             precommit_cast: false,
+            reported_equivocators: BTreeSet::new(),
             certificate: None,
         }
     }
@@ -213,7 +221,9 @@ impl RoundState {
                 }
                 self.set
                     .verify_vote(&vote, self.protocol_version, &self.chain_id)?;
-                self.record_vote(vote);
+                if let Some(evidence) = self.record_vote(vote) {
+                    actions.push(ConsensusAction::Equivocation(Box::new(evidence)));
+                }
                 self.maybe_advance(&mut actions)?;
             }
         }
@@ -239,12 +249,37 @@ impl RoundState {
 
     /// Records a verified vote, keeping only the first per validator and step so a
     /// later equivocating vote cannot change this node's tally.
-    fn record_vote(&mut self, vote: SignedVote) {
-        let map = match vote.payload.vote_type {
+    ///
+    /// Returns objective double-vote evidence the first time a validator is seen
+    /// voting for a *different* block in the same step. Both votes are already
+    /// signature-verified against the snapshot, so the returned evidence is
+    /// directly usable by the existing slashing path.
+    fn record_vote(&mut self, vote: SignedVote) -> Option<DoubleVoteEvidence> {
+        let vote_type = vote.payload.vote_type;
+        let validator = vote.payload.validator;
+        let map = match vote_type {
             VoteType::Prevote => &mut self.prevotes,
             VoteType::Precommit => &mut self.precommits,
         };
-        map.entry(vote.payload.validator).or_insert(vote);
+        match map.get(&validator) {
+            Some(existing) => {
+                // A conflicting vote for the same step is equivocation. Keep the
+                // first vote for the tally and surface the conflict once.
+                if existing.payload.block_hash != vote.payload.block_hash
+                    && self.reported_equivocators.insert((validator, vote_type))
+                {
+                    return Some(DoubleVoteEvidence {
+                        first: existing.clone(),
+                        second: vote,
+                    });
+                }
+                None
+            }
+            None => {
+                map.insert(validator, vote);
+                None
+            }
+        }
     }
 
     /// Drives step transitions after any state change, emitting this node's own
@@ -332,7 +367,8 @@ impl RoundState {
             VoteType::Precommit => self.precommit_cast = true,
         }
         // Count our own vote locally so single-validator sets can reach quorum.
-        self.record_vote(vote.clone());
+        // This node votes once per step, so it never equivocates against itself.
+        let _ = self.record_vote(vote.clone());
         actions.push(ConsensusAction::Broadcast(ConsensusMessage::Vote(vote)));
         Ok(())
     }
@@ -626,6 +662,86 @@ mod tests {
         }
         assert_eq!(observer.step(), Step::Committed);
         assert!(observer.certificate().is_some());
+    }
+
+    #[test]
+    fn equivocating_validator_is_surfaced_as_evidence() {
+        // A validator that prevotes two different blocks in the same step must be
+        // caught, and the emitted evidence must satisfy the existing slashing
+        // path's verification.
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let height = 1;
+        let round = 0;
+        // Observe as a non-voting node so only the injected votes are in play.
+        let mut engine = RoundState::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            round,
+            None,
+        );
+
+        let prevote = |validator: &Keypair, hash| {
+            SignedVote::sign(
+                Vote {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    chain_id: ChainId::devnet(),
+                    height,
+                    round,
+                    vote_type: VoteType::Prevote,
+                    block_hash: hash,
+                    validator: validator.address(),
+                },
+                validator,
+            )
+            .unwrap()
+        };
+
+        let hash_a = Hash256::digest(b"block-a");
+        let hash_b = Hash256::digest(b"block-b");
+        // First prevote: no conflict yet.
+        let out = engine
+            .on_message(ConsensusMessage::Vote(prevote(&b, hash_a)))
+            .unwrap();
+        assert!(!out
+            .iter()
+            .any(|a| matches!(a, ConsensusAction::Equivocation(_))));
+
+        // Second, conflicting prevote from the same validator: evidence emitted.
+        let out = engine
+            .on_message(ConsensusMessage::Vote(prevote(&b, hash_b)))
+            .unwrap();
+        let evidence = out
+            .iter()
+            .find_map(|a| match a {
+                ConsensusAction::Equivocation(ev) => Some((**ev).clone()),
+                _ => None,
+            })
+            .expect("equivocation surfaced");
+        assert_eq!(evidence.first.payload.validator, b.address());
+
+        // The evidence plugs straight into the slashing path: both votes verify
+        // against the offender's registered consensus key.
+        let slashing = crate::SlashingEvidence::DoubleVote(evidence);
+        assert!(slashing
+            .verify(
+                CURRENT_PROTOCOL_VERSION,
+                &ChainId::devnet(),
+                &b.public_key()
+            )
+            .is_ok());
+
+        // A third conflicting prevote does not re-report the same offender.
+        let out = engine
+            .on_message(ConsensusMessage::Vote(prevote(&b, Hash256::digest(b"c"))))
+            .unwrap();
+        assert!(!out
+            .iter()
+            .any(|a| matches!(a, ConsensusAction::Equivocation(_))));
     }
 
     #[test]
