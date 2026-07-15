@@ -772,8 +772,11 @@ dependencies = [
  "anyhow",
  "clap",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "webc-chain",
  "webc-crypto",
+ "webc-storage",
 ]
 
 [[package]]
