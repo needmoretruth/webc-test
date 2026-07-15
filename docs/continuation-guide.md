@@ -28,9 +28,9 @@ Use simple Korean when speaking to the user, address them as 관리자 (administ
 ## Current verified checkpoint
 
 Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
-is in progress — stage A-1 (networking plumbing) and A-2.1 (deterministic
-stake-weighted leader schedule) are done; the rest of A-2 (consensus core)
-is next** (see "Exact next work"). Always use `git log` to discover the current branch tip;
+is in progress — stage A-1 (networking plumbing) and the A-2 consensus core are
+done; stage A-3 (robustness) and the async network driver are next** (see "Exact
+next work"). Always use `git log` to discover the current branch tip;
 the checkpoint list below names implementation history, not an instruction to
 reset or return to an older commit. (The prototype remains unsafe for real funds,
 and reference-machine benchmark numbers are still owed before any performance
@@ -213,20 +213,42 @@ public and consensus messages are individually signed, so devnet uses
 authenticated plaintext framing); richer peer discovery beyond a static
 bootstrap list; peer scoring/rate-limiting on repeated rejects.
 
-**The next milestone is the rest of Phase 4 A-2 (signed BFT consensus core)** in
-`docs/development-plan.md`. A-2.1 is done: `ValidatorSet::proposer_for(height,
-round)` (`webc-chain::consensus`) is a deterministic, clock-free, stake-weighted,
-round-rotating leader schedule (domain `WEBC_LEADER_SCHEDULE_V1`) with tests.
-Remaining: extend `NetMessage` with proposals/votes/certs, persist the per-epoch
-stake snapshot, signed prevote/precommit producing a finality certificate, and
-committee-membership / voting-power verification, converging 2–4 local nodes on
-one finalized chain.
-The vote primitives already exist in `webc-chain::consensus` (`Vote`,
-`SignedVote`, `VoteType`, quorum math, `detect_double_votes`) and validator-set
-snapshot storage is already wired (`Table::ValidatorSets`,
-`BlockCommit.validator_set`, `ChainStore::validator_set`) but unpopulated — it
-activates in A-2. A-3 then adds timeouts/round-change, fork choice, state sync,
-and wiring objective evidence into the existing slashing path.
+**The A-2 signed BFT consensus core is done.** What shipped (do not redo):
+
+- `webc-chain::consensus` — the `ValidatorSet` snapshot now carries each member's
+  registered consensus key (`ValidatorPower.consensus_key`), so a finality
+  certificate verifies against the snapshot alone. `SignedProposal`
+  (`WEBC_CONSENSUS_PROPOSAL_V1`, leader-only, block-hash-bound) and
+  `FinalityCertificate` (aggregate precommits, unique snapshot members, strictly
+  `>2/3` power) with `build` and an independent `verify`.
+- `webc-chain::round` — a pure, clock-free `RoundState` state machine for one
+  height/round driving propose -> prevote -> precommit -> commit. It verifies
+  every proposal/vote against the snapshot, counts each validator once per step
+  (first vote wins, so a later equivocation cannot shift the tally), and
+  finalizes only when it holds the block and precommit quorum is proven.
+  Observers (`identity = None`) follow finality without voting. It emits
+  `ConsensusAction`s (broadcast / commit) for a driver to carry out; it does no
+  I/O itself.
+- `webc-net::wire` — `NetMessage` gained `Proposal`, `Vote`, and `Certificate`.
+- `webc-node::node` — `produce_block` now populates the per-epoch
+  `Table::ValidatorSets` snapshot at each epoch's first block (previously wired
+  but unpopulated). With no active validators the snapshot is an empty set.
+- A deterministic 3-validator convergence test (`round::tests`) drives the
+  engines over an in-memory bus and proves all reach the identical finalized
+  block and a verifying certificate.
+
+A-2.1 (the `WEBC_LEADER_SCHEDULE_V1` stake-weighted leader schedule) remains as
+before. `Vote`/`SignedVote`/`VoteType`/quorum math/`detect_double_votes` are the
+primitives the above build on.
+
+**The next milestone is Phase 4 A-3 plus the async network driver.** The round
+engine is pure and driver-agnostic; what is missing is the async shell in
+`webc-node` that runs it over real `webc-net` TCP (routing gossiped
+Proposal/Vote/Certificate into the engine — the gossip pump currently ignores
+them by design) so 2-4 separate processes converge, plus A-3 robustness:
+timeouts/round-change (the engine is single-round today, so a stalled proposer
+stalls the height), fork choice, state sync for a joining node, and wiring
+objective double-vote/invalid-proposal evidence into the existing slashing path.
 
 Public contract runtime, the WEBC high-level language and tooling, the native
 oracle, ZK expansion, the web/game platform, and real-fund bridge work stay
