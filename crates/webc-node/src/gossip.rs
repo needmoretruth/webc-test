@@ -33,12 +33,15 @@ where
             NetMessage::Transaction(tx) => {
                 let _ = state.service().admit_network_transaction(*tx, now_ms());
             }
-            // Consensus artifacts have their wire types (A-2) but are routed to a
-            // running round state machine only by the async consensus driver in
-            // A-3. Until that driver exists, this single-proposer devnet node does
-            // not act on gossiped proposals/votes/certificates; the transport
-            // still re-floods them to peers.
-            NetMessage::Proposal(_) | NetMessage::Vote(_) | NetMessage::Certificate(_) => {}
+            // Consensus and state-sync artifacts are handled by the async
+            // consensus driver (A-3), not this transaction-only pump. When the
+            // node runs the driver, that path consumes them; here they are
+            // absorbed (the transport still re-floods them to peers).
+            NetMessage::Proposal(_)
+            | NetMessage::Vote(_)
+            | NetMessage::Certificate(_)
+            | NetMessage::BlockRequest { .. }
+            | NetMessage::BlockResponse(_) => {}
         }
     }
 }

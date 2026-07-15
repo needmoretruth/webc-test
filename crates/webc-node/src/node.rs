@@ -24,7 +24,7 @@
 
 use webc_chain::{
     apply_block, build_block, Block, BlockBuildInput, ChainConfig, ChainError, ChainState,
-    GenesisConfig, SlashingEvidence, Transaction, ValidatorSet,
+    FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction, ValidatorSet,
 };
 use webc_crypto::{Address, Hash256};
 use webc_storage::{BlockCommit, ChainStore, KvStore, StorageError};
@@ -170,11 +170,28 @@ impl<K: KvStore> Node<K> {
             block: &block,
             state: &next_state,
             validator_set: epoch_snapshot.as_ref(),
+            certificate: None,
         })?;
 
         // Storage committed durably; only now adopt the new state.
         self.state = next_state;
         Ok(block)
+    }
+
+    /// Returns a finalized block together with its stored finality certificate,
+    /// or `None` if either is absent. State-sync serving uses this to hand a
+    /// certified block to a catching-up peer.
+    pub fn certified_block(
+        &self,
+        height: u64,
+    ) -> Result<Option<(Block, FinalityCertificate)>, NodeError> {
+        let Some(block) = self.store.block_by_height(height)? else {
+            return Ok(None);
+        };
+        let Some(certificate) = self.store.certificate(height)? else {
+            return Ok(None);
+        };
+        Ok(Some((block, certificate)))
     }
 
     /// Builds a candidate block for the next height **without committing it**.
@@ -221,6 +238,27 @@ impl<K: KvStore> Node<K> {
     /// It performs no consensus checks (proposer schedule, finality); a consensus
     /// driver commits a block here only after it is finalized by a certificate.
     pub fn import_block(&mut self, block: Block) -> Result<(), NodeError> {
+        self.import_validated(block, None)
+    }
+
+    /// Like [`Self::import_block`], but also persists the block's finality
+    /// certificate under its height, so this node can later serve the certified
+    /// block to a peer during state sync. The consensus driver uses this on commit.
+    pub fn import_finalized_block(
+        &mut self,
+        block: Block,
+        certificate: &FinalityCertificate,
+    ) -> Result<(), NodeError> {
+        self.import_validated(block, Some(certificate))
+    }
+
+    /// Shared import path: re-execute, snapshot the epoch validator set on the
+    /// epoch's first block, and atomically commit (optionally with a certificate).
+    fn import_validated(
+        &mut self,
+        block: Block,
+        certificate: Option<&FinalityCertificate>,
+    ) -> Result<(), NodeError> {
         if block.header.chain_id != self.config.chain_id {
             return Err(NodeError::ChainIdMismatch);
         }
@@ -244,6 +282,7 @@ impl<K: KvStore> Node<K> {
             block: &block,
             state: &next_state,
             validator_set: epoch_snapshot.as_ref(),
+            certificate,
         })?;
         self.state = next_state;
         Ok(())

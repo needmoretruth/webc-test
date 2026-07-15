@@ -180,6 +180,160 @@ async fn three_validators_converge_on_one_finalized_chain() {
 }
 
 #[tokio::test]
+async fn a_late_joining_node_catches_up_via_state_sync() {
+    let chain = ChainConfig::default().chain_id;
+    let seeds: [[u8; 32]; 3] = [[1u8; 32], [2u8; 32], [3u8; 32]];
+    let validators: Vec<Keypair> = seeds.iter().map(|s| Keypair::from_seed(*s)).collect();
+    let genesis = validator_genesis(&validators);
+
+    let timeouts = DriverTimeouts {
+        propose: Duration::from_millis(300),
+        prevote: Duration::from_millis(300),
+        precommit: Duration::from_millis(300),
+    };
+
+    // Bring up the three validator networks first and remember their addresses,
+    // so the late joiner can dial them.
+    let mut val_handles = Vec::new();
+    let mut val_inbounds = Vec::new();
+    let mut val_addrs = Vec::new();
+    let mut prior: Vec<std::net::SocketAddr> = Vec::new();
+    for index in 0..3 {
+        let (handle, inbound) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([200u8 + index as u8; 32]),
+            chain.clone(),
+            Some("127.0.0.1:0".parse().unwrap()),
+            prior.clone(),
+        ))
+        .await
+        .unwrap();
+        val_addrs.push(handle.local_addr().unwrap());
+        prior.push(handle.local_addr().unwrap());
+        val_handles.push(handle);
+        val_inbounds.push(inbound);
+    }
+
+    // Wait for the validators to peer, then start their drivers together so they
+    // begin consensus synchronized at round 0 (an isolated node races ahead in
+    // rounds and never re-aligns).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while val_handles.iter().any(|h| h.connected_peers() < 2) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "validators did not peer"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut val_commit_rxs = Vec::new();
+    for (index, (handle, inbound)) in val_handles.into_iter().zip(val_inbounds).enumerate() {
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let (commit_tx, commit_rx) = mpsc::channel::<CommitInfo>(64);
+        val_commit_rxs.push(commit_rx);
+        let driver = ConsensusDriver::new(
+            node,
+            handle,
+            Some(seeds[index]),
+            timeouts,
+            MempoolConfig::default(),
+        );
+        tokio::spawn(driver.run(inbound, Some(commit_tx)));
+    }
+
+    // Wait until the validators have finalized a few blocks, so a joiner must
+    // actually catch up rather than follow live from genesis.
+    let mut val_tips: std::collections::BTreeMap<u64, Hash256> = std::collections::BTreeMap::new();
+    let warmup = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            for rx in val_commit_rxs.iter_mut() {
+                while let Ok(info) = rx.try_recv() {
+                    if let Some(tip) = info.tip {
+                        val_tips.insert(info.height, tip);
+                    }
+                }
+            }
+            if val_tips.contains_key(&3) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(warmup.is_ok(), "validators did not produce three blocks");
+
+    // Now start a late observer node that dials all three validators.
+    let (obs_handle, obs_inbound) = spawn_network(NetworkConfig::new(
+        Keypair::from_seed([250u8; 32]),
+        chain.clone(),
+        Some("127.0.0.1:0".parse().unwrap()),
+        val_addrs.clone(),
+    ))
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while obs_handle.connected_peers() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "observer did not connect"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let obs_node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+    let (obs_commit_tx, mut obs_commit_rx) = mpsc::channel::<CommitInfo>(64);
+    // Observer: no consensus seed, so it never votes — it must catch up by sync.
+    let observer = ConsensusDriver::new(
+        obs_node,
+        obs_handle,
+        None,
+        timeouts,
+        MempoolConfig::default(),
+    );
+    tokio::spawn(observer.run(obs_inbound, Some(obs_commit_tx)));
+
+    // The observer must reach height 3 by syncing finalized blocks, and its
+    // finalized tips must match the validators' at every height it reports.
+    let mut obs_tips: std::collections::BTreeMap<u64, Hash256> = std::collections::BTreeMap::new();
+    let synced = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            // Keep draining the validator tips so the comparison map stays current.
+            for rx in val_commit_rxs.iter_mut() {
+                while let Ok(info) = rx.try_recv() {
+                    if let Some(tip) = info.tip {
+                        val_tips.insert(info.height, tip);
+                    }
+                }
+            }
+            while let Ok(info) = obs_commit_rx.try_recv() {
+                if let Some(tip) = info.tip {
+                    obs_tips.insert(info.height, tip);
+                }
+            }
+            if obs_tips.contains_key(&3) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        synced.is_ok(),
+        "the late-joining observer did not catch up to height 3 via state sync"
+    );
+
+    // Agreement: every height the observer finalized matches the validators'.
+    for (height, obs_tip) in &obs_tips {
+        if let Some(val_tip) = val_tips.get(height) {
+            assert_eq!(
+                obs_tip, val_tip,
+                "observer disagrees with validators at height {height}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_gossiped_transaction_is_included_in_a_finalized_block() {
     let chain = ChainConfig::default().chain_id;
     let seeds: [[u8; 32]; 3] = [[1u8; 32], [2u8; 32], [3u8; 32]];
