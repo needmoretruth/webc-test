@@ -192,7 +192,7 @@ WEBC does not use continuous PoH hashing. Signed ordered transaction batches, sl
 
 Native security-critical features remain explicit Rust modules first: transfers, staking, slashing, fees, tokens, NFTs, governance, and bridge accounting.
 
-The public smart-contract runtime remains a technical selection gate. Restricted deterministic WebAssembly with Rust authoring is the current front-runner. Move VM and EVM/Solidity compatibility will be tested using identical applications and hardware before the runtime is frozen.
+The smart-contract execution foundation is restricted, deterministic WebAssembly with Rust as the first authoring language. Above it WEBC provides its own easy high-level authoring language that lowers (transpiles) to an audited Rust framework, so contracts stay as safe and fast as Rust while being simple enough for humans, AI-assisted developers, and AI agents to assemble from documented, audited components. WEBC builds only the language front end and reuses the Rust/LLVM toolchain; it does not add a second virtual machine or its own compiler backend. Move VM and EVM/Solidity are not the native runtime — Ethereum and Solana compatibility comes through bridges, not native bytecode execution. Contract quality is protected by an opinionated structure, composable components, a dedicated linter/analyzer, and a pre-deploy review step so contracts do not degrade into unmaintainable monoliths.
 
 Contracts cannot directly click a browser button, read a file, call a website, or access the internet. Instead:
 
@@ -202,6 +202,8 @@ Contracts cannot directly click a browser button, read a file, call a website, o
 - the chain verifies only deterministic inputs and signatures.
 
 This model supports paid downloads, uploads, API calls, webhooks, memberships, subscriptions, games, and server automation without making blockchain execution depend on a particular website being online.
+
+External data reaches contracts through a native staked oracle rather than direct network calls: reporters stake WEBC, submit values as ordinary transactions, and reported values are aggregated (for example by median), with provably wrong reports slashed through the existing staking and slashing infrastructure. This keeps oracle data deterministic, cheap, fast, and hard to manipulate, while external oracles remain optional.
 
 ## 8. Tokens, NFTs, and application governance
 

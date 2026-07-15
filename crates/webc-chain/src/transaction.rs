@@ -7,9 +7,10 @@
 
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
-    ChainId, ExternalChain, ObjectId, ObjectVersion, PostQuantumRoot, ProtocolStateKey,
-    ProtocolVersion, SlashingEvidence, StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
+    ChainId, ExternalChain, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
+    ProtocolStateKey, ProtocolVersion, SessionKeyConstraints, SessionKeyId, SlashingEvidence,
+    StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, SignatureBytes};
@@ -111,6 +112,60 @@ pub enum Operation {
         lane: AuthorizationLaneId,
         /// Native base units moved from liquid balance into the lane.
         fee_deposit: Amount,
+    },
+    /// Installs a constrained session key under the sender's account policy.
+    ///
+    /// Critical action: requires the default lane, an installed policy, and a
+    /// reveal of the committed post-quantum root. The session key can only
+    /// authorize the operations, amounts, fees, lane, and lifetime it declares.
+    InstallSessionKey {
+        /// Ed25519 key the session may sign transactions with.
+        session_public_key: PublicKeyBytes,
+        /// Immutable constraint grant fixed at installation.
+        constraints: SessionKeyConstraints,
+        /// Reveal proving knowledge of the committed post-quantum root.
+        post_quantum_root_reveal: PostQuantumRootReveal,
+    },
+    /// Revokes an installed session key immediately.
+    ///
+    /// Critical action: requires the default lane and a post-quantum root reveal.
+    RevokeSessionKey {
+        /// Opaque identity of the session key to remove.
+        session_key: SessionKeyId,
+        /// Reveal proving knowledge of the committed post-quantum root.
+        post_quantum_root_reveal: PostQuantumRootReveal,
+    },
+    /// Rotates the account's active Ed25519 transaction key (recovery/rotation).
+    ///
+    /// Critical action: requires the default lane, an installed policy, and a
+    /// post-quantum root signature over the exact new key. Recovery works even
+    /// when the old key is lost or compromised, because the transaction envelope
+    /// may be signed by the *new* key and the real authority is the root
+    /// signature. A successful rotation advances the policy revision, which
+    /// invalidates every outstanding session key; the post-quantum root itself is
+    /// preserved.
+    RotateActiveTransactionKey {
+        /// Replacement Ed25519 key that will authorize ordinary transactions.
+        new_active_transaction_key: PublicKeyBytes,
+        /// Root signature over the exact rotation (chain, owner, revision, nonce,
+        /// new key), proving control of the account's recovery root.
+        post_quantum_root_reveal: PostQuantumRootReveal,
+    },
+    /// Rotates the account's post-quantum recovery root (root recovery).
+    ///
+    /// Critical action: requires the default lane, an installed policy, and a
+    /// signature by the *current* post-quantum root over the exact new root
+    /// commitment. The everyday active transaction key is preserved; the
+    /// revision advances, invalidating outstanding session keys. Use it to
+    /// replace a recovery root that may be weak or compromised. The transaction
+    /// envelope is signed by the current active key, so replacing the root
+    /// requires control of both the current root and the active key.
+    RotatePostQuantumRoot {
+        /// New committed post-quantum recovery root.
+        new_post_quantum_root: PostQuantumRoot,
+        /// Signature by the CURRENT root over the exact rotation, proving control
+        /// of the recovery root being replaced.
+        post_quantum_root_reveal: PostQuantumRootReveal,
     },
     /// Creates revision one of an address-owned application object.
     CreateObject {
@@ -245,7 +300,10 @@ impl Operation {
     pub fn required_units(&self) -> u64 {
         match self {
             Self::Transfer { .. } => 500,
-            Self::InstallAuthorizationPolicy { .. } => 25_000,
+            Self::InstallAuthorizationPolicy { .. }
+            | Self::RotateActiveTransactionKey { .. }
+            | Self::RotatePostQuantumRoot { .. } => 25_000,
+            Self::InstallSessionKey { .. } | Self::RevokeSessionKey { .. } => 15_000,
             Self::OpenAuthorizationLane { .. } | Self::FundAuthorizationLane { .. } => 10_000,
             Self::CreateObject { .. } | Self::MutateObject { .. } | Self::TransferObject { .. } => {
                 20_000
@@ -290,6 +348,27 @@ impl Operation {
             Self::OpenAuthorizationLane { lane, .. } | Self::FundAuthorizationLane { lane, .. } => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::authorization_lane(sender, *lane));
+            }
+            Self::InstallSessionKey {
+                session_public_key, ..
+            } => {
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::session_key(sender, SessionKeyId::derive(session_public_key)),
+                );
+            }
+            Self::RevokeSessionKey { session_key, .. } => {
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::session_key(sender, *session_key));
+            }
+            Self::RotateActiveTransactionKey { .. } | Self::RotatePostQuantumRoot { .. } => {
+                // Both rotations write the account (nonce/fees) and the policy
+                // record they replace. They intentionally touch no session-key
+                // records: the revision bump alone invalidates them lazily at use
+                // time.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::authorization_policy(sender));
             }
             Self::CreateObject {
                 object_id,
@@ -419,7 +498,12 @@ impl Operation {
                 }
             }
         }
-        if !matches!(self, Self::InstallAuthorizationPolicy { .. }) {
+        if !matches!(
+            self,
+            Self::InstallAuthorizationPolicy { .. }
+                | Self::RotateActiveTransactionKey { .. }
+                | Self::RotatePostQuantumRoot { .. }
+        ) {
             push_unique_key(&mut read_only, StateKey::authorization_policy(sender));
         }
         push_unique_key(
@@ -427,6 +511,24 @@ impl Operation {
             StateKey::fee_accumulator_for_lane(sender, lane),
         );
         Ok(AccessList::new(read_only, read_write))
+    }
+
+    /// Builds the exact access for a transaction signed by a session key.
+    ///
+    /// This is the lane access list plus the session-key record, which execution
+    /// reads to enforce constraints and writes to advance cumulative spend.
+    pub fn default_access_list_for_session(
+        &self,
+        sender: Address,
+        lane: AuthorizationLaneId,
+        session_key: SessionKeyId,
+    ) -> Result<AccessList, ChainError> {
+        let mut list = self.default_access_list_for_lane(sender, lane)?;
+        push_unique_key(
+            &mut list.read_write,
+            StateKey::session_key(sender, session_key),
+        );
+        Ok(list)
     }
 }
 
@@ -1019,6 +1121,58 @@ mod tests {
         assert_eq!(
             sender.address().to_string(),
             "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3"
+        );
+    }
+
+    #[test]
+    fn session_and_rotation_operations_have_a_stable_cross_language_wire_vector() {
+        // Deterministic placeholder bytes make this a cross-language vector: the
+        // TypeScript SDK builds the same four operations and must hash to the same
+        // value. Real signatures are unnecessary — only the canonical JSON shape
+        // and field naming are under test. If this hash changes, the SDK vector in
+        // `sdk/webc-js/src/transaction.test.ts` MUST be updated to match.
+        let reveal = PostQuantumRootReveal {
+            scheme: crate::PostQuantumScheme::MlDsa65,
+            public_key: vec![0x33; 1952],
+            signature: vec![0x44; 3309],
+        };
+        let constraints = SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: crate::SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_units(5),
+            total_amount_budget: Amount::from_units(20),
+            max_fee_per_use: Amount::from_units(1),
+            total_fee_budget: Amount::from_units(5),
+            lifetime_epochs: 60,
+        };
+        let operations = vec![
+            Operation::InstallSessionKey {
+                session_public_key: PublicKeyBytes([0x11; 32]),
+                constraints: constraints.clone(),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RevokeSessionKey {
+                session_key: SessionKeyId::new(Hash256([0x55; 32])),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotateActiveTransactionKey {
+                new_active_transaction_key: PublicKeyBytes([0x66; 32]),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root: PostQuantumRoot::new(
+                    crate::PostQuantumScheme::MlDsa65,
+                    Hash256([0x22; 32]),
+                )
+                .unwrap(),
+                post_quantum_root_reveal: reveal,
+            },
+        ];
+        let bytes = crate::canonical::canonical_json_bytes(&operations)
+            .expect("session/rotation operation vector serializes");
+        assert_eq!(
+            Hash256::digest(bytes).to_hex(),
+            "272f10267381f778bb9dc0d2d81c3aba143081facb9f677216e0e7bb538dbf1d"
         );
     }
 

@@ -22,6 +22,8 @@ If documents disagree, the higher item in this list wins. Fix the lower document
 - `roadmap.md` — short phase overview; details live in `development-plan.md`
 - `continuation-guide.md` — exact starting point for the next development session
 - `ai-handoff.md` — prevents stale conversation summaries from becoming decisions
+- `session-keys-implementation-plan.md` — constrained on-chain session-key design and staged build order (Phase 2 gate)
+- `session-keys-next-steps.md` — durable resume plan; the ML-DSA signature gate, primary-key recovery/rotation, recovery-root rotation, epoch-boundary pruning, the browser/SDK surface, and durable encrypted permission storage + automatic lane setup are done — only reference-machine benchmarks remain before Phase 3
 
 ## Editing rule
 
@@ -38,8 +40,23 @@ They cannot override confirmed product or economic policy in
 
 ## Current next action
 
-Phase 0 and Phase 1 are complete, and Phase 2 is active. Use `continuation-guide.md` for the
-verified checkpoint and exact first unfinished task; do not restart completed
-amount, inflation, genesis, block-atomicity, staking-ratio, or access-enforcement
-work. Complete wallet derivation, encrypted storage, and browser isolation before
-RPC and networking.
+Phases 0-3 are complete, and **Phase 4 (networking and signed BFT consensus) is
+active**. Phase 4 A-1 (authenticated P2P networking plumbing and transaction
+gossip) is **complete**, and the deterministic stake-weighted leader schedule
+(A-2.1) is **complete**. The next task is the rest of the signed consensus core:
+the Proposal/Vote/Certificate wire messages, the epoch stake-snapshot writer, the
+prevote/precommit round state machine, and the finality certificate. Use
+`continuation-guide.md` for the verified checkpoint and exact next task, and do
+not restart completed amount, inflation, genesis, block-atomicity, staking-ratio,
+access-enforcement, session-key, wallet-permission-storage, storage, node, or
+networking work.
+
+The AI-era product direction is now recorded in `decision-record.md`: a WEBC
+high-level contract language that lowers to the audited Rust/WASM layer, a native
+staked oracle, capped fee sponsorship, anti-complexity contract tooling, an
+AI-readable component catalog, and prioritized Ethereum/Solana bridges. These are
+built after consensus is stable; `development-plan.md` phases 6-14 carry them.
+
+This project runs in an ephemeral cloud container: the GitHub repo is the source
+of truth, so commit and push every step. `target/`, `node_modules/`, and `dist/`
+are git-ignored but regenerable from the committed lock files and toolchain pins.

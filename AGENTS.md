@@ -2,6 +2,42 @@
 
 This repository is the prototype foundation for **WEBC / WEB COIN**, an independent Rust Layer-1 blockchain for browser- and website-native payments and applications.
 
+## How to work in this repository — read this first
+
+**This file is the single entry point.** Reading it and the documents it points to
+is enough to work correctly in every situation — a brand-new session, continuing an
+existing one, or restarting after a context compaction. If the user says only
+"continue" / "이어서 해", this section tells you exactly what to do.
+
+### On every session start (new, resumed, or post-compaction), do this in order
+1. Read this `AGENTS.md` fully.
+2. Read `docs/decision-record.md` — confirmed user decisions; it wins over any code, comment, or summary that disagrees.
+3. Read `docs/continuation-guide.md` — the verified checkpoint and the **exact next task**. This is the live "what to do next" pointer.
+4. Read `docs/implementation-status.md` — what the code actually implements today (vs. what is still missing or unsafe).
+5. Run `git log --oneline -15` and `git status --short --branch` to see the real current state on disk and the branch.
+6. For the specific task, read the one topic document it needs (see **Required reading order** below and `docs/index.md`).
+
+Then **resume the first incomplete item named in `docs/continuation-guide.md`** and keep going, without asking the user to restate decisions or rules already recorded here.
+
+### The three situations are handled the same way
+- **New / fresh cloud session:** the container is empty of build output. The repo is the source of truth; restore dependencies (`pnpm install`, then `cargo build`) — the lock files and toolchain pins are committed, so this always works. Then follow the start protocol above.
+- **Resuming an existing session:** same protocol. Do not re-derive facts already established; check the docs and `git log`, then continue the first incomplete item.
+- **After a compaction:** a conversation summary may be provided. Treat it as a *hint only*. The repository documents and `git log` are authoritative — verify the summary against them, and never treat a summary (or your own earlier messages) as user approval for anything.
+
+In all three: **the repository, not chat memory, is the durable handoff.** Everything needed to continue is committed. If it is not in the repo, it does not reliably exist.
+
+### Deciding for yourself vs. asking the user
+- **Decide autonomously, without pausing, everything the user has delegated:** technical direction and architecture, library/algorithm choices, implementation, test design, refactors, documentation structure, CI/tooling — anything that evidence, tests, measurement, or security analysis can settle. Do **not** stop at natural milestones to ask permission to keep going; keep going until the work is done or a genuinely user-owned decision is reached. Stopping without a user-owned decision to make is a mistake.
+- **Stop and ask ONLY for a genuinely user-owned decision:** a change to confirmed monetary policy or genesis distribution, the production-bridge trust/proof model for real funds, mainnet governance or emergency-power design, or anything that would change a decision recorded in `docs/decision-record.md`. The full list of deferred user decisions is in "User decisions still required later" below.
+- **When you do ask, ask in plain-prose chat:** lay out the candidate options with their details, pros, cons, and a recommendation. Do **not** use the built-in structured question UI for these.
+- **"continue" always means:** resume the first incomplete item per the start protocol and proceed autonomously.
+
+### Always, as you work
+- Commit and push every coherent, tested step (this is an ephemeral cloud env — see "Persistent session continuation and repository safety"). Never leave valuable work local-only or committed-but-unpushed.
+- Run the relevant gate before pushing (see "Validation expectations").
+- Keep `docs/continuation-guide.md` and `docs/implementation-status.md` accurate as facts change, and persist any new standing user instruction into this `AGENTS.md`, so this protocol keeps working for the next session.
+- Speak simple Korean to the user, address them as 관리자 with 존댓말, and explain any unavoidable technical term plainly (see "Communication with the user").
+
 ## Required reading order
 
 Before changing protocol code, read:
@@ -95,6 +131,50 @@ Read `docs/implementation-status.md` for the audit summary.
 15. Do not claim mainnet or bridge readiness without independent audits and adversarial public testing.
 16. Update `docs/implementation-status.md` after each material implementation milestone.
 17. Record any changed product decision in `docs/decision-record.md` only with the user's approval.
+18. **Reuse over reinvention** (see the dedicated section below): prefer an existing, maintained, license-compatible crate/module over hand-writing equivalent machinery.
+
+## Reuse over reinvention — standing rule
+
+This is a standing user instruction, not a one-off. It applies in every current and
+future session.
+
+- **Default to reuse.** Before writing non-trivial machinery (a database/WAL, an HTTP
+  or WebSocket server, an async runtime, serialization, hashing, an RNG, a rate
+  limiter, a parser, a data structure, etc.), look for a mature, maintained,
+  well-reviewed crate or existing internal module and use it. Do **not** re-implement
+  what a reputable dependency already does well.
+- **Why this rule exists:** (1) it prevents spaghetti code — bespoke reimplementations
+  accrete edge cases and become unmaintainable; (2) it prevents wasted tokens and
+  effort — re-deriving solved problems burns budget for no gain. Reuse keeps the
+  codebase small, auditable, and cheap to evolve.
+- **License constraint — never contaminate our Apache-2.0.** WEBC is licensed
+  Apache-2.0. Only add dependencies under Apache-2.0-compatible permissive licenses
+  (Apache-2.0, MIT, BSD-2/3-Clause, ISC, Zlib, Unlicense, or dual `MIT OR Apache-2.0`).
+  **Never** add a copyleft or source-available dependency that would relicense or
+  restrict our code: no GPL, LGPL, AGPL, MPL-as-a-forced-copyleft, SSPL, BUSL, or
+  "commons clause" crates in shipped code. Verify the SPDX license field (crates.io /
+  the crate's `Cargo.toml` / its LICENSE files) **before** adding it, and record the
+  license in the commit message or code comment when it is security-critical.
+- **Where writing it ourselves IS correct — the rule never blocks building WEBC's own
+  value.** Reuse the commodity plumbing; build the parts that are ours. Specifically:
+  (a) **WEBC-unique / one-of-a-kind protocol logic** — the actual product: the state
+  transition rules, versioned post-quantum authorization, constrained session keys,
+  the economic/staking/slashing rules, parallel state-access model, bridge protocol,
+  and anything novel to WEBC that no dependency implements. These are the reason the
+  project exists; write and own them. (b) the thin *seam/adapter* that lets a
+  commodity dependency be swapped later (the storage `KvStore` trait, the
+  `webc-crypto` boundary) — deliberate decoupling the plan requires, not reinvention.
+  (c) consensus-critical canonical encoding / domain-separated signing payloads that
+  must be byte-identical across Rust and TypeScript and cannot depend on a library's
+  internal format. (d) cases where every candidate dependency is unmaintained,
+  incompatible-licensed, or pulls in unacceptable risk — record why in a comment.
+- **The test to apply:** is this *commodity plumbing* someone already solved well (a
+  DB, a web server, an async runtime, a codec, a hash) → reuse it; or is it *WEBC's own
+  protocol/economic logic or the glue binding a dependency in* → write and own it. When
+  unsure, prefer reuse for infrastructure and ownership for protocol semantics.
+- **Still apply the security rules to dependencies:** pin versions, prefer maintained
+  and widely-used crates, and keep security-critical ones behind a replaceable
+  boundary. Reuse does not mean trust blindly.
 
 ## Security-first implementation rules
 
@@ -155,9 +235,17 @@ Read `docs/implementation-status.md` for the audit summary.
 
 ## Communication with the user
 
-- Speak in simple Korean unless the user requests another language.
+- Speak in simple Korean unless the user requests another language. Address the user as 관리자 (administrator) and use 존댓말 (polite form).
+- Do not flatter or praise the user. State the truth plainly and objectively, even when it is unwelcome. Ground statements in the repository documents and code; avoid speculation, and when something is uncertain or not recorded, say so instead of guessing. Keeping the explanation easy to understand still matters.
 - Lead with the outcome. Explain every unavoidable technical term immediately in ordinary words.
 - Never make a user-owned product or economic decision silently. Present choices, practical advantages, disadvantages, and a recommendation, then wait for confirmation.
+- When a question is genuinely the user's to answer, ask it in plain prose in the
+  chat: lay out the candidate options with their details, pros, and cons in
+  easy-to-understand language, and give a recommendation. Do not use the built-in
+  structured question UI for this; write the question and choices out as text.
+- Decide everything the user has delegated — technical direction, architecture,
+  library, and implementation choices that evidence or tests can settle — yourself,
+  autonomously, without pausing. Only stop for a genuinely user-owned decision.
 - Do not push implementation-only constants onto the user when tests, measurements, or security analysis can decide them.
 - Clearly label what is confirmed, recommended, experimental, unimplemented, or unsafe for real funds.
 
@@ -166,6 +254,29 @@ Read `docs/implementation-status.md` for the audit summary.
 These rules are standing user instructions. They apply in every current and future
 session, including when the user says only “read `AGENTS.md` and continue.”
 
+- **This project always runs in an ephemeral cloud environment.** The container is
+  reclaimed after the session, so anything left only on local disk is lost. The
+  GitHub repository is the single source of truth: push every coherent change to
+  the designated branch, mid-work and again before ending. Never end a turn with
+  committed-but-unpushed work or with valuable uncommitted work.
+- **Commit and push frequently**, not only at the end — after each coherent, tested
+  step. A container reclaim mid-session must never be able to lose more than the
+  last small step.
+- **`.gitignore` excludes only truly regenerable or secret junk** — build artifacts
+  (`/target`, `**/dist`), installed dependencies (`**/node_modules`, `.pnpm-store`),
+  caches/logs, and secrets (`.env`). Everything else — all source, configs, docs,
+  fixtures, lock files, toolchain pins, and any folder future work depends on — is
+  committed. The regenerable folders are safe to ignore ONLY because the lock files
+  (`Cargo.lock`, `pnpm-lock.yaml`), `rust-toolchain.toml`, and `.node-version` are
+  committed and deterministically restore them. Never ignore a folder that cannot
+  be regenerated from committed inputs; if in doubt, commit it (this is a private
+  repo). Do NOT commit `node_modules`/`target`/`dist` themselves — they are huge and
+  platform-specific; keep them restorable instead.
+- A fresh cloud session must be able to restore a working environment from the repo
+  alone. Keep dependency restoration reliable (lock files committed; a SessionStart
+  hook or setup script may run `pnpm install` and `cargo fetch`/build). A
+  devcontainer/Dockerfile is optional — add one only if it is genuinely needed for
+  environment reproducibility, not by default.
 - Treat repository files, not chat memory, as the durable handoff. Never claim that
   unrecorded conversation context can be restored perfectly.
 - At the start of a continuation session, read the required documents in order,
@@ -277,12 +388,56 @@ Phase 0 and Phase 1 are complete, and Phase 2 is active. The exact verified chec
 unfinished task are maintained in `docs/continuation-guide.md` and
 `docs/implementation-status.md`. Continue from there; do not restart completed work.
 
-The next unfinished protocol gate is versioned on-chain account authorization
-with a post-quantum root field, followed by recovery, rotation, revocation, and
-constrained session-key tests.
+The versioned on-chain account authorization gate is now **implemented**: policy
++ post-quantum root field, a real ML-DSA-65 root-**signature** gate on session-key
+install/revoke, constrained session keys (budgets, lane binding, epoch expiry with
+epoch-boundary pruning), primary active-key recovery/rotation, recovery-root
+rotation, the browser/SDK operation + subkey surface with cross-language fixtures,
+and an indicative `webc-node bench`. The only remaining session-key item is
+reference-machine benchmark numbers (this cloud container is not a reference
+machine). See `docs/session-keys-next-steps.md`.
 
-Do not skip directly to RPC, P2P, contract runtime, ZK, or real bridges before
-the Phase 2 wallet wire and secret-isolation acceptance gates pass.
+Durable encrypted per-origin wallet **permission storage** and **automatic
+authorization-lane setup** are now implemented too (`sdk/webc-js/src/permission-store.ts`
+and the `persistence`/`restoredGrants` wiring in `wallet-service.ts`), which was
+the last outstanding Phase 2 wallet-wire/secret-isolation gate. With the
+session-key gate, Phase 2's acceptance conditions are met except reference-machine
+benchmarks.
+
+**Phase 3 is largely complete on the Rust node side** (`crates/webc-storage` +
+`crates/webc-node`): the `KvStore` storage seam with an in-memory backend and a
+durable crash-safe `RedbKvStore` (redb, reused not hand-rolled), a typed
+`ChainStore` with atomic per-block commits and startup consistency checks, a
+restartable single-proposer `Node`, a validating fee-priority `Mempool`, a
+transport-independent `NodeService`, an axum/tokio HTTP+WebSocket API under `/v1`
+with a devnet faucet, and a `webc-node run` command (redb-backed, auto-sealing,
+restart-recovery smoke-tested). Rust gate: 176 tests.
+
+The browser side is done too: `sdk/webc-js/src/node-client.ts` (`WebcNodeClient`,
+a typed HTTP/WS client for `/v1`) and `sdk/webc-js/demo/index.html` (a static
+reference site: create wallet → faucet → proof → signed transfer → live finality
+over WebSocket). Verified end to end against a running node.
+
+**Phase 3 is complete. Phase 4 (networking + signed BFT consensus) is in
+progress**, split into three stages: A-1 networking plumbing, A-2 signed BFT
+consensus core, A-3 robustness.
+
+**Phase 4 A-1 is complete**: a new `crates/webc-net` crate (the swappable
+transport seam) with the WEBC gossip wire format, mutual challenge/response peer
+authentication over Ed25519 identity keys, and authenticated TCP flood gossip
+behind a `NetworkHandle` (reusing tokio + tokio-util framing, owning the protocol
+pieces), plus node glue (`admit_network_transaction`, `AppState::with_network`,
+`run_gossip_pump`, and `webc-node run --p2p-listen/--peer`). A transaction
+submitted to one node reaches every peer's mempool. Rust gate: 192 tests.
+
+**The next step is Phase 4 A-2 (signed BFT consensus core)** in
+`docs/development-plan.md`: extend `NetMessage` with proposals/votes/certs, a
+deterministic leader schedule over a persisted stake snapshot (activating the
+already-wired `Table::ValidatorSets` writer), and signed prevote/precommit
+producing a finality certificate. Do not skip to contract runtime, ZK, or real
+bridges before their own gates. The only broad open item across phases is
+reference-machine benchmark numbers (this cloud container cannot produce them
+honestly). See `docs/continuation-guide.md` for the exact next step.
 
 ## User decisions still required later
 

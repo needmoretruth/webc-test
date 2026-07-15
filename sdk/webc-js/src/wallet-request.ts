@@ -92,6 +92,13 @@ export interface WalletConnectionResult {
   readonly public_key: string;
   /** Deterministic wallet-secret-bound lane assigned only to this origin. */
   readonly authorization_lane: string;
+  /**
+   * Installed on-chain authorization policy revision the wallet is operating
+   * under. The host must echo this exact revision in every signed transfer so a
+   * captured session cannot be replayed across a rotation. Zero means the legacy
+   * migration policy (no installed versioned policy yet).
+   */
+  readonly authorization_policy_revision: number;
   /** Random wallet-issued connection session identifier. */
   readonly session_id: string;
   readonly scopes: readonly WalletPermissionScope[];
@@ -155,10 +162,17 @@ export interface WalletTransferConfirmation {
   readonly authorization_policy_revision: number;
 }
 
+/** User-visible revocation shown before clearing an origin's grant. */
+export interface WalletRevocationConfirmation {
+  readonly kind: "revoke";
+  readonly origin: string;
+}
+
 /** Every trusted UI confirmation shape. */
 export type WalletConfirmation =
   | WalletConnectionConfirmation
-  | WalletTransferConfirmation;
+  | WalletTransferConfirmation
+  | WalletRevocationConfirmation;
 
 /** Parsed numeric spend limits used only inside the trusted service. */
 export interface ParsedSpendLimits {

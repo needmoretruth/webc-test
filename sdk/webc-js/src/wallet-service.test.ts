@@ -14,6 +14,10 @@ import {
   type WalletIncomingMessage,
   type WalletMessageSource,
 } from "./wallet-service";
+import type {
+  PermissionPersistencePort,
+  PersistedPermissionGrant,
+} from "./permission-store";
 import { verifySignedTransaction } from "./transaction";
 import { createDevnetWalletFromMnemonic } from "./wallet-derivation";
 import type { WebcWallet } from "./wallet";
@@ -317,5 +321,247 @@ describe("host client and trusted service", () => {
     expect(await verifySignedTransaction(signed)).toBe(true);
     await client.revoke();
     client.close();
+  });
+});
+
+/** Reads back a connection result from the last captured response. */
+function lastConnection(source: CapturingSource): {
+  lane: string;
+  sessionId: string;
+} {
+  const response = source.messages.at(-1)?.response;
+  if (!response?.ok || !("session_id" in response.result)) {
+    throw new Error("expected connection result");
+  }
+  return {
+    lane: response.result.authorization_lane,
+    sessionId: response.result.session_id,
+  };
+}
+
+describe("trusted wallet service persistence", () => {
+  it("persists grants and carries cumulative spend across a restart and reconnect", async () => {
+    let saved: readonly PersistedPermissionGrant[] = [];
+    const persistence: PermissionPersistencePort = {
+      async save(records) {
+        saved = records;
+      },
+    };
+
+    // First wallet session: connect, then spend 2 WEBC of the 2.5 WEBC cap.
+    const source1 = new CapturingSource();
+    const service1 = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source1,
+      confirm: async () => true,
+      persistence,
+    });
+    await service1.handleMessage({
+      origin: HOST_ORIGIN,
+      source: source1,
+      data: connectRequest(requestId("1")),
+    });
+    const first = lastConnection(source1);
+    await service1.handleMessage({
+      origin: HOST_ORIGIN,
+      source: source1,
+      data: transferRequest(requestId("2"), first.lane, first.sessionId, 0, "2000000000000"),
+    });
+    expect(source1.messages.at(-1)?.response.ok).toBe(true);
+    // The durable snapshot records the 2 WEBC cumulative spend for this origin.
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.origin).toBe(HOST_ORIGIN);
+    expect(saved[0]?.spent_amount).toBe("2000000000000");
+
+    // Second wallet session restores the snapshot and the origin reconnects.
+    const source2 = new CapturingSource();
+    const service2 = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source2,
+      confirm: async () => true,
+      persistence,
+      restoredGrants: saved,
+    });
+    await service2.handleMessage({
+      origin: HOST_ORIGIN,
+      source: source2,
+      data: connectRequest(requestId("3")),
+    });
+    const second = lastConnection(source2);
+    // The lane is deterministic, so it is identical across the restart.
+    expect(second.lane).toBe(first.lane);
+
+    // Only 0.5 WEBC of the 2.5 WEBC cumulative cap remains. A 1 WEBC transfer
+    // must be rejected: the carried-over spend was not reset by reconnecting.
+    await service2.handleMessage({
+      origin: HOST_ORIGIN,
+      source: source2,
+      data: transferRequest(requestId("4"), second.lane, second.sessionId, 0, "1000000000000"),
+    });
+    const rejected = source2.messages.at(-1)?.response;
+    expect(rejected?.ok).toBe(false);
+    if (rejected && !rejected.ok) expect(rejected.error.code).toBe("LIMIT_EXCEEDED");
+  });
+
+  it("rolls back the spend when the durable write fails, then succeeds on retry", async () => {
+    let failNextSave = false;
+    let saved: readonly PersistedPermissionGrant[] = [];
+    const persistence: PermissionPersistencePort = {
+      async save(records) {
+        if (failNextSave) {
+          failNextSave = false;
+          throw new Error("simulated storage failure");
+        }
+        saved = records;
+      },
+    };
+    const source = new CapturingSource();
+    const service = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source,
+      confirm: async () => true,
+      persistence,
+    });
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: connectRequest(requestId("1")),
+    });
+    const { lane, sessionId } = lastConnection(source);
+
+    // The next save (the spend) fails; the request must report INTERNAL_ERROR
+    // and roll back both the spend and the sequence.
+    failNextSave = true;
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: transferRequest(requestId("2"), lane, sessionId, 0),
+    });
+    const failed = source.messages.at(-1)?.response;
+    expect(failed?.ok).toBe(false);
+    if (failed && !failed.ok) expect(failed.error.code).toBe("INTERNAL_ERROR");
+
+    // Retrying the same sequence now succeeds, proving the sequence rolled back.
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: transferRequest(requestId("3"), lane, sessionId, 0),
+    });
+    const retried = source.messages.at(-1)?.response;
+    expect(retried?.ok).toBe(true);
+    if (retried?.ok && "signature" in retried.result) {
+      expect(await verifySignedTransaction(retried.result)).toBe(true);
+    }
+    expect(saved[0]?.spent_amount).toBe("1000000000000");
+  });
+
+  it("re-validates restoredGrants and rejects a budget-widening negative spend", async () => {
+    // A caller that bypasses the store and hands the constructor a hostile grant
+    // with a negative cumulative spend must be rejected, not trusted: otherwise
+    // `spentAmount` would go negative and widen the effective cumulative cap.
+    const hostile: PersistedPermissionGrant[] = [
+      {
+        origin: HOST_ORIGIN,
+        authorization_lane: "a".repeat(64),
+        scopes: ["sign_native_transfer"],
+        limits: LIMITS,
+        spent_amount: "-100",
+      },
+    ];
+    expect(
+      () =>
+        new TrustedWalletService({
+          wallet,
+          chainId: CHAIN_ID,
+          expectedSource: new CapturingSource(),
+          confirm: async () => true,
+          restoredGrants: hostile,
+        }),
+    ).toThrow();
+  });
+
+  it("requires user confirmation to revoke, preserving spend when rejected", async () => {
+    const source = new CapturingSource();
+    let confirmRevoke = false;
+    const service = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source,
+      confirm: async (confirmation) =>
+        confirmation.kind === "revoke" ? confirmRevoke : true,
+    });
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: connectRequest(requestId("1")),
+    });
+    const { lane, sessionId } = lastConnection(source);
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: transferRequest(requestId("2"), lane, sessionId, 0, "2000000000000"),
+    });
+    expect(source.messages.at(-1)?.response.ok).toBe(true);
+
+    // A host-driven revoke the user rejects must not clear the grant.
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: {
+        channel: WALLET_MESSAGE_CHANNEL,
+        version: WALLET_MESSAGE_VERSION,
+        request_id: requestId("3"),
+        method: "revoke",
+        params: {},
+      },
+    });
+    const rejected = source.messages.at(-1)?.response;
+    expect(rejected?.ok).toBe(false);
+    if (rejected && !rejected.ok) expect(rejected.error.code).toBe("USER_REJECTED");
+
+    // The grant (and its 2 WEBC spend) survives: a further 1 WEBC transfer that
+    // would exceed the 2.5 WEBC cumulative cap is still rejected as over-limit,
+    // proving the spend was not reset by the rejected revoke.
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: transferRequest(requestId("4"), lane, sessionId, 1, "1000000000000"),
+    });
+    const overLimit = source.messages.at(-1)?.response;
+    expect(overLimit?.ok).toBe(false);
+    if (overLimit && !overLimit.ok) expect(overLimit.error.code).toBe("LIMIT_EXCEEDED");
+  });
+
+  it("keeps a restored grant dormant until the origin reconnects", async () => {
+    const restored: PersistedPermissionGrant[] = [
+      {
+        origin: HOST_ORIGIN,
+        authorization_lane: "a".repeat(64),
+        scopes: ["sign_native_transfer"],
+        limits: LIMITS,
+        spent_amount: "0",
+      },
+    ];
+    const source = new CapturingSource();
+    const service = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source,
+      confirm: async () => true,
+      restoredGrants: restored,
+    });
+    // A signing attempt on the restored lane without reconnecting has no live
+    // session, so it is rejected as stale rather than honored.
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: transferRequest(requestId("9"), "a".repeat(64), "f".repeat(64), 0),
+    });
+    const response = source.messages.at(-1)?.response;
+    expect(response?.ok).toBe(false);
+    if (response && !response.ok) expect(response.error.code).toBe("REQUEST_REPLAY");
   });
 });

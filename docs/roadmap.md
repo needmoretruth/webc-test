@@ -11,7 +11,7 @@ The authoritative detailed roadmap is [`development-plan.md`](development-plan.m
 5. Build networking and stake-based BFT consensus.
 6. Implement correct staking, delegation, rewards, unbonding, and slashing.
 7. Add enforced access lists, parallel execution, app isolation, and localized fees.
-8. Benchmark restricted WASM/Rust, Move VM, and EVM compatibility before choosing the public contract runtime.
+8. Build the contract runtime on the chosen Rust->WASM foundation, then the WEBC high-level authoring language (lowering to the audited Rust framework), its anti-complexity tooling, AI-readable component catalog, and the native staked oracle.
 9. Add compact browser proofs and versioned post-quantum authorization.
 10. Complete the browser wallet, SDK, widget, and site-agent protocol.
 11. Add native tokens, NFTs, application rules, and optional token governance.
@@ -22,7 +22,15 @@ The authoritative detailed roadmap is [`development-plan.md`](development-plan.m
 
 ## Immediate milestone
 
-Phase 0 and Phase 1 are complete. Implement Phase 2 wallet derivation, encrypted
-storage, origin isolation, authorization policy, recovery, and post-quantum
-prototype gates. Do not build RPC, networking, ZK, or real bridges before the
-wallet security foundation passes its acceptance tests.
+Phases 0-3 are complete (single-node state machine, wallet/security foundation,
+durable node + storage + developer APIs). **Phase 4 (networking and signed BFT
+consensus) is active**: the P2P networking plumbing and authenticated transaction
+gossip are done, and the deterministic stake-weighted leader schedule is done; the
+signed prevote/precommit round machine and finality certificate are next. See
+`continuation-guide.md` for the exact next task.
+
+The AI-era product direction (a WEBC high-level contract language that lowers to
+the audited Rust/WASM layer, a native staked oracle, capped fee sponsorship,
+anti-complexity contract tooling, and prioritized Ethereum/Solana bridges) is
+recorded in `decision-record.md` and slotted into the phases above; it is built
+after consensus is stable.

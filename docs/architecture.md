@@ -64,9 +64,9 @@ The scheduler may execute independent work concurrently, but consensus commits o
 
 ## Smart-contract path
 
-Security-critical operations begin as audited Rust native modules. The public contract runtime is not selected yet. Restricted WASM/Rust, Move VM, and EVM/Solidity compatibility will be benchmarked for safety, browser tooling, parallel access declarations, performance, and maintenance.
+Security-critical operations begin as audited Rust native modules. The contract execution foundation is restricted, deterministic WASM with Rust as the first authoring language. Above it, WEBC provides its own high-level authoring language that lowers (transpiles) to an audited Rust framework, inheriting Rust/WASM safety and performance without a second VM or a hand-written compiler backend. Move VM and EVM are not the native runtime; Ethereum/Solana compatibility comes through bridges. A contract linter/analyzer and a pre-deploy review keep contracts small and maintainable.
 
-Contracts cannot access websites, files, device randomness, or wall-clock time directly. They communicate with browser or server agents through events and signed receipts.
+Contracts cannot access websites, files, device randomness, or wall-clock time directly. They communicate with browser or server agents through events and signed receipts, and read external data through a native staked oracle (reporters stake, values are aggregated, wrong reports are slashed) so every node computes the same result.
 
 ## Proofs and browser clients
 

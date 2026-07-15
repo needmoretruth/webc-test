@@ -9,11 +9,17 @@
 
 use crate::account::Account;
 use crate::authorization::AuthorizationLane;
-use crate::authorization_policy::AccountAuthorizationPolicy;
+use crate::authorization_policy::{
+    active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
+};
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy};
 use crate::genesis::GenesisConfig;
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
+use crate::session_key::{
+    session_key_authorization_message, SessionAllowedOperations, SessionKey,
+    SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyId,
+};
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
 };
@@ -46,6 +52,9 @@ pub struct ChainConfig {
     pub slashing: SlashingPolicy,
     pub inflation: InflationSchedule,
     pub bridge: BridgeConfig,
+    /// Constrained session-key lifetime and per-account count limits.
+    #[serde(default)]
+    pub session_keys: SessionKeyConfig,
 }
 
 impl Default for ChainConfig {
@@ -59,6 +68,7 @@ impl Default for ChainConfig {
             slashing: SlashingPolicy::default(),
             inflation: InflationSchedule::default(),
             bridge: BridgeConfig::default(),
+            session_keys: SessionKeyConfig::default(),
         }
     }
 }
@@ -147,6 +157,50 @@ pub enum Event {
         /// Committed post-quantum recovery root, not a verification claim.
         post_quantum_root: crate::PostQuantumRoot,
     },
+    SessionKeyInstalled {
+        /// Account that owns the new session key.
+        owner: Address,
+        /// Opaque session-key identity.
+        session_key: SessionKeyId,
+        /// Absolute last epoch the key may be used.
+        expires_after_epoch: Epoch,
+    },
+    SessionKeyRevoked {
+        /// Account whose session key was removed.
+        owner: Address,
+        /// Opaque identity of the revoked session key.
+        session_key: SessionKeyId,
+    },
+    SessionKeyExpired {
+        /// Account whose session key was pruned at an epoch boundary.
+        owner: Address,
+        /// Opaque identity of the expired session key.
+        session_key: SessionKeyId,
+    },
+    ActiveTransactionKeyRotated {
+        /// Account whose active transaction key was replaced.
+        owner: Address,
+        /// Revision after rotation; every prior-revision session key is now dead.
+        new_revision: crate::AuthorizationPolicyRevision,
+        /// New Ed25519 key now authorizing ordinary transactions.
+        new_active_transaction_key: webc_crypto::PublicKeyBytes,
+    },
+    PostQuantumRootRotated {
+        /// Account whose post-quantum recovery root was replaced.
+        owner: Address,
+        /// Revision after rotation; every prior-revision session key is now dead.
+        new_revision: crate::AuthorizationPolicyRevision,
+        /// New committed recovery root now required for critical actions.
+        new_post_quantum_root: crate::PostQuantumRoot,
+    },
+    SessionKeyUsed {
+        /// Account that owns the session key.
+        owner: Address,
+        /// Opaque identity of the session key that authorized the transaction.
+        session_key: SessionKeyId,
+        /// Native principal moved under this use.
+        amount: Amount,
+    },
     ObjectCreated {
         object_id: ObjectId,
         namespace: Hash256,
@@ -214,6 +268,12 @@ pub struct ChainState {
     pub authorization_policies: BTreeMap<Address, AccountAuthorizationPolicy>,
     /// Non-default wallet lanes with independent nonce and prepaid fee state.
     pub authorization_lanes: BTreeMap<(Address, AuthorizationLaneId), AuthorizationLane>,
+    /// Constrained session keys delegated under each account's policy.
+    ///
+    /// Keyed by owner and opaque session-key id. Records hold constraints and
+    /// cumulative spend, never funds, so they do not enter supply reconciliation.
+    #[serde(default)]
+    pub session_keys: BTreeMap<(Address, SessionKeyId), SessionKey>,
     /// Persistent versioned application/NFT objects keyed by stable identity.
     pub objects: BTreeMap<ObjectId, StateObject>,
     pub validators: BTreeMap<Address, Validator>,
@@ -290,6 +350,24 @@ enum IncomingBridgeAction {
     ReleaseNative,
 }
 
+/// Which account authority approved a verified transaction.
+///
+/// Returned by `verify_transaction_authorization` and consumed by execution so
+/// session-key constraint enforcement runs only for session-signed transactions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionAuthorization {
+    /// The account's active transaction key, or its legacy address-derived key.
+    AccountKey,
+    /// A registered constrained session key, identified for constraint checks.
+    SessionKey(SessionKeyId),
+    /// A recovery/rotation transaction whose envelope is signed by the *new*
+    /// active key. Its real authority is the post-quantum root signature, which
+    /// the `RotateActiveTransactionKey` arm verifies before mutating the policy.
+    /// Produced only for that operation and only when the signing key equals the
+    /// proposed new key, so a stranger's key can never take this path.
+    PostQuantumRootRecovery,
+}
+
 impl Default for ChainState {
     fn default() -> Self {
         Self {
@@ -298,6 +376,7 @@ impl Default for ChainState {
             accounts: BTreeMap::new(),
             authorization_policies: BTreeMap::new(),
             authorization_lanes: BTreeMap::new(),
+            session_keys: BTreeMap::new(),
             objects: BTreeMap::new(),
             validators: BTreeMap::new(),
             delegations: BTreeMap::new(),
@@ -505,10 +584,10 @@ impl ChainState {
             return Err(ChainError::TransactionChainIdMismatch);
         }
         tx.verify()?;
-        self.verify_transaction_authorization(tx)?;
+        let authorization = self.verify_transaction_authorization(tx)?;
         let tx_hash = tx.hash()?;
         let mut next = self.clone();
-        let receipt = next.apply_verified_transaction(tx, config, tx_hash)?;
+        let receipt = next.apply_verified_transaction(tx, config, tx_hash, authorization)?;
         *self = next;
         Ok(receipt)
     }
@@ -520,7 +599,10 @@ impl ChainState {
     /// first policy. Installed accounts require an exact revision and active
     /// key match; address derivation is no longer consulted, allowing later key
     /// rotation without changing the stable account address.
-    fn verify_transaction_authorization(&self, tx: &Transaction) -> Result<(), ChainError> {
+    fn verify_transaction_authorization(
+        &self,
+        tx: &Transaction,
+    ) -> Result<TransactionAuthorization, ChainError> {
         tx.authorization_policy_revision.validate()?;
         let Some(policy) = self.authorization_policies.get(&tx.sender) else {
             if tx.authorization_policy_revision != LEGACY_AUTHORIZATION_POLICY_REVISION {
@@ -532,7 +614,7 @@ impl ChainState {
             if Address::from_public_key(&tx.public_key) != tx.sender {
                 return Err(ChainError::SenderPublicKeyMismatch);
             }
-            return Ok(());
+            return Ok(TransactionAuthorization::AccountKey);
         };
 
         policy.validate()?;
@@ -542,10 +624,44 @@ impl ChainState {
                 actual: tx.authorization_policy_revision.get(),
             });
         }
-        if &tx.public_key != policy.active_transaction_key() {
+        if &tx.public_key == policy.active_transaction_key() {
+            return Ok(TransactionAuthorization::AccountKey);
+        }
+
+        // Recovery/rotation may be signed by the *new* key so a lost or
+        // compromised active key can still be replaced. The envelope signature
+        // only proves control of the proposed new key here; the real authority
+        // is the post-quantum root signature verified in the rotation arm. Any
+        // other signer for this operation is rejected, and this path is reachable
+        // for no other operation.
+        if let Operation::RotateActiveTransactionKey {
+            new_active_transaction_key,
+            ..
+        } = &tx.operation
+        {
+            if &tx.public_key == new_active_transaction_key {
+                return Ok(TransactionAuthorization::PostQuantumRootRecovery);
+            }
             return Err(ChainError::AuthorizationKeyMismatch);
         }
-        Ok(())
+
+        // The active key did not sign. The only other acceptable signer is a
+        // registered, policy-current, lane-bound session key. Expiry and spend
+        // limits are enforced in execution, where the operation and epoch are in
+        // hand and rollback is atomic; here we only bind the key to the account.
+        let id = SessionKeyId::derive(&tx.public_key);
+        let Some(session) = self.session_keys.get(&(tx.sender, id)) else {
+            return Err(ChainError::AuthorizationKeyMismatch);
+        };
+        if session.session_public_key != tx.public_key
+            || session.policy_revision != policy.revision()
+        {
+            return Err(ChainError::AuthorizationKeyMismatch);
+        }
+        if tx.authorization_lane != session.constraints.authorization_lane {
+            return Err(ChainError::SessionKeyLaneMismatch);
+        }
+        Ok(TransactionAuthorization::SessionKey(id))
     }
 
     /// Commits the next deterministic base fee after a completed block.
@@ -801,6 +917,29 @@ impl ChainState {
             }
         }
         self.current_epoch = next_epoch;
+
+        // Epoch-boundary pruning of expired session keys. A key is usable while
+        // `current_epoch <= expires_after_epoch`; once the epoch passes it, the
+        // key can never authorize again (epochs only ever increase), so removing
+        // it is safe. The use-time check already rejects expired keys, so this
+        // changes no authorization outcome — it only reclaims space and bounds
+        // session-key map growth. It is deterministic: `next_epoch` is committed
+        // state, iteration is sorted, and it is a pure function of the snapshot,
+        // so replaying from a serialized state prunes identically.
+        let expired: Vec<(Address, SessionKeyId)> = self
+            .session_keys
+            .iter()
+            .filter(|(_, session)| session.expires_after_epoch.get() < next_epoch)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expired {
+            self.session_keys.remove(&key);
+            events.push(Event::SessionKeyExpired {
+                owner: key.0,
+                session_key: key.1,
+            });
+        }
+
         Ok(events)
     }
 
@@ -819,6 +958,7 @@ impl ChainState {
             account_root: Hash256,
             authorization_policy_root: Hash256,
             authorization_lane_root: Hash256,
+            session_key_root: Hash256,
             object_root: Hash256,
             validator_root: Hash256,
             delegation_root: Hash256,
@@ -838,7 +978,7 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            domain: "WEBC_STATE_COMMITMENT_V5",
+            domain: "WEBC_STATE_COMMITMENT_V6",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -849,6 +989,10 @@ impl ChainState {
             authorization_lane_root: ordered_value_root(
                 b"WEBC_AUTHORIZATION_LANE_LEAF_V1",
                 self.authorization_lanes.iter(),
+            )?,
+            session_key_root: ordered_value_root(
+                b"WEBC_SESSION_KEY_LEAF_V1",
+                self.session_keys.iter(),
             )?,
             object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V1", self.objects.iter())?,
             validator_root: ordered_value_root(b"WEBC_VALIDATOR_LEAF_V1", self.validators.iter())?,
@@ -965,13 +1109,19 @@ impl ChainState {
         tx: &Transaction,
         config: &ChainConfig,
         tx_hash: Hash256,
+        authorization: TransactionAuthorization,
     ) -> Result<Receipt, ChainError> {
         let mut access =
             StateAccessRecorder::new(&tx.access_list.read_only, &tx.access_list.read_write)?;
         // Authorization policy is consensus state even though it is consulted
         // before mutation. Ordinary transactions read it; first installation
         // writes the same key and therefore conflicts with concurrent spends.
-        if matches!(&tx.operation, Operation::InstallAuthorizationPolicy { .. }) {
+        if matches!(
+            &tx.operation,
+            Operation::InstallAuthorizationPolicy { .. }
+                | Operation::RotateActiveTransactionKey { .. }
+                | Operation::RotatePostQuantumRoot { .. }
+        ) {
             access.write(StateKey::authorization_policy(tx.sender))?;
         } else {
             access.read(StateKey::authorization_policy(tx.sender))?;
@@ -1074,6 +1224,13 @@ impl ChainState {
             breakdown: fee,
         }];
 
+        // A session key authorizes only within its fixed constraints. This runs
+        // before the operation mutates balances; any failure rolls back the
+        // whole transaction because execution is applied to a cloned overlay.
+        if let TransactionAuthorization::SessionKey(id) = authorization {
+            self.enforce_session_key_use(tx, id, total_fee, &mut access, &mut events)?;
+        }
+
         match &tx.operation {
             Operation::InstallAuthorizationPolicy { post_quantum_root } => {
                 if !tx.authorization_lane.is_default() {
@@ -1082,10 +1239,7 @@ impl ChainState {
                 if self.authorization_policies.contains_key(&tx.sender) {
                     return Err(ChainError::AuthorizationPolicyAlreadyExists);
                 }
-                let policy = AccountAuthorizationPolicy::new_v1(
-                    tx.public_key,
-                    *post_quantum_root,
-                )?;
+                let policy = AccountAuthorizationPolicy::new_v1(tx.public_key, *post_quantum_root)?;
                 let revision = policy.revision();
                 self.authorization_policies.insert(tx.sender, policy);
                 events.push(Event::AuthorizationPolicyInstalled {
@@ -1140,6 +1294,241 @@ impl ChainState {
                     owner: tx.sender,
                     lane: *lane,
                     fee_deposit: *fee_deposit,
+                });
+            }
+            Operation::InstallSessionKey {
+                session_public_key,
+                constraints,
+                post_quantum_root_reveal,
+            } => {
+                // Installing a session key is a critical action: it must use the
+                // default lane and prove knowledge of the account's committed
+                // post-quantum root. A legacy account without a policy has no
+                // root to gate the action and therefore cannot own session keys.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+                }
+                let (policy_revision, root) = {
+                    let policy = self
+                        .authorization_policies
+                        .get(&tx.sender)
+                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+                    policy.validate()?;
+                    (policy.revision(), *policy.post_quantum_root())
+                };
+                // The root must sign this exact install (its lane-bound
+                // constraints and session key) under the current policy revision
+                // and account nonce, not merely prove knowledge of the public
+                // root key. A signature captured for any other action, nonce, or
+                // policy revision rebuilds a different message and fails here.
+                let authorization = SessionKeyAuthorizationAction::Install {
+                    session_public_key: *session_public_key,
+                    constraints: constraints.clone(),
+                };
+                let message = session_key_authorization_message(
+                    &config.chain_id,
+                    tx.sender,
+                    policy_revision,
+                    tx.nonce,
+                    &authorization,
+                )?;
+                if !post_quantum_root_reveal.verify(&root, &message)? {
+                    return Err(ChainError::InvalidPostQuantumRootReveal);
+                }
+                constraints.validate()?;
+                if constraints.lifetime_epochs > config.session_keys.max_lifetime_epochs {
+                    return Err(ChainError::SessionKeyLifetimeTooLong);
+                }
+                // Expiry is an absolute epoch derived from the install epoch, so
+                // the deadline never depends on a wall clock.
+                let expires_after_epoch = Epoch::new(
+                    self.current_epoch
+                        .checked_add(constraints.lifetime_epochs)
+                        .ok_or(ChainError::ArithmeticOverflow)?,
+                );
+                let id = SessionKeyId::derive(session_public_key);
+                access.write(StateKey::session_key(tx.sender, id))?;
+                if self.session_keys.contains_key(&(tx.sender, id)) {
+                    return Err(ChainError::SessionKeyAlreadyExists);
+                }
+                let installed = self
+                    .session_keys
+                    .keys()
+                    .filter(|(owner, _)| *owner == tx.sender)
+                    .count();
+                if installed >= config.session_keys.max_session_keys_per_account as usize {
+                    return Err(ChainError::SessionKeyLimitExceeded);
+                }
+                let record = SessionKey::new(
+                    tx.sender,
+                    *session_public_key,
+                    policy_revision,
+                    constraints.clone(),
+                    expires_after_epoch,
+                )?;
+                self.session_keys.insert((tx.sender, id), record);
+                events.push(Event::SessionKeyInstalled {
+                    owner: tx.sender,
+                    session_key: id,
+                    expires_after_epoch,
+                });
+            }
+            Operation::RevokeSessionKey {
+                session_key,
+                post_quantum_root_reveal,
+            } => {
+                // Revocation is immediate and unconditional so a compromised key
+                // can be killed at once. It is a critical action under the same
+                // default-lane and post-quantum-root gate as installation.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+                }
+                let (policy_revision, root) = {
+                    let policy = self
+                        .authorization_policies
+                        .get(&tx.sender)
+                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+                    policy.validate()?;
+                    (policy.revision(), *policy.post_quantum_root())
+                };
+                // Revocation is gated by the same root signature as installation,
+                // bound to this exact session-key id, policy revision, and nonce.
+                let authorization = SessionKeyAuthorizationAction::Revoke {
+                    session_key: *session_key,
+                };
+                let message = session_key_authorization_message(
+                    &config.chain_id,
+                    tx.sender,
+                    policy_revision,
+                    tx.nonce,
+                    &authorization,
+                )?;
+                if !post_quantum_root_reveal.verify(&root, &message)? {
+                    return Err(ChainError::InvalidPostQuantumRootReveal);
+                }
+                access.write(StateKey::session_key(tx.sender, *session_key))?;
+                if self
+                    .session_keys
+                    .remove(&(tx.sender, *session_key))
+                    .is_none()
+                {
+                    return Err(ChainError::SessionKeyNotFound);
+                }
+                events.push(Event::SessionKeyRevoked {
+                    owner: tx.sender,
+                    session_key: *session_key,
+                });
+            }
+            Operation::RotateActiveTransactionKey {
+                new_active_transaction_key,
+                post_quantum_root_reveal,
+            } => {
+                // Rotating the sole active key is the account recovery path and a
+                // critical action: default lane, an installed policy with a
+                // post-quantum root, and a real root signature over this exact
+                // rotation. A legacy account without a policy has no root to gate
+                // the change and therefore cannot rotate this way.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::ActiveKeyRotationRequiresDefaultLane);
+                }
+                let (policy_revision, root, current_active) = {
+                    let policy = self
+                        .authorization_policies
+                        .get(&tx.sender)
+                        .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?;
+                    policy.validate()?;
+                    (
+                        policy.revision(),
+                        *policy.post_quantum_root(),
+                        *policy.active_transaction_key(),
+                    )
+                };
+                // A no-op rotation would waste a revision and could be used to
+                // grief outstanding session keys without any real key change.
+                if *new_active_transaction_key == current_active {
+                    return Err(ChainError::ActiveKeyRotationToSameKey);
+                }
+                // The root must sign this exact new key under the current policy
+                // revision and account nonce. A signature captured for any other
+                // key, nonce, or revision rebuilds a different message and fails,
+                // so it cannot be replayed after this rotation bumps the revision.
+                let message = active_key_rotation_message(
+                    &config.chain_id,
+                    tx.sender,
+                    policy_revision,
+                    tx.nonce,
+                    new_active_transaction_key,
+                )?;
+                if !post_quantum_root_reveal.verify(&root, &message)? {
+                    return Err(ChainError::InvalidPostQuantumRootReveal);
+                }
+                // The policy state key was already recorded as a write at the top
+                // of apply, so the rotation conflicts with concurrent spends.
+                let rotated = self
+                    .authorization_policies
+                    .get(&tx.sender)
+                    .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?
+                    .rotate_active_key(*new_active_transaction_key)?;
+                let new_revision = rotated.revision();
+                self.authorization_policies.insert(tx.sender, rotated);
+                events.push(Event::ActiveTransactionKeyRotated {
+                    owner: tx.sender,
+                    new_revision,
+                    new_active_transaction_key: *new_active_transaction_key,
+                });
+            }
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root,
+                post_quantum_root_reveal,
+            } => {
+                // Replacing the recovery root is a critical action gated on a
+                // signature by the CURRENT root, so only the present recovery-root
+                // holder can change it. The envelope is signed by the active key
+                // (the AccountKey path), so a stolen root alone cannot rotate the
+                // root without also holding the active key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::PostQuantumRootRotationRequiresDefaultLane);
+                }
+                let (policy_revision, current_root) = {
+                    let policy = self
+                        .authorization_policies
+                        .get(&tx.sender)
+                        .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?;
+                    policy.validate()?;
+                    (policy.revision(), *policy.post_quantum_root())
+                };
+                new_post_quantum_root.validate()?;
+                // A no-op rotation would waste a revision and needlessly grief
+                // outstanding session keys without changing the root.
+                if *new_post_quantum_root == current_root {
+                    return Err(ChainError::PostQuantumRootRotationToSameRoot);
+                }
+                // The CURRENT root must sign this exact new commitment under the
+                // current revision and nonce. A signature captured for any other
+                // root, nonce, or revision rebuilds a different message and fails.
+                let message = post_quantum_root_rotation_message(
+                    &config.chain_id,
+                    tx.sender,
+                    policy_revision,
+                    tx.nonce,
+                    new_post_quantum_root,
+                )?;
+                if !post_quantum_root_reveal.verify(&current_root, &message)? {
+                    return Err(ChainError::InvalidPostQuantumRootReveal);
+                }
+                // The policy state key was already recorded as a write at the top
+                // of apply, so the rotation conflicts with concurrent spends.
+                let rotated = self
+                    .authorization_policies
+                    .get(&tx.sender)
+                    .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?
+                    .rotate_post_quantum_root(*new_post_quantum_root)?;
+                let new_revision = rotated.revision();
+                self.authorization_policies.insert(tx.sender, rotated);
+                events.push(Event::PostQuantumRootRotated {
+                    owner: tx.sender,
+                    new_revision,
+                    new_post_quantum_root: *new_post_quantum_root,
                 });
             }
             Operation::CreateObject {
@@ -1207,6 +1596,11 @@ impl ChainState {
                 });
             }
             Operation::Transfer { to, amount } => {
+                // The sender account is debited for the principal. On the default
+                // lane the fee step already recorded this write, but on a
+                // non-default lane fees come from the lane, so record it here or
+                // the signed access list's sender-account entry stays unused.
+                access.write(StateKey::account(tx.sender))?;
                 access.write(StateKey::account(*to))?;
                 self.debit_native(tx.sender, *amount)?;
                 self.credit_native(*to, *amount)?;
@@ -1864,6 +2258,75 @@ impl ChainState {
         Ok(())
     }
 
+    /// Enforces a session key's constraints and advances its cumulative spend.
+    ///
+    /// Runs during execution before the operation mutates balances. Every
+    /// failure returns a typed error and, because execution runs on a cloned
+    /// overlay, rolls back the entire transaction. A session key never gains
+    /// authority beyond its declared lane, operations, per-use amount,
+    /// cumulative budget, per-use fee, and expiry epoch. The lane binding was
+    /// already checked in `verify_transaction_authorization`.
+    fn enforce_session_key_use(
+        &mut self,
+        tx: &Transaction,
+        id: SessionKeyId,
+        total_fee: Amount,
+        access: &mut StateAccessRecorder,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
+        access.write(StateKey::session_key(tx.sender, id))?;
+        let session = self
+            .session_keys
+            .get(&(tx.sender, id))
+            .ok_or(ChainError::SessionKeyNotFound)?;
+        if self.current_epoch > session.expires_after_epoch.get() {
+            return Err(ChainError::SessionKeyExpired);
+        }
+        let principal =
+            session_permitted_principal(&tx.operation, session.constraints.allowed_operations)?;
+        if principal > session.constraints.max_amount_per_use {
+            return Err(ChainError::SessionKeyAmountExceeded);
+        }
+        let next_spent = session
+            .spent_amount
+            .checked_add(principal)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if next_spent > session.constraints.total_amount_budget {
+            return Err(ChainError::SessionKeyBudgetExceeded);
+        }
+        // Bound the maximum fee the transaction authorizes, independent of the
+        // current base fee, matching the off-chain grant's per-transaction cap.
+        let max_fee = Amount(
+            u128::from(tx.fee.gas_limit)
+                .checked_mul(u128::from(tx.fee.max_fee_per_unit))
+                .ok_or(ChainError::ArithmeticOverflow)?,
+        );
+        if max_fee > session.constraints.max_fee_per_use {
+            return Err(ChainError::SessionKeyFeeExceeded);
+        }
+        // Bound cumulative fees on the fee actually charged, so a compromised key
+        // cannot drain the account through fees on unlimited tiny transfers.
+        let next_fees = session
+            .spent_fees
+            .checked_add(total_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if next_fees > session.constraints.total_fee_budget {
+            return Err(ChainError::SessionKeyFeeBudgetExceeded);
+        }
+        let record = self
+            .session_keys
+            .get_mut(&(tx.sender, id))
+            .ok_or(ChainError::SessionKeyNotFound)?;
+        record.spent_amount = next_spent;
+        record.spent_fees = next_fees;
+        events.push(Event::SessionKeyUsed {
+            owner: tx.sender,
+            session_key: id,
+            amount: principal,
+        });
+        Ok(())
+    }
+
     fn account_mut(&mut self, address: Address) -> Result<&mut Account, ChainError> {
         self.accounts
             .get_mut(&address)
@@ -1988,6 +2451,22 @@ fn validate_owned_object(
     Ok(())
 }
 
+/// Returns the native principal a session key would move for an operation, or
+/// rejects an operation kind the session key is not permitted to authorize.
+///
+/// v1 permits only native transfers. Critical, staking, bridge, object, and
+/// lane/policy operations are never delegable to a session key, so they fall
+/// through to a rejection regardless of the grant's allow-list.
+fn session_permitted_principal(
+    operation: &Operation,
+    allowed: SessionAllowedOperations,
+) -> Result<Amount, ChainError> {
+    match operation {
+        Operation::Transfer { amount, .. } if allowed.transfer => Ok(*amount),
+        _ => Err(ChainError::SessionKeyOperationNotPermitted),
+    }
+}
+
 fn ordered_value_root<'a, K, V, I>(domain: &'static [u8], entries: I) -> Result<Hash256, ChainError>
 where
     K: Serialize + 'a,
@@ -2028,12 +2507,17 @@ fn leaf_hash<T: Serialize + ?Sized>(
 mod tests {
     use super::*;
     use crate::{
-        AuthorizationPolicyRevision, DoubleVoteEvidence, FeeBid, GenesisAccount,
-        GenesisValidator, Nonce, Operation, PostQuantumRoot, PostQuantumScheme, SignedVote,
-        SlashingEvidence, ValidatorSet, Vote, VoteType, MAX_AUTHORIZATION_POLICY_REVISION,
+        AuthorizationPolicyRevision, DoubleVoteEvidence, FeeBid, GenesisAccount, GenesisValidator,
+        Nonce, Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+        SessionKeyConstraints, SignedVote, SlashingEvidence, ValidatorSet, Vote, VoteType,
+        MAX_AUTHORIZATION_POLICY_REVISION,
     };
     use proptest::prelude::*;
-    use webc_crypto::{Keypair, PublicKeyBytes};
+    use std::sync::OnceLock;
+    use webc_crypto::{
+        ml_dsa65_keygen, Keypair, MlDsa65PublicKey, MlDsa65SecretKey, PublicKeyBytes,
+        ML_DSA_65_SIGNATURE_LEN,
+    };
 
     fn funded_state() -> (ChainConfig, ChainState, Keypair, Keypair) {
         let config = ChainConfig::default();
@@ -2049,6 +2533,1101 @@ mod tests {
         };
         let state = ChainState::from_genesis(&genesis).unwrap();
         (config, state, alice, bob)
+    }
+
+    // ----- session-key test helpers -----
+
+    /// Process-wide ML-DSA-65 recovery keypair for session-key tests.
+    ///
+    /// One keypair is generated once and reused so the committed root and every
+    /// signed reveal agree. Generation draws OS randomness (fine in tests);
+    /// verification inside the state machine stays deterministic.
+    fn pq_keypair() -> &'static (MlDsa65PublicKey, MlDsa65SecretKey) {
+        static KEYPAIR: OnceLock<(MlDsa65PublicKey, MlDsa65SecretKey)> = OnceLock::new();
+        KEYPAIR.get_or_init(|| ml_dsa65_keygen().expect("ml-dsa-65 keygen"))
+    }
+
+    /// The committed root public key bytes for `installed_policy_state`.
+    fn pq_public_key() -> Vec<u8> {
+        pq_keypair().0.to_bytes()
+    }
+
+    /// Signs an authorization message for `action` at `nonce` under Alice's
+    /// installed policy (revision 1) on the devnet chain, matching exactly what
+    /// the state machine rebuilds and verifies.
+    fn signed_reveal(
+        owner: Address,
+        nonce: u64,
+        action: &SessionKeyAuthorizationAction,
+    ) -> PostQuantumRootReveal {
+        let (public_key, secret) = pq_keypair();
+        let message = session_key_authorization_message(
+            &ChainId::devnet(),
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            action,
+        )
+        .unwrap();
+        // Empty context: the domain lives in the signed message, matching the
+        // verifier's `POST_QUANTUM_AUTHORIZATION_CONTEXT`.
+        let signature = secret.sign(&message, b"").unwrap();
+        PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: public_key.to_bytes(),
+            signature,
+        }
+    }
+
+    /// A reveal whose signature is over exactly `message` (a test may sign a
+    /// message that disagrees with what the chain will rebuild, to prove a
+    /// specific binding axis is enforced).
+    fn reveal_over_message(message: &[u8]) -> PostQuantumRootReveal {
+        let (public_key, secret) = pq_keypair();
+        PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: public_key.to_bytes(),
+            signature: secret.sign(message, b"").unwrap(),
+        }
+    }
+
+    /// A valid install reveal for the given session key and constraints.
+    fn install_reveal(
+        owner: Address,
+        nonce: u64,
+        session_public_key: PublicKeyBytes,
+        constraints: &SessionKeyConstraints,
+    ) -> PostQuantumRootReveal {
+        signed_reveal(
+            owner,
+            nonce,
+            &SessionKeyAuthorizationAction::Install {
+                session_public_key,
+                constraints: constraints.clone(),
+            },
+        )
+    }
+
+    /// A valid revoke reveal for the given session-key id.
+    fn revoke_reveal(
+        owner: Address,
+        nonce: u64,
+        session_key: SessionKeyId,
+    ) -> PostQuantumRootReveal {
+        signed_reveal(
+            owner,
+            nonce,
+            &SessionKeyAuthorizationAction::Revoke { session_key },
+        )
+    }
+
+    /// A well-formed reveal used only where the action is rejected *before* the
+    /// root signature is checked (wrong lane, no installed policy). Its signature
+    /// is never verified, so a correctly sized placeholder is enough.
+    fn unverified_reveal() -> PostQuantumRootReveal {
+        PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: pq_public_key(),
+            signature: vec![0u8; ML_DSA_65_SIGNATURE_LEN],
+        }
+    }
+
+    /// Funded Alice with an installed policy whose post-quantum root commits to
+    /// `pq_public_key()`. Alice's account nonce is 1 after installation.
+    fn installed_policy_state() -> (ChainConfig, ChainState, Keypair, Keypair) {
+        let (config, mut state, alice, bob) = funded_state();
+        let root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &pq_public_key()).unwrap();
+        let install = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::InstallAuthorizationPolicy {
+                post_quantum_root: root,
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .unwrap();
+        state.execute_transaction(&install, &config).unwrap();
+        (config, state, alice, bob)
+    }
+
+    /// Default-lane transfer constraints: 5 WEBC per use, 20 WEBC budget.
+    fn session_constraints() -> SessionKeyConstraints {
+        SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_webc(5),
+            total_amount_budget: Amount::from_webc(20),
+            max_fee_per_use: Amount::from_webc(1),
+            total_fee_budget: Amount::from_webc(5),
+            lifetime_epochs: 60,
+        }
+    }
+
+    fn install_session_key_tx(
+        owner: &Keypair,
+        session: &Keypair,
+        nonce: u64,
+        constraints: SessionKeyConstraints,
+    ) -> Transaction {
+        let reveal = install_reveal(owner.address(), nonce, session.public_key(), &constraints);
+        install_session_key_tx_with_reveal(owner, session, nonce, constraints, reveal)
+    }
+
+    fn install_session_key_tx_with_reveal(
+        owner: &Keypair,
+        session: &Keypair,
+        nonce: u64,
+        constraints: SessionKeyConstraints,
+        reveal: PostQuantumRootReveal,
+    ) -> Transaction {
+        Transaction::for_operation_with_policy(
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            Operation::InstallSessionKey {
+                session_public_key: session.public_key(),
+                constraints,
+                post_quantum_root_reveal: reveal,
+            },
+            FeeBid {
+                gas_limit: 20_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Builds and signs a transfer authorized by a session key.
+    fn session_transfer_tx(
+        owner: &Keypair,
+        session: &Keypair,
+        lane: AuthorizationLaneId,
+        nonce: u64,
+        to: Address,
+        amount: Amount,
+        fee: FeeBid,
+    ) -> Transaction {
+        let id = SessionKeyId::derive(&session.public_key());
+        let operation = Operation::Transfer { to, amount };
+        let access_list = operation
+            .default_access_list_for_session(owner.address(), lane, id)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            owner.address(),
+            session.public_key(),
+            lane,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign_with_policy_key(session).unwrap();
+        tx
+    }
+
+    fn small_fee() -> FeeBid {
+        FeeBid {
+            gas_limit: 1_000,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        }
+    }
+
+    // ----- session-key tests -----
+
+    #[test]
+    fn session_key_install_use_and_revoke_lifecycle() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+
+        let before_install = state.state_root().unwrap();
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+        assert!(state.session_keys.contains_key(&(alice.address(), id)));
+        assert_ne!(state.state_root().unwrap(), before_install);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A within-limits transfer signed by the session key succeeds and moves
+        // the owner's funds, advancing only the session's cumulative spend.
+        let bob_before = state.accounts.get(&bob.address()).map(|a| a.balance);
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(4),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_amount,
+            Amount::from_webc(4)
+        );
+        let bob_after = state.accounts.get(&bob.address()).unwrap().balance;
+        assert_eq!(
+            bob_after,
+            bob_before
+                .unwrap_or(Amount::ZERO)
+                .checked_add(Amount::from_webc(4))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Revocation removes the key; the same key can no longer authorize.
+        let revoke = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            3,
+            Operation::RevokeSessionKey {
+                session_key: id,
+                post_quantum_root_reveal: revoke_reveal(alice.address(), 3, id),
+            },
+            small_fee_with_units(20_000),
+        )
+        .unwrap();
+        state.execute_transaction(&revoke, &config).unwrap();
+        assert!(!state.session_keys.contains_key(&(alice.address(), id)));
+
+        let after_revoke = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&after_revoke, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    fn small_fee_with_units(gas_limit: u64) -> FeeBid {
+        FeeBid {
+            gas_limit,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        }
+    }
+
+    #[test]
+    fn session_transfer_respects_per_use_budget_and_fee_caps() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        // Per-use 5 WEBC, cumulative budget 12 WEBC, per-use fee cap 1 WEBC.
+        let mut constraints = session_constraints();
+        constraints.total_amount_budget = Amount::from_webc(12);
+        let install = install_session_key_tx(&alice, &session, 1, constraints);
+        state.execute_transaction(&install, &config).unwrap();
+
+        // Over the per-use cap (5 WEBC): rejected atomically, nonce unchanged.
+        let over_use = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(6),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over_use, &config),
+            Err(ChainError::SessionKeyAmountExceeded)
+        ));
+        assert_eq!(state, before);
+
+        // Two 5 WEBC transfers succeed and reach 10 WEBC cumulative spend.
+        for nonce in [2u64, 3] {
+            let tx = session_transfer_tx(
+                &alice,
+                &session,
+                AuthorizationLaneId::DEFAULT,
+                nonce,
+                bob.address(),
+                Amount::from_webc(5),
+                small_fee(),
+            );
+            state.execute_transaction(&tx, &config).unwrap();
+        }
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_amount,
+            Amount::from_webc(10)
+        );
+
+        // A third 5 WEBC transfer would reach 15 WEBC, above the 12 WEBC budget,
+        // and is rejected atomically.
+        let over_budget = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            4,
+            bob.address(),
+            Amount::from_webc(5),
+            small_fee(),
+        );
+        let before_budget = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over_budget, &config),
+            Err(ChainError::SessionKeyBudgetExceeded)
+        ));
+        assert_eq!(state, before_budget);
+
+        // A fee bid whose ceiling exceeds the per-use fee cap (1 WEBC) fails,
+        // even though the 1 WEBC principal is within budget.
+        let over_fee = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            4,
+            bob.address(),
+            Amount::from_webc(1),
+            FeeBid {
+                gas_limit: 2_000_000_000,
+                max_fee_per_unit: 1_000,
+                priority_fee_per_unit: 0,
+            },
+        );
+        let before_fee = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over_fee, &config),
+            Err(ChainError::SessionKeyFeeExceeded)
+        ));
+        assert_eq!(state, before_fee);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn expired_session_key_is_rejected_at_the_boundary() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let mut constraints = session_constraints();
+        constraints.lifetime_epochs = 2;
+        let install = install_session_key_tx(&alice, &session, 1, constraints);
+        state.execute_transaction(&install, &config).unwrap();
+
+        // Valid through the expiry epoch (inclusive). Advancing the epoch is a
+        // deterministic integer step; expiry never reads a wall clock.
+        state.current_epoch = 2;
+        let at_expiry = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        state.execute_transaction(&at_expiry, &config).unwrap();
+
+        // One epoch later the key is expired and cannot authorize.
+        state.current_epoch = 3;
+        let after_expiry = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&after_expiry, &config),
+            Err(ChainError::SessionKeyExpired)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_cannot_authorize_a_non_transfer_operation() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A claim operation is not in the session allow-list and is refused
+        // before any state change, even though the key is otherwise valid.
+        let operation = Operation::ClaimValidatorRewards;
+        let id = SessionKeyId::derive(&session.public_key());
+        let access_list = operation
+            .default_access_list_for_session(alice.address(), AuthorizationLaneId::DEFAULT, id)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            session.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            AuthorizationPolicyRevision::new(1),
+            2,
+            operation,
+            access_list,
+            small_fee_with_units(10_000),
+        );
+        tx.sign_with_policy_key(&session).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::SessionKeyOperationNotPermitted)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_bound_lane_mismatch_is_rejected() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let bound_lane = AuthorizationLaneId::new(Hash256([0x77; 32]));
+        let mut constraints = session_constraints();
+        constraints.authorization_lane = bound_lane;
+        let install = install_session_key_tx(&alice, &session, 1, constraints);
+        state.execute_transaction(&install, &config).unwrap();
+
+        // The key is bound to `bound_lane`; a transfer on the default lane is
+        // refused during authorization, before any fee or state change.
+        let wrong_lane = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&wrong_lane, &config),
+            Err(ChainError::SessionKeyLaneMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_is_invalidated_when_bound_policy_revision_changes() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A key rotation bumps the account policy revision. Simulate the stored
+        // effect: the session was installed under revision 1, so a policy now at
+        // revision 2 must invalidate it.
+        state
+            .session_keys
+            .get_mut(&(alice.address(), id))
+            .unwrap()
+            .policy_revision = AuthorizationPolicyRevision::new(2);
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&transfer, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn install_session_key_fail_closed_paths() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+
+        // Wrong post-quantum root reveal: a well-formed reveal whose public key
+        // does not match the committed root, so the commitment check rejects it
+        // before any signature verification.
+        let bad_reveal = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: vec![0xC4u8; 1_952],
+            signature: vec![0u8; ML_DSA_65_SIGNATURE_LEN],
+        };
+        let install_bad = install_session_key_tx_with_reveal(
+            &alice,
+            &session,
+            1,
+            session_constraints(),
+            bad_reveal,
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&install_bad, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // Lifetime beyond the configured maximum.
+        let mut too_long = session_constraints();
+        too_long.lifetime_epochs = config.session_keys.max_lifetime_epochs + 1;
+        let install_long = install_session_key_tx(&alice, &session, 1, too_long);
+        assert!(matches!(
+            state.execute_transaction(&install_long, &config),
+            Err(ChainError::SessionKeyLifetimeTooLong)
+        ));
+
+        // Invalid constraints (budget below per-use).
+        let mut invalid = session_constraints();
+        invalid.total_amount_budget = Amount::from_webc(1);
+        let install_invalid = install_session_key_tx(&alice, &session, 1, invalid);
+        assert!(matches!(
+            state.execute_transaction(&install_invalid, &config),
+            Err(ChainError::InvalidSessionKeyConstraints)
+        ));
+
+        // Duplicate installation is rejected.
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+        let dup = install_session_key_tx(&alice, &session, 2, session_constraints());
+        assert!(matches!(
+            state.execute_transaction(&dup, &config),
+            Err(ChainError::SessionKeyAlreadyExists)
+        ));
+    }
+
+    /// The root-signature gate must reject a reveal that does not carry a real
+    /// ML-DSA signature by the committed root over this exact install. These are
+    /// the attacks the commitment-only reveal could not stop.
+    #[test]
+    fn install_session_key_rejects_misbound_or_forged_root_signature() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let constraints = session_constraints();
+        let before = state.clone();
+
+        // (a) Correct root key and action, but signed for a different nonce than
+        // the transaction runs at: a captured signature cannot be replayed at a
+        // new nonce because the message binds the nonce.
+        let wrong_nonce = install_reveal(alice.address(), 2, session.public_key(), &constraints);
+        let install_wrong_nonce = install_session_key_tx_with_reveal(
+            &alice,
+            &session,
+            1,
+            constraints.clone(),
+            wrong_nonce,
+        );
+        assert!(matches!(
+            state.execute_transaction(&install_wrong_nonce, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (b) A real signature over a *different action* (a revoke) cannot be
+        // repurposed to authorize this install.
+        let wrong_action = revoke_reveal(
+            alice.address(),
+            1,
+            SessionKeyId::derive(&session.public_key()),
+        );
+        let install_wrong_action = install_session_key_tx_with_reveal(
+            &alice,
+            &session,
+            1,
+            constraints.clone(),
+            wrong_action,
+        );
+        assert!(matches!(
+            state.execute_transaction(&install_wrong_action, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (c) The committed public key but a garbage signature of the right
+        // length: the commitment check passes, the signature check fails closed.
+        let garbage = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: pq_public_key(),
+            signature: vec![0x7u8; ML_DSA_65_SIGNATURE_LEN],
+        };
+        let install_garbage =
+            install_session_key_tx_with_reveal(&alice, &session, 1, constraints.clone(), garbage);
+        assert!(matches!(
+            state.execute_transaction(&install_garbage, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (d) A *different* ML-DSA key with a genuine signature over the correct
+        // message: this models a compromised active key trying to substitute its
+        // own post-quantum key. The commitment check binds the reveal to the
+        // account's committed root, so it is rejected.
+        let (other_public, other_secret) = ml_dsa65_keygen().unwrap();
+        let action = SessionKeyAuthorizationAction::Install {
+            session_public_key: session.public_key(),
+            constraints: constraints.clone(),
+        };
+        let message = session_key_authorization_message(
+            &ChainId::devnet(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &action,
+        )
+        .unwrap();
+        let wrong_key = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: other_public.to_bytes(),
+            signature: other_secret.sign(&message, b"").unwrap(),
+        };
+        let install_wrong_key =
+            install_session_key_tx_with_reveal(&alice, &session, 1, constraints, wrong_key);
+        assert!(matches!(
+            state.execute_transaction(&install_wrong_key, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // The correctly bound install still succeeds, so the gate is not simply
+        // rejecting everything.
+        let good = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&good, &config).unwrap();
+        assert!(state
+            .session_keys
+            .contains_key(&(alice.address(), SessionKeyId::derive(&session.public_key()))));
+    }
+
+    /// The install root signature must bind the exact constraints, the owner, and
+    /// the chain id — not just the nonce and action. Each sub-case signs a message
+    /// that disagrees with the submitted transaction on exactly one axis and must
+    /// be rejected, so a future regression that drops any binding is caught.
+    #[test]
+    fn install_session_key_binds_signature_to_constraints_owner_and_chain() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let revision = AuthorizationPolicyRevision::new(1);
+        let before = state.clone();
+
+        // (a) Constraint escalation: sign a modest grant but submit a larger one.
+        // The chain rebuilds the message from the *submitted* constraints, so the
+        // signature over the smaller grant does not verify.
+        let signed_constraints = session_constraints();
+        let mut submitted_constraints = session_constraints();
+        submitted_constraints.max_amount_per_use = Amount::from_webc(4);
+        submitted_constraints.total_amount_budget = Amount::from_webc(80);
+        assert_ne!(signed_constraints, submitted_constraints);
+        let signed_action = SessionKeyAuthorizationAction::Install {
+            session_public_key: session.public_key(),
+            constraints: signed_constraints,
+        };
+        let message = session_key_authorization_message(
+            &ChainId::devnet(),
+            alice.address(),
+            revision,
+            1,
+            &signed_action,
+        )
+        .unwrap();
+        let install_escalated = install_session_key_tx_with_reveal(
+            &alice,
+            &session,
+            1,
+            submitted_constraints,
+            reveal_over_message(&message),
+        );
+        assert!(matches!(
+            state.execute_transaction(&install_escalated, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // The correctly bound install action, reused for the owner and chain axes.
+        let action = SessionKeyAuthorizationAction::Install {
+            session_public_key: session.public_key(),
+            constraints: session_constraints(),
+        };
+
+        // (b) Cross-account replay: sign with a different owner than the submitting
+        // account. Even if two accounts shared a post-quantum root, the owner
+        // binding stops a signature made for one account authorizing the other.
+        let wrong_owner_message = session_key_authorization_message(
+            &ChainId::devnet(),
+            bob.address(),
+            revision,
+            1,
+            &action,
+        )
+        .unwrap();
+        let install_wrong_owner = install_session_key_tx_with_reveal(
+            &alice,
+            &session,
+            1,
+            session_constraints(),
+            reveal_over_message(&wrong_owner_message),
+        );
+        assert!(matches!(
+            state.execute_transaction(&install_wrong_owner, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (c) Cross-chain replay: sign for a different chain id than the one the
+        // transaction executes on.
+        let other_chain = ChainId::new("webc-testnet-9").unwrap();
+        let wrong_chain_message =
+            session_key_authorization_message(&other_chain, alice.address(), revision, 1, &action)
+                .unwrap();
+        let install_wrong_chain = install_session_key_tx_with_reveal(
+            &alice,
+            &session,
+            1,
+            session_constraints(),
+            reveal_over_message(&wrong_chain_message),
+        );
+        assert!(matches!(
+            state.execute_transaction(&install_wrong_chain, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+    }
+
+    /// The revoke gate binds the root signature to the exact session-key id, so a
+    /// signature prepared for another id cannot revoke this one.
+    #[test]
+    fn revoke_session_key_rejects_misbound_root_signature() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // Revoke at nonce 2 with a reveal signed for a different session-key id.
+        let other_id = SessionKeyId::new(Hash256([0x33; 32]));
+        let revoke = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            2,
+            Operation::RevokeSessionKey {
+                session_key: id,
+                post_quantum_root_reveal: revoke_reveal(alice.address(), 2, other_id),
+            },
+            small_fee_with_units(20_000),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&revoke, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+        // The key is still installed because the misbound revoke was rejected.
+        assert!(state.session_keys.contains_key(&(alice.address(), id)));
+    }
+
+    #[test]
+    fn session_key_management_requires_default_lane() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let lane = AuthorizationLaneId::new(Hash256([0x55; 32]));
+        // Open a funded non-default lane so its nonce/fee lookup succeeds and the
+        // critical-action default-lane guard is the check that actually fires.
+        let open = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            small_fee_with_units(10_000),
+        )
+        .unwrap();
+        state.execute_transaction(&open, &config).unwrap();
+
+        let session = Keypair::from_seed([9u8; 32]);
+        let operation = Operation::InstallSessionKey {
+            session_public_key: session.public_key(),
+            constraints: session_constraints(),
+            // Rejected by the default-lane guard before the reveal is verified.
+            post_quantum_root_reveal: unverified_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), lane)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            lane,
+            AuthorizationPolicyRevision::new(1),
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(20_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::SessionKeyManagementRequiresDefaultLane)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn legacy_account_cannot_own_session_keys() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        // Alice has no installed policy, so `for_operation` uses revision zero.
+        let install = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::InstallSessionKey {
+                session_public_key: session.public_key(),
+                constraints: session_constraints(),
+                // Rejected for having no installed policy before reveal checks.
+                post_quantum_root_reveal: unverified_reveal(),
+            },
+            small_fee_with_units(20_000),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&install, &config),
+            Err(ChainError::SessionKeyRequiresInstalledPolicy)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_count_cap_is_enforced() {
+        let (mut config, mut state, alice, _bob) = installed_policy_state();
+        config.session_keys.max_session_keys_per_account = 2;
+        for (i, seed) in [[10u8; 32], [11u8; 32]].into_iter().enumerate() {
+            let session = Keypair::from_seed(seed);
+            let install =
+                install_session_key_tx(&alice, &session, 1 + i as u64, session_constraints());
+            state.execute_transaction(&install, &config).unwrap();
+        }
+        let third = Keypair::from_seed([12u8; 32]);
+        let install = install_session_key_tx(&alice, &third, 3, session_constraints());
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&install, &config),
+            Err(ChainError::SessionKeyLimitExceeded)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn revoke_unknown_session_key_is_rejected() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let missing = SessionKeyId::new(Hash256([0xEE; 32]));
+        let revoke = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::RevokeSessionKey {
+                session_key: missing,
+                post_quantum_root_reveal: revoke_reveal(alice.address(), 1, missing),
+            },
+            small_fee_with_units(20_000),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&revoke, &config),
+            Err(ChainError::SessionKeyNotFound)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_keys_survive_serialization_restart() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            2,
+            bob.address(),
+            Amount::from_webc(3),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
+
+        // The whole chain state uses tuple-keyed maps, so it round-trips through
+        // bincode (a non-string-key format) rather than JSON.
+        let bytes = bincode::serialize(&state).unwrap();
+        let restored: ChainState = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+    }
+
+    #[test]
+    fn cumulative_fee_budget_bounds_a_compromised_key() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        // Tiny principal, but a cumulative fee budget of 3,000 base units. Each
+        // transfer below charges exactly 1,000 base units in real fees.
+        let mut constraints = session_constraints();
+        constraints.max_fee_per_use = Amount::from_units(2_000);
+        constraints.total_fee_budget = Amount::from_units(3_000);
+        let install = install_session_key_tx(&alice, &session, 1, constraints);
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A fee bid that charges 1,000 base units per transfer (500 units * 2).
+        let drain_fee = FeeBid {
+            gas_limit: 500,
+            max_fee_per_unit: 2,
+            priority_fee_per_unit: 2,
+        };
+        for nonce in [2u64, 3, 4] {
+            let tx = session_transfer_tx(
+                &alice,
+                &session,
+                AuthorizationLaneId::DEFAULT,
+                nonce,
+                bob.address(),
+                Amount::from_units(1),
+                drain_fee,
+            );
+            state.execute_transaction(&tx, &config).unwrap();
+        }
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_fees,
+            Amount::from_units(3_000)
+        );
+
+        // The fourth transfer would push cumulative fees to 4,000 > 3,000 and is
+        // rejected, so the total fee drain is bounded regardless of use count.
+        let over = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            5,
+            bob.address(),
+            Amount::from_units(1),
+            drain_fee,
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over, &config),
+            Err(ChainError::SessionKeyFeeBudgetExceeded)
+        ));
+        assert_eq!(state, before);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn session_transfer_works_on_a_bound_non_default_lane() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        let lane = AuthorizationLaneId::new(Hash256::digest(b"origin-lane"));
+        // Open and fund the origin lane from the default lane.
+        let open = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            small_fee_with_units(10_000),
+        )
+        .unwrap();
+        state.execute_transaction(&open, &config).unwrap();
+
+        // Install a session key bound to that lane.
+        let session = Keypair::from_seed([9u8; 32]);
+        let id = SessionKeyId::derive(&session.public_key());
+        let mut constraints = session_constraints();
+        constraints.authorization_lane = lane;
+        let install = install_session_key_tx(&alice, &session, 2, constraints);
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A session transfer on the bound lane succeeds: principal leaves the
+        // owner account, the lane nonce advances, and cumulative spend updates.
+        let transfer = session_transfer_tx(
+            &alice,
+            &session,
+            lane,
+            0,
+            bob.address(),
+            Amount::from_webc(3),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
+        assert_eq!(
+            state.accounts.get(&bob.address()).unwrap().balance,
+            Amount::from_webc(3)
+        );
+        assert_eq!(
+            state.session_keys[&(alice.address(), id)].spent_amount,
+            Amount::from_webc(3)
+        );
+        assert_eq!(
+            state.authorization_lanes[&(alice.address(), lane)].next_nonce,
+            Nonce::new(1)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn session_spend_never_exceeds_budget(
+            amounts in proptest::collection::vec(1u64..8, 1..24)
+        ) {
+            let (config, mut state, alice, bob) = installed_policy_state();
+            let session = Keypair::from_seed([9u8; 32]);
+            let id = SessionKeyId::derive(&session.public_key());
+            let install = install_session_key_tx(
+                &alice, &session, 1, session_constraints());
+            state.execute_transaction(&install, &config).unwrap();
+
+            let per_use = Amount::from_webc(5);
+            let budget = Amount::from_webc(20);
+            let mut expected_spent = Amount::ZERO;
+            let mut nonce = 2u64;
+            for raw in amounts {
+                let amount = Amount::from_webc(raw);
+                let next = expected_spent.checked_add(amount).unwrap();
+                let accepted = amount <= per_use && next <= budget;
+                let tx = session_transfer_tx(
+                    &alice, &session, AuthorizationLaneId::DEFAULT,
+                    nonce, bob.address(), amount, small_fee());
+                let before = state.clone();
+                let result = state.execute_transaction(&tx, &config);
+                if accepted {
+                    prop_assert!(result.is_ok());
+                    expected_spent = next;
+                    nonce += 1;
+                } else {
+                    prop_assert!(result.is_err());
+                    prop_assert_eq!(&state, &before);
+                }
+                prop_assert_eq!(
+                    state.session_keys[&(alice.address(), id)].spent_amount,
+                    expected_spent
+                );
+                prop_assert!(state.session_keys[&(alice.address(), id)].spent_amount <= budget);
+                prop_assert!(state.supply_invariant_report().unwrap().balanced);
+            }
+        }
     }
 
     #[test]
@@ -4320,5 +5899,967 @@ mod tests {
             Err(ChainError::InvalidBridgeAssetFlow)
         ));
         assert_eq!(state, before_invalid);
+    }
+
+    // ----- active-key rotation (recovery) tests -----
+
+    /// A rotation reveal: the post-quantum root signs the exact rotation to
+    /// `new_key` at `nonce` under Alice's installed policy (revision 1), matching
+    /// what the state machine rebuilds and verifies.
+    fn rotation_reveal(
+        owner: Address,
+        nonce: u64,
+        new_key: &PublicKeyBytes,
+    ) -> PostQuantumRootReveal {
+        let message = crate::active_key_rotation_message(
+            &ChainId::devnet(),
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            new_key,
+        )
+        .unwrap();
+        reveal_over_message(&message)
+    }
+
+    /// Builds a default-lane rotation transaction whose envelope is signed by
+    /// `signer` (the new key for recovery, or the current active key for an
+    /// ordinary rotation) and carries `reveal` as the root authority.
+    fn rotate_key_tx(
+        owner: &Keypair,
+        signer: &Keypair,
+        nonce: u64,
+        new_key: PublicKeyBytes,
+        reveal: PostQuantumRootReveal,
+    ) -> Transaction {
+        let operation = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_key,
+            post_quantum_root_reveal: reveal,
+        };
+        let access_list = operation
+            .default_access_list_for_lane(owner.address(), AuthorizationLaneId::DEFAULT)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            owner.address(),
+            signer.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(signer).unwrap();
+        tx
+    }
+
+    #[test]
+    fn active_key_rotation_recovers_with_the_new_key_and_invalidates_sessions() {
+        let (config, mut state, alice, bob) = installed_policy_state();
+        // Install a session key under revision 1; rotation must invalidate it.
+        let session = Keypair::from_seed([9u8; 32]);
+        let session_id = SessionKeyId::derive(&session.public_key());
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+        assert!(state
+            .session_keys
+            .contains_key(&(alice.address(), session_id)));
+
+        let new_key = Keypair::from_seed([42u8; 32]);
+        let before_root = state.state_root().unwrap();
+        // Recovery: the NEW key signs the envelope (the old key is never used) and
+        // the real authority is the post-quantum root signature.
+        let rotate = rotate_key_tx(
+            &alice,
+            &new_key,
+            2,
+            new_key.public_key(),
+            rotation_reveal(alice.address(), 2, &new_key.public_key()),
+        );
+        state.execute_transaction(&rotate, &config).unwrap();
+
+        let policy = state.authorization_policies.get(&alice.address()).unwrap();
+        assert_eq!(policy.active_transaction_key(), &new_key.public_key());
+        assert_eq!(policy.revision(), AuthorizationPolicyRevision::new(2));
+        // The recovery root is preserved, never silently dropped.
+        assert_eq!(
+            *policy.post_quantum_root(),
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &pq_public_key()).unwrap()
+        );
+        assert_ne!(state.state_root().unwrap(), before_root);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // The session key installed under revision 1 can no longer be used: the
+        // policy is now at revision 2, so a transfer it signs fails.
+        let session_tx = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        assert!(matches!(
+            state.execute_transaction(&session_tx, &config),
+            Err(ChainError::AuthorizationPolicyRevisionMismatch { .. })
+        ));
+
+        // The new active key authorizes an ordinary transfer at revision 2.
+        let operation = Operation::Transfer {
+            to: bob.address(),
+            amount: Amount::from_webc(1),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), AuthorizationLaneId::DEFAULT)
+            .unwrap();
+        let mut new_tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            new_key.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            AuthorizationPolicyRevision::new(2),
+            3,
+            operation,
+            access_list,
+            small_fee(),
+        );
+        new_tx.sign_with_policy_key(&new_key).unwrap();
+        state.execute_transaction(&new_tx, &config).unwrap();
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn active_key_rotation_also_works_when_signed_by_the_current_key() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let new_key = Keypair::from_seed([42u8; 32]);
+        // Ordinary rotation: the CURRENT active key signs the envelope (the
+        // AccountKey authorization path), still gated by the root signature.
+        let rotate = rotate_key_tx(
+            &alice,
+            &alice,
+            1,
+            new_key.public_key(),
+            rotation_reveal(alice.address(), 1, &new_key.public_key()),
+        );
+        state.execute_transaction(&rotate, &config).unwrap();
+        let policy = state.authorization_policies.get(&alice.address()).unwrap();
+        assert_eq!(policy.active_transaction_key(), &new_key.public_key());
+        assert_eq!(policy.revision(), AuthorizationPolicyRevision::new(2));
+
+        // The old active key can no longer authorize a transfer.
+        let old_key_tx = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(2),
+            2,
+            Operation::Transfer {
+                to: _bob.address(),
+                amount: Amount::from_webc(1),
+            },
+            small_fee(),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&old_key_tx, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn active_key_rotation_rejects_rotating_to_the_same_key() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let same = alice.public_key();
+        // The current active key signs a rotation whose new key equals the old
+        // one; the no-op guard fires before the (valid) root signature is checked.
+        let rotate = rotate_key_tx(
+            &alice,
+            &alice,
+            1,
+            same,
+            rotation_reveal(alice.address(), 1, &same),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&rotate, &config),
+            Err(ChainError::ActiveKeyRotationToSameKey)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn active_key_rotation_requires_default_lane() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let lane = AuthorizationLaneId::new(Hash256([0x55; 32]));
+        let open = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            small_fee_with_units(10_000),
+        )
+        .unwrap();
+        state.execute_transaction(&open, &config).unwrap();
+
+        let new_key = Keypair::from_seed([42u8; 32]);
+        let operation = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_key.public_key(),
+            // Rejected by the default-lane guard before the reveal is verified.
+            post_quantum_root_reveal: unverified_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), lane)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            lane,
+            AuthorizationPolicyRevision::new(1),
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ActiveKeyRotationRequiresDefaultLane)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn active_key_rotation_requires_an_installed_policy() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let new_key = Keypair::from_seed([42u8; 32]);
+        // No policy is installed, so the account is still on the legacy revision.
+        // Signing with the address-deriving key at the legacy revision lets the
+        // authorization check pass so the arm's installed-policy guard is what
+        // actually fires.
+        let operation = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_key.public_key(),
+            post_quantum_root_reveal: unverified_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), AuthorizationLaneId::DEFAULT)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            LEGACY_AUTHORIZATION_POLICY_REVISION,
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ActiveKeyRotationRequiresInstalledPolicy)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn active_key_rotation_rejects_a_third_party_envelope_signer() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let new_key = Keypair::from_seed([42u8; 32]);
+        let stranger = Keypair::from_seed([44u8; 32]);
+        // The envelope is signed by a key that is neither the current active key
+        // nor the proposed new key; authorization fails before execution.
+        let rotate = rotate_key_tx(
+            &alice,
+            &stranger,
+            1,
+            new_key.public_key(),
+            rotation_reveal(alice.address(), 1, &new_key.public_key()),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&rotate, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    /// The root-signature gate must reject any reveal that is not a real ML-DSA
+    /// signature by the committed root over this exact rotation. Every binding
+    /// axis (new key, nonce, owner, chain) and forgery is checked, and each
+    /// rejection leaves state unchanged.
+    #[test]
+    fn active_key_rotation_rejects_misbound_or_forged_root_signature() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let new_key = Keypair::from_seed([42u8; 32]);
+        let before = state.clone();
+
+        // (a) Signed for a different new key.
+        let other_key = Keypair::from_seed([43u8; 32]);
+        let tx_a = rotate_key_tx(
+            &alice,
+            &new_key,
+            1,
+            new_key.public_key(),
+            rotation_reveal(alice.address(), 1, &other_key.public_key()),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_a, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (b) Signed for a different nonce: no replay at another nonce.
+        let tx_b = rotate_key_tx(
+            &alice,
+            &new_key,
+            1,
+            new_key.public_key(),
+            rotation_reveal(alice.address(), 2, &new_key.public_key()),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_b, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (c) Signed for a different owner: no cross-account reuse.
+        let stranger = Keypair::from_seed([44u8; 32]);
+        let wrong_owner_msg = crate::active_key_rotation_message(
+            &ChainId::devnet(),
+            stranger.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_key.public_key(),
+        )
+        .unwrap();
+        let tx_c = rotate_key_tx(
+            &alice,
+            &new_key,
+            1,
+            new_key.public_key(),
+            reveal_over_message(&wrong_owner_msg),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_c, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (d) Signed for a different chain: no cross-chain reuse.
+        let wrong_chain_msg = crate::active_key_rotation_message(
+            &ChainId::new("webc-testnet-9").unwrap(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_key.public_key(),
+        )
+        .unwrap();
+        let tx_d = rotate_key_tx(
+            &alice,
+            &new_key,
+            1,
+            new_key.public_key(),
+            reveal_over_message(&wrong_chain_msg),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_d, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (e) The committed public key but a garbage signature of the right
+        // length: the commitment check passes, the signature check fails closed.
+        let garbage = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: pq_public_key(),
+            signature: vec![0x7u8; ML_DSA_65_SIGNATURE_LEN],
+        };
+        let tx_e = rotate_key_tx(&alice, &new_key, 1, new_key.public_key(), garbage);
+        assert!(matches!(
+            state.execute_transaction(&tx_e, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (f) A different ML-DSA key with a genuine signature over the correct
+        // message: a compromised active key cannot substitute its own root key,
+        // because the commitment binds the reveal to the account's stored root.
+        let (other_public, other_secret) = ml_dsa65_keygen().unwrap();
+        let correct_msg = crate::active_key_rotation_message(
+            &ChainId::devnet(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_key.public_key(),
+        )
+        .unwrap();
+        let mismatched = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: other_public.to_bytes(),
+            signature: other_secret.sign(&correct_msg, b"").unwrap(),
+        };
+        let tx_f = rotate_key_tx(&alice, &new_key, 1, new_key.public_key(), mismatched);
+        assert!(matches!(
+            state.execute_transaction(&tx_f, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn session_key_cannot_authorize_a_rotation() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let session = Keypair::from_seed([9u8; 32]);
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+
+        // A session key tries to sign a rotation. Authorization only accepts the
+        // current active key or the exact proposed new key as a rotation envelope
+        // signer, so a session key (which is neither) is rejected outright with
+        // `AuthorizationKeyMismatch` and never reaches the rotation arm. The
+        // session-constraint gate would also refuse it, but this earlier check is
+        // what fires, so a session key can never rotate the account key.
+        let new_key = Keypair::from_seed([42u8; 32]);
+        let operation = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_key.public_key(),
+            post_quantum_root_reveal: rotation_reveal(alice.address(), 2, &new_key.public_key()),
+        };
+        let id = SessionKeyId::derive(&session.public_key());
+        let access_list = operation
+            .default_access_list_for_session(alice.address(), AuthorizationLaneId::DEFAULT, id)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            session.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            AuthorizationPolicyRevision::new(1),
+            2,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&session).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    // ----- post-quantum root rotation tests -----
+
+    /// A second process-wide ML-DSA-65 keypair used as the *new* recovery root in
+    /// root-rotation tests (the first keypair is the current committed root).
+    fn pq_keypair_b() -> &'static (MlDsa65PublicKey, MlDsa65SecretKey) {
+        static KEYPAIR_B: OnceLock<(MlDsa65PublicKey, MlDsa65SecretKey)> = OnceLock::new();
+        KEYPAIR_B.get_or_init(|| ml_dsa65_keygen().expect("ml-dsa-65 keygen b"))
+    }
+
+    /// The new post-quantum root committing to keypair B.
+    fn new_root_b() -> PostQuantumRoot {
+        PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &pq_keypair_b().0.to_bytes())
+            .unwrap()
+    }
+
+    /// A reveal whose public key and signature come from `keypair`, over exactly
+    /// `message`. Used to sign with either the current root (A) or a candidate
+    /// new root (B / a stranger).
+    fn reveal_with_keypair(
+        keypair: &(MlDsa65PublicKey, MlDsa65SecretKey),
+        message: &[u8],
+    ) -> PostQuantumRootReveal {
+        PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: keypair.0.to_bytes(),
+            signature: keypair.1.sign(message, b"").unwrap(),
+        }
+    }
+
+    /// A root-rotation reveal: the CURRENT root (keypair A) signs the rotation to
+    /// `new_root` at `nonce` under revision 1, matching what the state machine
+    /// rebuilds and verifies.
+    fn root_rotation_reveal(
+        owner: Address,
+        nonce: u64,
+        new_root: &PostQuantumRoot,
+    ) -> PostQuantumRootReveal {
+        let message = crate::post_quantum_root_rotation_message(
+            &ChainId::devnet(),
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            new_root,
+        )
+        .unwrap();
+        reveal_over_message(&message)
+    }
+
+    /// Builds a default-lane root-rotation transaction signed by the current
+    /// active key (the AccountKey authorization path).
+    fn rotate_root_tx(
+        owner: &Keypair,
+        nonce: u64,
+        new_root: PostQuantumRoot,
+        reveal: PostQuantumRootReveal,
+    ) -> Transaction {
+        Transaction::for_operation_with_policy(
+            owner,
+            AuthorizationPolicyRevision::new(1),
+            nonce,
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root: new_root,
+                post_quantum_root_reveal: reveal,
+            },
+            small_fee_with_units(25_000),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_replaces_the_root_and_preserves_the_active_key() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        // A session key installed under revision 1 must die on any policy bump.
+        let session = Keypair::from_seed([9u8; 32]);
+        let session_id = SessionKeyId::derive(&session.public_key());
+        let install = install_session_key_tx(&alice, &session, 1, session_constraints());
+        state.execute_transaction(&install, &config).unwrap();
+        assert!(state
+            .session_keys
+            .contains_key(&(alice.address(), session_id)));
+
+        let new_root = new_root_b();
+        let before_root = state.state_root().unwrap();
+        let rotate = rotate_root_tx(
+            &alice,
+            2,
+            new_root,
+            root_rotation_reveal(alice.address(), 2, &new_root),
+        );
+        state.execute_transaction(&rotate, &config).unwrap();
+
+        let policy = state.authorization_policies.get(&alice.address()).unwrap();
+        assert_eq!(*policy.post_quantum_root(), new_root);
+        // The everyday signing key is untouched by a root rotation.
+        assert_eq!(policy.active_transaction_key(), &alice.public_key());
+        assert_eq!(policy.revision(), AuthorizationPolicyRevision::new(2));
+        assert_ne!(state.state_root().unwrap(), before_root);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // The session key installed under revision 1 can no longer be used.
+        let session_tx = session_transfer_tx(
+            &alice,
+            &session,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            _bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        assert!(matches!(
+            state.execute_transaction(&session_tx, &config),
+            Err(ChainError::AuthorizationPolicyRevisionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_rejects_rotating_to_the_same_root() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let same_root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, &pq_public_key()).unwrap();
+        let rotate = rotate_root_tx(
+            &alice,
+            1,
+            same_root,
+            root_rotation_reveal(alice.address(), 1, &same_root),
+        );
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&rotate, &config),
+            Err(ChainError::PostQuantumRootRotationToSameRoot)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_requires_default_lane() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let lane = AuthorizationLaneId::new(Hash256([0x55; 32]));
+        let open = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            small_fee_with_units(10_000),
+        )
+        .unwrap();
+        state.execute_transaction(&open, &config).unwrap();
+
+        let new_root = new_root_b();
+        let operation = Operation::RotatePostQuantumRoot {
+            new_post_quantum_root: new_root,
+            // Rejected by the default-lane guard before the reveal is verified.
+            post_quantum_root_reveal: unverified_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), lane)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            lane,
+            AuthorizationPolicyRevision::new(1),
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::PostQuantumRootRotationRequiresDefaultLane)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_requires_an_installed_policy() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let new_root = new_root_b();
+        // No policy installed: sign with the address-deriving key at the legacy
+        // revision so authorization passes and the arm's policy guard fires.
+        let operation = Operation::RotatePostQuantumRoot {
+            new_post_quantum_root: new_root,
+            post_quantum_root_reveal: unverified_reveal(),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), AuthorizationLaneId::DEFAULT)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            alice.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            LEGACY_AUTHORIZATION_POLICY_REVISION,
+            0,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&alice).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn post_quantum_root_rotation_rejects_a_non_active_envelope_signer() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let new_root = new_root_b();
+        let stranger = Keypair::from_seed([44u8; 32]);
+        // A non-active Ed25519 key signs the envelope. Unlike active-key rotation,
+        // root rotation has no recovery signer path, so this is just an ordinary
+        // authorization failure.
+        let operation = Operation::RotatePostQuantumRoot {
+            new_post_quantum_root: new_root,
+            post_quantum_root_reveal: root_rotation_reveal(alice.address(), 1, &new_root),
+        };
+        let access_list = operation
+            .default_access_list_for_lane(alice.address(), AuthorizationLaneId::DEFAULT)
+            .unwrap();
+        let mut tx = Transaction::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            alice.address(),
+            stranger.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            AuthorizationPolicyRevision::new(1),
+            1,
+            operation,
+            access_list,
+            small_fee_with_units(25_000),
+        );
+        tx.sign_with_policy_key(&stranger).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::AuthorizationKeyMismatch)
+        ));
+        assert_eq!(state, before);
+    }
+
+    /// The gate must reject any reveal that is not a real ML-DSA signature by the
+    /// *current* committed root over this exact root rotation. Every binding axis
+    /// and forgery is checked, each leaving state unchanged.
+    #[test]
+    fn post_quantum_root_rotation_rejects_misbound_or_forged_current_root_signature() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let new_root = new_root_b();
+        let before = state.clone();
+
+        // (a) Signed over a different new root.
+        let other_root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, b"a third root").unwrap();
+        let tx_a = rotate_root_tx(
+            &alice,
+            1,
+            new_root,
+            root_rotation_reveal(alice.address(), 1, &other_root),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_a, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (b) Signed for a different nonce.
+        let tx_b = rotate_root_tx(
+            &alice,
+            1,
+            new_root,
+            root_rotation_reveal(alice.address(), 2, &new_root),
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx_b, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (c) Signed for a different owner.
+        let stranger = Keypair::from_seed([44u8; 32]);
+        let wrong_owner_msg = crate::post_quantum_root_rotation_message(
+            &ChainId::devnet(),
+            stranger.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_root,
+        )
+        .unwrap();
+        let tx_c = rotate_root_tx(&alice, 1, new_root, reveal_over_message(&wrong_owner_msg));
+        assert!(matches!(
+            state.execute_transaction(&tx_c, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (d) Signed for a different chain.
+        let wrong_chain_msg = crate::post_quantum_root_rotation_message(
+            &ChainId::new("webc-testnet-9").unwrap(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_root,
+        )
+        .unwrap();
+        let tx_d = rotate_root_tx(&alice, 1, new_root, reveal_over_message(&wrong_chain_msg));
+        assert!(matches!(
+            state.execute_transaction(&tx_d, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (e) The current root's public key but a garbage signature.
+        let garbage = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: pq_public_key(),
+            signature: vec![0x7u8; ML_DSA_65_SIGNATURE_LEN],
+        };
+        let tx_e = rotate_root_tx(&alice, 1, new_root, garbage);
+        assert!(matches!(
+            state.execute_transaction(&tx_e, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // (f) Signed by the NEW root instead of the current one: the current root
+        // must authorize its own replacement, so the future root cannot.
+        let correct_msg = crate::post_quantum_root_rotation_message(
+            &ChainId::devnet(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(1),
+            1,
+            &new_root,
+        )
+        .unwrap();
+        let signed_by_new = reveal_with_keypair(pq_keypair_b(), &correct_msg);
+        let tx_f = rotate_root_tx(&alice, 1, new_root, signed_by_new);
+        assert!(matches!(
+            state.execute_transaction(&tx_f, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn after_root_rotation_the_new_root_holds_authority_and_the_old_root_does_not() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        // Rotate the root from A to B (envelope signed by the active key).
+        let new_root = new_root_b();
+        let rotate = rotate_root_tx(
+            &alice,
+            1,
+            new_root,
+            root_rotation_reveal(alice.address(), 1, &new_root),
+        );
+        state.execute_transaction(&rotate, &config).unwrap();
+        assert_eq!(
+            *state
+                .authorization_policies
+                .get(&alice.address())
+                .unwrap()
+                .post_quantum_root(),
+            new_root
+        );
+
+        // Now attempt an active-key rotation at the new revision 2. The rotation
+        // message binds revision 2; the active key (alice) signs the envelope.
+        let new_ed = Keypair::from_seed([50u8; 32]);
+        let msg = crate::active_key_rotation_message(
+            &ChainId::devnet(),
+            alice.address(),
+            AuthorizationPolicyRevision::new(2),
+            2,
+            &new_ed.public_key(),
+        )
+        .unwrap();
+
+        // The OLD root (A) can no longer authorize: the commitment now binds B.
+        let signed_by_old = reveal_over_message(&msg);
+        let operation_old = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_ed.public_key(),
+            post_quantum_root_reveal: signed_by_old,
+        };
+        let old_tx = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(2),
+            2,
+            operation_old,
+            small_fee_with_units(25_000),
+        )
+        .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&old_tx, &config),
+            Err(ChainError::InvalidPostQuantumRootReveal)
+        ));
+        assert_eq!(state, before);
+
+        // The NEW root (B) now authorizes the same active-key rotation.
+        let signed_by_new = reveal_with_keypair(pq_keypair_b(), &msg);
+        let operation_new = Operation::RotateActiveTransactionKey {
+            new_active_transaction_key: new_ed.public_key(),
+            post_quantum_root_reveal: signed_by_new,
+        };
+        let new_tx = Transaction::for_operation_with_policy(
+            &alice,
+            AuthorizationPolicyRevision::new(2),
+            2,
+            operation_new,
+            small_fee_with_units(25_000),
+        )
+        .unwrap();
+        state.execute_transaction(&new_tx, &config).unwrap();
+        let policy = state.authorization_policies.get(&alice.address()).unwrap();
+        assert_eq!(policy.active_transaction_key(), &new_ed.public_key());
+        assert_eq!(policy.revision(), AuthorizationPolicyRevision::new(3));
+        // The recovery root is still B after the active-key rotation.
+        assert_eq!(*policy.post_quantum_root(), new_root);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    // ----- epoch-boundary session-key pruning -----
+
+    #[test]
+    fn expired_session_keys_are_pruned_at_the_epoch_boundary_deterministically() {
+        let (config, mut state, alice, _bob) = installed_policy_state();
+        let short = Keypair::from_seed([9u8; 32]);
+        let long = Keypair::from_seed([10u8; 32]);
+        let short_id = SessionKeyId::derive(&short.public_key());
+        let long_id = SessionKeyId::derive(&long.public_key());
+
+        // Installed at epoch 0: `short` expires after epoch 1, `long` after 50.
+        let mut short_c = session_constraints();
+        short_c.lifetime_epochs = 1;
+        let mut long_c = session_constraints();
+        long_c.lifetime_epochs = 50;
+        state
+            .execute_transaction(&install_session_key_tx(&alice, &short, 1, short_c), &config)
+            .unwrap();
+        state
+            .execute_transaction(&install_session_key_tx(&alice, &long, 2, long_c), &config)
+            .unwrap();
+
+        // Advance to epoch 1: `short` is still usable at its expiry epoch, so
+        // nothing is pruned yet.
+        state.distribute_epoch_rewards(&config).unwrap();
+        assert_eq!(state.current_epoch, 1);
+        assert!(state
+            .session_keys
+            .contains_key(&(alice.address(), short_id)));
+        assert!(state.session_keys.contains_key(&(alice.address(), long_id)));
+
+        // Snapshot at epoch 1, then advance to epoch 2 on both the live state and
+        // a serialized-then-restored copy. Pruning is a pure function of committed
+        // state, so both must produce identical state, root, and events.
+        // bincode (not JSON) because state maps use non-string tuple keys.
+        let snapshot = bincode::serialize(&state).unwrap();
+        let mut restored: ChainState = bincode::deserialize(&snapshot).unwrap();
+        let live_events = state.distribute_epoch_rewards(&config).unwrap();
+        let restored_events = restored.distribute_epoch_rewards(&config).unwrap();
+        assert_eq!(state, restored);
+        assert_eq!(state.state_root().unwrap(), restored.state_root().unwrap());
+        assert_eq!(live_events, restored_events);
+
+        // At epoch 2 the short key is gone (its expiry epoch has passed) and the
+        // long key survives; a prune event was emitted for the short key.
+        assert_eq!(state.current_epoch, 2);
+        assert!(!state
+            .session_keys
+            .contains_key(&(alice.address(), short_id)));
+        assert!(state.session_keys.contains_key(&(alice.address(), long_id)));
+        assert!(live_events.iter().any(|event| matches!(
+            event,
+            Event::SessionKeyExpired { owner, session_key }
+                if *owner == alice.address() && *session_key == short_id
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Pruning removes only unusable keys, so it never changes an authorization
+        // outcome: the surviving long key still authorizes a transfer.
+        let transfer = session_transfer_tx(
+            &alice,
+            &long,
+            AuthorizationLaneId::DEFAULT,
+            3,
+            _bob.address(),
+            Amount::from_webc(1),
+            small_fee(),
+        );
+        state.execute_transaction(&transfer, &config).unwrap();
     }
 }

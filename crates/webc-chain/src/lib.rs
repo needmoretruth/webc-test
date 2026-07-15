@@ -19,7 +19,9 @@ pub mod hex_bytes;
 pub mod inflation;
 pub mod object;
 pub mod protocol;
+pub mod round;
 pub mod scheduler;
+pub mod session_key;
 pub mod slashing;
 pub mod staking;
 pub mod state;
@@ -31,16 +33,22 @@ pub use account::Account;
 pub use amount::{Amount, WEBC_DECIMALS, WEBC_UNIT};
 pub use authorization::AuthorizationLane;
 pub use authorization_policy::{
-    AccountAuthorizationPolicy, AccountAuthorizationPolicyV1, AuthorizationPolicyRevision,
-    PostQuantumRoot, PostQuantumScheme, INITIAL_AUTHORIZATION_POLICY_REVISION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_AUTHORIZATION_POLICY_REVISION,
+    active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
+    AccountAuthorizationPolicyV1, AuthorizationPolicyRevision, PostQuantumRoot,
+    PostQuantumRootReveal, PostQuantumScheme, ACTIVE_KEY_ROTATION_DOMAIN,
+    INITIAL_AUTHORIZATION_POLICY_REVISION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    MAX_AUTHORIZATION_POLICY_REVISION, MAX_POST_QUANTUM_PUBLIC_KEY_BYTES,
+    MAX_POST_QUANTUM_SIGNATURE_BYTES, POST_QUANTUM_ROOT_ROTATION_DOMAIN,
 };
 pub use block::{Block, BlockHeader};
-pub use block_builder::{build_block, receipt_root, transaction_root, BlockBuildInput};
+pub use block_builder::{
+    apply_block, build_block, receipt_root, transaction_root, BlockBuildInput,
+};
 pub use bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 pub use consensus::{
-    detect_double_votes, DoubleVoteEvidence, SignedVote, ValidatorPower, ValidatorSet, Vote,
-    VoteType, CONSENSUS_VOTE_DOMAIN,
+    detect_double_votes, DoubleVoteEvidence, FinalityCertificate, Proposal, SignedProposal,
+    SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
+    CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
 pub use fees::{split_fee, FeeBreakdown, FeePolicy};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
@@ -50,7 +58,16 @@ pub use protocol::{
     AuthorizationLaneId, BaseUnits, BlockHeight, ChainId, ChainIdError, Epoch, Nonce,
     ProtocolVersion, ValidatorId, CURRENT_PROTOCOL_VERSION,
 };
+pub use round::{
+    ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage, Step, TimeoutKind,
+    ValidatorIdentity,
+};
 pub use scheduler::parallel_batches;
+pub use session_key::{
+    session_key_authorization_message, SessionAllowedOperations, SessionKey,
+    SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
+    SESSION_KEY_AUTHORIZATION_DOMAIN,
+};
 pub use slashing::{SlashingEvidence, SlashingOutcome, SlashingPolicy};
 pub use staking::{
     Delegation, StakingConfig, Validator, ValidatorStatus, SEVEN_DAY_TARGET_AT_ONE_MINUTE_EPOCHS,
@@ -106,7 +123,9 @@ pub enum ChainError {
     MissingSignature,
     #[error("public key does not match transaction sender address")]
     SenderPublicKeyMismatch,
-    #[error("transaction authorization policy revision mismatch: expected {expected}, got {actual}")]
+    #[error(
+        "transaction authorization policy revision mismatch: expected {expected}, got {actual}"
+    )]
     AuthorizationPolicyRevisionMismatch { expected: u64, actual: u64 },
     #[error("transaction public key is not active in the account authorization policy")]
     AuthorizationKeyMismatch,
@@ -228,6 +247,66 @@ pub enum ChainError {
     ObjectVersionMismatch { expected: u64, actual: u64 },
     #[error("object data contains {actual} bytes, above the maximum of {maximum}")]
     ObjectDataTooLarge { actual: usize, maximum: usize },
+    #[error("post-quantum root reveal does not match the committed account root")]
+    InvalidPostQuantumRootReveal,
+    #[error("session key was not found")]
+    SessionKeyNotFound,
+    #[error("session key already exists")]
+    SessionKeyAlreadyExists,
+    #[error("session key has expired")]
+    SessionKeyExpired,
+    #[error("account is at its maximum number of session keys")]
+    SessionKeyLimitExceeded,
+    #[error("requested session-key lifetime exceeds the configured maximum")]
+    SessionKeyLifetimeTooLong,
+    #[error("account has no installed policy able to own session keys")]
+    SessionKeyRequiresInstalledPolicy,
+    #[error("session-key management must use the default lane")]
+    SessionKeyManagementRequiresDefaultLane,
+    #[error("session-key transaction used a lane other than its bound lane")]
+    SessionKeyLaneMismatch,
+    #[error("session key is not permitted to authorize this operation")]
+    SessionKeyOperationNotPermitted,
+    #[error("session-key transaction exceeds the per-use amount limit")]
+    SessionKeyAmountExceeded,
+    #[error("session-key transaction exceeds the cumulative amount budget")]
+    SessionKeyBudgetExceeded,
+    #[error("session-key transaction exceeds the per-use fee limit")]
+    SessionKeyFeeExceeded,
+    #[error("session-key transaction exceeds the cumulative fee budget")]
+    SessionKeyFeeBudgetExceeded,
+    #[error("session-key constraints are invalid")]
+    InvalidSessionKeyConstraints,
+    #[error("active-key rotation must use the default lane")]
+    ActiveKeyRotationRequiresDefaultLane,
+    #[error("active-key rotation requires an installed policy with a post-quantum root")]
+    ActiveKeyRotationRequiresInstalledPolicy,
+    #[error("active-key rotation must change the active transaction key")]
+    ActiveKeyRotationToSameKey,
+    #[error("post-quantum root rotation must use the default lane")]
+    PostQuantumRootRotationRequiresDefaultLane,
+    #[error("post-quantum root rotation requires an installed policy with a post-quantum root")]
+    PostQuantumRootRotationRequiresInstalledPolicy,
+    #[error("post-quantum root rotation must change the committed recovery root")]
+    PostQuantumRootRotationToSameRoot,
+    #[error(
+        "consensus message chain ID or protocol version does not match the local configuration"
+    )]
+    ConsensusConfigMismatch,
+    #[error("consensus message does not match the expected height or round")]
+    ConsensusHeightRoundMismatch,
+    #[error("consensus proposal was not signed by the scheduled leader for this height and round")]
+    ConsensusProposalNotFromLeader,
+    #[error("consensus proposal block hash does not match its carried block")]
+    ConsensusProposalBlockMismatch,
+    #[error("consensus message came from a validator absent from the height's snapshot")]
+    ConsensusValidatorNotInSet,
+    #[error("consensus message signature is invalid for the registered consensus key")]
+    ConsensusSignatureInvalid,
+    #[error("finality certificate does not carry strictly more than two-thirds precommit power")]
+    FinalityQuorumNotReached,
+    #[error("imported block does not match local re-execution of its transactions")]
+    ImportedBlockMismatch,
 }
 
 impl From<bincode::Error> for ChainError {
