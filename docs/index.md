@@ -40,19 +40,22 @@ They cannot override confirmed product or economic policy in
 
 ## Current next action
 
-Phase 0 and Phase 1 are complete, and Phase 2 is active. The versioned
-authorization + constrained session-key gate is **complete** (ML-DSA-65
-root-signature gate, session keys with budgets/lane/expiry+pruning, active-key and
-recovery-root rotation, the browser/SDK surface, and an indicative benchmark).
-Durable encrypted per-origin wallet permission storage and automatic
-authorization-lane setup are **complete** too — the last outstanding Phase 2
-wallet-wire/secret-isolation gate. The only session-key remainder is
-reference-machine benchmark numbers. Use `continuation-guide.md` for the verified
-checkpoint and exact next task, and do not restart completed amount, inflation,
-genesis, block-atomicity, staking-ratio, access-enforcement, session-key, or
-wallet-permission-storage work. The next milestone is **Phase 3**: a local
-restartable node with storage traits, crash-safe commits, and HTTP/WebSocket
-developer APIs.
+Phases 0-3 are complete, and **Phase 4 (networking and signed BFT consensus) is
+active**. Phase 4 A-1 (authenticated P2P networking plumbing and transaction
+gossip) is **complete**, and the deterministic stake-weighted leader schedule
+(A-2.1) is **complete**. The next task is the rest of the signed consensus core:
+the Proposal/Vote/Certificate wire messages, the epoch stake-snapshot writer, the
+prevote/precommit round state machine, and the finality certificate. Use
+`continuation-guide.md` for the verified checkpoint and exact next task, and do
+not restart completed amount, inflation, genesis, block-atomicity, staking-ratio,
+access-enforcement, session-key, wallet-permission-storage, storage, node, or
+networking work.
+
+The AI-era product direction is now recorded in `decision-record.md`: a WEBC
+high-level contract language that lowers to the audited Rust/WASM layer, a native
+staked oracle, capped fee sponsorship, anti-complexity contract tooling, an
+AI-readable component catalog, and prioritized Ethereum/Solana bridges. These are
+built after consensus is stable; `development-plan.md` phases 6-14 carry them.
 
 This project runs in an ephemeral cloud container: the GitHub repo is the source
 of truth, so commit and push every step. `target/`, `node_modules/`, and `dist/`

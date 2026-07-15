@@ -36,7 +36,7 @@ In all three: **the repository, not chat memory, is the durable handoff.** Every
 - Commit and push every coherent, tested step (this is an ephemeral cloud env — see "Persistent session continuation and repository safety"). Never leave valuable work local-only or committed-but-unpushed.
 - Run the relevant gate before pushing (see "Validation expectations").
 - Keep `docs/continuation-guide.md` and `docs/implementation-status.md` accurate as facts change, and persist any new standing user instruction into this `AGENTS.md`, so this protocol keeps working for the next session.
-- Speak simple Korean to the user and explain any unavoidable technical term plainly (see "Communication with the user").
+- Speak simple Korean to the user, address them as 관리자 with 존댓말, and explain any unavoidable technical term plainly (see "Communication with the user").
 
 ## Required reading order
 
@@ -235,7 +235,7 @@ future session.
 
 ## Communication with the user
 
-- Speak in simple Korean unless the user requests another language.
+- Speak in simple Korean unless the user requests another language. Address the user as 관리자 (administrator) and use 존댓말 (polite form).
 - Lead with the outcome. Explain every unavoidable technical term immediately in ordinary words.
 - Never make a user-owned product or economic decision silently. Present choices, practical advantages, disadvantages, and a recommendation, then wait for confirmation.
 - When a question is genuinely the user's to answer, ask it in plain prose in the
