@@ -28,13 +28,14 @@ Use simple Korean when speaking to the user, address them as 관리자 (administ
 ## Current verified checkpoint
 
 Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
-is in progress — stage A-1 (networking plumbing) and the A-2 consensus core are
-done, and stage A-3 has landed its deterministic core: received-block validation
-(`Node::import_block`), a full multi-round Tendermint machine with locking and
-safe round changes (`webc-chain::ConsensusMachine`), and objective equivocation
-detection. What remains in A-3 is the async network driver that runs the machine
-over real TCP and a state-sync protocol** (see "Exact next work"). Always use
-`git log` to discover the current branch tip;
+is in progress — stage A-1 (networking plumbing), the A-2 consensus core, and most
+of A-3 are done: received-block validation (`Node::import_block`), a full
+multi-round Tendermint machine with locking and safe round changes
+(`webc-chain::ConsensusMachine`), objective equivocation detection, and the async
+`ConsensusDriver` that runs the machine over real TCP — proven by a loopback test
+where three validator nodes finalize the same chain. What remains in A-3 is a
+state-sync protocol (catch up a lagging/joining node) and mempool-fed proposals**
+(see "Exact next work"). Always use `git log` to discover the current branch tip;
 the checkpoint list below names implementation history, not an instruction to
 reset or return to an older commit. (The prototype remains unsafe for real funds,
 and reference-machine benchmark numbers are still owed before any performance
@@ -258,19 +259,31 @@ A-2.1 (the `WEBC_LEADER_SCHEDULE_V1` stake-weighted leader schedule) remains as
 before. `Vote`/`SignedVote`/`VoteType`/quorum math/`detect_double_votes` are the
 primitives the above build on.
 
-**What remains in Phase 4 A-3 is integration, not consensus theory.** The machine
-is pure and driver-agnostic; missing is (1) the async driver in `webc-node` that
-runs a `ConsensusMachine` per height over real `webc-net` TCP — building a
-candidate block on `NeedProposalBlock`, arming real timers on `ScheduleTimeout`,
-routing gossiped Proposal/Vote/Certificate into the machine (the gossip pump
-currently ignores them by design), committing on `Commit` via `import_block`, and
-including gossiped `Equivocation` evidence in the next proposed block — so 2-4
-separate processes converge; and (2) a state-sync protocol so a joining node
-fetches finalized blocks plus their certificates from a checkpoint and imports
-them without replaying all history. Fork choice is largely covered by the
-finality-certificate design (a node follows the certified chain and commits only
-finalized blocks); the double-vote slashing *application* path already exists, so
-only its wiring into produced blocks (part of the driver) is left.
+**The A-3 async consensus driver is done.** `webc-node::ConsensusDriver`
+(`consensus_driver.rs`) runs one `ConsensusMachine` per height over real
+`webc-net` TCP: it builds a candidate on `NeedProposalBlock`
+(`Node::build_candidate` — build without commit), arms real tokio timers on
+`ScheduleTimeout` (tagged by height so stale timers are dropped), routes gossiped
+Proposal/Vote into the machine, commits on `Commit` via `import_block` and
+advances to the next height, and stashes gossiped `Equivocation` evidence to
+embed in its next proposal. A validator passes its consensus-key seed; an
+observer (`None`) still follows and commits finalized blocks. A loopback
+integration test (`tests/consensus_convergence.rs`) proves three validator nodes
+(active at genesis via `self_stake` above the activation threshold) finalize the
+same blocks at the same heights over the real transport; stable across repeated
+runs.
+
+**What remains in Phase 4 A-3** is (1) a **state-sync protocol** so a node that is
+behind (or newly joining) fetches finalized blocks plus their certificates from a
+checkpoint and imports them (`import_block` already validates and commits) without
+replaying all history — the driver today keeps lockstep nodes in sync but cannot
+catch up a lagging node, since a gossiped `Certificate` carries a block hash but
+not the block; and (2) **mempool-fed proposals** (the driver proposes empty blocks
+today). Fork choice is largely covered by the finality-certificate design (a node
+follows the certified chain and commits only finalized blocks); objective
+double-vote evidence is detected, embedded in proposals by the driver, and applied
+by the existing slashing path — so that loop is closed end to end in code, pending
+a test that a proposed block's evidence actually slashes.
 
 Public contract runtime, the WEBC high-level language and tooling, the native
 oracle, ZK expansion, the web/game platform, and real-fund bridge work stay
