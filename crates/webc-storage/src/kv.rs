@@ -45,17 +45,21 @@ pub enum Table {
     BlockHashIndex,
     /// Validator-set snapshots keyed by 8-byte big-endian epoch.
     ValidatorSets,
+    /// Finality certificates keyed by 8-byte big-endian height, so a node can
+    /// prove a served block was finalized during state sync.
+    Certificates,
 }
 
 impl Table {
     /// Stable ordered list of every table. Backends iterate this to allocate
     /// one physical namespace per table; tests iterate it to assert coverage.
-    pub const ALL: [Table; 5] = [
+    pub const ALL: [Table; 6] = [
         Table::Meta,
         Table::Blocks,
         Table::StateSnapshots,
         Table::BlockHashIndex,
         Table::ValidatorSets,
+        Table::Certificates,
     ];
 
     /// A stable, compact byte tag identifying the table in a serialized batch.
@@ -70,6 +74,7 @@ impl Table {
             Table::StateSnapshots => 2,
             Table::BlockHashIndex => 3,
             Table::ValidatorSets => 4,
+            Table::Certificates => 5,
         }
     }
 }

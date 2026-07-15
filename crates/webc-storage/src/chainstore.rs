@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use webc_chain::{Block, BlockHeader, ChainState, ValidatorSet};
+use webc_chain::{Block, BlockHeader, ChainState, FinalityCertificate, ValidatorSet};
 use webc_crypto::Hash256;
 
 use crate::error::StorageError;
@@ -71,6 +71,9 @@ pub struct BlockCommit<'a> {
     pub state: &'a ChainState,
     /// Optional validator-set snapshot for this block's epoch.
     pub validator_set: Option<&'a ValidatorSet>,
+    /// Optional finality certificate proving this block was BFT-finalized, stored
+    /// under the block height so a node can serve it during state sync.
+    pub certificate: Option<&'a FinalityCertificate>,
 }
 
 /// Big-endian 8-byte key for a height or epoch, so byte order equals numeric order.
@@ -273,6 +276,13 @@ impl<K: KvStore> ChainStore<K> {
                 bincode::serialize(validator_set)?,
             );
         }
+        if let Some(certificate) = commit.certificate {
+            batch.put(
+                Table::Certificates,
+                be(header.height).to_vec(),
+                bincode::serialize(certificate)?,
+            );
+        }
         // The tip advances in the same batch, so it is never observable ahead of
         // its block or state.
         batch.put(Table::Meta, META_TIP, bincode::serialize(&new_tip)?);
@@ -333,6 +343,14 @@ impl<K: KvStore> ChainStore<K> {
     /// Returns the validator-set snapshot recorded for `epoch`, or `None`.
     pub fn validator_set(&self, epoch: u64) -> Result<Option<ValidatorSet>, StorageError> {
         match self.store.get(Table::ValidatorSets, &be(epoch))? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+        }
+    }
+
+    /// Returns the finality certificate recorded for `height`, or `None`.
+    pub fn certificate(&self, height: u64) -> Result<Option<FinalityCertificate>, StorageError> {
+        match self.store.get(Table::Certificates, &be(height))? {
             None => Ok(None),
             Some(bytes) => Ok(Some(decode(&bytes)?)),
         }
@@ -408,6 +426,7 @@ mod tests {
                 block,
                 state,
                 validator_set: None,
+                certificate: None,
             })
             .unwrap();
     }
@@ -486,6 +505,7 @@ mod tests {
                 block: &block1,
                 state: &state1,
                 validator_set: None,
+                certificate: None,
             })
             .unwrap_err();
         assert!(matches!(err, StorageError::Inconsistent(_)));
@@ -498,6 +518,7 @@ mod tests {
                 block: &block3,
                 state: &state3,
                 validator_set: None,
+                certificate: None,
             })
             .unwrap_err();
         assert!(matches!(err, StorageError::Inconsistent(_)));
@@ -522,6 +543,7 @@ mod tests {
                 block: &bad,
                 state: &state2,
                 validator_set: None,
+                certificate: None,
             })
             .unwrap_err();
         assert!(matches!(err, StorageError::Inconsistent(_)));
@@ -540,6 +562,7 @@ mod tests {
                 block: &block1,
                 state: &wrong_state,
                 validator_set: None,
+                certificate: None,
             })
             .unwrap_err();
         assert!(matches!(err, StorageError::Inconsistent(_)));

@@ -10,7 +10,7 @@
 //! defines what a single frame's bytes mean.
 
 use serde::{Deserialize, Serialize};
-use webc_chain::{FinalityCertificate, SignedProposal, SignedVote, Transaction};
+use webc_chain::{Block, FinalityCertificate, SignedProposal, SignedVote, Transaction};
 use webc_crypto::Hash256;
 
 use crate::codec::{decode as decode_frame, encode as encode_frame};
@@ -44,6 +44,25 @@ pub enum NetMessage {
     Vote(Box<SignedVote>),
     /// A finality certificate proving a block reached precommit quorum.
     Certificate(Box<FinalityCertificate>),
+    /// A state-sync request for finalized blocks starting at `from_height`.
+    BlockRequest {
+        /// First height requested (inclusive).
+        from_height: u64,
+        /// Maximum number of consecutive blocks to return.
+        max: u32,
+    },
+    /// A state-sync response carrying one certified finalized block.
+    BlockResponse(Box<CertifiedBlock>),
+}
+
+/// A finalized block bundled with the certificate that proves its finality, sent
+/// during state sync so a catching-up node can verify before importing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertifiedBlock {
+    /// The finalized block.
+    pub block: Block,
+    /// The certificate proving strictly over two thirds precommitted it.
+    pub certificate: FinalityCertificate,
 }
 
 /// Self-describing envelope wrapping one [`NetMessage`] on the wire.
@@ -213,6 +232,45 @@ mod tests {
             panic!("expected a vote message");
         };
         assert_eq!(got.payload.validator, vote.payload.validator);
+    }
+
+    #[test]
+    fn round_trips_a_block_request_message() {
+        let message = NetMessage::BlockRequest {
+            from_height: 7,
+            max: 32,
+        };
+        let decoded = decode_message(&encode_message(&message).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            NetMessage::BlockRequest {
+                from_height: 7,
+                max: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn round_trips_a_block_response_message() {
+        let leader = Keypair::from_seed([4u8; 32]);
+        let block = sample_block(leader.address());
+        let certificate = FinalityCertificate {
+            protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+            chain_id: webc_chain::ChainId::devnet(),
+            height: 1,
+            round: 0,
+            block_hash: block.hash().unwrap(),
+            precommits: vec![sample_vote(&leader)],
+        };
+        let message = NetMessage::BlockResponse(Box::new(CertifiedBlock {
+            block: block.clone(),
+            certificate,
+        }));
+        let decoded = decode_message(&encode_message(&message).unwrap()).unwrap();
+        let NetMessage::BlockResponse(got) = decoded else {
+            panic!("expected a block response message");
+        };
+        assert_eq!(got.block.hash().unwrap(), block.hash().unwrap());
     }
 
     #[test]
