@@ -177,6 +177,20 @@ impl ValidatorSet {
         power.0 > threshold
     }
 
+    /// Returns true when `power` is strictly greater than 1/3 of total power.
+    ///
+    /// This is the `f + 1` threshold: any set with more than one third of the
+    /// power must contain at least one honest validator (given less than one
+    /// third is Byzantine). Consensus uses it to safely catch up to a higher
+    /// round that a super-minority has already advanced to.
+    pub fn has_one_third_power(&self, power: Amount) -> bool {
+        if self.total_power.is_zero() {
+            return false;
+        }
+        let threshold = self.total_power.0 / 3;
+        power.0 > threshold
+    }
+
     /// Checks whether unique matching votes represent strictly over two thirds.
     ///
     /// This arithmetic helper assumes signatures and snapshot membership were
@@ -341,6 +355,12 @@ pub struct Proposal {
     pub round: u32,
     /// Hash of the exact proposed block.
     pub block_hash: Hash256,
+    /// The round in which this block previously gathered a prevote quorum (its
+    /// proof-of-lock round), or `None` for a fresh proposal. A validator locked on
+    /// a value in an earlier round may re-prevote a re-proposed block only when
+    /// this authenticated round justifies it, which is what makes round changes
+    /// both safe and live.
+    pub valid_round: Option<u32>,
     /// Validator-pool operator identity that must be the scheduled leader.
     pub proposer: Address,
 }
@@ -375,11 +395,13 @@ impl SignedProposal {
     ///
     /// Fails if the block cannot be hashed. The caller is responsible for having
     /// built a valid block; this only binds the proposer's signature to it.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         protocol_version: ProtocolVersion,
         chain_id: ChainId,
         height: u64,
         round: u32,
+        valid_round: Option<u32>,
         block: Block,
         proposer: Address,
         consensus_key: &Keypair,
@@ -391,6 +413,7 @@ impl SignedProposal {
             height,
             round,
             block_hash,
+            valid_round,
             proposer,
         };
         let signature = consensus_key.sign(&payload.signing_bytes()?);
@@ -849,6 +872,7 @@ mod tests {
             ChainId::devnet(),
             height,
             round,
+            None,
             block,
             leader.address(),
             leader,
@@ -879,6 +903,7 @@ mod tests {
             ChainId::devnet(),
             height,
             round,
+            None,
             block,
             usurper.address(),
             usurper,
@@ -904,6 +929,7 @@ mod tests {
             ChainId::devnet(),
             height,
             round,
+            None,
             block,
             a.address(),
             &a,

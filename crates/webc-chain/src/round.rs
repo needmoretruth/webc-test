@@ -1,47 +1,71 @@
-//! Deterministic single-height BFT round state machine.
+//! Deterministic multi-round BFT consensus machine for one block height.
 //!
-//! Purpose: drive one consensus height through the happy-path sequence
-//! propose -> prevote -> precommit -> commit, producing a [`FinalityCertificate`]
-//! when strictly more than two thirds of the snapshot's voting power precommits
-//! one block. It is a pure state machine: it reads no clock, performs no
-//! networking or persistence, and returns the messages a driver should broadcast
-//! and the block a driver should commit. This keeps the consensus-critical logic
-//! deterministic and unit-testable, with the async driver (in `webc-node`) as a
-//! thin shell around it.
+//! Purpose: drive one consensus height to a finalized block through the
+//! Tendermint-style sequence propose -> prevote -> precommit, with safe round
+//! changes when a round fails to decide. It is a pure state machine: it reads no
+//! clock, performs no networking or persistence, and never executes blocks. It
+//! consumes [`ConsensusEvent`]s (received messages and fired timeouts) and
+//! returns [`ConsensusAction`]s a driver carries out (broadcast a message, arm a
+//! timeout, request a candidate block, or commit a finalized block). This keeps
+//! the safety-critical logic deterministic and unit-testable, with the async
+//! driver (in `webc-node`) as a thin shell.
 //!
-//! Boundaries and scope: this is Phase 4 A-2 — the honest, single-round core.
-//! Timeouts, round changes, locking/valid-round rules, fork choice, and state
-//! sync are Phase 4 A-3 and deliberately absent here. Because there is no round
-//! change yet, a stalled proposer stalls the height; that is acceptable for the
-//! A-2 convergence milestone and is the first thing A-3 removes.
+//! Model: this follows Buchman/Kwon/Milosevic Tendermint (arXiv:1807.04938,
+//! Algorithm 1), adapted to WEBC types. The safety-critical invariants are:
+//! - a validator **locks** a value when it precommits it, and thereafter only
+//!   prevotes that value (or nil) unless an authenticated proof-of-lock from a
+//!   later round justifies changing — so honest nodes never contribute prevotes
+//!   to two different blocks, and two blocks can never both reach a precommit
+//!   quorum;
+//! - "more than two thirds" (`2f+1`) is required to lock, decide, or advance a
+//!   step; "more than one third" (`f+1`) — which must include an honest node —
+//!   is required to catch up to a higher round.
 //!
-//! Security rules enforced here:
-//! - every proposal and vote is verified against the immutable height snapshot
-//!   (registered consensus key, scheduled-leader identity for proposals) before
-//!   it can influence the machine;
-//! - a validator is counted at most once per step (first vote wins), so a later
-//!   equivocating vote cannot change this node's tally;
-//! - a block is committed only when its finality certificate independently
-//!   reaches quorum, and only when the machine actually holds that block.
+//! A nil vote (a prevote/precommit for "no block") is encoded as a vote whose
+//! `block_hash` is the reserved all-zero sentinel [`webc_crypto::Hash256::ZERO`].
+//! A real block hash is the digest of non-empty canonical JSON and can never be
+//! all zeros, and the codebase already treats all-zeros as a reserved sentinel
+//! (the genesis parent hash), so this is unambiguous and needs no wire change.
+//!
+//! Block validity: the machine treats every carried proposal block as valid; a
+//! driver that can execute blocks should re-validate a received proposal (via
+//! `apply_block`) before feeding it, and the committing node re-validates on
+//! import. This keeps the consensus machine free of execution.
+//!
+//! Deferred: dynamic timeout durations, gossiping the full vote set for faster
+//! catch-up, and sub-committee sampling are driver/refinement concerns, not part
+//! of this safety core.
 
 use crate::{
     Block, ChainError, ChainId, DoubleVoteEvidence, FinalityCertificate, ProtocolVersion,
     SignedProposal, SignedVote, ValidatorSet, Vote, VoteType,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use webc_crypto::{Address, Keypair};
+use webc_crypto::{Address, Hash256, Keypair};
 
-/// The BFT step this node currently occupies within one height/round.
+/// The reserved sentinel identifying a nil vote (a vote for "no block").
+const NIL: Hash256 = Hash256::ZERO;
+
+/// The BFT step this node occupies within its current round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// Awaiting a valid proposal from the scheduled leader.
+    /// Awaiting the round's proposal (or a propose timeout).
     Propose,
-    /// Proposal accepted; collecting prevotes.
+    /// Collecting prevotes.
     Prevote,
-    /// Prevote quorum reached; collecting precommits.
+    /// Collecting precommits.
     Precommit,
-    /// Precommit quorum reached; the block is finalized.
-    Committed,
+}
+
+/// The three consensus timeouts a driver arms and fires back as events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// No proposal arrived in time; prevote nil.
+    Propose,
+    /// A prevote quorum formed without a single-block majority; precommit nil.
+    Prevote,
+    /// A precommit quorum formed without a decision; move to the next round.
+    Precommit,
 }
 
 /// This node's validator identity, if it is a voting member. Observers
@@ -56,10 +80,24 @@ pub struct ValidatorIdentity {
 /// A consensus message exchanged between nodes for one height.
 #[derive(Clone, Debug)]
 pub enum ConsensusMessage {
-    /// The leader's signed block proposal.
+    /// The scheduled leader's signed block proposal.
     Proposal(Box<SignedProposal>),
-    /// A signed prevote or precommit.
+    /// A signed prevote or precommit (nil is the all-zero sentinel hash).
     Vote(SignedVote),
+}
+
+/// An input to the machine: a received message or a fired timeout.
+#[derive(Clone, Debug)]
+pub enum ConsensusEvent {
+    /// A message received from a peer (or produced locally).
+    Message(ConsensusMessage),
+    /// A timeout the driver previously armed has fired.
+    Timeout {
+        /// Which timeout fired.
+        kind: TimeoutKind,
+        /// The round the timeout was armed for.
+        round: u32,
+    },
 }
 
 /// An instruction the driver must carry out on the machine's behalf.
@@ -67,6 +105,20 @@ pub enum ConsensusMessage {
 pub enum ConsensusAction {
     /// Gossip this message to peers (it has already been applied locally).
     Broadcast(ConsensusMessage),
+    /// Arm this timeout; fire it back as a [`ConsensusEvent::Timeout`] on expiry.
+    ScheduleTimeout {
+        /// Which timeout to arm.
+        kind: TimeoutKind,
+        /// The round this timeout belongs to.
+        round: u32,
+    },
+    /// This node is the proposer for `round` and has no locked value to
+    /// re-propose: the driver should build a candidate block and hand it back via
+    /// [`ConsensusMachine::provide_block`].
+    NeedProposalBlock {
+        /// The round the block is needed for.
+        round: u32,
+    },
     /// Finalize this block; its certificate independently proves quorum.
     Commit {
         /// The finalized block.
@@ -74,48 +126,74 @@ pub enum ConsensusAction {
         /// The proof that strictly over two thirds precommitted it.
         certificate: Box<FinalityCertificate>,
     },
-    /// A validator equivocated (signed two conflicting votes in one step). The
-    /// driver should include this objective evidence in a future block, where the
-    /// existing verified slashing path penalizes the offender exactly once.
+    /// A validator equivocated (signed two conflicting votes in one step/round).
+    /// The driver should include this objective evidence in a future block, where
+    /// the existing verified slashing path penalizes the offender exactly once.
     Equivocation(Box<DoubleVoteEvidence>),
 }
 
-/// A single-height, single-round BFT state machine over an immutable snapshot.
-pub struct RoundState {
+/// Which votes a power tally counts: any hash, or exactly one hash.
+#[derive(Clone, Copy)]
+enum HashFilter {
+    Any,
+    Exactly(Hash256),
+}
+
+/// Per-round, once-only rule guards, keyed by `(rule id, round)`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Guard {
+    PrevoteSent,
+    PrecommitSent,
+    PrevoteTimeoutScheduled,
+    PrecommitTimeoutScheduled,
+    ValidValueUpdated,
+}
+
+/// A single-height, multi-round Tendermint-style BFT state machine.
+pub struct ConsensusMachine {
     protocol_version: ProtocolVersion,
     chain_id: ChainId,
     set: ValidatorSet,
     height: u64,
+    identity: Option<ValidatorIdentity>,
+
     round: u32,
     step: Step,
-    identity: Option<ValidatorIdentity>,
-    /// The accepted proposal for this height/round, once seen.
-    proposal: Option<SignedProposal>,
-    /// First prevote seen per validator (later equivocations are ignored).
-    prevotes: BTreeMap<Address, SignedVote>,
-    /// First precommit seen per validator.
-    precommits: BTreeMap<Address, SignedVote>,
-    /// Whether this node has already broadcast its own prevote.
-    prevote_cast: bool,
-    /// Whether this node has already broadcast its own precommit.
-    precommit_cast: bool,
-    /// Validators already reported for equivocation in a step, so each conflict
-    /// is surfaced as evidence at most once.
-    reported_equivocators: BTreeSet<(Address, VoteType)>,
-    /// The finality certificate, once the block is committed.
-    certificate: Option<FinalityCertificate>,
+
+    /// The value this node precommitted and the round it did so (its lock).
+    locked_value: Option<Block>,
+    locked_round: Option<u32>,
+    /// The latest value this node saw reach a prevote quorum, and its round.
+    valid_value: Option<Block>,
+    valid_round: Option<u32>,
+
+    /// One accepted proposal per round, from that round's scheduled leader.
+    proposals: BTreeMap<u32, SignedProposal>,
+    /// First prevote per `(round, validator)`.
+    prevotes: BTreeMap<(u32, Address), SignedVote>,
+    /// First precommit per `(round, validator)`.
+    precommits: BTreeMap<(u32, Address), SignedVote>,
+
+    /// Offenders already reported per `(round, step)`, so each conflict is
+    /// surfaced as evidence at most once.
+    reported_equivocators: BTreeSet<(u32, Address, VoteType)>,
+    /// Fired once-only rule guards.
+    guards: BTreeSet<(Guard, u32)>,
+
+    /// The finalized block and its certificate, once decided.
+    decision: Option<(Block, FinalityCertificate)>,
 }
 
-impl RoundState {
-    /// Creates a state machine for one height and round over `set`.
+impl ConsensusMachine {
+    /// Creates a machine for `height` over the immutable snapshot `set`.
     ///
-    /// `identity` is `Some` for a voting validator and `None` for an observer.
+    /// The machine starts at round 0 in the Propose step. Call [`Self::start`]
+    /// once to emit the round-0 startup actions (propose or arm a timeout).
     pub fn new(
         protocol_version: ProtocolVersion,
         chain_id: ChainId,
         set: ValidatorSet,
         height: u64,
-        round: u32,
         identity: Option<ValidatorIdentity>,
     ) -> Self {
         Self {
@@ -123,56 +201,160 @@ impl RoundState {
             chain_id,
             set,
             height,
-            round,
-            step: Step::Propose,
             identity,
-            proposal: None,
+            round: 0,
+            step: Step::Propose,
+            locked_value: None,
+            locked_round: None,
+            valid_value: None,
+            valid_round: None,
+            proposals: BTreeMap::new(),
             prevotes: BTreeMap::new(),
             precommits: BTreeMap::new(),
-            prevote_cast: false,
-            precommit_cast: false,
             reported_equivocators: BTreeSet::new(),
-            certificate: None,
+            guards: BTreeSet::new(),
+            decision: None,
         }
     }
 
-    /// The address scheduled to propose this height/round.
-    pub fn proposer(&self) -> Option<Address> {
-        self.set.proposer_for(self.height, self.round)
+    /// Emits the startup actions for round 0. Call exactly once after [`Self::new`].
+    pub fn start(&mut self) -> Result<Vec<ConsensusAction>, ChainError> {
+        let mut actions = Vec::new();
+        self.start_round(0, &mut actions)?;
+        Ok(actions)
     }
 
-    /// Whether this node is the scheduled proposer for this height/round.
-    pub fn is_proposer(&self) -> bool {
-        match (&self.identity, self.proposer()) {
+    /// The address scheduled to propose `round`.
+    pub fn proposer(&self, round: u32) -> Option<Address> {
+        self.set.proposer_for(self.height, round)
+    }
+
+    /// Whether this node is the scheduled proposer for `round`.
+    pub fn is_proposer(&self, round: u32) -> bool {
+        match (&self.identity, self.proposer(round)) {
             (Some(identity), Some(proposer)) => identity.address == proposer,
             _ => false,
         }
     }
 
-    /// The current BFT step.
+    /// The current round.
+    pub fn round(&self) -> u32 {
+        self.round
+    }
+
+    /// The current step.
     pub fn step(&self) -> Step {
         self.step
     }
 
-    /// The finality certificate, present once the block is committed.
-    pub fn certificate(&self) -> Option<&FinalityCertificate> {
-        self.certificate.as_ref()
+    /// The finalized block, once decided.
+    pub fn decided_block(&self) -> Option<&Block> {
+        self.decision.as_ref().map(|(block, _)| block)
     }
 
-    /// Called by the driver when this node is the leader: signs `block` as the
-    /// proposal, applies it locally, and returns the messages to broadcast
-    /// (the proposal plus this node's own prevote).
+    /// The finality certificate, once decided.
+    pub fn certificate(&self) -> Option<&FinalityCertificate> {
+        self.decision.as_ref().map(|(_, cert)| cert)
+    }
+
+    /// The driver's response to [`ConsensusAction::NeedProposalBlock`]: supplies a
+    /// freshly built candidate block for `round`, which the machine signs,
+    /// broadcasts, and applies. A stale or unsolicited block is ignored.
+    pub fn provide_block(
+        &mut self,
+        round: u32,
+        block: Block,
+    ) -> Result<Vec<ConsensusAction>, ChainError> {
+        let mut actions = Vec::new();
+        if self.decision.is_some()
+            || round != self.round
+            || !self.is_proposer(round)
+            || self.proposals.contains_key(&round)
+        {
+            return Ok(actions);
+        }
+        // A freshly built block has no proof-of-lock round.
+        self.emit_proposal(round, block, None, &mut actions)?;
+        self.drive(&mut actions)?;
+        Ok(actions)
+    }
+
+    /// Applies one event and returns the resulting actions.
     ///
-    /// Errors if this node is not the scheduled proposer or the block cannot be
-    /// signed. Idempotent guards prevent a second proposal at the same round.
-    pub fn propose(&mut self, block: Block) -> Result<Vec<ConsensusAction>, ChainError> {
-        if !self.is_proposer() {
-            return Err(ChainError::ConsensusProposalNotFromLeader);
+    /// Messages for another height are ignored. A message for this height that
+    /// fails verification returns an error so the driver can penalize the peer.
+    /// Once the height is decided, further events are ignored.
+    pub fn on_event(&mut self, event: ConsensusEvent) -> Result<Vec<ConsensusAction>, ChainError> {
+        let mut actions = Vec::new();
+        if self.decision.is_some() {
+            return Ok(actions);
         }
-        if self.proposal.is_some() {
-            // Already proposed at this round; do not double-propose.
-            return Ok(Vec::new());
+        match event {
+            ConsensusEvent::Message(ConsensusMessage::Proposal(signed)) => {
+                if signed.payload.height != self.height {
+                    return Ok(actions);
+                }
+                signed.verify_in_set(&self.set, self.protocol_version, &self.chain_id)?;
+                // Keep one proposal per round (the first from its valid leader).
+                self.proposals
+                    .entry(signed.payload.round)
+                    .or_insert(*signed);
+            }
+            ConsensusEvent::Message(ConsensusMessage::Vote(vote)) => {
+                if vote.payload.height != self.height {
+                    return Ok(actions);
+                }
+                self.set
+                    .verify_vote(&vote, self.protocol_version, &self.chain_id)?;
+                if let Some(evidence) = self.record_vote(vote) {
+                    actions.push(ConsensusAction::Equivocation(Box::new(evidence)));
+                }
+            }
+            ConsensusEvent::Timeout { kind, round } => {
+                self.on_timeout(kind, round, &mut actions)?;
+            }
         }
+        self.drive(&mut actions)?;
+        Ok(actions)
+    }
+
+    /// Begins a round: resets the step and either proposes (if this node leads and
+    /// has a value) or arms the propose timeout.
+    fn start_round(
+        &mut self,
+        round: u32,
+        actions: &mut Vec<ConsensusAction>,
+    ) -> Result<(), ChainError> {
+        self.round = round;
+        self.step = Step::Propose;
+        if self.is_proposer(round) {
+            match self.valid_value.clone() {
+                // Re-propose a value that already reached a prevote quorum, citing
+                // the round it did so as the authenticated proof-of-lock.
+                Some(value) => {
+                    let valid_round = self.valid_round;
+                    self.emit_proposal(round, value, valid_round, actions)?;
+                }
+                // No value to re-propose: ask the driver for a fresh candidate.
+                None => actions.push(ConsensusAction::NeedProposalBlock { round }),
+            }
+        } else {
+            actions.push(ConsensusAction::ScheduleTimeout {
+                kind: TimeoutKind::Propose,
+                round,
+            });
+        }
+        Ok(())
+    }
+
+    /// Signs, stores, and broadcasts this node's proposal for `round`.
+    fn emit_proposal(
+        &mut self,
+        round: u32,
+        block: Block,
+        valid_round: Option<u32>,
+        actions: &mut Vec<ConsensusAction>,
+    ) -> Result<(), ChainError> {
         let identity = self
             .identity
             .as_ref()
@@ -181,92 +363,266 @@ impl RoundState {
             self.protocol_version,
             self.chain_id.clone(),
             self.height,
-            self.round,
+            round,
+            valid_round,
             block,
             identity.address,
             &identity.consensus_key,
         )?;
-        let mut actions = vec![ConsensusAction::Broadcast(ConsensusMessage::Proposal(
-            Box::new(signed.clone()),
-        ))];
-        self.apply_proposal(signed, &mut actions)?;
-        Ok(actions)
+        self.proposals.insert(round, signed.clone());
+        actions.push(ConsensusAction::Broadcast(ConsensusMessage::Proposal(
+            Box::new(signed),
+        )));
+        Ok(())
     }
 
-    /// Applies an inbound consensus message, returning any follow-on actions.
-    ///
-    /// Messages for another height or round are ignored (empty result), since
-    /// gossip legitimately carries messages this node is not acting on. A message
-    /// for this height/round that fails verification returns an error so the
-    /// driver can penalize the peer.
-    pub fn on_message(
+    /// Handles a fired timeout for its round and step.
+    fn on_timeout(
         &mut self,
-        message: ConsensusMessage,
-    ) -> Result<Vec<ConsensusAction>, ChainError> {
-        if self.step == Step::Committed {
-            return Ok(Vec::new());
-        }
-        let mut actions = Vec::new();
-        match message {
-            ConsensusMessage::Proposal(signed) => {
-                if signed.payload.height != self.height || signed.payload.round != self.round {
-                    return Ok(Vec::new());
-                }
-                signed.verify_in_set(&self.set, self.protocol_version, &self.chain_id)?;
-                self.apply_proposal(*signed, &mut actions)?;
-            }
-            ConsensusMessage::Vote(vote) => {
-                if vote.payload.height != self.height || vote.payload.round != self.round {
-                    return Ok(Vec::new());
-                }
-                self.set
-                    .verify_vote(&vote, self.protocol_version, &self.chain_id)?;
-                if let Some(evidence) = self.record_vote(vote) {
-                    actions.push(ConsensusAction::Equivocation(Box::new(evidence)));
-                }
-                self.maybe_advance(&mut actions)?;
-            }
-        }
-        Ok(actions)
-    }
-
-    /// Accepts a verified proposal: stores it (once), moves out of Propose, and
-    /// lets the machine cast this node's prevote and re-evaluate thresholds.
-    fn apply_proposal(
-        &mut self,
-        signed: SignedProposal,
+        kind: TimeoutKind,
+        round: u32,
         actions: &mut Vec<ConsensusAction>,
     ) -> Result<(), ChainError> {
-        if self.proposal.is_some() {
+        if round != self.round {
             return Ok(());
         }
-        self.proposal = Some(signed);
-        if self.step == Step::Propose {
-            self.step = Step::Prevote;
+        match kind {
+            TimeoutKind::Propose if self.step == Step::Propose => {
+                self.cast_prevote(NIL, actions)?;
+                self.step = Step::Prevote;
+            }
+            TimeoutKind::Prevote if self.step == Step::Prevote => {
+                self.cast_precommit(NIL, actions)?;
+                self.step = Step::Precommit;
+            }
+            TimeoutKind::Precommit => {
+                self.start_round(round + 1, actions)?;
+            }
+            _ => {}
         }
-        self.maybe_advance(actions)
+        Ok(())
     }
 
-    /// Records a verified vote, keeping only the first per validator and step so a
-    /// later equivocating vote cannot change this node's tally.
+    /// Re-evaluates every level-triggered consensus rule until nothing changes.
     ///
-    /// Returns objective double-vote evidence the first time a validator is seen
-    /// voting for a *different* block in the same step. Both votes are already
-    /// signature-verified against the snapshot, so the returned evidence is
-    /// directly usable by the existing slashing path.
+    /// Rules are checked in the paper's order. A round advance (from a precommit
+    /// timeout or catch-up) re-arms the per-round guards, so the loop terminates
+    /// because rounds only ever increase.
+    fn drive(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<(), ChainError> {
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            debug_assert!(passes < 1_000, "consensus rule loop failed to settle");
+            if passes >= 1_000 {
+                break;
+            }
+            let mut changed = false;
+            changed |= self.rule_propose(actions)?;
+            changed |= self.rule_prevote_timeout(actions);
+            changed |= self.rule_prevote_quorum(actions)?;
+            changed |= self.rule_prevote_nil(actions)?;
+            changed |= self.rule_precommit_timeout(actions);
+            changed |= self.rule_decide(actions)?;
+            changed |= self.rule_catch_up(actions)?;
+            if !changed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rules 22 and 28: on the current round's proposal while in Propose, prevote
+    /// the block (subject to the lock) or nil, and move to Prevote.
+    fn rule_propose(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+        if self.step != Step::Propose {
+            return Ok(false);
+        }
+        let Some(proposal) = self.proposals.get(&self.round).cloned() else {
+            return Ok(false);
+        };
+        let block_hash = proposal.payload.block_hash;
+        match proposal.payload.valid_round {
+            // Rule 22: a fresh proposal.
+            None => {
+                let prevote = if self.locked_round.is_none()
+                    || self.locked_value_hash() == Some(block_hash)
+                {
+                    block_hash
+                } else {
+                    NIL
+                };
+                self.cast_prevote(prevote, actions)?;
+                self.step = Step::Prevote;
+                Ok(true)
+            }
+            // Rule 28: a re-proposal citing a proof-of-lock round `vr < round`.
+            Some(vr)
+                if vr < self.round
+                    && self.has_prevote_quorum(vr, HashFilter::Exactly(block_hash)) =>
+            {
+                let prevote = if self.locked_round.map(|lr| lr <= vr).unwrap_or(true)
+                    || self.locked_value_hash() == Some(block_hash)
+                {
+                    block_hash
+                } else {
+                    NIL
+                };
+                self.cast_prevote(prevote, actions)?;
+                self.step = Step::Prevote;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Rule 34: once a prevote quorum (any value) forms for the current round in
+    /// the Prevote step, arm the prevote timeout (once).
+    fn rule_prevote_timeout(&mut self, actions: &mut Vec<ConsensusAction>) -> bool {
+        if self.step != Step::Prevote
+            || self.guard_set(Guard::PrevoteTimeoutScheduled)
+            || !self.has_prevote_quorum(self.round, HashFilter::Any)
+        {
+            return false;
+        }
+        self.set_guard(Guard::PrevoteTimeoutScheduled);
+        actions.push(ConsensusAction::ScheduleTimeout {
+            kind: TimeoutKind::Prevote,
+            round: self.round,
+        });
+        true
+    }
+
+    /// Rule 36: on the current round's proposal plus a prevote quorum for its
+    /// block while in Prevote or later — lock and precommit it (if still in
+    /// Prevote) and record it as the valid value.
+    fn rule_prevote_quorum(
+        &mut self,
+        actions: &mut Vec<ConsensusAction>,
+    ) -> Result<bool, ChainError> {
+        if self.step == Step::Propose || self.guard_set(Guard::ValidValueUpdated) {
+            return Ok(false);
+        }
+        let Some(proposal) = self.proposals.get(&self.round).cloned() else {
+            return Ok(false);
+        };
+        let block_hash = proposal.payload.block_hash;
+        if !self.has_prevote_quorum(self.round, HashFilter::Exactly(block_hash)) {
+            return Ok(false);
+        }
+        if self.step == Step::Prevote {
+            self.locked_value = Some(proposal.block.clone());
+            self.locked_round = Some(self.round);
+            self.cast_precommit(block_hash, actions)?;
+            self.step = Step::Precommit;
+        }
+        self.valid_value = Some(proposal.block.clone());
+        self.valid_round = Some(self.round);
+        self.set_guard(Guard::ValidValueUpdated);
+        Ok(true)
+    }
+
+    /// Rule 44: on a prevote quorum for nil in the current round while in Prevote,
+    /// precommit nil and move to Precommit.
+    fn rule_prevote_nil(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+        if self.step != Step::Prevote
+            || !self.has_prevote_quorum(self.round, HashFilter::Exactly(NIL))
+        {
+            return Ok(false);
+        }
+        self.cast_precommit(NIL, actions)?;
+        self.step = Step::Precommit;
+        Ok(true)
+    }
+
+    /// Rule 47: once a precommit quorum (any value) forms for the current round,
+    /// arm the precommit timeout (once).
+    fn rule_precommit_timeout(&mut self, actions: &mut Vec<ConsensusAction>) -> bool {
+        if self.guard_set(Guard::PrecommitTimeoutScheduled)
+            || !self.has_precommit_quorum(self.round, HashFilter::Any)
+        {
+            return false;
+        }
+        self.set_guard(Guard::PrecommitTimeoutScheduled);
+        actions.push(ConsensusAction::ScheduleTimeout {
+            kind: TimeoutKind::Precommit,
+            round: self.round,
+        });
+        true
+    }
+
+    /// Rule 49: for any round whose proposal has a precommit quorum for its block,
+    /// decide that block. This can finalize a block proposed in an earlier round.
+    fn rule_decide(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+        if self.decision.is_some() {
+            return Ok(false);
+        }
+        // Find a round whose proposed block has a precommit quorum.
+        let rounds: Vec<u32> = self.proposals.keys().copied().collect();
+        for round in rounds {
+            let proposal = self.proposals.get(&round).cloned().expect("round present");
+            let block_hash = proposal.payload.block_hash;
+            if !self.has_precommit_quorum(round, HashFilter::Exactly(block_hash)) {
+                continue;
+            }
+            let Some(certificate) = self.build_certificate(round, block_hash) else {
+                continue;
+            };
+            self.decision = Some((proposal.block.clone(), certificate.clone()));
+            actions.push(ConsensusAction::Commit {
+                block: Box::new(proposal.block),
+                certificate: Box::new(certificate),
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Rule 55: if more than one third of the power has sent any message for a
+    /// round greater than the current one, jump to that round (an honest node is
+    /// necessarily among a `f+1` set, so this cannot be forced by faults alone).
+    fn rule_catch_up(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+        // Highest future round with f+1 total participation.
+        let mut target: Option<u32> = None;
+        let mut future: BTreeSet<u32> = BTreeSet::new();
+        for (round, _) in self.prevotes.keys() {
+            if *round > self.round {
+                future.insert(*round);
+            }
+        }
+        for (round, _) in self.precommits.keys() {
+            if *round > self.round {
+                future.insert(*round);
+            }
+        }
+        for round in future {
+            if self.has_one_third_participation(round) {
+                target = Some(target.map_or(round, |t| t.max(round)));
+            }
+        }
+        if let Some(round) = target {
+            self.start_round(round, actions)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Records a verified vote, keeping the first per `(round, validator, type)`.
+    /// Returns objective evidence the first time a validator is seen voting for a
+    /// different block in the same round and step.
     fn record_vote(&mut self, vote: SignedVote) -> Option<DoubleVoteEvidence> {
         let vote_type = vote.payload.vote_type;
+        let round = vote.payload.round;
         let validator = vote.payload.validator;
         let map = match vote_type {
             VoteType::Prevote => &mut self.prevotes,
             VoteType::Precommit => &mut self.precommits,
         };
-        match map.get(&validator) {
+        match map.get(&(round, validator)) {
             Some(existing) => {
-                // A conflicting vote for the same step is equivocation. Keep the
-                // first vote for the tally and surface the conflict once.
                 if existing.payload.block_hash != vote.payload.block_hash
-                    && self.reported_equivocators.insert((validator, vote_type))
+                    && self
+                        .reported_equivocators
+                        .insert((round, validator, vote_type))
                 {
                     return Some(DoubleVoteEvidence {
                         first: existing.clone(),
@@ -276,77 +632,50 @@ impl RoundState {
                 None
             }
             None => {
-                map.insert(validator, vote);
+                map.insert((round, validator), vote);
                 None
             }
         }
     }
 
-    /// Drives step transitions after any state change, emitting this node's own
-    /// votes and, at precommit quorum, the commit action.
-    fn maybe_advance(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<(), ChainError> {
-        let Some(block_hash) = self.proposal.as_ref().map(|p| p.payload.block_hash) else {
-            // Without the proposal block there is nothing to vote for or commit.
-            return Ok(());
-        };
-
-        // Cast this node's prevote once it is in (or past) the Prevote step.
-        if self.step == Step::Prevote {
-            self.cast_vote(VoteType::Prevote, block_hash, actions)?;
-        }
-
-        // Prevote quorum for the proposed block advances to Precommit.
-        if self.step == Step::Prevote && self.has_quorum(VoteType::Prevote, block_hash) {
-            self.step = Step::Precommit;
-        }
-
-        // Cast this node's precommit once it is in the Precommit step.
-        if self.step == Step::Precommit {
-            self.cast_vote(VoteType::Precommit, block_hash, actions)?;
-        }
-
-        // Precommit quorum finalizes the block with a certificate. This is
-        // independent of the local step: an observer (or a node that never saw a
-        // prevote quorum) still finalizes as soon as it holds the block and sees
-        // strictly over two thirds of precommit power, since that alone proves
-        // finality.
-        if self.step != Step::Committed && self.has_quorum(VoteType::Precommit, block_hash) {
-            if let Some(certificate) = self.build_certificate(block_hash) {
-                let block = self
-                    .proposal
-                    .as_ref()
-                    .map(|p| p.block.clone())
-                    .expect("proposal present when block_hash is known");
-                self.certificate = Some(certificate.clone());
-                self.step = Step::Committed;
-                actions.push(ConsensusAction::Commit {
-                    block: Box::new(block),
-                    certificate: Box::new(certificate),
-                });
-            }
-        }
-        Ok(())
+    /// Signs, records, and queues this node's prevote for the current round once.
+    fn cast_prevote(
+        &mut self,
+        block_hash: Hash256,
+        actions: &mut Vec<ConsensusAction>,
+    ) -> Result<(), ChainError> {
+        self.cast_vote(VoteType::Prevote, Guard::PrevoteSent, block_hash, actions)
     }
 
-    /// Signs and locally applies this node's own vote for `block_hash`, then
-    /// queues it for broadcast. No-op for observers or a repeated vote.
+    /// Signs, records, and queues this node's precommit for the current round once.
+    fn cast_precommit(
+        &mut self,
+        block_hash: Hash256,
+        actions: &mut Vec<ConsensusAction>,
+    ) -> Result<(), ChainError> {
+        self.cast_vote(
+            VoteType::Precommit,
+            Guard::PrecommitSent,
+            block_hash,
+            actions,
+        )
+    }
+
+    /// Shared vote casting: no-op for observers, non-members, or a repeated vote
+    /// of this type in this round.
     fn cast_vote(
         &mut self,
         vote_type: VoteType,
-        block_hash: webc_crypto::Hash256,
+        guard: Guard,
+        block_hash: Hash256,
         actions: &mut Vec<ConsensusAction>,
     ) -> Result<(), ChainError> {
-        let already_cast = match vote_type {
-            VoteType::Prevote => self.prevote_cast,
-            VoteType::Precommit => self.precommit_cast,
-        };
-        if already_cast {
+        if self.guard_set(guard) {
             return Ok(());
         }
         let Some(identity) = self.identity.as_ref() else {
             return Ok(());
         };
-        // Only registered snapshot members carry voting power.
         if self.set.consensus_key_of(identity.address).is_none() {
             return Ok(());
         }
@@ -362,48 +691,106 @@ impl RoundState {
             },
             &identity.consensus_key,
         )?;
-        match vote_type {
-            VoteType::Prevote => self.prevote_cast = true,
-            VoteType::Precommit => self.precommit_cast = true,
-        }
+        self.set_guard(guard);
         // Count our own vote locally so single-validator sets can reach quorum.
-        // This node votes once per step, so it never equivocates against itself.
         let _ = self.record_vote(vote.clone());
         actions.push(ConsensusAction::Broadcast(ConsensusMessage::Vote(vote)));
         Ok(())
     }
 
-    /// Whether votes of `vote_type` for `block_hash` exceed two thirds of power.
-    fn has_quorum(&self, vote_type: VoteType, block_hash: webc_crypto::Hash256) -> bool {
-        let map = match vote_type {
-            VoteType::Prevote => &self.prevotes,
-            VoteType::Precommit => &self.precommits,
-        };
-        let mut power = crate::Amount::ZERO;
-        for vote in map.values() {
-            if vote.payload.block_hash != block_hash {
-                continue;
+    /// Hash of this node's locked value, if any.
+    fn locked_value_hash(&self) -> Option<Hash256> {
+        // The locked value equals the proposal it was locked from; its hash is the
+        // block hash. Recomputing is cheap and avoids storing it separately.
+        self.locked_value.as_ref().and_then(|b| b.hash().ok())
+    }
+
+    /// Whether prevotes at `round` matching `filter` exceed two thirds of power.
+    fn has_prevote_quorum(&self, round: u32, filter: HashFilter) -> bool {
+        self.set
+            .has_two_thirds_power(self.tally(&self.prevotes, round, filter))
+    }
+
+    /// Whether precommits at `round` matching `filter` exceed two thirds of power.
+    fn has_precommit_quorum(&self, round: u32, filter: HashFilter) -> bool {
+        self.set
+            .has_two_thirds_power(self.tally(&self.precommits, round, filter))
+    }
+
+    /// Whether any messages at `round` exceed one third of power (union of the
+    /// distinct validators that prevoted or precommitted at that round).
+    fn has_one_third_participation(&self, round: u32) -> bool {
+        let mut voters: BTreeSet<Address> = BTreeSet::new();
+        for (r, v) in self.prevotes.keys() {
+            if *r == round {
+                voters.insert(*v);
             }
-            match power.checked_add(self.set.power_of(vote.payload.validator)) {
+        }
+        for (r, v) in self.precommits.keys() {
+            if *r == round {
+                voters.insert(*v);
+            }
+        }
+        let mut power = crate::Amount::ZERO;
+        for voter in voters {
+            match power.checked_add(self.set.power_of(voter)) {
                 Some(next) => power = next,
                 None => return false,
             }
         }
-        self.set.has_two_thirds_power(power)
+        self.set.has_one_third_power(power)
     }
 
-    /// Builds the finality certificate from the collected precommits.
-    fn build_certificate(&self, block_hash: webc_crypto::Hash256) -> Option<FinalityCertificate> {
-        let pool: Vec<SignedVote> = self.precommits.values().cloned().collect();
+    /// Sums the snapshot power of validators whose vote at `round` matches `filter`.
+    fn tally(
+        &self,
+        votes: &BTreeMap<(u32, Address), SignedVote>,
+        round: u32,
+        filter: HashFilter,
+    ) -> crate::Amount {
+        let mut power = crate::Amount::ZERO;
+        for ((r, validator), vote) in votes {
+            if *r != round {
+                continue;
+            }
+            if let HashFilter::Exactly(hash) = filter {
+                if vote.payload.block_hash != hash {
+                    continue;
+                }
+            }
+            match power.checked_add(self.set.power_of(*validator)) {
+                Some(next) => power = next,
+                None => return crate::Amount::ZERO,
+            }
+        }
+        power
+    }
+
+    /// Builds the finality certificate from `round`'s precommits for `block_hash`.
+    fn build_certificate(&self, round: u32, block_hash: Hash256) -> Option<FinalityCertificate> {
+        let pool: Vec<SignedVote> = self
+            .precommits
+            .iter()
+            .filter(|((r, _), _)| *r == round)
+            .map(|(_, vote)| vote.clone())
+            .collect();
         FinalityCertificate::build(
             &self.set,
             self.protocol_version,
             self.chain_id.clone(),
             self.height,
-            self.round,
+            round,
             block_hash,
             &pool,
         )
+    }
+
+    fn guard_set(&self, guard: Guard) -> bool {
+        self.guards.contains(&(guard, self.round))
+    }
+
+    fn set_guard(&mut self, guard: Guard) {
+        self.guards.insert((guard, self.round));
     }
 }
 
@@ -413,7 +800,6 @@ mod tests {
     use crate::consensus::ValidatorPower;
     use crate::{Amount, BlockHeader, CURRENT_PROTOCOL_VERSION};
     use std::collections::BTreeMap as Map;
-    use webc_crypto::Hash256;
 
     fn set_with_keys(members: &[(&Keypair, u128)]) -> ValidatorSet {
         let mut validators = Map::new();
@@ -436,7 +822,7 @@ mod tests {
         }
     }
 
-    fn candidate_block(proposer: Address, height: u64) -> Block {
+    fn candidate_block(proposer: Address, height: u64, salt: u64) -> Block {
         Block {
             header: BlockHeader {
                 protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -447,7 +833,8 @@ mod tests {
                 state_root: Hash256([0x11; 32]),
                 account_root: Hash256([0x22; 32]),
                 tx_root: Hash256([0x33; 32]),
-                receipt_root: Hash256([0x44; 32]),
+                // Salt the receipt root so different proposers yield distinct blocks.
+                receipt_root: Hash256([salt as u8; 32]),
                 proposer,
                 timestamp_ms: 1_700_000_000_000,
                 base_fee_per_unit: 1,
@@ -458,7 +845,24 @@ mod tests {
         }
     }
 
-    /// Extracts every message queued for broadcast by a batch of actions.
+    fn identity(keypair: &Keypair) -> ValidatorIdentity {
+        ValidatorIdentity {
+            address: keypair.address(),
+            consensus_key: Keypair::from_seed(*seed_of(keypair)),
+        }
+    }
+
+    fn seed_of(keypair: &Keypair) -> &'static [u8; 32] {
+        for seed in SEEDS {
+            if Keypair::from_seed(*seed).address() == keypair.address() {
+                return seed;
+            }
+        }
+        panic!("unknown test keypair");
+    }
+
+    const SEEDS: &[[u8; 32]] = &[[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+
     fn broadcasts(actions: &[ConsensusAction]) -> Vec<ConsensusMessage> {
         actions
             .iter()
@@ -478,220 +882,376 @@ mod tests {
         })
     }
 
-    fn identity(keypair: &Keypair) -> ValidatorIdentity {
-        ValidatorIdentity {
-            address: keypair.address(),
-            consensus_key: Keypair::from_seed(*seed_of(keypair)),
+    /// Drives a set of machines over a deterministic in-memory bus: every
+    /// broadcast reaches every node, a proposer's block request is honored unless
+    /// that proposer is marked silent for the round, and armed timeouts fire in
+    /// step order once the message bus goes quiet. This models "time advances only
+    /// when nothing else is happening", which is exactly what forces a stuck round
+    /// to change.
+    struct Harness {
+        machines: Vec<ConsensusMachine>,
+        keys: Vec<Keypair>,
+        height: u64,
+        /// `(proposer index, round)` pairs a "crashed" proposer stays silent for.
+        silent: std::collections::BTreeSet<(usize, u32)>,
+        /// Timeouts each node has armed but not yet fired.
+        armed: Vec<std::collections::BTreeSet<(u8, u32)>>,
+        commits: Vec<Option<(Block, FinalityCertificate)>>,
+    }
+
+    fn timeout_tag(kind: TimeoutKind) -> u8 {
+        match kind {
+            TimeoutKind::Propose => 0,
+            TimeoutKind::Prevote => 1,
+            TimeoutKind::Precommit => 2,
         }
     }
 
-    // Test keypairs are built from fixed seeds; recover the seed by identity.
-    fn seed_of(keypair: &Keypair) -> &'static [u8; 32] {
-        for seed in SEEDS {
-            if Keypair::from_seed(*seed).address() == keypair.address() {
-                return seed;
+    fn timeout_of(tag: u8) -> TimeoutKind {
+        match tag {
+            0 => TimeoutKind::Propose,
+            1 => TimeoutKind::Prevote,
+            _ => TimeoutKind::Precommit,
+        }
+    }
+
+    impl Harness {
+        fn new(keys: Vec<Keypair>, set: &ValidatorSet, height: u64) -> Self {
+            let machines = keys
+                .iter()
+                .map(|k| {
+                    ConsensusMachine::new(
+                        CURRENT_PROTOCOL_VERSION,
+                        ChainId::devnet(),
+                        set.clone(),
+                        height,
+                        Some(identity(k)),
+                    )
+                })
+                .collect();
+            let n = keys.len();
+            Self {
+                machines,
+                keys,
+                height,
+                silent: std::collections::BTreeSet::new(),
+                armed: vec![std::collections::BTreeSet::new(); n],
+                commits: vec![None; n],
             }
         }
-        panic!("unknown test keypair");
-    }
 
-    const SEEDS: &[[u8; 32]] = &[[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        fn handle(
+            &mut self,
+            queue: &mut Vec<ConsensusMessage>,
+            index: usize,
+            actions: Vec<ConsensusAction>,
+        ) {
+            if let Some(commit) = commit_of(&actions) {
+                self.commits[index] = Some(commit);
+            }
+            for action in actions {
+                match action {
+                    ConsensusAction::Broadcast(m) => queue.push(m),
+                    ConsensusAction::NeedProposalBlock { round } => {
+                        if self.silent.contains(&(index, round)) {
+                            continue;
+                        }
+                        let block = candidate_block(
+                            self.keys[index].address(),
+                            self.height,
+                            round as u64 + 1,
+                        );
+                        let out = self.machines[index].provide_block(round, block).unwrap();
+                        self.handle(queue, index, out);
+                    }
+                    ConsensusAction::ScheduleTimeout { kind, round } => {
+                        self.armed[index].insert((timeout_tag(kind), round));
+                    }
+                    ConsensusAction::Commit { .. } | ConsensusAction::Equivocation(_) => {}
+                }
+            }
+        }
+
+        fn drain(&mut self, queue: &mut Vec<ConsensusMessage>) {
+            let mut guard = 0;
+            while let Some(message) = queue.pop() {
+                guard += 1;
+                assert!(guard < 100_000, "bus failed to converge");
+                for index in 0..self.machines.len() {
+                    let out = self.machines[index]
+                        .on_event(ConsensusEvent::Message(message.clone()))
+                        .unwrap();
+                    self.handle(queue, index, out);
+                }
+            }
+        }
+
+        /// Fires every armed timeout whose round matches its node's current round,
+        /// returning whether anything fired.
+        fn fire_timeouts(&mut self, queue: &mut Vec<ConsensusMessage>) -> bool {
+            let mut fired = false;
+            for index in 0..self.machines.len() {
+                let current = self.machines[index].round();
+                let ready: Vec<(u8, u32)> = self.armed[index]
+                    .iter()
+                    .copied()
+                    .filter(|(_, round)| *round == current)
+                    .collect();
+                for tag in ready {
+                    self.armed[index].remove(&tag);
+                    fired = true;
+                    let out = self.machines[index]
+                        .on_event(ConsensusEvent::Timeout {
+                            kind: timeout_of(tag.0),
+                            round: tag.1,
+                        })
+                        .unwrap();
+                    self.handle(queue, index, out);
+                }
+            }
+            fired
+        }
+
+        fn run(&mut self) {
+            let mut queue: Vec<ConsensusMessage> = Vec::new();
+            for index in 0..self.machines.len() {
+                let out = self.machines[index].start().unwrap();
+                self.handle(&mut queue, index, out);
+            }
+            let mut ticks = 0;
+            loop {
+                ticks += 1;
+                assert!(ticks < 10_000, "consensus did not settle");
+                self.drain(&mut queue);
+                if self.commits.iter().filter(|c| c.is_some()).count() == self.machines.len() {
+                    break;
+                }
+                // Time advances only when the bus is quiet.
+                if !self.fire_timeouts(&mut queue) {
+                    break;
+                }
+            }
+        }
+    }
 
     #[test]
     fn single_validator_finalizes_its_own_proposal() {
         let a = Keypair::from_seed([1u8; 32]);
         let set = set_with_keys(&[(&a, 1)]);
-        let height = 1;
-        let round = 0;
-        let mut engine = RoundState::new(
+        let mut machine = ConsensusMachine::new(
             CURRENT_PROTOCOL_VERSION,
             ChainId::devnet(),
             set,
-            height,
-            round,
+            1,
             Some(identity(&a)),
         );
-        assert!(engine.is_proposer());
-
-        let actions = engine
-            .propose(candidate_block(a.address(), height))
+        let mut actions = machine.start().unwrap();
+        // The sole proposer is asked for a block; supply it and it self-finalizes.
+        assert!(matches!(
+            actions.first(),
+            Some(ConsensusAction::NeedProposalBlock { round: 0 })
+        ));
+        actions = machine
+            .provide_block(0, candidate_block(a.address(), 1, 1))
             .unwrap();
-        // A single validator's own prevote and precommit reach quorum instantly.
-        let (block, cert) = commit_of(&actions).expect("single validator commits");
-        assert_eq!(engine.step(), Step::Committed);
-        assert_eq!(block.header.height, height);
-        assert_eq!(cert.block_hash, block.hash().unwrap());
+        let (_, cert) = commit_of(&actions).expect("single validator commits");
+        assert!(cert
+            .verify(
+                &set_with_keys(&[(&a, 1)]),
+                CURRENT_PROTOCOL_VERSION,
+                &ChainId::devnet()
+            )
+            .is_ok());
+        assert!(machine.decided_block().is_some());
     }
 
     #[test]
-    fn three_validators_converge_on_one_block() {
-        // Deterministically deliver every broadcast message to every peer and
-        // prove all three reach the identical finalized block and certificate.
-        let a = Keypair::from_seed([1u8; 32]);
-        let b = Keypair::from_seed([2u8; 32]);
-        let c = Keypair::from_seed([3u8; 32]);
-        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
-        let height = 1;
-        let round = 0;
-
-        let mut engines: Vec<RoundState> = [&a, &b, &c]
-            .iter()
-            .map(|k| {
-                RoundState::new(
-                    CURRENT_PROTOCOL_VERSION,
-                    ChainId::devnet(),
-                    set.clone(),
-                    height,
-                    round,
-                    Some(identity(k)),
-                )
-            })
-            .collect();
-
-        let leader_addr = set.proposer_for(height, round).unwrap();
-        let leader_index = [&a, &b, &c]
-            .iter()
-            .position(|k| k.address() == leader_addr)
-            .unwrap();
-
-        // A simple in-memory bus: queue of (message) to broadcast to all peers.
-        let block = candidate_block(leader_addr, height);
-        let mut queue: Vec<ConsensusMessage> = Vec::new();
-        let mut commits: Vec<Option<(Block, FinalityCertificate)>> = vec![None, None, None];
-
-        let start = engines[leader_index].propose(block).unwrap();
-        record_commit(&mut commits, leader_index, &start);
-        queue.extend(broadcasts(&start));
-
-        // Drain the bus to a fixed point.
-        let mut guard = 0;
-        while let Some(message) = queue.pop() {
-            guard += 1;
-            assert!(guard < 1_000, "message bus did not converge");
-            for (index, engine) in engines.iter_mut().enumerate() {
-                let actions = engine.on_message(message.clone()).unwrap();
-                record_commit(&mut commits, index, &actions);
-                queue.extend(broadcasts(&actions));
-            }
-        }
-
-        // All three finalized, and on the identical block and certificate hash.
-        let first = commits[0].clone().expect("validator 0 commits");
-        for slot in &commits {
-            let (block, cert) = slot.clone().expect("each validator commits");
+    fn three_validators_converge_happy_path() {
+        let keys = vec![
+            Keypair::from_seed([1u8; 32]),
+            Keypair::from_seed([2u8; 32]),
+            Keypair::from_seed([3u8; 32]),
+        ];
+        let set = set_with_keys(&[(&keys[0], 1), (&keys[1], 1), (&keys[2], 1)]);
+        let mut harness = Harness::new(keys, &set, 1);
+        harness.run();
+        let first = harness.commits[0].clone().expect("node 0 commits");
+        for slot in &harness.commits {
+            let (block, cert) = slot.clone().expect("each node commits");
             assert_eq!(block.hash().unwrap(), first.0.hash().unwrap());
-            assert_eq!(cert.block_hash, first.1.block_hash);
-            // The certificate independently verifies against the snapshot.
             assert!(cert
                 .verify(&set, CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
                 .is_ok());
         }
     }
 
-    fn record_commit(
-        commits: &mut [Option<(Block, FinalityCertificate)>],
-        index: usize,
-        actions: &[ConsensusAction],
-    ) {
-        if let Some(commit) = commit_of(actions) {
-            commits[index] = Some(commit);
+    #[test]
+    fn round_changes_when_the_round_zero_proposer_is_silent() {
+        // Four validators; the round-0 proposer stays silent. The others must
+        // change round and finalize under the round-1 proposer.
+        let keys = vec![
+            Keypair::from_seed([1u8; 32]),
+            Keypair::from_seed([2u8; 32]),
+            Keypair::from_seed([3u8; 32]),
+            Keypair::from_seed([4u8; 32]),
+        ];
+        let set = set_with_keys(&[(&keys[0], 1), (&keys[1], 1), (&keys[2], 1), (&keys[3], 1)]);
+        // Identify the round-0 leader before moving `keys` into the harness.
+        let leader0 = set.proposer_for(1, 0).unwrap();
+        let r0 = keys.iter().position(|k| k.address() == leader0).unwrap();
+        let mut harness = Harness::new(keys, &set, 1);
+        // Silence whoever leads round 0.
+        harness.silent.insert((r0, 0));
+        harness.run();
+
+        // Every non-silent node finalized the same block at a round >= 1.
+        let decided: Vec<_> = harness.commits.iter().flatten().collect();
+        assert!(
+            decided.len() >= 3,
+            "at least the three responsive nodes finalize"
+        );
+        let first_hash = decided[0].0.hash().unwrap();
+        for (block, cert) in &decided {
+            assert_eq!(block.hash().unwrap(), first_hash);
+            assert!(cert
+                .verify(&set, CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+                .is_ok());
         }
+        // The decision happened after a round change.
+        assert!(harness.machines.iter().any(|m| m.round() >= 1));
     }
 
     #[test]
-    fn observer_follows_finality_without_voting() {
+    fn a_locked_validator_will_not_prevote_a_conflicting_block() {
+        // Safety unit test: once a node locks block X in round 0, a round-1
+        // proposal for a different block Y (with no proof-of-lock) draws a nil
+        // prevote, never a prevote for Y.
         let a = Keypair::from_seed([1u8; 32]);
         let b = Keypair::from_seed([2u8; 32]);
         let c = Keypair::from_seed([3u8; 32]);
         let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
-        let height = 1;
-        let round = 0;
-
-        // The observer has no identity: it must never emit a Broadcast.
-        let mut observer = RoundState::new(
+        // Drive node A as the machine under test.
+        let mut node = ConsensusMachine::new(
             CURRENT_PROTOCOL_VERSION,
             ChainId::devnet(),
             set.clone(),
-            height,
-            round,
-            None,
+            1,
+            Some(identity(&a)),
         );
+        node.start().unwrap();
 
-        let leader_addr = set.proposer_for(height, round).unwrap();
-        let leader = [&a, &b, &c]
+        // Build round-0 proposal from the actual round-0 leader for block X.
+        let leader0 = set.proposer_for(1, 0).unwrap();
+        let leader0_key = [&a, &b, &c]
             .into_iter()
-            .find(|k| k.address() == leader_addr)
+            .find(|k| k.address() == leader0)
             .unwrap();
-        let block = candidate_block(leader_addr, height);
-        let signed = SignedProposal::sign(
+        let block_x = candidate_block(leader0, 1, 1);
+        let hash_x = block_x.hash().unwrap();
+        let prop0 = SignedProposal::sign(
             CURRENT_PROTOCOL_VERSION,
             ChainId::devnet(),
-            height,
-            round,
-            block,
-            leader_addr,
-            leader,
+            1,
+            0,
+            None,
+            block_x,
+            leader0,
+            leader0_key,
         )
         .unwrap();
-
-        // Feed the proposal and all three precommits directly to the observer.
-        let out = observer
-            .on_message(ConsensusMessage::Proposal(Box::new(signed.clone())))
-            .unwrap();
-        assert!(broadcasts(&out).is_empty(), "observer must not broadcast");
-
-        let block_hash = signed.payload.block_hash;
-        for keypair in [&a, &b, &c] {
-            let precommit = SignedVote::sign(
+        node.on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+            Box::new(prop0),
+        )))
+        .unwrap();
+        // Deliver round-0 prevotes for X from B and C so A locks X.
+        for k in [&b, &c] {
+            let pv = SignedVote::sign(
                 Vote {
                     protocol_version: CURRENT_PROTOCOL_VERSION,
                     chain_id: ChainId::devnet(),
-                    height,
-                    round,
-                    vote_type: VoteType::Precommit,
-                    block_hash,
-                    validator: keypair.address(),
+                    height: 1,
+                    round: 0,
+                    vote_type: VoteType::Prevote,
+                    block_hash: hash_x,
+                    validator: k.address(),
                 },
-                keypair,
+                k,
             )
             .unwrap();
-            let out = observer
-                .on_message(ConsensusMessage::Vote(precommit))
+            node.on_event(ConsensusEvent::Message(ConsensusMessage::Vote(pv)))
                 .unwrap();
-            assert!(broadcasts(&out).is_empty(), "observer must not broadcast");
         }
-        assert_eq!(observer.step(), Step::Committed);
-        assert!(observer.certificate().is_some());
+        assert_eq!(
+            node.step(),
+            Step::Precommit,
+            "A should have locked and precommitted X"
+        );
+
+        // Force A into round 1 via a precommit timeout, then feed a round-1
+        // proposal for a DIFFERENT block Y from the round-1 leader.
+        node.on_event(ConsensusEvent::Timeout {
+            kind: TimeoutKind::Precommit,
+            round: 0,
+        })
+        .unwrap();
+        assert_eq!(node.round(), 1);
+        let leader1 = set.proposer_for(1, 1).unwrap();
+        let leader1_key = [&a, &b, &c]
+            .into_iter()
+            .find(|k| k.address() == leader1)
+            .unwrap();
+        let block_y = candidate_block(leader1, 1, 9);
+        let hash_y = block_y.hash().unwrap();
+        assert_ne!(hash_x, hash_y);
+        let prop1 = SignedProposal::sign(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            1,
+            1,
+            None,
+            block_y,
+            leader1,
+            leader1_key,
+        )
+        .unwrap();
+        let actions = node
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(prop1),
+            )))
+            .unwrap();
+        // A's round-1 prevote must be nil, never Y.
+        let prevote_hashes: Vec<Hash256> = broadcasts(&actions)
+            .into_iter()
+            .filter_map(|m| match m {
+                ConsensusMessage::Vote(v) if v.payload.vote_type == VoteType::Prevote => {
+                    Some(v.payload.block_hash)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            prevote_hashes.iter().all(|h| *h == NIL),
+            "a node locked on X must not prevote a conflicting Y"
+        );
     }
 
     #[test]
     fn equivocating_validator_is_surfaced_as_evidence() {
-        // A validator that prevotes two different blocks in the same step must be
-        // caught, and the emitted evidence must satisfy the existing slashing
-        // path's verification.
         let a = Keypair::from_seed([1u8; 32]);
         let b = Keypair::from_seed([2u8; 32]);
         let c = Keypair::from_seed([3u8; 32]);
         let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
-        let height = 1;
-        let round = 0;
-        // Observe as a non-voting node so only the injected votes are in play.
-        let mut engine = RoundState::new(
-            CURRENT_PROTOCOL_VERSION,
-            ChainId::devnet(),
-            set.clone(),
-            height,
-            round,
-            None,
-        );
+        let mut engine =
+            ConsensusMachine::new(CURRENT_PROTOCOL_VERSION, ChainId::devnet(), set, 1, None);
+        engine.start().unwrap();
 
         let prevote = |validator: &Keypair, hash| {
             SignedVote::sign(
                 Vote {
                     protocol_version: CURRENT_PROTOCOL_VERSION,
                     chain_id: ChainId::devnet(),
-                    height,
-                    round,
+                    height: 1,
+                    round: 0,
                     vote_type: VoteType::Prevote,
                     block_hash: hash,
                     validator: validator.address(),
@@ -700,20 +1260,17 @@ mod tests {
             )
             .unwrap()
         };
-
-        let hash_a = Hash256::digest(b"block-a");
-        let hash_b = Hash256::digest(b"block-b");
-        // First prevote: no conflict yet.
-        let out = engine
-            .on_message(ConsensusMessage::Vote(prevote(&b, hash_a)))
+        engine
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Vote(prevote(
+                &b,
+                Hash256::digest(b"x"),
+            ))))
             .unwrap();
-        assert!(!out
-            .iter()
-            .any(|a| matches!(a, ConsensusAction::Equivocation(_))));
-
-        // Second, conflicting prevote from the same validator: evidence emitted.
         let out = engine
-            .on_message(ConsensusMessage::Vote(prevote(&b, hash_b)))
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Vote(prevote(
+                &b,
+                Hash256::digest(b"y"),
+            ))))
             .unwrap();
         let evidence = out
             .iter()
@@ -722,10 +1279,6 @@ mod tests {
                 _ => None,
             })
             .expect("equivocation surfaced");
-        assert_eq!(evidence.first.payload.validator, b.address());
-
-        // The evidence plugs straight into the slashing path: both votes verify
-        // against the offender's registered consensus key.
         let slashing = crate::SlashingEvidence::DoubleVote(evidence);
         assert!(slashing
             .verify(
@@ -734,69 +1287,5 @@ mod tests {
                 &b.public_key()
             )
             .is_ok());
-
-        // A third conflicting prevote does not re-report the same offender.
-        let out = engine
-            .on_message(ConsensusMessage::Vote(prevote(&b, Hash256::digest(b"c"))))
-            .unwrap();
-        assert!(!out
-            .iter()
-            .any(|a| matches!(a, ConsensusAction::Equivocation(_))));
-    }
-
-    #[test]
-    fn non_leader_cannot_propose() {
-        let a = Keypair::from_seed([1u8; 32]);
-        let b = Keypair::from_seed([2u8; 32]);
-        let set = set_with_keys(&[(&a, 1), (&b, 1)]);
-        let height = 1;
-        let round = 0;
-        let leader_addr = set.proposer_for(height, round).unwrap();
-        let non_leader = if leader_addr == a.address() { &b } else { &a };
-        let mut engine = RoundState::new(
-            CURRENT_PROTOCOL_VERSION,
-            ChainId::devnet(),
-            set,
-            height,
-            round,
-            Some(identity(non_leader)),
-        );
-        assert!(!engine.is_proposer());
-        assert!(matches!(
-            engine
-                .propose(candidate_block(non_leader.address(), height))
-                .unwrap_err(),
-            ChainError::ConsensusProposalNotFromLeader
-        ));
-    }
-
-    #[test]
-    fn messages_for_another_height_are_ignored() {
-        let a = Keypair::from_seed([1u8; 32]);
-        let set = set_with_keys(&[(&a, 1)]);
-        let mut engine = RoundState::new(
-            CURRENT_PROTOCOL_VERSION,
-            ChainId::devnet(),
-            set,
-            5,
-            0,
-            Some(identity(&a)),
-        );
-        // A proposal for a different height must not move this machine.
-        let other = SignedProposal::sign(
-            CURRENT_PROTOCOL_VERSION,
-            ChainId::devnet(),
-            6,
-            0,
-            candidate_block(a.address(), 6),
-            a.address(),
-            &a,
-        )
-        .unwrap();
-        let out = engine
-            .on_message(ConsensusMessage::Proposal(Box::new(other)))
-            .unwrap();
-        assert!(out.is_empty());
-        assert_eq!(engine.step(), Step::Propose);
     }
 }

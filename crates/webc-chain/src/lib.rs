@@ -58,7 +58,10 @@ pub use protocol::{
     AuthorizationLaneId, BaseUnits, BlockHeight, ChainId, ChainIdError, Epoch, Nonce,
     ProtocolVersion, ValidatorId, CURRENT_PROTOCOL_VERSION,
 };
-pub use round::{ConsensusAction, ConsensusMessage, RoundState, Step, ValidatorIdentity};
+pub use round::{
+    ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage, Step, TimeoutKind,
+    ValidatorIdentity,
+};
 pub use scheduler::parallel_batches;
 pub use session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
