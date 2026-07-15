@@ -28,14 +28,17 @@ Use simple Korean when speaking to the user, address them as 관리자 (administ
 ## Current verified checkpoint
 
 Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
-is in progress — stage A-1 (networking plumbing), the A-2 consensus core, and most
-of A-3 are done: received-block validation (`Node::import_block`), a full
-multi-round Tendermint machine with locking and safe round changes
-(`webc-chain::ConsensusMachine`), objective equivocation detection, and the async
-`ConsensusDriver` that runs the machine over real TCP with mempool-fed proposals —
-proven by loopback tests where three validator nodes finalize the same chain and a
-gossiped transfer is finalized by all of them. What remains in A-3 is a state-sync
-protocol to catch up a lagging/joining node** (see "Exact next work"). Always use
+has its full mechanism in place — A-1 (networking plumbing), the A-2 consensus
+core, and A-3 (received-block validation, a multi-round Tendermint machine with
+locking and safe round changes, objective equivocation detection, the async
+`ConsensusDriver` with mempool-fed proposals, and certificate-verified state
+sync) are all done.** Loopback integration tests prove three validator nodes
+finalize one chain, a gossiped transfer is finalized by all, and a late-joining
+node catches up purely via state sync. The honest remaining Phase 4 items are
+*validation*, not missing mechanism: a reference-machine finality-timing number,
+an end-to-end test that a proposed block's embedded double-vote evidence actually
+slashes, and a multi-node Byzantine test that <1/3 power cannot finalize
+conflicting blocks (the lock-safety property is unit-tested today). Always use
 `git log` to discover the current branch tip;
 the checkpoint list below names implementation history, not an instruction to
 reset or return to an older commit. (The prototype remains unsafe for real funds,
@@ -279,19 +282,24 @@ proposes fee-priority nonce-ordered transactions under the block unit budget, an
 prunes included/stale transactions after each commit — proven by an integration
 test where a gossiped transfer is included in a block all three nodes finalize.
 
-**What remains in Phase 4 A-3** is a **state-sync protocol** so a node that is
-behind (or newly joining) fetches finalized blocks plus their certificates from a
-checkpoint and imports them (`import_block` already validates and commits) without
-replaying all history — the driver keeps lockstep nodes in sync but cannot catch
-up a lagging node, since a gossiped `Certificate` carries a block hash but not the
-block. Doing this well means persisting the finality certificate per height
-(a new store table + `ChainStore` methods, written at commit time when the driver
-holds the certificate) and adding block-request/response wire messages. Fork
-choice is largely covered by the finality-certificate design (a node follows the
-certified chain and commits only finalized blocks); objective double-vote evidence
-is detected, embedded in proposals by the driver, and applied by the existing
-slashing path — so that loop is closed end to end in code, pending a test that a
-proposed block's evidence actually slashes.
+**State sync is done.** The finality certificate is persisted per height
+(`Table::Certificates`; `BlockCommit.certificate`; `ChainStore::certificate`;
+`Node::import_finalized_block` stores it and `Node::certified_block` reads it),
+`NetMessage` gained `BlockRequest`/`BlockResponse(CertifiedBlock)`, and the driver
+runs live consensus and sync in one per-height loop: a node advances a height
+either by finalizing it live or by importing a peer's certified block (verifying
+the certificate against the validator snapshot, then re-executing on import), and
+serves `BlockRequest`s from its store. An integration test has a late-joining node
+catch up to height 3 purely via sync, tips matching the validators'.
+
+**What remains in Phase 4 is validation, not mechanism:** a reference-machine
+finality-timing number (this cloud container cannot produce it honestly), an
+end-to-end test that a proposed block's embedded double-vote evidence actually
+slashes (the detection→embed→apply loop is closed in code), and a multi-node
+Byzantine test that <1/3 power cannot finalize conflicting blocks (the lock-safety
+property is unit-tested in `webc-chain::round`). Fork choice is covered by the
+finality-certificate design: a node follows the certified chain and commits only
+finalized blocks.
 
 Public contract runtime, the WEBC high-level language and tooling, the native
 oracle, ZK expansion, the web/game platform, and real-fund bridge work stay

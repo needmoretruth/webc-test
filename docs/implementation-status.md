@@ -164,12 +164,14 @@ height 1 from the persisted redb store.
 ## Phase 4: networking and signed consensus (in progress)
 
 Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
-consensus core**, **A-3 robustness**. A-1, the A-2 consensus core, and most of A-3
-are complete: received-block validation, the multi-round Tendermint machine with
-locking and round changes, equivocation detection, the async consensus driver, and
-mempool-fed proposals (proven by loopback tests where three validator nodes
-finalize the same chain and a gossiped transfer is finalized by all of them). What
-remains in A-3 is a state-sync protocol to catch up a lagging/joining node.
+consensus core**, **A-3 robustness**. **All three are mechanism-complete.** A-3
+covers received-block validation, the multi-round Tendermint machine with locking
+and round changes, equivocation detection, the async consensus driver with
+mempool-fed proposals, and certificate-verified state sync — proven by loopback
+tests where three validator nodes finalize the same chain, a gossiped transfer is
+finalized by all, and a late-joining node catches up purely via sync. The honest
+remaining Phase 4 items are validation, not missing mechanism (see the end of the
+A-3 section).
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
 
@@ -332,19 +334,30 @@ The safety-critical, deterministic parts of A-3 are implemented and gate-verifie
   admitted by every mempool and included by a proposer in a block all three nodes
   finalize at the same height with agreeing tips.
 
-What remains in A-3 is a **state-sync protocol** so a lagging or newly-joining
-node fetches finalized blocks plus their certificates from a checkpoint and
-imports them (`import_block` already validates and commits) without replaying all
-history — the driver keeps lockstep nodes in sync but cannot catch up a node that
-fell behind, since a gossiped `Certificate` carries a block hash but not the
-block. This needs persisting the finality certificate per height (a new store
-table plus `ChainStore` methods, written at commit time when the driver holds the
-certificate) and block-request/response wire messages. Fork choice is largely
+- **Certificate-verified state sync** — a lagging or newly-joining node fetches
+  finalized blocks with their certificates and imports them without replaying
+  consensus. The finality certificate is persisted per height
+  (`Table::Certificates`; `BlockCommit.certificate`; `ChainStore::certificate`;
+  `Node::import_finalized_block` writes it, `Node::certified_block` reads it).
+  `NetMessage` gained `BlockRequest` and `BlockResponse(CertifiedBlock)`. The
+  driver runs live consensus and sync in one per-height loop: a node advances a
+  height either by finalizing it live or by importing a peer's certified block —
+  verifying the block-bound certificate against the current validator snapshot,
+  then re-executing on import — and serves `BlockRequest`s from its store. A node
+  that observes the network ahead requests the finalized block for its current
+  height once, so a node missing votes advances by import instead of stalling.
+  Integration test: three synchronized validators produce blocks, then a late
+  observer joins and catches up to height 3 purely via state sync, its finalized
+  tips matching the validators' at every height.
+
+The honest remaining Phase 4 items are validation, not missing mechanism: a
+reference-machine finality-timing number (this cloud container cannot produce it
+honestly); an end-to-end test that a proposed block's embedded double-vote
+evidence actually slashes (the detect→embed→apply loop is closed in code); and a
+multi-node Byzantine test that <1/3 power cannot finalize conflicting blocks (the
+lock-safety property is unit-tested in `webc-chain::round`). Fork choice is
 covered by the finality-certificate design (a node follows the certified chain and
-commits only finalized blocks); objective double-vote evidence is detected by the
-machine, embedded in proposals by the driver, and applied by the existing slashing
-path — that loop is closed in code, pending a test that a proposed block's embedded
-evidence actually slashes.
+commits only finalized blocks).
 
 ## Phase 3: local restartable node, storage, and developer APIs
 
