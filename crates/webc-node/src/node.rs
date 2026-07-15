@@ -177,6 +177,37 @@ impl<K: KvStore> Node<K> {
         Ok(block)
     }
 
+    /// Builds a candidate block for the next height **without committing it**.
+    ///
+    /// A consensus proposer uses this to produce the block it proposes; the block
+    /// is committed later — by every node, including the proposer — through
+    /// [`Self::import_block`] once consensus finalizes it. Because it never mutates
+    /// the node, a proposal that loses a round leaves no trace. It shares
+    /// `produce_block`'s deterministic construction, differing only in that it
+    /// stops before the durable commit.
+    pub fn build_candidate(
+        &self,
+        transactions: Vec<Transaction>,
+        evidence: Vec<SlashingEvidence>,
+        proposer: Address,
+        timestamp_ms: u64,
+    ) -> Result<Block, NodeError> {
+        let height = self.height() + 1;
+        let previous_hash = self.tip_hash().unwrap_or(Hash256([0u8; 32]));
+        let epoch = self.state.current_epoch;
+        let input = BlockBuildInput {
+            chain_id: self.config.chain_id.clone(),
+            height,
+            epoch,
+            previous_hash,
+            proposer,
+            timestamp_ms,
+        };
+        let mut next_state = self.state.clone();
+        let block = build_block(&mut next_state, &self.config, input, transactions, evidence)?;
+        Ok(block)
+    }
+
     /// Validates and durably commits a block produced by another node.
     ///
     /// This is the receiving side of networked consensus and the building block
@@ -418,6 +449,30 @@ mod tests {
         );
         // The follower also persisted the epoch-0 snapshot on its first import.
         assert!(follower.store().validator_set(0).unwrap().is_some());
+    }
+
+    #[test]
+    fn build_candidate_does_not_commit_but_imports_cleanly() {
+        let (genesis, alice, bob) = test_genesis();
+        let mut proposer = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let mut follower = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+
+        let block = proposer
+            .build_candidate(
+                vec![transfer(&alice, &bob, 7, 0)],
+                Vec::new(),
+                alice.address(),
+                1_700_000_000_000,
+            )
+            .unwrap();
+        // Building a candidate leaves the proposer's committed height unchanged.
+        assert_eq!(proposer.height(), 0);
+
+        // The candidate is a valid block: both nodes import it to the same tip.
+        proposer.import_block(block.clone()).unwrap();
+        follower.import_block(block).unwrap();
+        assert_eq!(proposer.height(), 1);
+        assert_eq!(proposer.tip_hash(), follower.tip_hash());
     }
 
     #[test]
