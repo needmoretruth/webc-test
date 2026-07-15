@@ -164,11 +164,12 @@ height 1 from the persisted redb store.
 ## Phase 4: networking and signed consensus (in progress)
 
 Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
-consensus core**, **A-3 robustness**. A-1, the A-2 consensus core, and the A-3
-deterministic core (received-block validation, the multi-round Tendermint machine
-with locking and round changes, and equivocation detection) are complete. What
-remains in A-3 is integration: the async network driver that runs the machine
-over real TCP, and a state-sync protocol.
+consensus core**, **A-3 robustness**. A-1, the A-2 consensus core, and most of A-3
+are complete: received-block validation, the multi-round Tendermint machine with
+locking and round changes, equivocation detection, and the async consensus driver
+(proven by a loopback test where three validator nodes finalize the same chain).
+What remains in A-3 is a state-sync protocol (catch up a lagging/joining node) and
+mempool-fed proposals.
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
 
@@ -309,18 +310,31 @@ The safety-critical, deterministic parts of A-3 are implemented and gate-verifie
   `SlashingEvidence::DoubleVote` path (whose application was already implemented in
   Phase 1). Tested against `SlashingEvidence::verify`.
 
-What remains in A-3 is integration, not consensus theory: (1) the async network
-driver in `webc-node` that runs a `ConsensusMachine` per height over real
-`webc-net` TCP — building a candidate block on `NeedProposalBlock`, arming real
-timers on `ScheduleTimeout`, routing gossiped Proposal/Vote/Certificate into the
-machine (the gossip pump ignores them today by design), committing on `Commit`
-via `import_block`, and including gossiped equivocation evidence in the next
-proposed block — so 2-4 separate processes converge; and (2) a state-sync protocol
-so a joining node fetches finalized blocks and certificates from a checkpoint and
-imports them without replaying all history. Fork choice is largely covered by the
-finality-certificate design (a node follows the certified chain and commits only
-finalized blocks); the double-vote slashing application path already exists, so
-only its wiring into produced blocks (part of the driver) is left.
+- **Async consensus driver** — `webc-node::ConsensusDriver` (`consensus_driver.rs`)
+  runs one `ConsensusMachine` per height over real `webc-net` TCP. It builds a
+  candidate on `NeedProposalBlock` (`Node::build_candidate`, which builds without
+  committing), arms real tokio timers on `ScheduleTimeout` (tagged by height so
+  stale timers are ignored), routes gossiped Proposal/Vote into the machine,
+  commits on `Commit` via `import_block` and advances to the next height, and
+  stashes gossiped equivocation evidence to embed in its next proposal. A
+  validator supplies its consensus-key seed; an observer (`None`) still follows
+  and commits finalized blocks. A loopback integration test
+  (`tests/consensus_convergence.rs`) has three validator nodes — active at genesis
+  because their `self_stake` exceeds the activation threshold — finalize the same
+  blocks at the same heights over the real authenticated transport, stable across
+  repeated runs.
+
+What remains in A-3: (1) a **state-sync protocol** so a lagging or newly-joining
+node fetches finalized blocks plus their certificates from a checkpoint and
+imports them (`import_block` already validates and commits) without replaying all
+history — the driver keeps lockstep nodes in sync but cannot catch up a node that
+fell behind, since a gossiped `Certificate` carries a block hash but not the
+block; and (2) **mempool-fed proposals** (the driver proposes empty blocks today).
+Fork choice is largely covered by the finality-certificate design (a node follows
+the certified chain and commits only finalized blocks); objective double-vote
+evidence is detected by the machine, embedded in proposals by the driver, and
+applied by the existing slashing path — that loop is closed in code, pending a
+test that a proposed block's embedded evidence actually slashes.
 
 ## Phase 3: local restartable node, storage, and developer APIs
 

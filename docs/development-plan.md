@@ -12,10 +12,12 @@ writer, a self-verifying finality certificate, received-block validation
 (`Node::import_block`), a full multi-round Tendermint machine with locking and
 safe round changes (`webc-chain::ConsensusMachine`), and objective equivocation
 detection — proven by deterministic tests (multi-validator convergence, a round
-change under a silent proposer, and the lock-safety property). What remains in
-Phase 4 A-3 is integration: the async network driver that runs the machine over
-real TCP and a state-sync protocol. This marker records progress and does not
-weaken any acceptance criterion below.
+change under a silent proposer, and the lock-safety property). The async
+`ConsensusDriver` that runs the machine over real `webc-net` TCP is done too,
+proven by a loopback test where three validator nodes finalize the same chain.
+What remains in Phase 4 A-3 is a state-sync protocol (catch up a lagging/joining
+node) and mempool-fed proposals. This marker records progress and does not weaken
+any acceptance criterion below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
 
@@ -478,17 +480,21 @@ active**. A-1, the A-2 consensus core, and the A-3 deterministic core are done:
 6. objective equivocation detection surfaces double-vote evidence for the existing
    slashing path — done.
 
-The remaining Phase 4 A-3 work is integration:
+7. the async network driver (`webc-node::ConsensusDriver`) runs a
+   `ConsensusMachine` per height over real TCP — candidate build on
+   `NeedProposalBlock`, real timers on `ScheduleTimeout`, gossiped consensus
+   messages into the machine, commit on `Commit` via `import_block`, gossiped
+   evidence into the next block — proven by a loopback test where three validator
+   nodes converge on one finalized chain — done.
 
-7. build the async network driver that runs a `ConsensusMachine` per height over
-   real TCP (`webc-net`) — build a candidate block on `NeedProposalBlock`, arm
-   real timers on `ScheduleTimeout`, route gossiped consensus messages into the
-   machine, commit on `Commit` via `import_block`, and include gossiped evidence
-   in the next block — so 2-4 separate processes converge on one finalized chain;
-8. implement a state-sync protocol so a joining node fetches finalized blocks and
-   certificates from a checkpoint and imports them without replaying all history;
-9. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
-   every completed item.
+The remaining Phase 4 A-3 work:
+
+8. implement a state-sync protocol so a lagging or joining node fetches finalized
+   blocks and their certificates from a checkpoint and imports them without
+   replaying all history;
+9. feed the mempool into proposed blocks (the driver proposes empty blocks today);
+10. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
+    every completed item.
 
 Only after consensus is stable should the contract runtime, the WEBC high-level
 language and tooling, the native oracle, the web platform, and the bridges be
