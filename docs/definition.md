@@ -24,8 +24,10 @@ A website should be able to add WEBC features through a small SDK or widget whil
 - browser wallets and website payments;
 - native WEBC, user-created fungible tokens, and NFTs;
 - staking, delegation, and public verification nodes;
-- simple exchange, games, voting, and website-connected applications;
+- simple exchange, games (including web games), voting, and website-connected applications;
 - parallel execution so unrelated applications do not block one another;
+- smart contracts that humans, AI-assisted developers, and AI agents can all build easily and safely;
+- a native staked oracle so contracts can use external data without trusting one reporter;
 - short proofs so browsers can verify important chain facts;
 - bidirectional Ethereum and Solana bridges.
 
@@ -38,6 +40,8 @@ WEBC combines three design directions:
 - Mina-inspired compact proofs for lightweight browser verification.
 
 Ordinary money and token balances use a simple account model. NFTs, games, and application state can use owned or shared objects. PoH is not part of the protocol.
+
+Smart contracts run on a restricted, deterministic Rust->WASM foundation. Above it, WEBC provides its own easy high-level authoring language that lowers to an audited Rust framework, so contracts stay as safe as Rust while being simple enough for humans and AI to assemble from documented, audited components. WEBC does not build a second virtual machine or its own compiler backend.
 
 ## Website actions
 

@@ -1,6 +1,6 @@
 # WEBC confirmed decisions and technical gates
 
-Last updated: 2026-07-12
+Last updated: 2026-07-15
 
 This file is the authoritative short record of decisions made with the project owner. If an older document or the current prototype code conflicts with this file, this file wins until the conflict is deliberately resolved in code and tests.
 
@@ -14,6 +14,8 @@ This file is the authoritative short record of decisions made with the project o
 - Core implementation language: Rust.
 - Primary use: browser- and website-native wallets, payments, tokens, applications, staking, and cross-chain assets.
 - A website may embed WEBC features, but wallet secrets must remain isolated from the host website.
+- Non-negotiable qualities across the protocol: fast, stable, secure, decentralized, and low-fee. Usability and ease-of-integration improvements must never be bought by weakening these.
+- WEBC is designed for the AI development era: humans, human-with-AI, and AI-only workflows are all first-class for building on and using the chain.
 
 ## Native coin and distribution
 
@@ -72,6 +74,7 @@ This file is the authoritative short record of decisions made with the project o
 ## Execution and parallelism
 
 - Parallel execution is a core requirement, not an optional optimization.
+- The parallel model combines Solana-style declared per-transaction access lists with Sui-style versioned owned objects: unrelated transactions run concurrently and owned-object versions guard against conflicts. The data model (`object.rs`) and the deterministic batch scheduler (`scheduler.rs`) already exist in the prototype; the remaining work is the parallel executor and the public contract runtime on top of them.
 - The state model is hybrid:
   - account-style balances for WEBC, ordinary fungible-token balances, staking, delegation, and simple payments;
   - object-style state for NFTs, game items, escrows, orders, application sessions, and contract-owned data.
@@ -96,6 +99,8 @@ This file is the authoritative short record of decisions made with the project o
 - Sponsors must be able to set per-user, per-application, per-operation, and daily limits.
 - Token/NFT creation, persistent storage, and contract deployment cost more than a simple transfer.
 - Priority fees must not allow one application to monopolize unrelated localized execution lanes.
+- Sponsorship policies must be bounded, never open-ended: a sponsor sets eligibility (for example authenticated users or users with a site account) and hard caps (for example a per-user daily limit such as one dollar equivalent), and the protocol enforces the cap so a site cannot be drained.
+- Reputation- or domain-based automatic fee discounts are deferred. They invite Sybil, gaming, and centralization problems (who decides which domain is "good"). The same goal — cheaper or free usage for a site's users — is met safely through capped, policy-based sponsorship above.
 
 ## Browser wallet and website security
 
@@ -133,17 +138,25 @@ This file is the authoritative short record of decisions made with the project o
 ## Smart contracts and web integration
 
 - The core node and native protocol modules remain Rust.
-- The final public smart-contract runtime/language is not yet frozen.
-- Current front-runner: deterministic, restricted WebAssembly with Rust as the first authoring language.
-- Move VM and EVM/Solidity must be benchmarked against the same reference applications before the public runtime is frozen.
-- A new WEBC-specific programming language must not be invented without overwhelming evidence.
+- The smart-contract execution foundation is chosen: deterministic, restricted WebAssembly, with Rust as the first authoring language compiled to WASM. This is the safety/speed engine, not the language most developers write by hand.
+- Above that foundation WEBC provides its own high-level contract language and framework, designed to be easy and intuitive for humans and AI. It is implemented as a safe authoring layer that lowers (transpiles) to the audited Rust framework and its components; it does not add a second from-scratch VM or a hand-written compiler backend, so it inherits Rust/WASM safety, determinism, and performance. WEBC builds the language front end (parser + lowering), and reuses the Rust/LLVM toolchain for the hard optimization/codegen work.
+- The earlier caution against "inventing a new language" refers to a new low-level VM or an independent compiler backend, which WEBC does not build. A high-level authoring language that lowers to the audited Rust layer is explicitly wanted.
+- Move VM and EVM/Solidity are not the native WEBC runtime. Ethereum/Solana compatibility is delivered through bridges (see the bridge section), not by executing their bytecode natively.
+- AI-native development is a design goal: the language, framework, and documentation are machine-readable and composable so an AI agent can read a component catalog and assemble a contract from documented, audited building blocks. The same catalog serves human-only and human-with-AI developers.
+- Contract quality is protected by tooling, not left to developer discipline. To keep contracts from becoming unmaintainable "spaghetti"/"god contracts": an opinionated, uniform contract structure; small composable components instead of monoliths; a dedicated contract linter/analyzer (a WEBC clippy) that flags long functions, missing access declarations, and unsafe patterns; and a pre-deploy review step (including automated/AI review) run before deployment.
 - TypeScript is the primary website SDK language, with generated clients from contract interface descriptions.
 - Contracts cannot access the internet, local files, wall-clock time, or random device state directly.
+- External data reaches contracts through a native WEBC oracle rather than direct network calls, so every node still computes the same result:
+  - oracle reporters stake WEBC, submit data as ordinary signed transactions, and reported values are aggregated (for example by median) so a single reporter cannot forge the answer;
+  - provably wrong or conflicting oracle reports are slashable, reusing the existing staking and slashing infrastructure, which makes the native oracle cheap (no external chain), fast (WEBC block speed), and hard to manipulate;
+  - the native oracle is the default path; external oracle integration remains possible but is not required.
 - File upload/download, button actions, webhooks, headless services, and external APIs use a split design:
   - on-chain contract records payment, authorization, hashes, and events;
   - browser/server agents perform the external action and may return signed receipts.
 - File bytes normally remain off-chain; WEBC stores content hashes, permissions, payment state, and optional encrypted-key release conditions.
-- Required application capability includes swaps, conditional payments, sponsored fees, simple games, token policies, governance, NFT issuance, and website membership/access rules.
+- Required application capability includes swaps, conditional payments, sponsored fees, simple and web games, token policies, governance, NFT issuance, and website membership/access rules.
+- Web-native application patterns are first-class targets: in-page payments; easy peer-to-peer WEBC exchange during a conversation; real-time wallet creation and server-managed tokens inside web games (including plain HTML games); AI web agents that pay and get paid in WEBC while browsing; optional reward-for-attention (ad) flows; and site-level fee surcharge or revenue-share, implemented at the application layer so the protocol stays simple.
+- A dedicated WEBC module should let non-web applications integrate the same way a website does, so WEBC is optimized for the web and internet generally, not confined to websites.
 
 ## Native tokens, NFTs, and governance
 
@@ -159,6 +172,7 @@ This file is the authoritative short record of decisions made with the project o
 ## Ethereum and Solana bridge
 
 - The bridge is bidirectional.
+- Delivery priority: (1) native ETH and SOL first, ideally in parallel, otherwise Ethereum first then Solana; (2) their standard sub-tokens (Ethereum ERC-20, Solana Token/Token-2022) and cross-chain messaging so contracts on different chains can communicate, not only move assets; (3) additional chains such as Bitcoin and Tron later. Bitcoin/Tron are explicitly deferred because they carry higher trust complexity (Bitcoin has no native contracts, forcing federation/multisig assumptions).
 - Native WEBC can be locked on WEBC and minted as wrapped WEBC on Ethereum or Solana.
 - Wrapped WEBC can be burned on Ethereum or Solana and native WEBC released on WEBC.
 - Supported Ethereum/Solana assets can be locked on their origin chain and represented on WEBC.
@@ -185,7 +199,8 @@ These are technical gates, not questions the project owner must answer now:
 - exact block unit/byte limits at each devnet stage;
 - exact initial fee-per-unit constants;
 - validator committee size and selection algorithm;
-- final smart-contract VM/language;
+- the WEBC high-level authoring language's exact surface syntax and name (the Rust->WASM execution foundation and the decision to provide a high-level language that lowers to the audited Rust layer are settled; only the language's look-and-feel and naming remain open, to be chosen when the language is designed);
+- exact native-oracle economic parameters (reporter stake size, aggregation window, slash severity);
 - final ZK/STARK backend;
 - strict post-quantum-per-transaction versus post-quantum-root plus limited session-key policy;
 - production bridge verification/trust implementation;

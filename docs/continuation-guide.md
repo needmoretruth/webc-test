@@ -19,14 +19,17 @@ without asking the user to restate recorded decisions or safety rules.
 
 ## What the user has already decided
 
-Do not reopen confirmed product choices without new evidence. Important examples are the independent L1, Rust core, 10 million genesis supply, 12 decimals, 10% inflation with yearly 20% relative decline to a 1% floor, 100 WEBC validator-pool activation, 20 WEBC operator minimum at activation, continuous 20% operator self-stake, 1 WEBC minimum delegation, no PoH, 2-second blocks, parallel app isolation, hybrid account/object state, browser wallet isolation, post-quantum-ready authorization, and bidirectional Ethereum/Solana bridges.
+Do not reopen confirmed product choices without new evidence. Important examples are the independent L1, Rust core, 10 million genesis supply, 12 decimals, 10% inflation with yearly 20% relative decline to a 1% floor, 100 WEBC validator-pool activation, 20 WEBC operator minimum at activation, continuous 20% operator self-stake, 1 WEBC minimum delegation, no PoH, 2-second blocks, parallel app isolation, hybrid account/object state, browser wallet isolation, and post-quantum-ready authorization.
 
-Use simple Korean when speaking to the user. Explain unavoidable technical terms immediately.
+The AI-era product direction was confirmed on 2026-07-15 and is recorded in `docs/decision-record.md`; do not reopen it without new evidence. In short: a Rust->WASM contract execution foundation with a WEBC high-level authoring language that lowers (transpiles) to the audited Rust framework (no second VM, no hand-written compiler backend); AI-native machine-readable contract docs + a component catalog serving human-only, human-with-AI, and AI-only development; anti-complexity contract tooling (opinionated structure, composable components, a WEBC clippy, and a pre-deploy review); a native staked oracle (reporters stake, median aggregation, slash liars, reusing staking/slashing); capped policy-based fee sponsorship (reputation/domain discounts deferred as unsafe); web-native targets (in-page payments, web games with real-time wallets and server-managed tokens, AI web-agent payments, site revenue-share at the app layer); and bidirectional Ethereum/Solana bridges with the priority ETH+SOL -> ERC-20/SPL sub-tokens + cross-chain messaging -> other chains (Bitcoin/Tron later). Non-negotiable qualities: fast, stable, secure, decentralized, low-fee.
+
+Use simple Korean when speaking to the user, address them as 관리자 (administrator), and use 존댓말 (polite form). Explain unavoidable technical terms immediately.
 
 ## Current verified checkpoint
 
 Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
-is in progress — stage A-1 (networking plumbing) is done, A-2 (consensus core)
+is in progress — stage A-1 (networking plumbing) and A-2.1 (deterministic
+stake-weighted leader schedule) are done; the rest of A-2 (consensus core)
 is next** (see "Exact next work"). Always use `git log` to discover the current branch tip;
 the checkpoint list below names implementation history, not an instruction to
 reset or return to an older commit. (The prototype remains unsafe for real funds,
@@ -210,11 +213,14 @@ public and consensus messages are individually signed, so devnet uses
 authenticated plaintext framing); richer peer discovery beyond a static
 bootstrap list; peer scoring/rate-limiting on repeated rejects.
 
-**The next milestone is Phase 4 A-2 (signed BFT consensus core)** in
-`docs/development-plan.md`: extend `NetMessage` with proposals/votes/certs, a
-deterministic leader schedule over a persisted stake snapshot, signed
-prevote/precommit producing a finality certificate, and committee-membership /
-voting-power verification, converging 2–4 local nodes on one finalized chain.
+**The next milestone is the rest of Phase 4 A-2 (signed BFT consensus core)** in
+`docs/development-plan.md`. A-2.1 is done: `ValidatorSet::proposer_for(height,
+round)` (`webc-chain::consensus`) is a deterministic, clock-free, stake-weighted,
+round-rotating leader schedule (domain `WEBC_LEADER_SCHEDULE_V1`) with tests.
+Remaining: extend `NetMessage` with proposals/votes/certs, persist the per-epoch
+stake snapshot, signed prevote/precommit producing a finality certificate, and
+committee-membership / voting-power verification, converging 2–4 local nodes on
+one finalized chain.
 The vote primitives already exist in `webc-chain::consensus` (`Vote`,
 `SignedVote`, `VoteType`, quorum math, `detect_double_votes`) and validator-set
 snapshot storage is already wired (`Table::ValidatorSets`,
@@ -222,9 +228,12 @@ snapshot storage is already wired (`Table::ValidatorSets`,
 activates in A-2. A-3 then adds timeouts/round-change, fork choice, state sync,
 and wiring objective evidence into the existing slashing path.
 
-Public contract VM, ZK expansion, and real-fund bridge work stay disabled until
-their later gates. Historical state snapshots/deltas beyond the latest are a
-storage follow-up when proofs against past heights are needed.
+Public contract runtime, the WEBC high-level language and tooling, the native
+oracle, ZK expansion, the web/game platform, and real-fund bridge work stay
+disabled until their later gates; the AI-era product direction for all of these
+is now recorded in `docs/decision-record.md` and slotted into
+`docs/development-plan.md` phases 6-14. Historical state snapshots/deltas beyond
+the latest are a storage follow-up when proofs against past heights are needed.
 
 ## Working rules
 
@@ -256,4 +265,4 @@ storage follow-up when proofs against past heights are needed.
 
 ## Questions to postpone
 
-The user does not need to choose technical constants now. Use benchmarks and public testnet evidence for epoch length, committee size, fee constants, block limits, and VM choice. Ask the user later only for decisions that truly change policy, especially final distribution rules, production bridge trust, or emergency governance powers.
+The user does not need to choose technical constants now. Use benchmarks and public testnet evidence for epoch length, committee size, fee constants, block limits, and native-oracle economic parameters. The contract execution foundation (Rust->WASM) and the decision to build a WEBC high-level authoring language are settled; bring the user the language's surface-syntax look-and-feel and its name only when the language is actually designed. Ask the user later only for decisions that truly change policy, especially final distribution rules, production bridge trust, or emergency governance powers.

@@ -1,11 +1,13 @@
 # WEBC development plan
 
 Status: authoritative implementation plan  
-Date: 2026-07-12
+Date: 2026-07-15
 
-Implementation checkpoint: Phase 0 and Phase 1 passed their repository gates on
-2026-07-13; Phase 2 is active. This marker records progress and does not weaken
-any acceptance criterion below.
+Implementation checkpoint: Phases 0-3 passed their repository gates; Phase 4
+(networking and signed BFT consensus) is active. Phase 4 A-1 (authenticated P2P
+networking and transaction gossip) and the deterministic stake-weighted leader
+schedule (A-2.1) are done. This marker records progress and does not weaken any
+acceptance criterion below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
 
@@ -240,15 +242,33 @@ Measure simple transfers, conflicting transfers, independent applications, token
 - sustained simple-transfer benchmark reaches staged 100/500/1,000/2,000+ TPS gates before any claim is published;
 - deterministic roots match across thread counts and machines.
 
-## Phase 7: contract runtime bakeoff
+## Phase 7: contract runtime, WEBC language, and native oracle
 
-Goal: select one initial public runtime using evidence, not preference.
+Goal: ship the parallel contract runtime on the chosen Rust->WASM foundation, the
+WEBC high-level authoring language above it, the tooling that keeps contracts
+maintainable, and the native staked oracle that feeds contracts external data
+deterministically.
 
-### Candidates
+### Execution foundation (decided)
 
-- restricted deterministic WebAssembly, Rust-first;
-- Move VM with WEBC storage integration;
-- EVM/Solidity compatibility runtime.
+- restricted deterministic WebAssembly, Rust-first, is the execution engine;
+- Move VM and EVM are not the native runtime; Ethereum/Solana compatibility is delivered by the bridges in Phase 11/14, not by running their bytecode here;
+- benchmark the WASM runtime against the reference applications below to validate throughput, determinism, and parallel access enforcement before freezing the ABI.
+
+### WEBC high-level authoring language and tooling
+
+- build the WEBC high-level contract language as a front end (parser + lowering) that transpiles to the audited Rust framework and its components, inheriting Rust/WASM safety and determinism; do not build a second VM or an independent compiler backend;
+- ship a component catalog and machine-readable documentation so AI agents, AI-assisted developers, and human-only developers can all assemble contracts from documented, audited building blocks;
+- enforce an opinionated, uniform contract structure and small composable components instead of monoliths;
+- ship a contract linter/analyzer (a WEBC clippy) plus a pre-deploy review step (including automated/AI review) that block long functions, missing access declarations, and unsafe patterns before deployment;
+- auto-derive each contract's read/write access declarations from the language where possible so developers do not hand-maintain them.
+
+### Native oracle
+
+- implement a native staked oracle: reporters stake WEBC, submit values as ordinary signed transactions, and reported values are aggregated (for example by median) so one reporter cannot forge the answer;
+- slash provably wrong or conflicting reports through the existing staking/slashing path;
+- keep contracts unable to touch the network directly: oracle data enters as transactions so every node computes the same result;
+- expose external oracle integration as an option, not a requirement.
 
 ### Common reference applications
 
@@ -276,8 +296,10 @@ Goal: select one initial public runtime using evidence, not preference.
 ### Acceptance
 
 - publish benchmark code/results;
-- choose one initial runtime and freeze a versioned ABI;
-- keep other runtimes disabled unless separately specified/audited;
+- freeze a versioned contract ABI on the WASM runtime;
+- WEBC high-level language contracts lower to the Rust framework and pass the reference-application suite;
+- the linter/pre-deploy review rejects the anti-pattern fixtures (oversized functions, undeclared access, unsafe patterns);
+- the native oracle resists a single lying reporter in tests and slashes provably wrong reports exactly once;
 - never claim source-level Solidity compatibility without EVM-semantic conformance tests.
 
 ## Phase 8: succinct proofs and post-quantum experiments
@@ -304,9 +326,11 @@ Goal: browsers verify compact finalized state and WEBC determines a defensible m
 - mainnet security wording exactly matches what is implemented;
 - no dependency on one proof vendor is embedded without a replacement/version path.
 
-## Phase 9: website platform
+## Phase 9: web and internet platform
 
-Goal: safe embedded website use.
+Goal: safe embedded website use plus broader web/internet-native integration
+(sites, web apps, web games, and AI agents), easier to adopt than Ethereum or
+Solana.
 
 ### Tasks
 
@@ -315,6 +339,10 @@ Goal: safe embedded website use.
 - add payment requests, subscriptions, sponsored transactions, token/NFT operations, staking, and governance clients;
 - add application namespace registration and permission inspection;
 - add event subscriptions and headless-agent toolkit;
+- add a web-game integration module: real-time in-page wallet creation, server-managed tokens, and low-friction player-to-player transfers, embeddable in plain HTML games;
+- add an AI web-agent payment toolkit so agents can pay and receive WEBC while browsing, within sponsor caps;
+- add in-page payment and easy peer-to-peer exchange flows, plus optional reward-for-attention (ad) and application-layer site fee surcharge/revenue-share examples;
+- add a non-web integration module so native applications embed WEBC the same way a website does;
 - add file/content hash helpers and encrypted-access examples;
 - add one-click voluntary donation/payment links;
 - add origin/security indicators and a user-readable transaction simulator.
@@ -352,6 +380,7 @@ Goal: prove bidirectional accounting with no real value.
 
 ### Tasks
 
+- follow the confirmed delivery priority: native ETH and SOL first (ideally in parallel, otherwise Ethereum then Solana), then their sub-tokens (ERC-20, Solana Token/Token-2022) and cross-chain messaging so contracts on different chains can communicate, then other chains later;
 - freeze versioned cross-chain message format and asset identifiers;
 - build Solidity Ethereum mock bridge and wrapped WEBC token;
 - build Rust Solana mock bridge program and wrapped WEBC mint;
@@ -421,18 +450,24 @@ Real-fund bridges are a post-mainnet or separately gated launch.
 - If a guardian/quorum bridge is temporarily used, publish every trust assumption, key holder, threshold, limit, pause path, and exit risk.
 - Require separate audits for Ethereum contracts, Solana programs, WEBC bridge logic, relayers, and operations.
 - Begin with low per-asset limits and increase only after measured safe operation.
+- Bitcoin and Tron are later targets than Ethereum/Solana and carry higher trust complexity (Bitcoin has no native contracts, forcing federation/multisig assumptions); do not begin them before the Ethereum/Solana bridges are proven.
 
 ## Immediate next implementation milestone
 
-Do not start with RPC or P2P yet.
+Phases 0-3 are complete and **Phase 4 (networking and signed BFT consensus) is
+active**. A-1 (authenticated P2P networking and transaction gossip) and A-2.1 (the
+deterministic stake-weighted leader schedule) are done.
 
-The next implementation milestone is **Phase 0 plus the first half of Phase 1**:
+The next implementation steps are the rest of the signed consensus core:
 
-1. establish reproducible toolchain/CI;
-2. add invariant tests that expose current genesis, block atomicity, slashing, access-list, and delegation inconsistencies;
-3. introduce versioned protocol configuration;
-4. implement 12-decimal amounts and the new inflation curve;
-5. remove zero-collateral bootstrap behavior from the new protocol path;
-6. update `docs/implementation-status.md` after every completed item.
+1. extend the network message set with Proposal, Vote, and Certificate;
+2. populate the per-epoch validator-set stake snapshot writer;
+3. implement the signed prevote/precommit round state machine (propose -> prevote -> precommit -> commit);
+4. implement the finality certificate (aggregate precommits, verify committee membership and >2/3 power);
+5. add a multi-node convergence integration test;
+6. then Phase 4 A-3 robustness: timeouts/round-change, fork choice, state sync, and objective double-vote/invalid-proposal evidence wired into slashing;
+7. update `docs/implementation-status.md` and `docs/continuation-guide.md` after every completed item.
 
-Only after the single-node state machine is internally consistent should networking, RPC, contracts, proofs, or bridges be expanded.
+Only after consensus is stable should the contract runtime, the WEBC high-level
+language and tooling, the native oracle, the web platform, and the bridges be
+expanded.
