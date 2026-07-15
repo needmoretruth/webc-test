@@ -1,14 +1,18 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use webc_chain::{
     build_block, Amount, BlockBuildInput, ChainConfig, ChainState, FeeBid, GenesisAccount,
     GenesisConfig, Operation, Transaction,
 };
 use webc_crypto::{Hash256, Keypair, PublicKeyBytes};
-use webc_node::{AppState, FaucetConfig, MempoolConfig, Node, NodeService, NodeServiceOptions};
+use webc_net::{spawn_network, NetworkConfig};
+use webc_node::{
+    run_gossip_pump, AppState, FaucetConfig, MempoolConfig, Node, NodeService, NodeServiceOptions,
+};
 use webc_storage::RedbKvStore;
 
 #[derive(Parser)]
@@ -41,6 +45,13 @@ enum Command {
         /// Address to bind the HTTP/WebSocket API to.
         #[arg(long, default_value = "127.0.0.1:8645")]
         listen: String,
+        /// Optional address to listen on for peer-to-peer connections. When set
+        /// (or when --peer is given), the node joins the gossip network.
+        #[arg(long)]
+        p2p_listen: Option<String>,
+        /// Peer address to dial and gossip with (repeatable).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
     },
 }
 
@@ -51,7 +62,12 @@ fn main() -> Result<()> {
         Command::GenesisTemplate => genesis_template(),
         Command::Demo => demo(),
         Command::Bench { iterations } => bench(iterations),
-        Command::Run { data_dir, listen } => run(data_dir, listen),
+        Command::Run {
+            data_dir,
+            listen,
+            p2p_listen,
+            peers,
+        } => run(data_dir, listen, p2p_listen, peers),
     }
 }
 
@@ -71,7 +87,12 @@ fn now_ms() -> u64 {
 /// API, and auto-seals a block every two seconds (the devnet block target) when
 /// the mempool has pending transactions. The faucet identity is a fixed devnet
 /// seed and its funds are valueless test units.
-fn run(data_dir: PathBuf, listen: String) -> Result<()> {
+fn run(
+    data_dir: PathBuf,
+    listen: String,
+    p2p_listen: Option<String>,
+    peers: Vec<String>,
+) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
 
     // Fixed devnet faucet identity. Devnet only; these units carry no value.
@@ -84,6 +105,7 @@ fn run(data_dir: PathBuf, listen: String) -> Result<()> {
         }],
         validators: Vec::new(),
     };
+    let chain_id = genesis.chain.chain_id.clone();
 
     let store = RedbKvStore::open(data_dir.join("chain.redb"))?;
     let node = Node::open(store, &genesis)?;
@@ -100,7 +122,18 @@ fn run(data_dir: PathBuf, listen: String) -> Result<()> {
             proposer: faucet.address(),
         },
     );
-    let state = AppState::new(service);
+
+    // Parse the peer-to-peer configuration. The node joins the network if it
+    // either listens for peers or is told to dial some.
+    let p2p_listen_addr: Option<SocketAddr> = match &p2p_listen {
+        Some(addr) => Some(addr.parse().context("invalid --p2p-listen address")?),
+        None => None,
+    };
+    let bootstrap_peers: Vec<SocketAddr> = peers
+        .iter()
+        .map(|addr| addr.parse().context("invalid --peer address"))
+        .collect::<Result<_>>()?;
+    let networked = p2p_listen_addr.is_some() || !bootstrap_peers.is_empty();
 
     println!("WEBC devnet node");
     println!("  data dir:       {}", data_dir.display());
@@ -110,6 +143,31 @@ fn run(data_dir: PathBuf, listen: String) -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
+        // Bring up the peer-to-peer network first (if configured), so the API
+        // state can gossip locally submitted transactions.
+        let state = if networked {
+            // A fresh random network identity per process for devnet. It names
+            // this node on the wire and is distinct from any account key.
+            let identity = Keypair::generate();
+            let (handle, inbound) = spawn_network(NetworkConfig::new(
+                identity,
+                chain_id,
+                p2p_listen_addr,
+                bootstrap_peers,
+            ))
+            .await?;
+            println!("  p2p identity:   {}", handle.local_peer_id());
+            if let Some(addr) = handle.local_addr() {
+                println!("  p2p listen:     {addr}");
+            }
+            let state = AppState::with_network(service, Some(handle));
+            // Drain inbound gossip into the mempool.
+            tokio::spawn(run_gossip_pump(state.clone(), inbound));
+            state
+        } else {
+            AppState::new(service)
+        };
+
         let listener = tokio::net::TcpListener::bind(&listen).await?;
 
         // Auto-seal pending transactions on the devnet block cadence so submitted

@@ -135,6 +135,15 @@ pub struct AccountSummary {
     pub account: Account,
 }
 
+/// The classified outcome of admitting a gossiped transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAdmission {
+    /// The transaction was new and entered (or replaced within) the mempool.
+    Accepted,
+    /// The transaction was refused (stale, duplicate, invalid, or full mempool).
+    Rejected,
+}
+
 /// The result of admitting a transaction to the mempool.
 #[derive(Debug, serde::Serialize)]
 pub struct SubmitReceipt {
@@ -274,6 +283,22 @@ impl<K: KvStore> NodeService<K> {
             .store()
             .block_by_hash(&hash)?
             .ok_or(ApiError::NotFound)
+    }
+
+    /// Admits a transaction that arrived over gossip from a peer.
+    ///
+    /// Unlike [`Self::submit_transaction`], a peer legitimately re-sends
+    /// transactions the node already knows, so this never surfaces an error: it
+    /// classifies the outcome instead. A rejected transaction (stale nonce,
+    /// duplicate, invalid signature, full mempool) is simply dropped. Peer
+    /// scoring on repeated rejections is later work.
+    pub fn admit_network_transaction(&self, tx: Transaction, now_ms: u64) -> NetworkAdmission {
+        let mut inner = self.lock();
+        let Inner { node, mempool, .. } = &mut *inner;
+        match mempool.insert(tx, node.state(), node.config(), now_ms) {
+            Ok(_) => NetworkAdmission::Accepted,
+            Err(_) => NetworkAdmission::Rejected,
+        }
     }
 
     /// Admits a transaction to the mempool after full validation.

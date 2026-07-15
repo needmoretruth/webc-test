@@ -18,6 +18,7 @@ serde_json.workspace = true
 webc-chain = { path = "../webc-chain" }
 webc-crypto = { path = "../webc-crypto" }
 webc-storage = { path = "../webc-storage" }
+webc-net = { path = "../webc-net" }
 thiserror.workspace = true
 hex.workspace = true
 # HTTP/WebSocket developer API. axum (MIT) + tokio (MIT) are Apache-2.0-compatible.
