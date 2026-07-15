@@ -34,11 +34,15 @@ locking and safe round changes, objective equivocation detection, the async
 `ConsensusDriver` with mempool-fed proposals, and certificate-verified state
 sync) are all done.** Loopback integration tests prove three validator nodes
 finalize one chain, a gossiped transfer is finalized by all, and a late-joining
-node catches up purely via state sync. The honest remaining Phase 4 items are
-*validation*, not missing mechanism: a reference-machine finality-timing number,
-an end-to-end test that a proposed block's embedded double-vote evidence actually
-slashes, and a multi-node Byzantine test that <1/3 power cannot finalize
-conflicting blocks (the lock-safety property is unit-tested today). Always use
+node catches up purely via state sync. Honest remaining Phase 4 items: (a) a
+reference-machine finality-timing number; (b) **wiring consensus-detected
+equivocation to an applied slash** — the machine detects it and produces
+verifiable `DoubleVoteEvidence`, but the driver does NOT yet slash: `block.evidence`
+is neither committed by the header nor executed, and slashing applies only via an
+`Operation::SubmitSlashingEvidence` transaction, so closing this needs an
+authenticated evidence path or an auto-submitted evidence transaction plus a test;
+and (c) a multi-node Byzantine test that <1/3 power cannot finalize conflicting
+blocks (the lock-safety property is unit-tested today). Always use
 `git log` to discover the current branch tip;
 the checkpoint list below names implementation history, not an instruction to
 reset or return to an older commit. (The prototype remains unsafe for real funds,
@@ -292,14 +296,18 @@ the certificate against the validator snapshot, then re-executing on import), an
 serves `BlockRequest`s from its store. An integration test has a late-joining node
 catch up to height 3 purely via sync, tips matching the validators'.
 
-**What remains in Phase 4 is validation, not mechanism:** a reference-machine
-finality-timing number (this cloud container cannot produce it honestly), an
-end-to-end test that a proposed block's embedded double-vote evidence actually
-slashes (the detection→embed→apply loop is closed in code), and a multi-node
-Byzantine test that <1/3 power cannot finalize conflicting blocks (the lock-safety
-property is unit-tested in `webc-chain::round`). Fork choice is covered by the
-finality-certificate design: a node follows the certified chain and commits only
-finalized blocks.
+**What remains in Phase 4:** a reference-machine finality-timing number (this
+cloud container cannot produce it honestly); **wiring consensus-detected
+equivocation to an applied slash** — the machine detects equivocation and emits
+verifiable `DoubleVoteEvidence`, but the driver does NOT act on it: `block.evidence`
+is neither committed by the block header nor executed, and slashing applies only
+through an `Operation::SubmitSlashingEvidence` transaction, so this needs either an
+authenticated block-evidence path (an evidence root in the header plus block
+execution) or the driver auto-submitting an evidence transaction, plus an
+end-to-end slash test; and a multi-node Byzantine test that <1/3 power cannot
+finalize conflicting blocks (the lock-safety property is unit-tested in
+`webc-chain::round`). Fork choice is covered by the finality-certificate design: a
+node follows the certified chain and commits only finalized blocks.
 
 Public contract runtime, the WEBC high-level language and tooling, the native
 oracle, ZK expansion, the web/game platform, and real-fund bridge work stay

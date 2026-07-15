@@ -17,10 +17,11 @@ change under a silent proposer, and the lock-safety property). The async
 the driver feeds its mempool into proposals, and certificate-verified state sync
 lets a late-joining node catch up — proven by loopback tests (three validators
 finalize one chain, a gossiped transfer is finalized by all, a late node catches
-up via sync). Phase 4's consensus mechanism is complete; the honest remainder is
-validation (a reference finality-timing number, an evidence-slashes end-to-end
-test, and a multi-node Byzantine test). This marker records progress and does not
-weaken any acceptance criterion below.
+up via sync). Phase 4's consensus mechanism is complete except that
+consensus-detected equivocation is not yet wired to an applied slash; the rest of
+the remainder is validation (a reference finality-timing number and a multi-node
+Byzantine test). This marker records progress and does not weaken any acceptance
+criterion below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
 
@@ -499,12 +500,16 @@ active**. A-1, the A-2 consensus core, and the A-3 deterministic core are done:
    BlockRequest/BlockResponse wire messages, and a unified live-or-sync per-height
    loop) lets a late-joining node catch up — proven by a loopback test — done.
 
-The honest remaining Phase 4 work is validation, not mechanism:
+The remaining Phase 4 work:
 
 10. publish a reference-machine finality-timing number (cannot be produced in this
     cloud container);
-11. add an end-to-end test that a proposed block's embedded double-vote evidence
-    slashes exactly once;
+11. wire consensus-detected equivocation to an applied slash — the machine detects
+    it and emits verifiable `DoubleVoteEvidence`, but the driver does not act on
+    it: `block.evidence` is neither committed by the header nor executed, and
+    slashing applies only via an `Operation::SubmitSlashingEvidence` transaction,
+    so close the loop (an authenticated block-evidence path or an auto-submitted
+    evidence transaction) and add an end-to-end slash test;
 12. add a multi-node Byzantine test that <1/3 power cannot finalize conflicting
     blocks (the lock-safety property is unit-tested today);
 13. update `docs/implementation-status.md` and `docs/continuation-guide.md` after

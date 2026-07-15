@@ -164,14 +164,16 @@ height 1 from the persisted redb store.
 ## Phase 4: networking and signed consensus (in progress)
 
 Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
-consensus core**, **A-3 robustness**. **All three are mechanism-complete.** A-3
-covers received-block validation, the multi-round Tendermint machine with locking
-and round changes, equivocation detection, the async consensus driver with
-mempool-fed proposals, and certificate-verified state sync — proven by loopback
-tests where three validator nodes finalize the same chain, a gossiped transfer is
-finalized by all, and a late-joining node catches up purely via sync. The honest
-remaining Phase 4 items are validation, not missing mechanism (see the end of the
-A-3 section).
+consensus core**, **A-3 robustness**. **A-1 and A-2 are complete; A-3 is in place
+except that consensus-detected equivocation is not yet wired to an applied slash.**
+A-3 covers received-block validation, the multi-round Tendermint machine with
+locking and round changes, equivocation *detection*, the async consensus driver
+with mempool-fed proposals, and certificate-verified state sync — proven by
+loopback tests where three validator nodes finalize the same chain, a gossiped
+transfer is finalized by all, and a late-joining node catches up purely via sync.
+The remaining Phase 4 items (the equivocation-to-slash wiring, a reference
+finality-timing number, and a multi-node Byzantine test) are detailed at the end
+of the A-3 section.
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
 
@@ -317,9 +319,10 @@ The safety-critical, deterministic parts of A-3 are implemented and gate-verifie
   candidate on `NeedProposalBlock` (`Node::build_candidate`, which builds without
   committing), arms real tokio timers on `ScheduleTimeout` (tagged by height so
   stale timers are ignored), routes gossiped Proposal/Vote into the machine,
-  commits on `Commit` via `import_block` and advances to the next height, and
-  stashes gossiped equivocation evidence to embed in its next proposal. A
-  validator supplies its consensus-key seed; an observer (`None`) still follows
+  commits on `Commit` via `import_block` and advances to the next height. (It does
+  not act on `ConsensusAction::Equivocation` yet — see the note at the end of this
+  section.) A validator supplies its consensus-key seed; an observer (`None`)
+  still follows
   and commits finalized blocks. A loopback integration test
   (`tests/consensus_convergence.rs`) has three validator nodes — active at genesis
   because their `self_stake` exceeds the activation threshold — finalize the same
@@ -350,14 +353,21 @@ The safety-critical, deterministic parts of A-3 are implemented and gate-verifie
   observer joins and catches up to height 3 purely via state sync, its finalized
   tips matching the validators' at every height.
 
-The honest remaining Phase 4 items are validation, not missing mechanism: a
-reference-machine finality-timing number (this cloud container cannot produce it
-honestly); an end-to-end test that a proposed block's embedded double-vote
-evidence actually slashes (the detect→embed→apply loop is closed in code); and a
-multi-node Byzantine test that <1/3 power cannot finalize conflicting blocks (the
-lock-safety property is unit-tested in `webc-chain::round`). Fork choice is
-covered by the finality-certificate design (a node follows the certified chain and
-commits only finalized blocks).
+Remaining Phase 4 items: a reference-machine finality-timing number (this cloud
+container cannot produce it honestly); **wiring consensus-detected equivocation to
+an applied slash** — the machine detects equivocation and emits verifiable
+`DoubleVoteEvidence` (whose `SlashingEvidence::verify` passes), but the driver does
+NOT apply it. `block.evidence` is neither committed by the block header (there is
+no evidence root) nor executed by `build_block`/`apply_block`; slashing is applied
+only through an `Operation::SubmitSlashingEvidence` transaction (implemented and
+tested in Phase 1). Closing the loop needs either an authenticated block-evidence
+path (an evidence root in the header + block-evidence execution) or the driver
+auto-submitting a `SubmitSlashingEvidence` transaction, plus an end-to-end test
+that an offender's stake is actually reduced. Also remaining: a multi-node
+Byzantine test that <1/3 power cannot finalize conflicting blocks (the lock-safety
+property is unit-tested in `webc-chain::round`). Fork choice is covered by the
+finality-certificate design (a node follows the certified chain and commits only
+finalized blocks).
 
 ## Phase 3: local restartable node, storage, and developer APIs
 

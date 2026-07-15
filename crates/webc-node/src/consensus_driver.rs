@@ -15,12 +15,18 @@
 //!
 //! Scope (Phase 4 A-3): the driver admits gossiped transactions into a mempool
 //! and includes fee-priority, nonce-ordered transactions in the blocks it
-//! proposes, along with any gossiped equivocation evidence. It broadcasts and
-//! consumes proposals and votes, and it runs **state sync**: when it observes the
-//! network at a higher height, it requests finalized blocks and imports each
-//! after verifying the block's finality certificate, so a lagging or newly-joined
-//! node catches up without replaying consensus. It also serves such requests from
-//! its own store.
+//! proposes. It broadcasts and consumes proposals and votes, and it runs **state
+//! sync**: when it observes the network at a higher height, it requests finalized
+//! blocks and imports each after verifying the block's finality certificate, so a
+//! lagging or newly-joined node catches up without replaying consensus. It also
+//! serves such requests from its own store.
+//!
+//! Not yet wired: the machine surfaces objective equivocation
+//! ([`ConsensusAction::Equivocation`]), but this driver does not yet convert it
+//! into an applied slash — `block.evidence` is neither committed by the header nor
+//! executed today, and slashing is applied only through an
+//! `Operation::SubmitSlashingEvidence` transaction. Closing that loop is a Phase 4
+//! validation follow-up.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -28,7 +34,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use webc_chain::{
     Block, ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage,
-    FinalityCertificate, SlashingEvidence, TimeoutKind, ValidatorIdentity, ValidatorSet,
+    FinalityCertificate, TimeoutKind, ValidatorIdentity, ValidatorSet,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_net::{InboundMessage, NetMessage, NetworkHandle};
@@ -95,9 +101,6 @@ pub struct ConsensusDriver<K: KvStore> {
     timeouts: DriverTimeouts,
     /// Pending transactions to include when this node proposes; fed by gossip.
     mempool: Mempool,
-    /// Objective equivocation evidence gathered from gossip, to embed in the next
-    /// block this node proposes.
-    pending_evidence: Vec<SlashingEvidence>,
 }
 
 /// Maximum blocks requested per state-sync round.
@@ -125,7 +128,6 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             consensus_address,
             timeouts,
             mempool: Mempool::new(mempool_config),
-            pending_evidence: Vec::new(),
         }
     }
 
@@ -441,7 +443,6 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                     let Some(proposer) = self.consensus_address else {
                         continue;
                     };
-                    let evidence = std::mem::take(&mut self.pending_evidence);
                     // Select fee-priority, nonce-contiguous transactions under the
                     // block unit budget from the mempool.
                     let max_units = self.node.config().fee_policy.max_block_units;
@@ -451,29 +452,31 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                         max_units,
                         now_ms(),
                     );
-                    match self.node.build_candidate(
-                        transactions,
-                        evidence.clone(),
-                        proposer,
-                        now_ms(),
-                    ) {
-                        Ok(block) => {
-                            let more = machine.provide_block(round, block).unwrap_or_default();
-                            work.extend(more);
-                        }
-                        Err(_) => {
-                            // Restore the evidence for the next attempt.
-                            self.pending_evidence = evidence;
-                        }
+                    // Note: consensus-detected equivocation is NOT slashed here.
+                    // The `block.evidence` field is neither committed by the header
+                    // nor applied by block execution today; slashing is applied
+                    // only via an `Operation::SubmitSlashingEvidence` transaction.
+                    // Converting a detected `Equivocation` into an applied slash
+                    // (an authenticated evidence root + block-evidence execution,
+                    // or an auto-submitted evidence transaction) is a Phase 4
+                    // validation follow-up, so we propose no block-level evidence.
+                    if let Ok(block) =
+                        self.node
+                            .build_candidate(transactions, Vec::new(), proposer, now_ms())
+                    {
+                        let more = machine.provide_block(round, block).unwrap_or_default();
+                        work.extend(more);
                     }
                 }
                 ConsensusAction::Commit { block, certificate } => {
                     *decided = Some((*block, *certificate));
                 }
-                ConsensusAction::Equivocation(evidence) => {
-                    self.pending_evidence
-                        .push(SlashingEvidence::DoubleVote(*evidence));
-                }
+                // The machine has proven a validator equivocated. Wiring this
+                // objective evidence through to an applied slash — via an
+                // authenticated block-evidence path or an auto-submitted
+                // `SubmitSlashingEvidence` transaction — is a Phase 4 validation
+                // follow-up; for now the detection is surfaced but not acted on.
+                ConsensusAction::Equivocation(_evidence) => {}
             }
         }
     }
