@@ -152,6 +152,72 @@ schema bug (the connection and signed-transaction result parsers omitted
 Node 22. No Rust files changed in this pass, so the Rust gate is unaffected from
 the prior green run (133 tests).
 
+On 2026-07-15 (this cloud environment), Phase 3 landed the local restartable node.
+The pinned Rust `1.96.0` toolchain passed `cargo fmt --check`, strict workspace
+Clippy (`-D warnings`), **176 tests (120 `webc-chain` + 13 `webc-crypto` + 20
+`webc-storage` + 23 `webc-node`)**, rustdoc with warnings denied, and the node
+demo. The `webc-node run` devnet node was smoke-tested end to end: `GET
+/v1/health`, `POST /v1/faucet/{addr}` funding a fresh wallet to block height 1
+with the no-value disclaimer, block/fee queries, and a kill/restart that recovered
+height 1 from the persisted redb store.
+
+## Phase 3: local restartable node, storage, and developer APIs
+
+Largely complete on the Rust side (the browser SDK client + reference demo site
+remain). A standing "reuse over reinvention" rule was added to `AGENTS.md`: prefer
+mature, Apache-2.0-compatible crates for commodity plumbing; own WEBC's protocol
+logic, the swappable seams, and cross-language canonical encoding.
+
+Completed and verified:
+
+- **`crates/webc-storage`** — the storage abstraction, defined before choosing a
+  database:
+  - `KvStore`: an atomic, durable, ordered key/value contract (`WriteBatch`,
+    `Table` namespaces). Corruption is a first-class reported outcome
+    (`StorageError::Corruption`), never a panic, so a node fails closed on a
+    damaged store.
+  - `MemoryKvStore` (tests/ephemeral) and `RedbKvStore`, a durable crash-safe
+    backend built on the redb embedded ACID database (MIT OR Apache-2.0) — reused
+    behind the seam, not a hand-rolled WAL. One `commit` == one durable redb
+    transaction.
+  - `ChainStore`: typed block/latest-state/tip persistence with one atomic
+    per-block commit (tip advances in the same batch as its block and state, so a
+    crash never leaves them disagreeing) and startup schema + tip-consistency
+    checks. Latest-only state retention for now; historical snapshots/deltas are a
+    later step.
+- **`crates/webc-node`** (now lib+bin):
+  - `Node` — a restartable single-proposer runtime that recovers the latest
+    committed state or initializes genesis, and produces blocks via the existing
+    `build_block` against a clone, committing atomically so memory and disk never
+    disagree; refuses to resume a store with a mismatched chain id.
+  - `Mempool` — admission (signature, chain id, per-lane nonce not stale and
+    bounded ahead, fee floor, best-effort affordability), replacement-by-fee, TTL
+    expiry, obsolete-nonce removal, and fee-priority nonce-contiguous block
+    selection under a unit budget. Reads no clock (caller supplies `now_ms`).
+  - `NodeService` — a transport-independent core (health, fees, account + Merkle
+    proof, object, block-by-height/hash, submit, seal) plus a **devnet-only
+    faucet**: drips valueless test units from a genesis-funded account, seals a
+    block so funds are immediately final, enforces a per-recipient cooldown,
+    refuses to top up already-funded recipients, and stamps every receipt with a
+    no-real-value disclaimer.
+  - `http.rs` — axum/tokio (MIT) HTTP + WebSocket transport with every route under
+    `/v1`, a 1 MiB request-body limit, typed status-code error mapping, and a
+    `subscribe/blocks` WebSocket that pushes a `BlockEvent` on each new tip.
+  - `webc-node run` — launches a redb-backed devnet node under `--data-dir`,
+    recovering on restart, serving the API on `--listen`, and auto-sealing every
+    2s (the devnet block target) when the mempool is non-empty.
+
+Phase 3 acceptance status: restart without loss/duplication — met (verified);
+corruption detected and reported — met; invalid transactions do not mutate state —
+met (tested); APIs publish explicit versioning (`/v1`) and resource limits (body
+limit, mempool caps, faucet limits) — met. The browser end-to-end acceptance
+(wallet → faucet → proof → transfer → finality) is served by the API but the
+TypeScript client and demo site that exercise it remain to be built.
+
+Deliberately deferred within Phase 3: validator-set snapshot storage is wired
+(`Table::ValidatorSets`, `BlockCommit.validator_set`) but not populated until
+consensus (Phase 4); historical state snapshots/deltas beyond the latest.
+
 ## Phase 2 work in progress
 
 Completed and verified:
