@@ -174,6 +174,7 @@ mod tests {
                 account_root: Hash256([0x22; 32]),
                 tx_root: Hash256([0x33; 32]),
                 receipt_root: Hash256([0x44; 32]),
+                evidence_root: Hash256([0x55; 32]),
                 proposer,
                 timestamp_ms: 1_700_000_000_000,
                 base_fee_per_unit: 1,

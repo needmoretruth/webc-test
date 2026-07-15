@@ -835,6 +835,7 @@ mod tests {
                 tx_root: Hash256([0x33; 32]),
                 // Salt the receipt root so different proposers yield distinct blocks.
                 receipt_root: Hash256([salt as u8; 32]),
+                evidence_root: Hash256::ZERO,
                 proposer,
                 timestamp_ms: 1_700_000_000_000,
                 base_fee_per_unit: 1,

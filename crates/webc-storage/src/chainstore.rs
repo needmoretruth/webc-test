@@ -47,13 +47,13 @@ const META_TIP: &[u8] = b"tip";
 ///
 /// `height` is 0 at genesis (the genesis state, before any block). `block_hash`
 /// is `None` only at genesis, since there is no block 0; every committed block
-/// sets it to that block's V2 header hash. `state_root` always matches the state
+/// sets it to that block's V3 header hash. `state_root` always matches the state
 /// snapshot stored at `height`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainTip {
     /// Height of the most recently committed block, or 0 for genesis-only state.
     pub height: u64,
-    /// V2 header hash of the tip block, or `None` at genesis.
+    /// V3 header hash of the tip block, or `None` at genesis.
     pub block_hash: Option<Hash256>,
     /// State root committed after applying the tip (matches the stored snapshot).
     pub state_root: Hash256,
@@ -305,7 +305,7 @@ impl<K: KvStore> ChainStore<K> {
         }
     }
 
-    /// Returns the finalized block with the given V2 header hash, via the index.
+    /// Returns the finalized block with the given V3 header hash, via the index.
     pub fn block_by_hash(&self, hash: &Hash256) -> Result<Option<Block>, StorageError> {
         let Some(height_bytes) = self.store.get(Table::BlockHashIndex, &hash.0)? else {
             return Ok(None);
@@ -408,6 +408,7 @@ mod tests {
             account_root: state.account_root().unwrap(),
             tx_root: Hash256([0u8; 32]),
             receipt_root: Hash256([0u8; 32]),
+            evidence_root: Hash256([0u8; 32]),
             proposer: Keypair::from_seed([1u8; 32]).address(),
             timestamp_ms: 1_700_000_000_000 + height,
             base_fee_per_unit: 0,

@@ -21,20 +21,19 @@
 //! lagging or newly-joined node catches up without replaying consensus. It also
 //! serves such requests from its own store.
 //!
-//! Not yet wired: the machine surfaces objective equivocation
-//! ([`ConsensusAction::Equivocation`]), but this driver does not yet convert it
-//! into an applied slash — `block.evidence` is neither committed by the header nor
-//! executed today, and slashing is applied only through an
-//! `Operation::SubmitSlashingEvidence` transaction. Closing that loop is a Phase 4
-//! validation follow-up.
+//! Objective equivocation surfaced by the machine is retained by replay-stable
+//! evidence hash and included in a later candidate block. The block header commits
+//! the evidence root and deterministic execution applies the slash before user
+//! transactions, so every importing node reaches the same penalized state.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use webc_chain::{
     Block, ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage,
-    FinalityCertificate, TimeoutKind, ValidatorIdentity, ValidatorSet,
+    FinalityCertificate, SlashingEvidence, TimeoutKind, ValidatorIdentity, ValidatorSet,
+    MAX_BLOCK_SLASHING_EVIDENCE,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_net::{InboundMessage, NetMessage, NetworkHandle};
@@ -101,6 +100,9 @@ pub struct ConsensusDriver<K: KvStore> {
     timeouts: DriverTimeouts,
     /// Pending transactions to include when this node proposes; fed by gossip.
     mempool: Mempool,
+    /// Verified double-vote evidence awaiting inclusion, keyed by its
+    /// order-independent replay hash for deterministic ordering and de-duplication.
+    pending_evidence: BTreeMap<Hash256, SlashingEvidence>,
 }
 
 /// Maximum blocks requested per state-sync round.
@@ -128,6 +130,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             consensus_address,
             timeouts,
             mempool: Mempool::new(mempool_config),
+            pending_evidence: BTreeMap::new(),
         }
     }
 
@@ -235,6 +238,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         }
         self.mempool.remove_obsolete(self.node.state());
         self.mempool.prune_expired(now_ms());
+        self.prune_pending_evidence();
         self.report_commit(height, tx_count, commit_tx).await;
         false
     }
@@ -302,6 +306,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             return false;
         }
         self.mempool.remove_obsolete(self.node.state());
+        self.prune_pending_evidence();
         self.report_commit(height, tx_count, commit_tx).await;
         true
     }
@@ -416,6 +421,27 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         }
     }
 
+    /// Drops evidence already committed or no longer verifiable against current
+    /// validator state, preventing one stale item from stalling proposal creation.
+    fn prune_pending_evidence(&mut self) {
+        let state = self.node.state();
+        let protocol_version = self.node.config().protocol_version;
+        let chain_id = self.node.config().chain_id.clone();
+        self.pending_evidence.retain(|hash, evidence| {
+            if state.processed_slashing_evidence.contains(hash) {
+                return false;
+            }
+            state
+                .validators
+                .get(&evidence.validator())
+                .is_some_and(|validator| {
+                    evidence
+                        .verify(protocol_version, &chain_id, &validator.consensus_key)
+                        .is_ok()
+                })
+        });
+    }
+
     /// Executes the machine's actions, feeding follow-on actions back into the
     /// queue until it drains.
     async fn pump(
@@ -452,17 +478,16 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                         max_units,
                         now_ms(),
                     );
-                    // Note: consensus-detected equivocation is NOT slashed here.
-                    // The `block.evidence` field is neither committed by the header
-                    // nor applied by block execution today; slashing is applied
-                    // only via an `Operation::SubmitSlashingEvidence` transaction.
-                    // Converting a detected `Equivocation` into an applied slash
-                    // (an authenticated evidence root + block-evidence execution,
-                    // or an auto-submitted evidence transaction) is a Phase 4
-                    // validation follow-up, so we propose no block-level evidence.
+                    self.prune_pending_evidence();
+                    let evidence = self
+                        .pending_evidence
+                        .values()
+                        .take(MAX_BLOCK_SLASHING_EVIDENCE)
+                        .cloned()
+                        .collect();
                     if let Ok(block) =
                         self.node
-                            .build_candidate(transactions, Vec::new(), proposer, now_ms())
+                            .build_candidate(transactions, evidence, proposer, now_ms())
                     {
                         let more = machine.provide_block(round, block).unwrap_or_default();
                         work.extend(more);
@@ -471,12 +496,12 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 ConsensusAction::Commit { block, certificate } => {
                     *decided = Some((*block, *certificate));
                 }
-                // The machine has proven a validator equivocated. Wiring this
-                // objective evidence through to an applied slash — via an
-                // authenticated block-evidence path or an auto-submitted
-                // `SubmitSlashingEvidence` transaction — is a Phase 4 validation
-                // follow-up; for now the detection is surfaced but not acted on.
-                ConsensusAction::Equivocation(_evidence) => {}
+                ConsensusAction::Equivocation(evidence) => {
+                    let evidence = SlashingEvidence::DoubleVote(*evidence);
+                    if let Ok(hash) = evidence.hash() {
+                        self.pending_evidence.entry(hash).or_insert(evidence);
+                    }
+                }
             }
         }
     }

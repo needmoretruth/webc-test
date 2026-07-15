@@ -13,6 +13,13 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use webc_crypto::{merkle_root, Address, Hash256};
 
+/// Maximum objective slashing artifacts carried by one block.
+///
+/// Evidence has no user-paid gas envelope, so a fixed consensus bound prevents
+/// an equivocating proposer from forcing unbounded signature verification while
+/// still allowing many independently proven offenders to be processed together.
+pub const MAX_BLOCK_SLASHING_EVIDENCE: usize = 64;
+
 /// Metadata supplied by the consensus/proposer layer when building a block.
 ///
 /// The state transition code should not read wall-clock time or global node
@@ -56,6 +63,21 @@ pub fn build_block(
     let mut receipts = Vec::with_capacity(transactions.len());
     let mut units_used = 0u64;
 
+    if evidence.len() > MAX_BLOCK_SLASHING_EVIDENCE {
+        return Err(ChainError::TooManyBlockEvidence {
+            actual: evidence.len(),
+            maximum: MAX_BLOCK_SLASHING_EVIDENCE,
+        });
+    }
+    let evidence_root = evidence_root(&evidence)?;
+    // Objective evidence executes before user transactions. This prevents an
+    // offender from moving or exiting slashable stake earlier in the same block.
+    // The whole-block overlay preserves atomic rollback if evidence or any later
+    // transaction fails.
+    for item in &evidence {
+        next_state.apply_block_slashing_evidence(item, config)?;
+    }
+
     for transaction in &transactions {
         let projected_units = units_used
             .checked_add(transaction.required_units())
@@ -85,6 +107,7 @@ pub fn build_block(
         account_root: next_state.account_root()?,
         tx_root: transaction_root(&transactions)?,
         receipt_root: receipt_root(&receipts)?,
+        evidence_root,
         proposer: input.proposer,
         timestamp_ms: input.timestamp_ms,
         base_fee_per_unit: base_fee_for_block,
@@ -117,8 +140,9 @@ pub fn build_block(
 /// transactions and evidence with the block's own header metadata, then requires
 /// the locally recomputed header and receipts to match the received ones exactly.
 /// Because the recomputed header carries `state_root`, `account_root`, `tx_root`,
-/// `receipt_root`, and `base_fee_per_unit`, a single mismatch anywhere — a forged
-/// root, an altered transaction set, a wrong fee — rejects the block. All work
+/// `receipt_root`, `evidence_root`, and `base_fee_per_unit`, a single mismatch
+/// anywhere — a forged root, altered evidence/transactions, or a wrong fee —
+/// rejects the block. All work
 /// happens on a clone, so a rejected block leaves `state` untouched.
 ///
 /// This does not check consensus placement (height linkage, proposer schedule,
@@ -179,10 +203,22 @@ pub fn receipt_root(receipts: &[Receipt]) -> Result<Hash256, ChainError> {
     Ok(merkle_root(&leaves))
 }
 
+/// Computes the ordered Merkle root of replay-stable slashing-evidence IDs.
+pub fn evidence_root(evidence: &[SlashingEvidence]) -> Result<Hash256, ChainError> {
+    let leaves = evidence
+        .iter()
+        .map(SlashingEvidence::hash)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(merkle_root(&leaves))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Amount, FeeBid, FeePolicy, GenesisAccount, GenesisConfig, Operation};
+    use crate::{
+        Amount, DoubleVoteEvidence, FeeBid, FeePolicy, GenesisAccount, GenesisConfig,
+        GenesisValidator, Operation, SignedVote, SlashingEvidence, ValidatorStatus, Vote, VoteType,
+    };
     use webc_crypto::Keypair;
 
     #[test]
@@ -243,6 +279,89 @@ mod tests {
             proposer,
             timestamp_ms: 1_700_000_000_000,
         }
+    }
+
+    fn double_vote_evidence(
+        validator: &Keypair,
+        config: &ChainConfig,
+        height: u64,
+    ) -> SlashingEvidence {
+        let vote = |block_hash| Vote {
+            protocol_version: config.protocol_version,
+            chain_id: config.chain_id.clone(),
+            height,
+            round: 0,
+            vote_type: VoteType::Prevote,
+            block_hash,
+            validator: validator.address(),
+        };
+        SlashingEvidence::DoubleVote(DoubleVoteEvidence {
+            first: SignedVote::sign(vote(Hash256([0xA1; 32])), validator).unwrap(),
+            second: SignedVote::sign(vote(Hash256([0xB2; 32])), validator).unwrap(),
+        })
+    }
+
+    #[test]
+    fn header_committed_evidence_slashes_and_imports_deterministically() {
+        let config = ChainConfig::default();
+        let validator = Keypair::from_seed([61u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: validator.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: vec![GenesisValidator {
+                operator: validator.address(),
+                consensus_key: validator.public_key(),
+                self_stake: Amount::from_webc(200),
+                commission_bps: 500,
+                bootstrap: false,
+            }],
+        };
+        let evidence = double_vote_evidence(&validator, &config, 1);
+        let evidence_hash = evidence.hash().unwrap();
+
+        let mut producer = ChainState::from_genesis(&genesis).unwrap();
+        let block = build_block(
+            &mut producer,
+            &config,
+            build_input(&config, validator.address()),
+            Vec::new(),
+            vec![evidence.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            block.header.evidence_root,
+            evidence_root(&[evidence]).unwrap()
+        );
+        assert_eq!(block.header.evidence_root, evidence_hash);
+        assert_eq!(producer.slashed_units, Amount::from_webc(160));
+        assert_eq!(
+            producer.validators[&validator.address()].self_stake,
+            Amount::from_webc(40)
+        );
+        assert!(matches!(
+            producer.validators[&validator.address()].status,
+            ValidatorStatus::Tombstoned { .. }
+        ));
+
+        let mut importer = ChainState::from_genesis(&genesis).unwrap();
+        apply_block(&mut importer, &config, &block).unwrap();
+        assert_eq!(importer, producer);
+
+        // Removing the evidence without changing the signed header cannot
+        // preserve the evidence root or the post-slash state root.
+        let mut tampered = block;
+        tampered.evidence.clear();
+        let before = ChainState::from_genesis(&genesis).unwrap();
+        let mut rejected = before.clone();
+        assert!(matches!(
+            apply_block(&mut rejected, &config, &tampered),
+            Err(ChainError::ImportedBlockMismatch)
+        ));
+        assert_eq!(rejected, before);
     }
 
     #[test]

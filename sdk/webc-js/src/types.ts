@@ -149,6 +149,8 @@ export interface BlockHeaderJson {
   tx_root: HexString;
   /** Ordered Merkle root of deterministic receipts. */
   receipt_root: HexString;
+  /** Ordered Merkle root of objective slashing-evidence identifiers. */
+  evidence_root: HexString;
   /** Validator operator address that proposed the block. */
   proposer: WebcAddress;
   /** Consensus-validated Unix timestamp in milliseconds. */

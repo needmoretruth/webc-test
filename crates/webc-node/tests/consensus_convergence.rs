@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use webc_chain::{
-    Amount, ChainConfig, FeeBid, GenesisAccount, GenesisConfig, GenesisValidator, Operation,
-    Transaction,
+    Amount, ChainConfig, DoubleVoteEvidence, FeeBid, GenesisAccount, GenesisConfig,
+    GenesisValidator, Operation, SignedVote, SlashingEvidence, Transaction, ValidatorStatus, Vote,
+    VoteType,
 };
 use webc_crypto::{Hash256, Keypair};
 use webc_net::{spawn_network, NetMessage, NetworkConfig};
 use webc_node::{CommitInfo, ConsensusDriver, DriverTimeouts, MempoolConfig, Node};
-use webc_storage::MemoryKvStore;
+use webc_storage::{MemoryKvStore, RedbKvStore};
 
 /// A genesis with three equally-staked validators, each active from genesis
 /// (self-stake comfortably exceeds the activation threshold), so the validator
@@ -459,4 +460,134 @@ async fn a_gossiped_transaction_is_included_in_a_finalized_block() {
         result.is_ok(),
         "the gossiped transaction was never included in an agreed finalized block"
     );
+}
+
+#[tokio::test]
+async fn consensus_detected_equivocation_is_finalized_and_slashed_once() {
+    let chain = ChainConfig::default().chain_id;
+    // Three honest validators hold 75% of voting power. The fourth validator
+    // equivocates but runs no driver, so honest power remains above the strict
+    // two-thirds finality threshold after its messages are observed.
+    let seeds: [[u8; 32]; 4] = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+    let validators: Vec<Keypair> = seeds.iter().map(|seed| Keypair::from_seed(*seed)).collect();
+    let genesis = validator_genesis(&validators);
+
+    let mut handles = Vec::new();
+    let mut inbounds = Vec::new();
+    let mut prior = Vec::new();
+    for index in 0..4 {
+        let (handle, inbound) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([150u8 + index as u8; 32]),
+            chain.clone(),
+            Some("127.0.0.1:0".parse().unwrap()),
+            prior.clone(),
+        ))
+        .await
+        .unwrap();
+        prior.push(handle.local_addr().unwrap());
+        handles.push(handle);
+        inbounds.push(inbound);
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while handles.iter().any(|handle| handle.connected_peers() < 3) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "equivocation-test peers did not connect"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let equivocator = &validators[3];
+    let vote = |block_hash| Vote {
+        protocol_version: genesis.chain.protocol_version,
+        chain_id: chain.clone(),
+        height: 1,
+        round: 0,
+        vote_type: VoteType::Prevote,
+        block_hash,
+        validator: equivocator.address(),
+    };
+    let first = SignedVote::sign(vote(Hash256([0xA1; 32])), equivocator).unwrap();
+    let second = SignedVote::sign(vote(Hash256([0xB2; 32])), equivocator).unwrap();
+    let evidence = SlashingEvidence::DoubleVote(DoubleVoteEvidence {
+        first: first.clone(),
+        second: second.clone(),
+    });
+    let evidence_hash = evidence.hash().unwrap();
+
+    // Inject both valid but conflicting votes before the honest drivers start.
+    // Their inbound queues retain the messages, ensuring every machine observes
+    // the same objective proof at height one.
+    let attacker = handles[3].clone();
+    attacker
+        .broadcast(NetMessage::Vote(Box::new(first)))
+        .unwrap();
+    attacker
+        .broadcast(NetMessage::Vote(Box::new(second)))
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = (0..3)
+        .map(|index| temp.path().join(format!("validator-{index}.redb")))
+        .collect();
+    let timeouts = DriverTimeouts {
+        propose: Duration::from_millis(300),
+        prevote: Duration::from_millis(300),
+        precommit: Duration::from_millis(300),
+    };
+    let honest_handles: Vec<_> = handles.drain(..3).collect();
+    let honest_inbounds: Vec<_> = inbounds.drain(..3).collect();
+    let mut commit_rxs = Vec::new();
+    let mut tasks = Vec::new();
+    for (index, (handle, inbound)) in honest_handles.into_iter().zip(honest_inbounds).enumerate() {
+        let node = Node::open(RedbKvStore::open(&paths[index]).unwrap(), &genesis).unwrap();
+        let (commit_tx, commit_rx) = mpsc::channel::<CommitInfo>(64);
+        commit_rxs.push(commit_rx);
+        let driver = ConsensusDriver::new(
+            node,
+            handle,
+            Some(seeds[index]),
+            timeouts,
+            MempoolConfig::default(),
+        );
+        tasks.push(tokio::spawn(driver.run(inbound, Some(commit_tx))));
+    }
+
+    let finalized = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut heights = [0u64; 3];
+        loop {
+            for (index, rx) in commit_rxs.iter_mut().enumerate() {
+                while let Ok(info) = rx.try_recv() {
+                    heights[index] = heights[index].max(info.height);
+                }
+            }
+            if heights.iter().all(|height| *height >= 3) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        finalized.is_ok(),
+        "honest validators did not finalize the evidence-carrying chain"
+    );
+
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    drop(attacker);
+
+    for path in paths {
+        let node = Node::open(RedbKvStore::open(path).unwrap(), &genesis).unwrap();
+        let state = node.state();
+        let record = &state.validators[&equivocator.address()];
+        assert_eq!(record.self_stake, Amount::from_webc(40));
+        assert!(matches!(record.status, ValidatorStatus::Tombstoned { .. }));
+        assert_eq!(state.slashed_units, Amount::from_webc(160));
+        assert_eq!(state.processed_slashing_evidence.len(), 1);
+        assert!(state.processed_slashing_evidence.contains(&evidence_hash));
+    }
 }

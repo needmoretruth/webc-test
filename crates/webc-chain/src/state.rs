@@ -29,8 +29,8 @@ use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
 use crate::{
     Amount, AuthorizationLaneId, ChainError, ChainId, Epoch, InflationSchedule, ObjectId,
-    ObjectVersion, ProtocolStateKey, ProtocolVersion, StateKey, CURRENT_PROTOCOL_VERSION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION,
+    ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, StateKey,
+    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1902,120 +1902,7 @@ impl ChainState {
                 });
             }
             Operation::SubmitSlashingEvidence { evidence } => {
-                let validator_address = evidence.validator();
-                access.write(StateKey::validator(validator_address))?;
-                let consensus_key = self
-                    .validators
-                    .get(&validator_address)
-                    .ok_or(ChainError::ValidatorNotFound(validator_address))?
-                    .consensus_key;
-                evidence.verify(config.protocol_version, &config.chain_id, &consensus_key)?;
-                let evidence_hash = evidence.hash()?;
-                access.write(StateKey::slashing_evidence(evidence_hash))?;
-                if self.processed_slashing_evidence.contains(&evidence_hash) {
-                    return Err(ChainError::SlashingReplay);
-                }
-
-                let penalty_bps = slashing_bps(evidence, &config.slashing);
-                access.write(StateKey::unbonding_queue(validator_address))?;
-                let delegation_losses = self
-                    .delegations
-                    .iter()
-                    .filter(|((_, validator), _)| *validator == validator_address)
-                    .map(|(key, delegation)| {
-                        Ok((
-                            *key,
-                            delegation
-                                .amount
-                                .checked_mul_bps(penalty_bps)
-                                .ok_or(ChainError::ArithmeticOverflow)?,
-                        ))
-                    })
-                    .filter(|result| result.as_ref().map_or(true, |(_, loss)| !loss.is_zero()))
-                    .collect::<Result<Vec<_>, ChainError>>()?;
-                let delegated_slashed =
-                    delegation_losses
-                        .iter()
-                        .try_fold(Amount::ZERO, |total, (_, loss)| {
-                            total
-                                .checked_add(*loss)
-                                .ok_or(ChainError::ArithmeticOverflow)
-                        })?;
-
-                for ((delegator, validator), loss) in &delegation_losses {
-                    self.unbonding.apply_active_slash(
-                        *delegator,
-                        *validator,
-                        UnbondingKind::Delegation,
-                        *loss,
-                    )?;
-                }
-                let locked_slash = self
-                    .unbonding
-                    .slash_locked(validator_address, penalty_bps)?;
-                for owner in locked_slash.locked_losses.keys() {
-                    access.write(StateKey::account(*owner))?;
-                }
-
-                access.write(StateKey::account(validator_address))?;
-                for ((delegator, validator), _) in &delegation_losses {
-                    access.write(StateKey::delegation(*delegator, *validator))?;
-                    access.write(StateKey::account(*delegator))?;
-                }
-                let validator = self
-                    .validators
-                    .get_mut(&validator_address)
-                    .ok_or(ChainError::ValidatorNotFound(validator_address))?;
-                let outcome = slash_validator_with_delegation_loss(
-                    validator,
-                    evidence,
-                    &config.slashing,
-                    delegated_slashed,
-                )?;
-                self.unbonding.apply_active_slash(
-                    validator_address,
-                    validator_address,
-                    UnbondingKind::OperatorStake,
-                    outcome.self_slashed,
-                )?;
-                let operator = self.account_mut(validator_address)?;
-                operator.staked = operator
-                    .staked
-                    .checked_sub(outcome.self_slashed)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                for ((delegator, validator), loss) in delegation_losses {
-                    let delegation = self
-                        .delegations
-                        .get_mut(&(delegator, validator))
-                        .ok_or(ChainError::DelegationNotFound)?;
-                    delegation.amount = delegation
-                        .amount
-                        .checked_sub(loss)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    let account = self.account_mut(delegator)?;
-                    account.delegated = account
-                        .delegated
-                        .checked_sub(loss)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                let locked_total_slashed = locked_slash.total_locked_slashed;
-                for (owner, loss) in locked_slash.locked_losses {
-                    let account = self.account_mut(owner)?;
-                    account.unbonding = account
-                        .unbonding
-                        .checked_sub(loss)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                let total_slashed = outcome
-                    .self_slashed
-                    .checked_add(outcome.delegated_slashed)
-                    .and_then(|amount| amount.checked_add(locked_total_slashed))
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.slashed_units = self
-                    .slashed_units
-                    .checked_add(total_slashed)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.processed_slashing_evidence.insert(evidence_hash);
+                let outcome = self.apply_slashing_evidence(evidence, config, Some(&mut access))?;
                 events.push(Event::Slashed { outcome });
             }
             Operation::BridgeLock {
@@ -2135,6 +2022,157 @@ impl ChainState {
             events,
             error: None,
         })
+    }
+
+    /// Applies block-carried objective evidence without a transaction access list.
+    ///
+    /// Block construction already runs on a whole-block overlay, so any failure
+    /// rolls back this slash together with every other block transition. The
+    /// evidence is still independently signature-verified and replay-protected;
+    /// only the transaction-specific declared-access bookkeeping is skipped.
+    pub(crate) fn apply_block_slashing_evidence(
+        &mut self,
+        evidence: &SlashingEvidence,
+        config: &ChainConfig,
+    ) -> Result<SlashingOutcome, ChainError> {
+        self.apply_slashing_evidence(evidence, config, None)
+    }
+
+    /// Shared deterministic slashing transition used by signed transactions and
+    /// header-committed block evidence.
+    fn apply_slashing_evidence(
+        &mut self,
+        evidence: &SlashingEvidence,
+        config: &ChainConfig,
+        mut access: Option<&mut StateAccessRecorder>,
+    ) -> Result<SlashingOutcome, ChainError> {
+        let validator_address = evidence.validator();
+        Self::record_slashing_write(&mut access, StateKey::validator(validator_address))?;
+        let consensus_key = self
+            .validators
+            .get(&validator_address)
+            .ok_or(ChainError::ValidatorNotFound(validator_address))?
+            .consensus_key;
+        evidence.verify(config.protocol_version, &config.chain_id, &consensus_key)?;
+        let evidence_hash = evidence.hash()?;
+        Self::record_slashing_write(&mut access, StateKey::slashing_evidence(evidence_hash))?;
+        if self.processed_slashing_evidence.contains(&evidence_hash) {
+            return Err(ChainError::SlashingReplay);
+        }
+
+        let penalty_bps = slashing_bps(evidence, &config.slashing);
+        Self::record_slashing_write(&mut access, StateKey::unbonding_queue(validator_address))?;
+        let delegation_losses = self
+            .delegations
+            .iter()
+            .filter(|((_, validator), _)| *validator == validator_address)
+            .map(|(key, delegation)| {
+                Ok((
+                    *key,
+                    delegation
+                        .amount
+                        .checked_mul_bps(penalty_bps)
+                        .ok_or(ChainError::ArithmeticOverflow)?,
+                ))
+            })
+            .filter(|result| result.as_ref().map_or(true, |(_, loss)| !loss.is_zero()))
+            .collect::<Result<Vec<_>, ChainError>>()?;
+        let delegated_slashed =
+            delegation_losses
+                .iter()
+                .try_fold(Amount::ZERO, |total, (_, loss)| {
+                    total
+                        .checked_add(*loss)
+                        .ok_or(ChainError::ArithmeticOverflow)
+                })?;
+
+        for ((delegator, validator), loss) in &delegation_losses {
+            self.unbonding.apply_active_slash(
+                *delegator,
+                *validator,
+                UnbondingKind::Delegation,
+                *loss,
+            )?;
+        }
+        let locked_slash = self
+            .unbonding
+            .slash_locked(validator_address, penalty_bps)?;
+        for owner in locked_slash.locked_losses.keys() {
+            Self::record_slashing_write(&mut access, StateKey::account(*owner))?;
+        }
+
+        Self::record_slashing_write(&mut access, StateKey::account(validator_address))?;
+        for ((delegator, validator), _) in &delegation_losses {
+            Self::record_slashing_write(&mut access, StateKey::delegation(*delegator, *validator))?;
+            Self::record_slashing_write(&mut access, StateKey::account(*delegator))?;
+        }
+        let validator = self
+            .validators
+            .get_mut(&validator_address)
+            .ok_or(ChainError::ValidatorNotFound(validator_address))?;
+        let outcome = slash_validator_with_delegation_loss(
+            validator,
+            evidence,
+            &config.slashing,
+            delegated_slashed,
+        )?;
+        self.unbonding.apply_active_slash(
+            validator_address,
+            validator_address,
+            UnbondingKind::OperatorStake,
+            outcome.self_slashed,
+        )?;
+        let operator = self.account_mut(validator_address)?;
+        operator.staked = operator
+            .staked
+            .checked_sub(outcome.self_slashed)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        for ((delegator, validator), loss) in delegation_losses {
+            let delegation = self
+                .delegations
+                .get_mut(&(delegator, validator))
+                .ok_or(ChainError::DelegationNotFound)?;
+            delegation.amount = delegation
+                .amount
+                .checked_sub(loss)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let account = self.account_mut(delegator)?;
+            account.delegated = account
+                .delegated
+                .checked_sub(loss)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        let locked_total_slashed = locked_slash.total_locked_slashed;
+        for (owner, loss) in locked_slash.locked_losses {
+            let account = self.account_mut(owner)?;
+            account.unbonding = account
+                .unbonding
+                .checked_sub(loss)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        let total_slashed = outcome
+            .self_slashed
+            .checked_add(outcome.delegated_slashed)
+            .and_then(|amount| amount.checked_add(locked_total_slashed))
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.slashed_units = self
+            .slashed_units
+            .checked_add(total_slashed)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.processed_slashing_evidence.insert(evidence_hash);
+        Ok(outcome)
+    }
+
+    /// Records a slashing write for a user transaction, or deliberately skips
+    /// access-list bookkeeping for authenticated block-system evidence.
+    fn record_slashing_write(
+        access: &mut Option<&mut StateAccessRecorder>,
+        key: StateKey,
+    ) -> Result<(), ChainError> {
+        if let Some(recorder) = access.as_deref_mut() {
+            recorder.write(key)?;
+        }
+        Ok(())
     }
 
     fn process_incoming_bridge_message(

@@ -11,7 +11,7 @@ import { canonicalJsonHashHex } from "./canonical.js";
 import type { BlockHeaderJson, HexString } from "./types.js";
 
 /** Domain separator for the PoH-free authoritative block-header schema. */
-export const BLOCK_HEADER_DOMAIN = "WEBC_BLOCK_HEADER_V2";
+export const BLOCK_HEADER_DOMAIN = "WEBC_BLOCK_HEADER_V3";
 
 /**
  * Computes the SHA-256 block identifier committed and signed by validators.

@@ -38,6 +38,11 @@ pub struct BlockHeader {
     pub tx_root: Hash256,
     /// Merkle root of deterministic receipts in transaction order.
     pub receipt_root: Hash256,
+    /// Ordered Merkle root of objective slashing-evidence identifiers.
+    ///
+    /// This binds every system-level slash to the validator-signed block hash;
+    /// changing, removing, or reordering evidence therefore invalidates finality.
+    pub evidence_root: Hash256,
     /// Validator operator address that proposed this block.
     pub proposer: Address,
     /// Consensus-validated Unix timestamp in milliseconds; execution never reads a clock.
@@ -49,7 +54,7 @@ pub struct BlockHeader {
 /// Stable domain tag mixed into the header hash. Bumping this invalidates all
 /// existing block hashes, so only change it when deliberately taking a
 /// breaking header-format change.
-pub const BLOCK_HEADER_DOMAIN: &str = "WEBC_BLOCK_HEADER_V2";
+pub const BLOCK_HEADER_DOMAIN: &str = "WEBC_BLOCK_HEADER_V3";
 
 impl BlockHeader {
     pub fn hash(&self) -> Result<Hash256, ChainError> {
@@ -84,7 +89,7 @@ pub struct Block {
 }
 
 impl Block {
-    /// Returns the block identifier, which is exactly the V2 header hash.
+    /// Returns the block identifier, which is exactly the V3 header hash.
     pub fn hash(&self) -> Result<Hash256, ChainError> {
         self.header.hash()
     }
@@ -107,6 +112,7 @@ mod tests {
             account_root: Hash256([0x22; 32]),
             tx_root: Hash256([0x33; 32]),
             receipt_root: Hash256([0x44; 32]),
+            evidence_root: Hash256([0x55; 32]),
             proposer: Keypair::from_seed([1u8; 32]).address(),
             timestamp_ms: 1_700_000_000_000,
             base_fee_per_unit: 5,
@@ -114,11 +120,11 @@ mod tests {
     }
 
     #[test]
-    fn v2_header_hash_is_stable_and_rejects_removed_poh_field() {
+    fn v3_header_hash_is_stable_and_rejects_removed_poh_field() {
         let header = fixture_header();
         assert_eq!(
             header.hash().expect("fixture hashes").to_hex(),
-            "2c653168456a27e69be83a02a670570b333e71b4c63e25ea023b72220fe98649"
+            "c5f26fe6564fcc1394e12cab50783f561ca586f0fb80a9c04b9fe5bdb3be7b74"
         );
 
         let mut legacy = serde_json::to_value(header).expect("fixture serializes");

@@ -42,7 +42,8 @@ pub use authorization_policy::{
 };
 pub use block::{Block, BlockHeader};
 pub use block_builder::{
-    apply_block, build_block, receipt_root, transaction_root, BlockBuildInput,
+    apply_block, build_block, evidence_root, receipt_root, transaction_root, BlockBuildInput,
+    MAX_BLOCK_SLASHING_EVIDENCE,
 };
 pub use bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 pub use consensus::{
@@ -193,6 +194,8 @@ pub enum ChainError {
         "serialized block size {actual} bytes exceeds the configured maximum of {maximum} bytes"
     )]
     BlockBytesExceeded { actual: u64, maximum: u64 },
+    #[error("block carries {actual} slashing evidence items, above the maximum of {maximum}")]
+    TooManyBlockEvidence { actual: usize, maximum: usize },
     #[error("supply invariant does not reconcile")]
     SupplyInvariantViolation,
     #[error("unsupported state-key version: {actual:?}")]
