@@ -24,7 +24,7 @@
 
 use webc_chain::{
     build_block, Block, BlockBuildInput, ChainConfig, ChainError, ChainState, GenesisConfig,
-    SlashingEvidence, Transaction,
+    SlashingEvidence, Transaction, ValidatorSet,
 };
 use webc_crypto::{Address, Hash256};
 use webc_storage::{BlockCommit, ChainStore, KvStore, StorageError};
@@ -154,10 +154,22 @@ impl<K: KvStore> Node<K> {
         let mut next_state = self.state.clone();
         let block = build_block(&mut next_state, &self.config, input, transactions, evidence)?;
 
+        // Persist the per-epoch validator-set snapshot the first time this epoch
+        // is committed. Consensus requires a fixed snapshot per epoch so voting
+        // power cannot shift mid-epoch; taking it from the pre-block state at the
+        // epoch's first block fixes the active set as the epoch opens. Later
+        // blocks in the same epoch reuse it. Until validators activate through
+        // staking, the snapshot is an empty (zero-power) set, which is correct.
+        let epoch_snapshot = if self.store.validator_set(epoch)?.is_none() {
+            Some(ValidatorSet::from_state(&self.state)?)
+        } else {
+            None
+        };
+
         self.store.commit_block(BlockCommit {
             block: &block,
             state: &next_state,
-            validator_set: None,
+            validator_set: epoch_snapshot.as_ref(),
         })?;
 
         // Storage committed durably; only now adopt the new state.
@@ -230,6 +242,44 @@ mod tests {
         // Bob received the transfer.
         let bob_balance = node.state().accounts.get(&bob.address()).unwrap().balance;
         assert_eq!(bob_balance, Amount::from_webc(1_010));
+    }
+
+    #[test]
+    fn writes_the_epoch_validator_set_snapshot_once() {
+        let (genesis, alice, bob) = test_genesis();
+        let mut node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+
+        // No snapshot exists before the first block of epoch 0.
+        assert!(node.store().validator_set(0).unwrap().is_none());
+
+        node.produce_block(
+            vec![transfer(&alice, &bob, 10, 0)],
+            Vec::new(),
+            alice.address(),
+            1_700_000_000_000,
+        )
+        .unwrap();
+
+        // The writer fired: epoch 0 now has a persisted snapshot. This devnet
+        // genesis has no active validators, so the set is empty but present,
+        // proving the previously-unpopulated path is now live.
+        let snapshot = node
+            .store()
+            .validator_set(0)
+            .unwrap()
+            .expect("epoch 0 snapshot persisted");
+        assert!(snapshot.validators.is_empty());
+        assert_eq!(snapshot.total_power, Amount::ZERO);
+
+        // A second block in the same epoch does not fail or duplicate the write.
+        node.produce_block(
+            vec![transfer(&alice, &bob, 5, 1)],
+            Vec::new(),
+            alice.address(),
+            1_700_000_000_001,
+        )
+        .unwrap();
+        assert!(node.store().validator_set(0).unwrap().is_some());
     }
 
     #[test]

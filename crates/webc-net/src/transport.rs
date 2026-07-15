@@ -533,7 +533,9 @@ mod tests {
             .expect("gossip delivered before timeout")
             .expect("inbound channel open");
         assert_eq!(received.from, a_handle.local_peer_id());
-        let NetMessage::Transaction(got) = received.message;
+        let NetMessage::Transaction(got) = received.message else {
+            panic!("expected a transaction message");
+        };
         assert_eq!(got.hash().unwrap(), tx_hash);
     }
 

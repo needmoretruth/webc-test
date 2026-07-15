@@ -10,7 +10,7 @@
 //! defines what a single frame's bytes mean.
 
 use serde::{Deserialize, Serialize};
-use webc_chain::Transaction;
+use webc_chain::{FinalityCertificate, SignedProposal, SignedVote, Transaction};
 use webc_crypto::Hash256;
 
 use crate::codec::{decode as decode_frame, encode as encode_frame};
@@ -31,13 +31,19 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 /// One gossiped peer-to-peer message.
 ///
-/// Phase 4 A-1 carries only transactions between mempools. Consensus proposals,
-/// votes, and finality certificates are added as further variants in A-2; the
-/// envelope's version guards compatibility as the set grows.
+/// A-1 carries transactions between mempools; A-2 adds the three signed
+/// consensus artifacts. The envelope's wire version guards compatibility as the
+/// set grows. Large payloads are boxed so the enum stays small on the stack.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NetMessage {
     /// A signed transaction being propagated toward validators' mempools.
     Transaction(Box<Transaction>),
+    /// A leader's signed block proposal for a height and round.
+    Proposal(Box<SignedProposal>),
+    /// A validator's signed prevote or precommit.
+    Vote(Box<SignedVote>),
+    /// A finality certificate proving a block reached precommit quorum.
+    Certificate(Box<FinalityCertificate>),
 }
 
 /// Self-describing envelope wrapping one [`NetMessage`] on the wire.
@@ -131,8 +137,100 @@ mod tests {
         let encoded = encode_message(&message).unwrap();
         assert_eq!(&encoded[0..4], &NET_PROTOCOL_MAGIC);
         let decoded = decode_message(&encoded).unwrap();
-        let NetMessage::Transaction(tx) = decoded;
+        let NetMessage::Transaction(tx) = decoded else {
+            panic!("expected a transaction message");
+        };
         assert_eq!(tx.hash().unwrap(), sample_transaction().hash().unwrap());
+    }
+
+    fn sample_block(proposer: webc_crypto::Address) -> webc_chain::Block {
+        webc_chain::Block {
+            header: webc_chain::BlockHeader {
+                protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+                chain_id: webc_chain::ChainId::devnet(),
+                height: 1,
+                epoch: 0,
+                previous_hash: Hash256([0u8; 32]),
+                state_root: Hash256([0x11; 32]),
+                account_root: Hash256([0x22; 32]),
+                tx_root: Hash256([0x33; 32]),
+                receipt_root: Hash256([0x44; 32]),
+                proposer,
+                timestamp_ms: 1_700_000_000_000,
+                base_fee_per_unit: 1,
+            },
+            transactions: Vec::new(),
+            receipts: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    fn sample_vote(validator: &Keypair) -> SignedVote {
+        SignedVote::sign(
+            webc_chain::Vote {
+                protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+                chain_id: webc_chain::ChainId::devnet(),
+                height: 1,
+                round: 0,
+                vote_type: webc_chain::VoteType::Precommit,
+                block_hash: Hash256::digest(b"block"),
+                validator: validator.address(),
+            },
+            validator,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn round_trips_a_proposal_message() {
+        let leader = Keypair::from_seed([1u8; 32]);
+        let proposal = SignedProposal::sign(
+            webc_chain::CURRENT_PROTOCOL_VERSION,
+            webc_chain::ChainId::devnet(),
+            1,
+            0,
+            sample_block(leader.address()),
+            leader.address(),
+            &leader,
+        )
+        .unwrap();
+        let message = NetMessage::Proposal(Box::new(proposal.clone()));
+        let decoded = decode_message(&encode_message(&message).unwrap()).unwrap();
+        let NetMessage::Proposal(got) = decoded else {
+            panic!("expected a proposal message");
+        };
+        assert_eq!(got.payload.block_hash, proposal.payload.block_hash);
+    }
+
+    #[test]
+    fn round_trips_a_vote_message() {
+        let validator = Keypair::from_seed([2u8; 32]);
+        let vote = sample_vote(&validator);
+        let message = NetMessage::Vote(Box::new(vote.clone()));
+        let decoded = decode_message(&encode_message(&message).unwrap()).unwrap();
+        let NetMessage::Vote(got) = decoded else {
+            panic!("expected a vote message");
+        };
+        assert_eq!(got.payload.validator, vote.payload.validator);
+    }
+
+    #[test]
+    fn round_trips_a_certificate_message() {
+        let validator = Keypair::from_seed([3u8; 32]);
+        let certificate = FinalityCertificate {
+            protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+            chain_id: webc_chain::ChainId::devnet(),
+            height: 1,
+            round: 0,
+            block_hash: Hash256::digest(b"block"),
+            precommits: vec![sample_vote(&validator)],
+        };
+        let message = NetMessage::Certificate(Box::new(certificate.clone()));
+        let decoded = decode_message(&encode_message(&message).unwrap()).unwrap();
+        let NetMessage::Certificate(got) = decoded else {
+            panic!("expected a certificate message");
+        };
+        assert_eq!(got.block_hash, certificate.block_hash);
     }
 
     #[test]

@@ -7,7 +7,9 @@
 //! ID. This module verifies cryptographic authenticity but does not implement
 //! networking, committee membership, finality rounds, or durable vote storage.
 
-use crate::{canonical, Amount, ChainError, ChainId, ChainState, ProtocolVersion, ValidatorStatus};
+use crate::{
+    canonical, Amount, Block, ChainError, ChainId, ChainState, ProtocolVersion, ValidatorStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, SignatureBytes};
@@ -18,6 +20,9 @@ pub const CONSENSUS_VOTE_DOMAIN: &str = "WEBC_CONSENSUS_VOTE_V1";
 /// Domain separator for the version-1 deterministic leader schedule.
 pub const LEADER_SCHEDULE_DOMAIN: &str = "WEBC_LEADER_SCHEDULE_V1";
 
+/// Domain separator for version-1 signed block proposals.
+pub const CONSENSUS_PROPOSAL_DOMAIN: &str = "WEBC_CONSENSUS_PROPOSAL_V1";
+
 /// Voting power assigned to one validator for BFT consensus.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorPower {
@@ -25,6 +30,11 @@ pub struct ValidatorPower {
     pub validator: Address,
     /// Active voting power in native base units for this immutable snapshot.
     pub power: Amount,
+    /// Registered Ed25519 consensus key that must sign this validator's votes and
+    /// proposals. Carrying it inside the snapshot makes a finality certificate
+    /// self-verifiable: a light client can check every signature against the
+    /// snapshot alone, without a full copy of validator state.
+    pub consensus_key: PublicKeyBytes,
 }
 
 /// Deterministic validator set snapshot for a height/epoch.
@@ -66,6 +76,7 @@ impl ValidatorSet {
                 ValidatorPower {
                     validator: validator.operator,
                     power,
+                    consensus_key: validator.consensus_key,
                 },
             );
         }
@@ -125,6 +136,31 @@ impl ValidatorSet {
             .get(&validator)
             .map(|entry| entry.power)
             .unwrap_or(Amount::ZERO)
+    }
+
+    /// Returns the registered consensus key of a snapshot member, if present.
+    pub fn consensus_key_of(&self, validator: Address) -> Option<PublicKeyBytes> {
+        self.validators
+            .get(&validator)
+            .map(|entry| entry.consensus_key)
+    }
+
+    /// Verifies a signed vote against this snapshot: the validator must be a
+    /// member and the signature must match the member's registered consensus key.
+    ///
+    /// This binds vote authenticity to the immutable snapshot, so a caller can
+    /// trust a vote's voting power without a separate lookup into live state.
+    pub fn verify_vote(
+        &self,
+        vote: &SignedVote,
+        expected_protocol_version: ProtocolVersion,
+        expected_chain_id: &ChainId,
+    ) -> Result<(), ChainError> {
+        let key = self
+            .consensus_key_of(vote.payload.validator)
+            .ok_or(ChainError::ConsensusValidatorNotInSet)?;
+        vote.verify(expected_protocol_version, expected_chain_id, &key)
+            .map_err(|_| ChainError::ConsensusSignatureInvalid)
     }
 
     /// Returns true when `power` is strictly greater than 2/3 of total power.
@@ -287,6 +323,233 @@ pub fn detect_double_votes(votes: &[SignedVote]) -> Vec<DoubleVoteEvidence> {
     evidence
 }
 
+/// A block proposal payload signed by the scheduled leader's consensus key.
+///
+/// The signature covers the proposed block *hash* (not the full block bytes), so
+/// a verifier recomputes the block hash and checks it equals `block_hash` before
+/// trusting the signature. Round is a consensus artifact and is not part of the
+/// block header, so it is bound here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proposal {
+    /// Protocol configuration schema signed by the proposer.
+    pub protocol_version: ProtocolVersion,
+    /// Network replay-protection domain.
+    pub chain_id: ChainId,
+    /// Proposed block height counted from genesis.
+    pub height: u64,
+    /// BFT round number at this height.
+    pub round: u32,
+    /// Hash of the exact proposed block.
+    pub block_hash: Hash256,
+    /// Validator-pool operator identity that must be the scheduled leader.
+    pub proposer: Address,
+}
+
+impl Proposal {
+    fn signing_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        #[derive(Serialize)]
+        struct SigningPayload<'a> {
+            domain: &'static str,
+            proposal: &'a Proposal,
+        }
+        canonical::canonical_json_bytes(&SigningPayload {
+            domain: CONSENSUS_PROPOSAL_DOMAIN,
+            proposal: self,
+        })
+    }
+}
+
+/// A [`Proposal`] plus the carried block and the proposer's consensus signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedProposal {
+    /// Domain-separated payload covered by `signature`.
+    pub payload: Proposal,
+    /// The exact block whose hash must equal `payload.block_hash`.
+    pub block: Block,
+    /// Ed25519 signature from the proposer's registered consensus key.
+    pub signature: SignatureBytes,
+}
+
+impl SignedProposal {
+    /// Signs a block proposal with the proposer's consensus key.
+    ///
+    /// Fails if the block cannot be hashed. The caller is responsible for having
+    /// built a valid block; this only binds the proposer's signature to it.
+    pub fn sign(
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        height: u64,
+        round: u32,
+        block: Block,
+        proposer: Address,
+        consensus_key: &Keypair,
+    ) -> Result<Self, ChainError> {
+        let block_hash = block.hash()?;
+        let payload = Proposal {
+            protocol_version,
+            chain_id,
+            height,
+            round,
+            block_hash,
+            proposer,
+        };
+        let signature = consensus_key.sign(&payload.signing_bytes()?);
+        Ok(Self {
+            payload,
+            block,
+            signature,
+        })
+    }
+
+    /// Verifies the proposal against a snapshot: configuration match, that the
+    /// carried block hashes to `payload.block_hash`, that the proposer is the
+    /// scheduled leader for `(height, round)`, and that the signature matches the
+    /// proposer's registered consensus key.
+    pub fn verify_in_set(
+        &self,
+        set: &ValidatorSet,
+        expected_protocol_version: ProtocolVersion,
+        expected_chain_id: &ChainId,
+    ) -> Result<(), ChainError> {
+        if self.payload.protocol_version != expected_protocol_version
+            || &self.payload.chain_id != expected_chain_id
+        {
+            return Err(ChainError::ConsensusConfigMismatch);
+        }
+        // The signature only covers the hash, so bind the carried block to it.
+        if self.block.hash()? != self.payload.block_hash {
+            return Err(ChainError::ConsensusProposalBlockMismatch);
+        }
+        // Only the deterministically scheduled leader may propose this slot.
+        if set.proposer_for(self.payload.height, self.payload.round) != Some(self.payload.proposer)
+        {
+            return Err(ChainError::ConsensusProposalNotFromLeader);
+        }
+        let key = set
+            .consensus_key_of(self.payload.proposer)
+            .ok_or(ChainError::ConsensusValidatorNotInSet)?;
+        verify_signature(&key, &self.payload.signing_bytes()?, &self.signature)
+            .map_err(|_| ChainError::ConsensusSignatureInvalid)
+    }
+}
+
+/// A finality certificate: an aggregate of precommit votes proving that strictly
+/// more than two thirds of a height's snapshot voting power committed to one
+/// block at one round.
+///
+/// Together with the validator-set snapshot it is self-verifying, so a light
+/// client can confirm a block is final without replaying execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalityCertificate {
+    /// Protocol configuration schema the precommits were signed under.
+    pub protocol_version: ProtocolVersion,
+    /// Network replay-protection domain.
+    pub chain_id: ChainId,
+    /// Finalized block height.
+    pub height: u64,
+    /// Round at which finality was reached.
+    pub round: u32,
+    /// Finalized block hash.
+    pub block_hash: Hash256,
+    /// Precommit votes, each for exactly this height/round/block.
+    pub precommits: Vec<SignedVote>,
+}
+
+impl FinalityCertificate {
+    /// Assembles a certificate from a pool of votes if the qualifying precommits
+    /// reach quorum against `set`. Returns `None` when quorum is not met.
+    ///
+    /// Only precommits matching this exact height/round/block and verifying
+    /// against a snapshot member's registered key are included, at most one per
+    /// validator. This is the honest path a node uses once it observes quorum.
+    pub fn build(
+        set: &ValidatorSet,
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        height: u64,
+        round: u32,
+        block_hash: Hash256,
+        pool: &[SignedVote],
+    ) -> Option<Self> {
+        let mut seen = BTreeSet::new();
+        let mut precommits = Vec::new();
+        let mut power = Amount::ZERO;
+        for vote in pool {
+            if vote.payload.vote_type != VoteType::Precommit
+                || vote.payload.height != height
+                || vote.payload.round != round
+                || vote.payload.block_hash != block_hash
+                || vote.payload.protocol_version != protocol_version
+                || vote.payload.chain_id != chain_id
+            {
+                continue;
+            }
+            if set.verify_vote(vote, protocol_version, &chain_id).is_err() {
+                continue;
+            }
+            if !seen.insert(vote.payload.validator) {
+                continue;
+            }
+            power = power.checked_add(set.power_of(vote.payload.validator))?;
+            precommits.push(vote.clone());
+        }
+        if !set.has_two_thirds_power(power) {
+            return None;
+        }
+        Some(Self {
+            protocol_version,
+            chain_id,
+            height,
+            round,
+            block_hash,
+            precommits,
+        })
+    }
+
+    /// Independently verifies a received certificate against a snapshot.
+    ///
+    /// Every precommit must match the certificate's exact fields and verify
+    /// against a distinct snapshot member's registered consensus key, and the
+    /// aggregate power must exceed two thirds. Any mismatch, foreign validator,
+    /// duplicate, or bad signature rejects the whole certificate.
+    pub fn verify(
+        &self,
+        set: &ValidatorSet,
+        expected_protocol_version: ProtocolVersion,
+        expected_chain_id: &ChainId,
+    ) -> Result<(), ChainError> {
+        if self.protocol_version != expected_protocol_version || &self.chain_id != expected_chain_id
+        {
+            return Err(ChainError::ConsensusConfigMismatch);
+        }
+        let mut seen = BTreeSet::new();
+        let mut power = Amount::ZERO;
+        for vote in &self.precommits {
+            if vote.payload.vote_type != VoteType::Precommit
+                || vote.payload.height != self.height
+                || vote.payload.round != self.round
+                || vote.payload.block_hash != self.block_hash
+                || vote.payload.protocol_version != self.protocol_version
+                || vote.payload.chain_id != self.chain_id
+            {
+                return Err(ChainError::ConsensusHeightRoundMismatch);
+            }
+            set.verify_vote(vote, expected_protocol_version, expected_chain_id)?;
+            if !seen.insert(vote.payload.validator) {
+                // A duplicated validator cannot pad power; reject the whole cert.
+                return Err(ChainError::ConsensusValidatorNotInSet);
+            }
+            power = power
+                .checked_add(set.power_of(vote.payload.validator))
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        if !set.has_two_thirds_power(power) {
+            return Err(ChainError::FinalityQuorumNotReached);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +584,9 @@ mod tests {
                 ValidatorPower {
                     validator: address,
                     power: Amount::from_units(1),
+                    // has_quorum_for assumes pre-verified votes, so a placeholder
+                    // consensus key is sufficient here.
+                    consensus_key: PublicKeyBytes([0u8; 32]),
                 },
             );
         }
@@ -358,6 +624,8 @@ mod tests {
                 ValidatorPower {
                     validator: *address,
                     power: Amount::from_units(*power),
+                    // Proposer-weighting tests never verify signatures.
+                    consensus_key: PublicKeyBytes([0u8; 32]),
                 },
             );
         }
@@ -365,6 +633,45 @@ mod tests {
             validators,
             total_power: Amount::from_units(total),
         }
+    }
+
+    /// Builds a snapshot whose members carry their real consensus keys, so
+    /// proposal and certificate signatures actually verify against it.
+    fn set_with_keys(members: &[(&Keypair, u128)]) -> ValidatorSet {
+        let mut validators = BTreeMap::new();
+        let mut total = 0u128;
+        for (keypair, power) in members {
+            total += *power;
+            let address = keypair.address();
+            validators.insert(
+                address,
+                ValidatorPower {
+                    validator: address,
+                    power: Amount::from_units(*power),
+                    consensus_key: keypair.public_key(),
+                },
+            );
+        }
+        ValidatorSet {
+            validators,
+            total_power: Amount::from_units(total),
+        }
+    }
+
+    fn precommit(validator: &Keypair, height: u64, round: u32, block_hash: Hash256) -> SignedVote {
+        SignedVote::sign(
+            Vote {
+                protocol_version: crate::CURRENT_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height,
+                round,
+                vote_type: VoteType::Precommit,
+                block_hash,
+                validator: validator.address(),
+            },
+            validator,
+        )
+        .expect("deterministic precommit signs")
     }
 
     #[test]
@@ -496,5 +803,250 @@ mod tests {
         let set = ValidatorSet::from_state(&state).expect("validator set builds");
         assert_eq!(set.total_power, Amount::ZERO);
         assert_eq!(set.power_of(key.address()), Amount::ZERO);
+    }
+
+    /// A minimal well-formed block that hashes deterministically. It carries no
+    /// transactions; consensus signing binds only to its header hash.
+    fn sample_block(proposer: Address, height: u64, epoch: u64) -> Block {
+        Block {
+            header: crate::BlockHeader {
+                protocol_version: crate::CURRENT_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height,
+                epoch,
+                previous_hash: Hash256([0u8; 32]),
+                state_root: Hash256([0x11; 32]),
+                account_root: Hash256([0x22; 32]),
+                tx_root: Hash256([0x33; 32]),
+                receipt_root: Hash256([0x44; 32]),
+                proposer,
+                timestamp_ms: 1_700_000_000_000,
+                base_fee_per_unit: 1,
+            },
+            transactions: Vec::new(),
+            receipts: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn signed_proposal_verifies_only_for_the_scheduled_leader() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let height = 5;
+        let round = 0;
+        let leader_addr = set.proposer_for(height, round).unwrap();
+        let leader = [&a, &b, &c]
+            .into_iter()
+            .find(|k| k.address() == leader_addr)
+            .unwrap();
+
+        let block = sample_block(leader.address(), height, 0);
+        let proposal = SignedProposal::sign(
+            crate::CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            round,
+            block,
+            leader.address(),
+            leader,
+        )
+        .unwrap();
+        assert!(proposal
+            .verify_in_set(&set, crate::CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+            .is_ok());
+    }
+
+    #[test]
+    fn signed_proposal_from_non_leader_is_rejected() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let height = 5;
+        let round = 0;
+        let leader_addr = set.proposer_for(height, round).unwrap();
+        // Pick a non-leader signer and have it claim to propose.
+        let usurper = [&a, &b, &c]
+            .into_iter()
+            .find(|k| k.address() != leader_addr)
+            .unwrap();
+        let block = sample_block(usurper.address(), height, 0);
+        let proposal = SignedProposal::sign(
+            crate::CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            round,
+            block,
+            usurper.address(),
+            usurper,
+        )
+        .unwrap();
+        assert!(matches!(
+            proposal
+                .verify_in_set(&set, crate::CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+                .unwrap_err(),
+            ChainError::ConsensusProposalNotFromLeader
+        ));
+    }
+
+    #[test]
+    fn signed_proposal_rejects_a_swapped_block() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let set = set_with_keys(&[(&a, 1)]);
+        let height = 1;
+        let round = 0;
+        let block = sample_block(a.address(), height, 0);
+        let mut proposal = SignedProposal::sign(
+            crate::CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            round,
+            block,
+            a.address(),
+            &a,
+        )
+        .unwrap();
+        // Swap in a different block whose hash no longer matches the signed hash.
+        proposal.block = sample_block(a.address(), height, 9);
+        assert!(matches!(
+            proposal
+                .verify_in_set(&set, crate::CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+                .unwrap_err(),
+            ChainError::ConsensusProposalBlockMismatch
+        ));
+    }
+
+    #[test]
+    fn certificate_builds_and_verifies_at_quorum() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let block_hash = Hash256::digest(b"finalized-block");
+        let (height, round) = (10, 0);
+
+        // Two of three validators precommit: 2/3 is NOT strictly greater than 2/3.
+        let two = vec![
+            precommit(&a, height, round, block_hash),
+            precommit(&b, height, round, block_hash),
+        ];
+        assert!(FinalityCertificate::build(
+            &set,
+            crate::CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            round,
+            block_hash,
+            &two,
+        )
+        .is_none());
+
+        // All three precommit: strictly greater than 2/3 -> a certificate forms.
+        let three = vec![
+            precommit(&a, height, round, block_hash),
+            precommit(&b, height, round, block_hash),
+            precommit(&c, height, round, block_hash),
+        ];
+        let cert = FinalityCertificate::build(
+            &set,
+            crate::CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            round,
+            block_hash,
+            &three,
+        )
+        .expect("quorum forms a certificate");
+        assert!(cert
+            .verify(&set, crate::CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+            .is_ok());
+    }
+
+    #[test]
+    fn certificate_rejects_a_foreign_validator_precommit() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let outsider = Keypair::from_seed([99u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let block_hash = Hash256::digest(b"finalized-block");
+        let (height, round) = (10, 0);
+
+        // A hand-assembled certificate that pads power with a non-member vote.
+        let cert = FinalityCertificate {
+            protocol_version: crate::CURRENT_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            height,
+            round,
+            block_hash,
+            precommits: vec![
+                precommit(&a, height, round, block_hash),
+                precommit(&b, height, round, block_hash),
+                precommit(&outsider, height, round, block_hash),
+            ],
+        };
+        assert!(matches!(
+            cert.verify(&set, crate::CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+                .unwrap_err(),
+            ChainError::ConsensusValidatorNotInSet
+        ));
+    }
+
+    #[test]
+    fn certificate_rejects_a_duplicated_validator() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let block_hash = Hash256::digest(b"finalized-block");
+        let (height, round) = (10, 0);
+        // `a` counted twice must not manufacture quorum from a 1-of-3 minority.
+        let cert = FinalityCertificate {
+            protocol_version: crate::CURRENT_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            height,
+            round,
+            block_hash,
+            precommits: vec![
+                precommit(&a, height, round, block_hash),
+                precommit(&a, height, round, block_hash),
+                precommit(&b, height, round, block_hash),
+            ],
+        };
+        assert!(cert
+            .verify(&set, crate::CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+            .is_err());
+    }
+
+    #[test]
+    fn certificate_rejects_a_precommit_for_another_block() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let block_hash = Hash256::digest(b"finalized-block");
+        let other_hash = Hash256::digest(b"other-block");
+        let (height, round) = (10, 0);
+        let cert = FinalityCertificate {
+            protocol_version: crate::CURRENT_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            height,
+            round,
+            block_hash,
+            precommits: vec![
+                precommit(&a, height, round, block_hash),
+                precommit(&b, height, round, block_hash),
+                // A precommit for a different block hash smuggled into the cert.
+                precommit(&c, height, round, other_hash),
+            ],
+        };
+        assert!(matches!(
+            cert.verify(&set, crate::CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+                .unwrap_err(),
+            ChainError::ConsensusHeightRoundMismatch
+        ));
     }
 }
