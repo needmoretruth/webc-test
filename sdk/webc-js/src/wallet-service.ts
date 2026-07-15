@@ -9,9 +9,10 @@
  */
 
 import { bytesToHex, concatBytes, toArrayBuffer } from "./hex.js";
-import type {
-  PermissionPersistencePort,
-  PersistedPermissionGrant,
+import {
+  validatePermissionGrants,
+  type PermissionPersistencePort,
+  type PersistedPermissionGrant,
 } from "./permission-store.js";
 import {
   CURRENT_TRANSACTION_PROTOCOL_VERSION,
@@ -144,11 +145,12 @@ export class TrustedWalletService {
 
   // Restores persisted grants as dormant: cumulative spend and the assigned lane
   // survive, but the live session is empty so an origin must reconnect (which
-  // issues a fresh session id) before it can sign. A restored grant that repeats
-  // an origin keeps the first entry.
+  // issues a fresh session id) before it can sign. `restoredGrants` is a public
+  // option that may not have passed through `decryptPermissionStore`, so it is
+  // treated as hostile and re-validated here — otherwise a negative or over-cap
+  // `spent_amount` (e.g. `BigInt("-100")`) would silently widen the spend cap.
   #rehydrate(restored: readonly PersistedPermissionGrant[]): void {
-    for (const record of restored) {
-      if (this.#grants.has(record.origin)) continue;
+    for (const record of validatePermissionGrants(restored)) {
       this.#grants.set(record.origin, {
         limitsJson: record.limits,
         limits: parseSpendLimits(record.limits),
@@ -296,6 +298,11 @@ export class TrustedWalletService {
     if (request.method === "revoke") {
       const previous = this.#grants.get(origin);
       if (!previous) return { revoked: true };
+      // Clearing a grant discards its cumulative spend, so it must be an explicit
+      // user action: without this a hostile host could revoke silently and then
+      // reconnect to reset the spend budget. A rejected revoke leaves the grant.
+      const approved = await this.#confirm({ kind: "revoke", origin });
+      if (!approved) throw serviceError("USER_REJECTED", "user rejected revocation");
       this.#grants.delete(origin);
       await this.#persistOrRollback(origin, previous);
       return { revoked: true };

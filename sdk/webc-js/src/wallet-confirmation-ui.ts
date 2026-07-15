@@ -10,6 +10,7 @@
 import type {
   WalletConfirmation,
   WalletConnectionConfirmation,
+  WalletRevocationConfirmation,
   WalletTransferConfirmation,
 } from "./wallet-request.js";
 import type { WalletConfirmationHandler } from "./wallet-service.js";
@@ -103,13 +104,17 @@ function renderConfirmation(
   appendField(panel, "Requesting site", confirmation.origin, true);
   if (confirmation.kind === "connect") {
     renderConnection(panel, confirmation);
+  } else if (confirmation.kind === "revoke") {
+    renderRevocation(panel, confirmation);
   } else {
     renderTransfer(panel, confirmation);
   }
 
   const warning = document.createElement("p");
   warning.textContent =
-    "Approve only if the site, recipient, amount, asset, and maximum fee are correct.";
+    confirmation.kind === "revoke"
+      ? "Approving clears this site's permission and its recorded spend history."
+      : "Approve only if the site, recipient, amount, asset, and maximum fee are correct.";
   panel.append(warning);
 
   const actions = document.createElement("div");
@@ -158,6 +163,18 @@ function renderConnection(
     panel,
     "Maximum fee per transfer (base units)",
     confirmation.limits.max_fee_per_transaction,
+  );
+}
+
+function renderRevocation(
+  panel: HTMLElement,
+  _confirmation: WalletRevocationConfirmation,
+): void {
+  appendField(panel, "Action", "Disconnect this site");
+  appendField(
+    panel,
+    "Effect",
+    "Removes the site's permission and its cumulative spend history",
   );
 }
 

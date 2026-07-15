@@ -162,10 +162,17 @@ export interface WalletTransferConfirmation {
   readonly authorization_policy_revision: number;
 }
 
+/** User-visible revocation shown before clearing an origin's grant. */
+export interface WalletRevocationConfirmation {
+  readonly kind: "revoke";
+  readonly origin: string;
+}
+
 /** Every trusted UI confirmation shape. */
 export type WalletConfirmation =
   | WalletConnectionConfirmation
-  | WalletTransferConfirmation;
+  | WalletTransferConfirmation
+  | WalletRevocationConfirmation;
 
 /** Parsed numeric spend limits used only inside the trusted service. */
 export interface ParsedSpendLimits {
