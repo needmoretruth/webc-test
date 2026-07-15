@@ -164,7 +164,8 @@ height 1 from the persisted redb store.
 ## Phase 4: networking and signed consensus (in progress)
 
 Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
-consensus core**, **A-3 robustness**. A-1 is complete; A-2 is next.
+consensus core**, **A-3 robustness**. A-1 and the A-2 consensus core are
+complete; A-3 and the async network driver are next.
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
 
@@ -226,12 +227,55 @@ Deferred within A-1 (not required for its milestone): channel encryption, richer
 peer discovery beyond a static bootstrap list, and peer scoring/rate-limiting on
 repeated rejections. These are hardening or later-stage items.
 
-A-2 will extend `NetMessage` with proposals/votes/finality certificates, build a
-deterministic leader schedule over a persisted stake snapshot (the
-`Table::ValidatorSets` writer path, wired but unpopulated since Phase 3,
-activates here), and add signed prevote/precommit producing a finality
-certificate verified against committee membership and voting power. The vote
-primitives already exist in `webc-chain::consensus`.
+### Phase 4 A-2: signed BFT consensus core — complete
+
+The deterministic, clock-free consensus core is implemented and gate-verified.
+
+- **`webc-chain::consensus`** — the `ValidatorSet` snapshot now carries every
+  member's registered Ed25519 consensus key (`ValidatorPower.consensus_key`), so
+  a finality certificate is self-verifiable against the snapshot alone (a
+  light-client-friendly property: no full validator state needed to check
+  finality). Added `SignedProposal` (domain `WEBC_CONSENSUS_PROPOSAL_V1`; the
+  signature covers the block hash, and `verify_in_set` re-hashes the carried
+  block, requires the signer to be the scheduled leader for `(height, round)`,
+  and checks the signature against the snapshot key) and `FinalityCertificate`
+  (aggregate precommits for one exact height/round/block, each verified against a
+  distinct snapshot member, aggregate power strictly greater than two thirds),
+  with a `build` convenience and an independent `verify` that rejects a foreign
+  validator, a duplicated validator, or a precommit for another block.
+- **`webc-chain::round`** — a pure `RoundState` state machine for one
+  height/round driving propose -> prevote -> precommit -> commit. It reads no
+  clock and performs no I/O: it returns `ConsensusAction`s (broadcast a message,
+  or commit a block) for a driver to execute. It verifies every proposal and
+  vote against the immutable snapshot before acting, counts each validator at
+  most once per step (first vote wins, so a later equivocating vote cannot change
+  the tally), and finalizes a block only when it holds that block and observes
+  strictly over two-thirds precommit power. An observer (no validator identity)
+  follows finality without ever broadcasting. Timeouts and round changes are
+  deferred to A-3, so the engine is single-round: a stalled proposer stalls the
+  height.
+- **`webc-net::wire`** — `NetMessage` gained `Proposal`, `Vote`, and
+  `Certificate` variants (large payloads boxed), each with a round-trip test.
+- **`webc-node::node`** — `produce_block` populates the per-epoch
+  `Table::ValidatorSets` snapshot at each epoch's first block; the writer path
+  (wired but unpopulated since Phase 3) is now live. With no active validators in
+  devnet genesis the snapshot is an empty (zero-power) set, which is correct
+  until validators activate through staking.
+
+Convergence is proven by a deterministic 3-validator test that drives the round
+engines over an in-memory message bus and asserts all three finalize the
+identical block and a certificate that independently verifies against the
+snapshot. Verified: `cargo fmt --check`, strict workspace Clippy (`-D warnings`),
+rustdoc with warnings denied, and the full workspace test suite (webc-chain 137,
+webc-crypto 13, webc-net 18, webc-node 24, webc-storage 20, plus the gossip
+integration test).
+
+What A-2 deliberately does not include (it is A-3): the async network driver that
+runs the round engine over real `webc-net` TCP so separate processes converge
+(the gossip pump currently ignores gossiped consensus messages by design, since
+no driver consumes them yet); timeouts and round changes; fork choice; state sync
+for a joining node; and wiring objective double-vote/invalid-proposal evidence
+into the existing slashing path.
 
 ## Phase 3: local restartable node, storage, and developer APIs
 

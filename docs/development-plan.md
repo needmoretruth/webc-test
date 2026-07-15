@@ -5,9 +5,15 @@ Date: 2026-07-15
 
 Implementation checkpoint: Phases 0-3 passed their repository gates; Phase 4
 (networking and signed BFT consensus) is active. Phase 4 A-1 (authenticated P2P
-networking and transaction gossip) and the deterministic stake-weighted leader
-schedule (A-2.1) are done. This marker records progress and does not weaken any
-acceptance criterion below.
+networking and transaction gossip) and the A-2 consensus core are done: the
+deterministic stake-weighted leader schedule (A-2.1), the signed proposal and
+prevote/precommit round state machine, the self-verifying finality certificate,
+the Proposal/Vote/Certificate wire messages, and the per-epoch validator-set
+snapshot writer, proven by a deterministic multi-validator convergence test.
+What remains in Phase 4 is A-3 robustness (timeouts/round-change, fork choice,
+state sync, evidence wired to slashing) and the async network driver that runs
+the round state machine over real TCP. This marker records progress and does not
+weaken any acceptance criterion below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
 
@@ -455,18 +461,28 @@ Real-fund bridges are a post-mainnet or separately gated launch.
 ## Immediate next implementation milestone
 
 Phases 0-3 are complete and **Phase 4 (networking and signed BFT consensus) is
-active**. A-1 (authenticated P2P networking and transaction gossip) and A-2.1 (the
-deterministic stake-weighted leader schedule) are done.
+active**. A-1 (authenticated P2P networking and transaction gossip) and the A-2
+consensus core are done:
 
-The next implementation steps are the rest of the signed consensus core:
+1. the network message set now carries Proposal, Vote, and Certificate — done;
+2. the per-epoch validator-set stake snapshot writer is populated — done;
+3. the signed prevote/precommit round state machine (propose -> prevote ->
+   precommit -> commit) exists as a pure, deterministic `webc-chain::round`
+   engine — done;
+4. the self-verifying finality certificate (aggregate precommits, snapshot
+   membership, strictly >2/3 power) is implemented — done;
+5. convergence is proven by a deterministic multi-validator test driving the
+   engines over an in-memory bus to one finalized block and certificate — done
+   at the state-machine level.
 
-1. extend the network message set with Proposal, Vote, and Certificate;
-2. populate the per-epoch validator-set stake snapshot writer;
-3. implement the signed prevote/precommit round state machine (propose -> prevote -> precommit -> commit);
-4. implement the finality certificate (aggregate precommits, verify committee membership and >2/3 power);
-5. add a multi-node convergence integration test;
-6. then Phase 4 A-3 robustness: timeouts/round-change, fork choice, state sync, and objective double-vote/invalid-proposal evidence wired into slashing;
-7. update `docs/implementation-status.md` and `docs/continuation-guide.md` after every completed item.
+The remaining Phase 4 work is A-3 robustness plus the async driver:
+
+6. build the async network driver that runs the round engine over real TCP
+   (`webc-net`), so 2-4 separate processes converge on one finalized chain;
+7. Phase 4 A-3 robustness: timeouts/round-change, fork choice, state sync, and
+   objective double-vote/invalid-proposal evidence wired into slashing;
+8. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
+   every completed item.
 
 Only after consensus is stable should the contract runtime, the WEBC high-level
 language and tooling, the native oracle, the web platform, and the bridges be
