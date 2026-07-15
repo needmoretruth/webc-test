@@ -65,7 +65,7 @@ environment) passed `cargo fmt --check`, strict workspace Clippy (`-D warnings`)
 133 Rust tests (120 `webc-chain` + 13 `webc-crypto`), rustdoc with warnings
 denied, and `webc-node demo`; the permission-storage pass changed no Rust files,
 so that gate is unaffected. The TypeScript SDK (2026-07-15, Node 22) builds and
-passes 55/55 tests, the widget suite 3/3, plus the package-entry and
+passes 57/57 tests, the widget suite 3/3, plus the package-entry and
 Markdown-link checks. The previously reported single SDK failure was a real
 host-client schema bug (missing `authorization_policy_revision`), now fixed — not
 a Node 22 WebCrypto gap; the suite is green on Node 22. Historical note: on a
@@ -121,7 +121,7 @@ Phase 2 wallet-wire/secret-isolation gate). Do not redo them. What shipped:
 - Fixed a real host-client schema bug found here: the connection and
   signed-transaction result parsers omitted `authorization_policy_revision`,
   which had failed the end-to-end exchange on every Node version (not a Node 22
-  issue). SDK suite is now 55/55.
+  issue). SDK suite is now 57/57.
 
 With this, Phase 2's acceptance conditions are met except reference-machine
 benchmarks. The next milestone is **Phase 3** in `docs/development-plan.md`: a

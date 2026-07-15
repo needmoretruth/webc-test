@@ -144,7 +144,7 @@ passes on both Rust and TypeScript with its updated digest.
 
 On 2026-07-15 (this cloud environment, Node 22), after adding durable encrypted
 permission storage and automatic lane setup, both TypeScript packages build and
-the SDK suite passes 55/55 with the widget suite at 3/3; the Markdown-link and
+the SDK suite passes 57/57 with the widget suite at 3/3; the Markdown-link and
 package-entry checks pass. The previously reported single failing
 `wallet-service.test.ts` case was not a Node 22 issue: it was a real host-client
 schema bug (the connection and signed-transaction result parsers omitted
