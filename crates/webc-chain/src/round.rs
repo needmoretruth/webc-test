@@ -1237,6 +1237,328 @@ mod tests {
     }
 
     #[test]
+    fn less_than_one_third_byzantine_power_cannot_finalize_conflicting_blocks() {
+        // Four equal-power validators give the attacker 25% of the snapshot.
+        // The attacker is selected as round-0 proposer so it can equivocate at
+        // every available layer: conflicting proposals, prevotes, and
+        // precommits are delivered selectively across two network partitions.
+        let keys: Vec<Keypair> = SEEDS.iter().map(|seed| Keypair::from_seed(*seed)).collect();
+        let attacker = &keys[3];
+        let set = set_with_keys(&[(&keys[0], 1), (&keys[1], 1), (&keys[2], 1), (attacker, 1)]);
+        let height = (1..=4_096)
+            .find(|height| {
+                set.proposer_for(*height, 0) == Some(attacker.address())
+                    && set.proposer_for(*height, 1) != Some(attacker.address())
+            })
+            .expect("test schedule contains an attacker-led round followed by an honest leader");
+
+        // Designate the round-1 honest leader as C (the initially-unlocked
+        // partition) and the other two honest validators as A/B (the X-locked
+        // partition). This lets the attacker make the strongest possible
+        // cross-round attempt at finalizing a different value.
+        let c_address = set.proposer_for(height, 1).unwrap();
+        let c = keys[..3]
+            .iter()
+            .find(|key| key.address() == c_address)
+            .unwrap();
+        let locked: Vec<&Keypair> = keys[..3]
+            .iter()
+            .filter(|key| key.address() != c_address)
+            .collect();
+        let a = locked[0];
+        let b = locked[1];
+
+        let mut machine_a = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(a)),
+        );
+        let mut machine_b = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(b)),
+        );
+        let mut machine_c = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(c)),
+        );
+        let mut observer = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            None,
+        );
+        machine_a.start().unwrap();
+        machine_b.start().unwrap();
+        machine_c.start().unwrap();
+        observer.start().unwrap();
+
+        let sign_vote = |key: &Keypair, round: u32, vote_type: VoteType, block_hash: Hash256| {
+            SignedVote::sign(
+                Vote {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    chain_id: ChainId::devnet(),
+                    height,
+                    round,
+                    vote_type,
+                    block_hash,
+                    validator: key.address(),
+                },
+                key,
+            )
+            .unwrap()
+        };
+        let vote_from = |actions: &[ConsensusAction], vote_type: VoteType, block_hash: Hash256| {
+            broadcasts(actions)
+                .into_iter()
+                .find_map(|message| match message {
+                    ConsensusMessage::Vote(vote)
+                        if vote.payload.vote_type == vote_type
+                            && vote.payload.block_hash == block_hash =>
+                    {
+                        Some(vote)
+                    }
+                    _ => None,
+                })
+                .expect("machine broadcasts the expected vote")
+        };
+        let deliver_votes = |machine: &mut ConsensusMachine, votes: &[SignedVote]| {
+            let mut actions = Vec::new();
+            for vote in votes {
+                actions.extend(
+                    machine
+                        .on_event(ConsensusEvent::Message(ConsensusMessage::Vote(
+                            vote.clone(),
+                        )))
+                        .unwrap(),
+                );
+            }
+            actions
+        };
+
+        // Round 0: the Byzantine proposer sends X to A/B and an observer, but Y
+        // to C. Its equivocating prevotes let A/B reach the 3-of-4 quorum for X;
+        // C's Y partition has only two votes and cannot lock.
+        let block_x = candidate_block(attacker.address(), height, 1);
+        let hash_x = block_x.hash().unwrap();
+        let proposal_x = SignedProposal::sign(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            0,
+            None,
+            block_x,
+            attacker.address(),
+            attacker,
+        )
+        .unwrap();
+        let block_y0 = candidate_block(attacker.address(), height, 2);
+        let hash_y0 = block_y0.hash().unwrap();
+        let proposal_y0 = SignedProposal::sign(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            0,
+            None,
+            block_y0,
+            attacker.address(),
+            attacker,
+        )
+        .unwrap();
+        assert_ne!(hash_x, hash_y0);
+
+        let actions_a = machine_a
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(proposal_x.clone()),
+            )))
+            .unwrap();
+        let actions_b = machine_b
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(proposal_x.clone()),
+            )))
+            .unwrap();
+        let actions_c = machine_c
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(proposal_y0),
+            )))
+            .unwrap();
+        observer
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(proposal_x),
+            )))
+            .unwrap();
+        let prevote_a = vote_from(&actions_a, VoteType::Prevote, hash_x);
+        let prevote_b = vote_from(&actions_b, VoteType::Prevote, hash_x);
+        let prevote_c = vote_from(&actions_c, VoteType::Prevote, hash_y0);
+        let attacker_prevote_x = sign_vote(attacker, 0, VoteType::Prevote, hash_x);
+        let attacker_prevote_y = sign_vote(attacker, 0, VoteType::Prevote, hash_y0);
+
+        let lock_actions_a = deliver_votes(
+            &mut machine_a,
+            &[prevote_b.clone(), attacker_prevote_x.clone()],
+        );
+        let lock_actions_b = deliver_votes(
+            &mut machine_b,
+            &[prevote_a.clone(), attacker_prevote_x.clone()],
+        );
+        deliver_votes(&mut machine_c, &[prevote_c, attacker_prevote_y]);
+        let precommit_a = vote_from(&lock_actions_a, VoteType::Precommit, hash_x);
+        let precommit_b = vote_from(&lock_actions_b, VoteType::Precommit, hash_x);
+        let attacker_precommit_x = sign_vote(attacker, 0, VoteType::Precommit, hash_x);
+
+        // An observer in the X partition can genuinely finalize X from A/B plus
+        // the attacker. A/B do not receive each other's precommits yet, so they
+        // stay live and locked for the next-round conflict attempt.
+        let observer_actions = deliver_votes(
+            &mut observer,
+            &[
+                precommit_a.clone(),
+                precommit_b.clone(),
+                attacker_precommit_x,
+            ],
+        );
+        let (finalized_x, certificate_x) =
+            commit_of(&observer_actions).expect("the X partition has a valid finality quorum");
+        assert_eq!(finalized_x.hash().unwrap(), hash_x);
+        certificate_x
+            .verify(&set, CURRENT_PROTOCOL_VERSION, &ChainId::devnet())
+            .unwrap();
+
+        // Advance the three honest validators to round 1. C, which never locked
+        // Y0, is the scheduled leader and makes a fresh conflicting proposal Y1.
+        machine_a
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Precommit,
+                round: 0,
+            })
+            .unwrap();
+        machine_b
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Precommit,
+                round: 0,
+            })
+            .unwrap();
+        machine_c
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Prevote,
+                round: 0,
+            })
+            .unwrap();
+        machine_c
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Precommit,
+                round: 0,
+            })
+            .unwrap();
+        assert_eq!(machine_a.round(), 1);
+        assert_eq!(machine_b.round(), 1);
+        assert_eq!(machine_c.round(), 1);
+
+        let block_y1 = candidate_block(c.address(), height, 3);
+        let hash_y1 = block_y1.hash().unwrap();
+        assert_ne!(hash_x, hash_y1);
+        let leader_actions = machine_c.provide_block(1, block_y1).unwrap();
+        let proposal_y1 = broadcasts(&leader_actions)
+            .into_iter()
+            .find_map(|message| match message {
+                ConsensusMessage::Proposal(proposal) => Some(proposal),
+                _ => None,
+            })
+            .expect("round-1 leader broadcasts Y1");
+        let prevote_c_y1 = vote_from(&leader_actions, VoteType::Prevote, hash_y1);
+        let actions_a_y1 = machine_a
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal_y1.clone(),
+            )))
+            .unwrap();
+        let actions_b_y1 = machine_b
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal_y1,
+            )))
+            .unwrap();
+        let prevote_a_nil = vote_from(&actions_a_y1, VoteType::Prevote, NIL);
+        let prevote_b_nil = vote_from(&actions_b_y1, VoteType::Prevote, NIL);
+        let attacker_prevote_y1 = sign_vote(attacker, 1, VoteType::Prevote, hash_y1);
+
+        // Locked A/B refuse Y1 and split the round-1 prevotes 2-for-Y1 versus
+        // 2-for-nil. Even after all four votes are visible, every honest node
+        // precommits nil on timeout; none signs the conflicting block.
+        deliver_votes(
+            &mut machine_a,
+            &[
+                prevote_b_nil.clone(),
+                prevote_c_y1.clone(),
+                attacker_prevote_y1.clone(),
+            ],
+        );
+        deliver_votes(
+            &mut machine_b,
+            &[
+                prevote_a_nil.clone(),
+                prevote_c_y1.clone(),
+                attacker_prevote_y1.clone(),
+            ],
+        );
+        deliver_votes(
+            &mut machine_c,
+            &[prevote_a_nil, prevote_b_nil, attacker_prevote_y1],
+        );
+        let precommit_actions_a = machine_a
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Prevote,
+                round: 1,
+            })
+            .unwrap();
+        let precommit_actions_b = machine_b
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Prevote,
+                round: 1,
+            })
+            .unwrap();
+        let precommit_actions_c = machine_c
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Prevote,
+                round: 1,
+            })
+            .unwrap();
+        let precommit_a_nil = vote_from(&precommit_actions_a, VoteType::Precommit, NIL);
+        let precommit_b_nil = vote_from(&precommit_actions_b, VoteType::Precommit, NIL);
+        let precommit_c_nil = vote_from(&precommit_actions_c, VoteType::Precommit, NIL);
+        let attacker_precommit_y1 = sign_vote(attacker, 1, VoteType::Precommit, hash_y1);
+        let attempted_conflict = vec![
+            precommit_a_nil,
+            precommit_b_nil,
+            precommit_c_nil,
+            attacker_precommit_y1,
+        ];
+
+        assert!(FinalityCertificate::build(
+            &set,
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            1,
+            hash_y1,
+            &attempted_conflict,
+        )
+        .is_none());
+        assert!(
+            [&machine_a, &machine_b, &machine_c]
+                .into_iter()
+                .all(|machine| machine.decided_block().is_none()),
+            "no honest machine may finalize the conflicting Y1 block"
+        );
+    }
+
+    #[test]
     fn equivocating_validator_is_surfaced_as_evidence() {
         let a = Keypair::from_seed([1u8; 32]);
         let b = Keypair::from_seed([2u8; 32]);
