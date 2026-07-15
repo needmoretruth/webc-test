@@ -144,7 +144,7 @@ passes on both Rust and TypeScript with its updated digest.
 
 On 2026-07-15 (this cloud environment, Node 22), after adding durable encrypted
 permission storage and automatic lane setup, both TypeScript packages build and
-the SDK suite passes 57/57 with the widget suite at 3/3; the Markdown-link and
+the SDK suite passes 69/69 with the widget suite at 3/3; the Markdown-link and
 package-entry checks pass. The previously reported single failing
 `wallet-service.test.ts` case was not a Node 22 issue: it was a real host-client
 schema bug (the connection and signed-transaction result parsers omitted
@@ -163,10 +163,19 @@ height 1 from the persisted redb store.
 
 ## Phase 3: local restartable node, storage, and developer APIs
 
-Largely complete on the Rust side (the browser SDK client + reference demo site
-remain). A standing "reuse over reinvention" rule was added to `AGENTS.md`: prefer
-mature, Apache-2.0-compatible crates for commodity plumbing; own WEBC's protocol
-logic, the swappable seams, and cross-language canonical encoding.
+**Complete.** A standing "reuse over reinvention" rule was added to `AGENTS.md`:
+prefer mature, Apache-2.0-compatible crates for commodity plumbing; own WEBC's
+protocol logic, the swappable seams, and cross-language canonical encoding.
+
+The browser side landed alongside the Rust node: `sdk/webc-js/src/node-client.ts`
+(`WebcNodeClient`) is a typed, defensively-validated HTTP/WebSocket client for the
+`/v1` API, and `sdk/webc-js/demo/index.html` is a static reference site (create
+wallet → faucet → account + Merkle proof → signed transfer → live finality over
+the block-subscription WebSocket). The node applies a permissive devnet CORS
+policy so the page can reach it. The full flow was verified end to end against a
+running node: a `createWallet` + `signTransaction` transfer is accepted (browser
+canonical signing matches Rust exactly) and the recipient is funded after the 2s
+auto-seal. 12 client tests over an injected fetch and a fake WebSocket.
 
 Completed and verified:
 
@@ -210,9 +219,9 @@ Completed and verified:
 Phase 3 acceptance status: restart without loss/duplication — met (verified);
 corruption detected and reported — met; invalid transactions do not mutate state —
 met (tested); APIs publish explicit versioning (`/v1`) and resource limits (body
-limit, mempool caps, faucet limits) — met. The browser end-to-end acceptance
-(wallet → faucet → proof → transfer → finality) is served by the API but the
-TypeScript client and demo site that exercise it remain to be built.
+limit, mempool caps, faucet limits) — met; browser creates wallet, receives faucet
+funds, reads a proof, submits a transfer, and sees finality — met (verified end to
+end against a running node). All Phase 3 acceptance conditions are satisfied.
 
 Deliberately deferred within Phase 3: validator-set snapshot storage is wired
 (`Table::ValidatorSets`, `BlockCommit.validator_set`) but not populated until

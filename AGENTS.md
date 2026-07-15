@@ -412,12 +412,16 @@ transport-independent `NodeService`, an axum/tokio HTTP+WebSocket API under `/v1
 with a devnet faucet, and a `webc-node run` command (redb-backed, auto-sealing,
 restart-recovery smoke-tested). Rust gate: 176 tests.
 
-The remaining Phase 3 item is the **browser side**: a TypeScript SDK HTTP/WS
-client for this API and a small reference demo site (create wallet → faucet →
-verify proof → submit transfer → watch finality). Do that to close Phase 3, then
-move to **Phase 4** (networking + signed BFT consensus). Do not skip to contract
-runtime, ZK, or real bridges before their own gates. See
-`docs/continuation-guide.md` for the exact next step.
+The browser side is done too: `sdk/webc-js/src/node-client.ts` (`WebcNodeClient`,
+a typed HTTP/WS client for `/v1`) and `sdk/webc-js/demo/index.html` (a static
+reference site: create wallet → faucet → proof → signed transfer → live finality
+over WebSocket). Verified end to end against a running node.
+
+**Phase 3 is complete.** The next milestone is **Phase 4** (networking + signed
+BFT consensus) in `docs/development-plan.md`. Do not skip to contract runtime, ZK,
+or real bridges before their own gates. The only broad open item across phases is
+reference-machine benchmark numbers (this cloud container cannot produce them
+honestly). See `docs/continuation-guide.md` for the exact next step.
 
 ## User decisions still required later
 

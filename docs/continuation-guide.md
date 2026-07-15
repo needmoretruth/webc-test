@@ -25,9 +25,12 @@ Use simple Korean when speaking to the user. Explain unavoidable technical terms
 
 ## Current verified checkpoint
 
-Phase 0 and Phase 1 are complete, and Phase 2 is active. Always use `git log` to discover the
-current branch tip; the checkpoint list below names implementation history, not
-an instruction to reset or return to an older commit.
+Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
+is the next milestone**. Always use `git log` to discover the current branch tip;
+the checkpoint list below names implementation history, not an instruction to
+reset or return to an older commit. (The prototype remains unsafe for real funds,
+and reference-machine benchmark numbers are still owed before any performance
+claim.)
 
 Completed Phase 1 work, in implementation order:
 
@@ -66,7 +69,7 @@ Latest verified gate: the Rust side (2026-07-15, this cloud environment) passed
 rustdoc with warnings denied, and `webc-node demo`. The `webc-node run` devnet
 node was smoke-tested end to end (health, faucet drip to a fresh wallet, block
 and fee queries, and kill/restart recovery from the persisted redb store). The
-TypeScript SDK (2026-07-15, Node 22) builds and passes 57/57 tests, the widget
+TypeScript SDK (2026-07-15, Node 22) builds and passes 69/69 tests, the widget
 suite 3/3, plus the package-entry and Markdown-link checks. Historical note: on a
 Windows GNU host use `cargo +1.96.0-x86_64-pc-windows-gnu` (the MSVC target lacks
 `link.exe`); the cloud Linux toolchain needs no override.
@@ -126,7 +129,7 @@ Phase 2 wallet-wire/secret-isolation gate). Do not redo them. What shipped:
 - Fixed a real host-client schema bug found here: the connection and
   signed-transaction result parsers omitted `authorization_policy_revision`,
   which had failed the end-to-end exchange on every Node version (not a Node 22
-  issue). SDK suite is now 57/57.
+  issue). SDK suite is now 69/69.
 
 With this, Phase 2's acceptance conditions are met except reference-machine
 benchmarks.
@@ -154,15 +157,30 @@ benchmarks.
   - `main.rs` `run` — launches a redb-backed devnet node, auto-sealing every 2s,
     smoke-tested incl. kill/restart recovery.
 
-**The remaining Phase 3 item is the browser side:** a TypeScript SDK HTTP/WS
-client for this API (in `sdk/webc-js`) and a small reference demo site that
-creates a wallet, calls the faucet, verifies an account proof, submits a
-transfer, and watches finality over the WebSocket. Do that next to close Phase 3,
-then move to **Phase 4** (networking + signed BFT consensus) in
-`docs/development-plan.md`. Public contract VM, ZK expansion, and real-fund bridge
-work stay disabled until their later gates. Validator-set snapshot storage is
-wired (`Table::ValidatorSets`, `BlockCommit.validator_set`) but not yet populated
-— it activates with consensus in Phase 4.
+**The browser side is now done too:** `sdk/webc-js/src/node-client.ts`
+(`WebcNodeClient`) is a typed, defensively-validated HTTP/WebSocket client for the
+`/v1` API (health, fees, account, proof, blocks, submit, faucet, block
+subscription), and `sdk/webc-js/demo/index.html` is a static reference site that
+creates a wallet, calls the faucet, reads the account + Merkle proof, submits a
+signed transfer, and watches finality live over the WebSocket. The node applies a
+permissive devnet CORS policy so the browser page can reach it. The whole flow was
+verified end to end against a running node — a `createWallet` + `signTransaction`
+transfer is accepted by the node (browser canonical signing matches Rust exactly)
+and the recipient is funded after the 2s auto-seal.
+
+**Phase 3 is therefore complete** (all acceptance conditions met; the only broad
+open item across phases remains reference-machine benchmark numbers, which this
+cloud container cannot produce honestly). The next milestone is **Phase 4**
+(networking + signed BFT consensus) in `docs/development-plan.md`: authenticated
+peers and discovery, gossip, a deterministic leader schedule and stake snapshots,
+signed prevote/precommit with rotating stake-weighted committees, fork choice and
+lock rules, state sync, and objective double-vote/invalid-proposal evidence.
+Validator-set snapshot storage is already wired (`Table::ValidatorSets`,
+`BlockCommit.validator_set`) but unpopulated — it activates with consensus.
+
+Public contract VM, ZK expansion, and real-fund bridge work stay disabled until
+their later gates. Historical state snapshots/deltas beyond the latest are a
+storage follow-up when proofs against past heights are needed.
 
 ## Working rules
 
