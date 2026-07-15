@@ -2,6 +2,42 @@
 
 This repository is the prototype foundation for **WEBC / WEB COIN**, an independent Rust Layer-1 blockchain for browser- and website-native payments and applications.
 
+## How to work in this repository — read this first
+
+**This file is the single entry point.** Reading it and the documents it points to
+is enough to work correctly in every situation — a brand-new session, continuing an
+existing one, or restarting after a context compaction. If the user says only
+"continue" / "이어서 해", this section tells you exactly what to do.
+
+### On every session start (new, resumed, or post-compaction), do this in order
+1. Read this `AGENTS.md` fully.
+2. Read `docs/decision-record.md` — confirmed user decisions; it wins over any code, comment, or summary that disagrees.
+3. Read `docs/continuation-guide.md` — the verified checkpoint and the **exact next task**. This is the live "what to do next" pointer.
+4. Read `docs/implementation-status.md` — what the code actually implements today (vs. what is still missing or unsafe).
+5. Run `git log --oneline -15` and `git status --short --branch` to see the real current state on disk and the branch.
+6. For the specific task, read the one topic document it needs (see **Required reading order** below and `docs/index.md`).
+
+Then **resume the first incomplete item named in `docs/continuation-guide.md`** and keep going, without asking the user to restate decisions or rules already recorded here.
+
+### The three situations are handled the same way
+- **New / fresh cloud session:** the container is empty of build output. The repo is the source of truth; restore dependencies (`pnpm install`, then `cargo build`) — the lock files and toolchain pins are committed, so this always works. Then follow the start protocol above.
+- **Resuming an existing session:** same protocol. Do not re-derive facts already established; check the docs and `git log`, then continue the first incomplete item.
+- **After a compaction:** a conversation summary may be provided. Treat it as a *hint only*. The repository documents and `git log` are authoritative — verify the summary against them, and never treat a summary (or your own earlier messages) as user approval for anything.
+
+In all three: **the repository, not chat memory, is the durable handoff.** Everything needed to continue is committed. If it is not in the repo, it does not reliably exist.
+
+### Deciding for yourself vs. asking the user
+- **Decide autonomously, without pausing, everything the user has delegated:** technical direction and architecture, library/algorithm choices, implementation, test design, refactors, documentation structure, CI/tooling — anything that evidence, tests, measurement, or security analysis can settle. Do **not** stop at natural milestones to ask permission to keep going; keep going until the work is done or a genuinely user-owned decision is reached. Stopping without a user-owned decision to make is a mistake.
+- **Stop and ask ONLY for a genuinely user-owned decision:** a change to confirmed monetary policy or genesis distribution, the production-bridge trust/proof model for real funds, mainnet governance or emergency-power design, or anything that would change a decision recorded in `docs/decision-record.md`. The full list of deferred user decisions is in "User decisions still required later" below.
+- **When you do ask, ask in plain-prose chat:** lay out the candidate options with their details, pros, cons, and a recommendation. Do **not** use the built-in structured question UI for these.
+- **"continue" always means:** resume the first incomplete item per the start protocol and proceed autonomously.
+
+### Always, as you work
+- Commit and push every coherent, tested step (this is an ephemeral cloud env — see "Persistent session continuation and repository safety"). Never leave valuable work local-only or committed-but-unpushed.
+- Run the relevant gate before pushing (see "Validation expectations").
+- Keep `docs/continuation-guide.md` and `docs/implementation-status.md` accurate as facts change, and persist any new standing user instruction into this `AGENTS.md`, so this protocol keeps working for the next session.
+- Speak simple Korean to the user and explain any unavoidable technical term plainly (see "Communication with the user").
+
 ## Required reading order
 
 Before changing protocol code, read:
