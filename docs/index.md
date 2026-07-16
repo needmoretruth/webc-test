@@ -53,16 +53,15 @@ They cannot override confirmed product or economic policy in
 
 ## Current next action
 
-Phases 0-3 are complete, and **Phase 4 (networking and signed BFT consensus) is
-active**. Phase 4 A-1 (authenticated P2P networking plumbing and transaction
-gossip) is **complete**, and the deterministic stake-weighted leader schedule
-(A-2.1) is **complete**. The next task is the rest of the signed consensus core:
-the Proposal/Vote/Certificate wire messages, the epoch stake-snapshot writer, the
-prevote/precommit round state machine, and the finality certificate. Use
-`continuation-guide.md` for the verified checkpoint and exact next task, and do
-not restart completed amount, inflation, genesis, block-atomicity, staking-ratio,
-access-enforcement, session-key, wallet-permission-storage, storage, node, or
-networking work.
+Phases 0-3 are complete and **Phase 4 (networking and signed BFT consensus) is
+active but not complete or safe.** This page does not restate the phase status
+(it rots — see `AGENTS.md` pitfall 8). `continuation-guide.md` and
+`implementation-status.md` are the live owners of "what is done / what is next,"
+and `docs/review/2026-07-16-plan-review.md` §6 holds the prioritized worklist
+(chiefly the reported HIGH-severity consensus findings in
+`docs/review/findings.md`). Do not restart completed amount, inflation, genesis,
+block-atomicity, staking-ratio, access-enforcement, session-key,
+wallet-permission-storage, storage, node, or networking work.
 
 The AI-era product direction is now recorded in `decision-record.md`: a WEBC
 high-level contract language that lowers to the audited Rust/WASM layer, a native

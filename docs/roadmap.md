@@ -24,10 +24,12 @@ The authoritative detailed roadmap is [`development-plan.md`](development-plan.m
 
 Phases 0-3 are complete (single-node state machine, wallet/security foundation,
 durable node + storage + developer APIs). **Phase 4 (networking and signed BFT
-consensus) is active**: the P2P networking plumbing and authenticated transaction
-gossip are done, and the deterministic stake-weighted leader schedule is done; the
-signed prevote/precommit round machine and finality certificate are next. See
-`continuation-guide.md` for the exact next task.
+consensus) is active but not complete or safe:** the happy-path mechanism exists
+and converges in loopback tests, but a 2026-07-16 review reported HIGH-severity
+consensus safety/liveness/DoS gaps that must be fixed first. This file is a map
+only and does not restate detailed status; see `continuation-guide.md` for the
+verified checkpoint and `docs/review/2026-07-16-plan-review.md` §6 for the
+prioritized worklist.
 
 The AI-era product direction (a WEBC high-level contract language that lowers to
 the audited Rust/WASM layer, a native staked oracle, capped fee sponsorship,
