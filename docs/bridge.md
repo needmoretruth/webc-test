@@ -1,8 +1,19 @@
 # WEBC bridge design
 
+Capability scope and delivery priority come from `WEBC-DEFINITION.md` §10;
+the cross-chain user-experience direction from §15.36. The trust,
+verification, and safety model is owned by the security documents and the
+safety-boundary sections below (out of the definition's scope by design).
+
 ## Required result
 
 WEBC must support bidirectional movement with both Ethereum and Solana.
+
+Delivery priority (§10): native ETH and SOL first (ideally in parallel), then
+their standard sub-tokens (Ethereum ERC-20, Solana Token/Token-2022) and
+cross-chain messaging so applications on different chains can communicate —
+not only move assets — then additional chains (such as Bitcoin and Tron)
+later.
 
 ### Native WEBC going outward
 
@@ -38,6 +49,20 @@ Every message includes version, source and destination network, source transacti
 ## Token coverage
 
 The bridge architecture should be generic enough for normal Ethereum ERC-20 and Solana token-program assets. This does not mean every token is automatically safe. Non-standard, upgradeable, transfer-tax, rebasing, frozen, malicious, or unusual assets require adapters, limits, or rejection.
+
+## User experience direction — planned (§15.36, details open)
+
+The product bar for cross-chain movement, delegated design work within the
+recorded direction:
+
+- **One action:** "Send to Ethereum/Solana" as a single step, with an upfront
+  quote of the total cost and expected time before the user commits.
+- **One status view:** a single tracker covering both chains' finality states,
+  so the user never watches two explorers.
+- **A guaranteed refund path on failure:** a transfer that cannot complete
+  returns the funds; no silent stuck states.
+- Wallets display represented assets with their exact origin so two same-name
+  assets are never conflated (§10).
 
 ## Development stages
 

@@ -4,16 +4,27 @@ This file intentionally contains no separate conversation summary. Separate summ
 
 Use these sources in order:
 
-1. `AGENTS.md` for repository rules and immediate scope;
-2. `docs/decision-record.md` for confirmed user decisions;
-3. `docs/development-plan.md` for exact phase order and acceptance gates;
-4. `docs/whitepaper.md` for the full design;
-5. `docs/implementation-status.md` for what the current code really does;
-6. `docs/index.md` and the topic document for architecture, economics, bridges,
+1. `WEBC-DEFINITION.md` (repository root) for every product, economic,
+   experience, and functional design decision — read §16 first; §15 wins over
+   older sections; the file is read-only;
+2. `AGENTS.md` for repository rules and immediate scope;
+3. `docs/decision-record.md` for security-adjacent decisions and
+   implementation gates (it defers to the definition for product decisions);
+4. `docs/development-plan.md` for exact phase order and acceptance gates;
+5. `docs/whitepaper.md` for the full design;
+6. `docs/implementation-status.md` for what the current code really does;
+7. `docs/index.md` and the topic document for architecture, economics, bridges,
    or security;
-7. `docs/continuation-guide.md` for the verified checkpoint and exact next task.
+8. `docs/continuation-guide.md` for the verified checkpoint and exact next task.
 
-The current code is a reusable prototype, not the confirmed protocol. In particular, do not revive 9 decimals, six-month halving, zero-collateral validators, PoH, global fee contention, or a trusted-relayer production bridge.
+The current code is a reusable prototype, not the confirmed protocol. In
+particular, do not revive 9 decimals, six-month halving, zero-collateral
+validators, PoH, global fee contention, or a trusted-relayer production
+bridge. Also do not revive superseded documentation claims: the 30/70
+distribution split (superseded by the 25/5/30/15/15/10 allocation,
+definition §15.38) or 6–8s finality as the *only* speed framing (the decided
+engineering targets are two-track — definition §15.42 — while 2s/6–8s remains
+the conservative public claim until benchmarks).
 
 When talking to the user, avoid unexplained technical language. When implementing, distinguish clearly among:
 

@@ -11,7 +11,13 @@ existing one, or restarting after a context compaction. If the user says only
 
 ### On every session start (new, resumed, or post-compaction), do this in order
 1. Read this `AGENTS.md` fully.
-2. Read `docs/decision-record.md` — confirmed user decisions; it wins over any code, comment, or summary that disagrees.
+2. Read `WEBC-DEFINITION.md` §16 (repository root) — the single source of truth
+   for product, economic, experience, and functional design; §15 entries win
+   over its older sections; the file is **read-only** (report contradictions to
+   the owner, never edit it). Then read `docs/decision-record.md` — the
+   security-adjacent decisions and implementation gates the definition
+   deliberately does not cover; together they win over any code, comment, or
+   summary that disagrees.
 3. Read `docs/continuation-guide.md` — the verified checkpoint and the **exact next task**. This is the live "what to do next" pointer.
 4. Read `docs/implementation-status.md` — what the code actually implements today (vs. what is still missing or unsafe).
 5. Read `docs/review/` — the durable review artifacts a session must not re-derive:
@@ -49,18 +55,24 @@ In all three: **the repository, not chat memory, is the durable handoff.** Every
 Before changing protocol code, read:
 
 1. `AGENTS.md`
-2. `docs/decision-record.md`
-3. `docs/development-plan.md`
-4. `docs/whitepaper.md`
-5. `docs/implementation-status.md`
-6. `docs/index.md`
-7. the specific supporting document for the task:
+2. `WEBC-DEFINITION.md` (§16 first — product/economic/functional source of truth, read-only)
+3. `docs/decision-record.md` (security-adjacent decisions and gates)
+4. `docs/development-plan.md`
+5. `docs/whitepaper.md`
+6. `docs/implementation-status.md`
+7. `docs/index.md`
+8. the specific supporting document for the task:
    - `docs/architecture.md`
    - `docs/tokenomics.md`
    - `docs/bridge.md`
    - `docs/security.md`
+   - the system plans (`docs/distribution-program.md`, `docs/dex-batch-settlement.md`,
+     `docs/oracle-economics.md`, `docs/weft-language-plan.md`, `docs/speed-roadmap.md`,
+     `docs/validator-operations.md`, `docs/agent-commerce.md`)
 
-`docs/decision-record.md` is authoritative when older documentation or the current prototype conflicts with confirmed product decisions.
+`WEBC-DEFINITION.md` is authoritative for product/economic/experience/functional
+design; `docs/decision-record.md` is authoritative for security-adjacent
+decisions, when older documentation or the current prototype conflicts.
 
 ## Project identity
 
@@ -74,37 +86,51 @@ Before changing protocol code, read:
 
 ## Confirmed protocol/product decisions
 
-- Genesis supply: `10,000,000 WEBC`
-- Native precision: 12 decimals
-- Initial inflation: 10% annually
-- Inflation-rate decay: multiply the rate by 0.8 each year
-- Long-term inflation floor: 1%
-- Genesis distribution intent:
-  - 30% public devnet/testnet contributors after a formally announced start;
-  - 70% broad global public distribution;
-  - no fixed developer/founder/foundation/investor/private-sale allocation.
-- Consensus: permissionless delegated Proof of Stake with BFT-style finality
-- PoH: not part of the WEBC protocol
-- Block target: 2 seconds
-- Normal finality target: 6-8 seconds
-- Validator pool activation minimum: 100 WEBC total active stake
-- Validator operator minimum at activation: 20 WEBC
-- Validator operator self-stake: at least 20% of pool stake
-- Delegated stake: at most 80% of pool stake
-- Minimum individual delegation: 1 WEBC
-- Validator stake is required on devnet and mainnet; devnet uses a valueless faucet
-- Unstaking target: about 7 minutes devnet, about 7 days mainnet
-- Base fees: 50% burned, 50% validator/delegator rewards
-- Dynamic localized congestion pricing and sponsored fees
-- Parallel execution is a core requirement
-- Hybrid state: account-style fungible balances plus object-style application/NFT state
-- Every transaction declares enforced read/write state access
-- Website/application namespaces must avoid unrelated cross-site state and fee contention
+The complete decided set lives in `WEBC-DEFINITION.md` (§16 summary; §15
+detail). Key facts for quick orientation — the definition wins if this list
+ever drifts:
+
+- Genesis supply: `10,000,000 WEBC`; native precision: 12 decimals; amounts
+  u128 with 256-bit multiply intermediates and variable-length encoding
+  (§15.14)
+- Inflation: 10% initial, ×0.8 each year, 1% floor (§7)
+- Genesis distribution (decided, §15.33/15.38): 25% contributors / 5%
+  validator-bootstrap ceiling / 30% usage subsidies / 15% airdrop in three
+  waves / 15% ecosystem fund as non-transferable fee credits / 10% strategic
+  reserve; no founder/investor/private-sale allocation; the founder is paid
+  under the same published contribution rules, disclosed (§15.16)
+- Consensus: permissionless stake-based BFT with a rotating stake-weighted
+  committee; PoH not used; votes are permissioned aggregated messages with
+  **no per-vote fees** (§8, §15.23, §15.28)
+- Speed (§15.42): conservative public claim ~2s blocks / 6–8s finality until
+  benchmarks; decided engineering targets: fast path ~0.4–0.8s for
+  single-owner operations (launch scope), consensus ~1s blocks / ~1–2s
+  finality (≤4s degraded), Mysticeti-class DAG-BFT reference
+- Validator pool activation: 100 WEBC total / operator ≥20 WEBC and ≥20% of
+  pool / delegation ≤80% / minimum delegation 1 WEBC; unstaking ~7 min
+  devnet, ~7 days mainnet; devnet uses a valueless faucet (§7)
+- Base fees: 50% burned, 50% rewards; dynamic localized pricing; capped
+  sponsorship (launch values are measurement placeholders — §15.35); storage
+  is deposit + deletion rebate with hot/cold tiering (§15.22)
+- Parallel execution is a core requirement; hybrid account/object state
+  (§8, §15.30); enforced declared read/write access; per-app namespaces
+- Native DEX: canonical shared pools, disclosed frontend fees, **mandatory
+  per-block uniform-price batch settlement** with chain-native retry; MEV is
+  not monetized (§15.13, §15.18, §15.37)
+- Native oracle: consumers pay, accuracy-weighted bonded reporters,
+  pull-based once-per-block updates, free display-only reads (§15.17, §15.21)
+- Agent commerce: revocable mandate objects (no re-delegation, instant
+  revocation), on-chain service registry, HTTP-402-style flows (§15.5, §15.32)
+- Authoring: deterministic WASM + Rust first; **Weft** (working name) is the
+  decided high-level language — TS-familiar surface, Rust semantics, linear
+  assets, never-break editions (§15.41, §15.43, §15.44)
 - Browser wallet secrets stay isolated from host-site JavaScript
-- ZK/light-client direction is inspired by Mina
-- Post-quantum-ready versioned wallet/account authorization is required from genesis
+- ZK: succinct light-client verification yes; never on the consensus critical
+  path; state compression phase-2 optional (§15.25)
+- Post-quantum-ready versioned wallet/account authorization from genesis
 - Bidirectional Ethereum/Solana bridges and wrapped WEBC are required
-- Real bridge funds remain disabled until separately designed, audited, limited, monitored, and approved
+- Real bridge funds remain disabled until separately designed, audited,
+  limited, monitored, and approved
 
 ## Things agents must not assume are already implemented
 
@@ -499,16 +525,25 @@ bridges before their own phase gates.
 
 Do not ask prematurely. Ask only when the relevant phase is ready to freeze:
 
-- final public distribution/anti-duplicate-account specification;
 - production bridge trust/proof model for real funds;
-- any change to confirmed genesis distribution or monetary policy;
+- any change to the decided genesis distribution (definition §15.38) or
+  monetary policy;
 - any mainnet governance emergency-power design;
 - **slashing severity percentages and the downtime-penalty schedule** — economic
   policy of the same class as inflation; bring numbers with a threat model at the
   Phase 5 economics freeze, not before;
-- **contract-language sequencing** and whether an interim "WASM + Rust-eDSL/SDK"
-  path ships before the bespoke WEBC language (see the plan review; the decision to
-  build the language is confirmed, only its timing is open).
+- the **§15.2 bootstrap-phase issuance** proposal (issuance keyed to staked
+  amount during bootstrap) — decide at the Phase 5 economics freeze;
+- any **hardware-floor trade-off** the §15.42 speed targets turn out to
+  require (the definition forbids buying speed by silently raising the floor);
+- renaming **Weft** before public branding (trademark/domain search first —
+  §15.43).
+
+Already decided — do not re-ask: the distribution allocation and channel
+rules (§15.33/15.38), the contract-language sequencing (interim Rust-eDSL
+first, Weft later over the same seam — Phase 7a/7b), the Weft design
+commitments (§15.41/15.43/15.44), batch-settlement semantics (§15.37), and
+the MEV revenue policy (§15.37).
 
 See `docs/review/2026-07-16-plan-review.md` §5 for the framing of the open owner
 decisions. Technical gates such as epoch duration, committee size, fee constants,

@@ -1,5 +1,11 @@
 # WEBC security model
 
+Scope note: `WEBC-DEFINITION.md` (the product/economic/functional source of
+truth) deliberately excludes security, cryptography, and robustness — those
+are owned by this document, the ADRs, and the review artifacts. Product-level
+claims (speed targets, distribution, fees) live in the definition and the
+documents that cite it; nothing here weakens or overrides a security rule.
+
 ## Current posture
 
 WEBC is a research prototype and must not hold real funds. Security claims require code review, automated tests, public adversarial testing, independent audits, and operational drills.

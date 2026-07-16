@@ -1,54 +1,62 @@
-# WEBC definition
+# WEBC definition (summary)
 
-## One-sentence definition
+The full, authoritative definition is [`WEBC-DEFINITION.md`](../WEBC-DEFINITION.md)
+at the repository root — the single source of truth for product, economic,
+experience, and functional design, completed with the owner on 2026-07-16.
+Read its §16 handoff summary first; §15 overrides earlier sections where they
+differ. This page is a one-screen orientation only and must not be edited into
+a competing source.
 
-WEBC is an independent Layer-1 blockchain that lets websites and browser users make payments, create applications, issue assets, and verify the chain without handing wallet secrets to a website.
+## One-paragraph essence (§1)
 
-## Identity
+WEBC is an independent Layer-1 blockchain built for the web and the AI era.
+It lets any website, web app, web game, or software agent send and receive
+money, issue assets, and run applications as naturally as they load a page —
+fast, cheap, final, and without handing accounts to the site. Humans, humans
+working with AI, and fully autonomous AI agents are all first-class
+participants, in both using and building on the chain. Native coin: **WEB
+COIN (WEBC)**.
 
-- Project: `WEBC`
-- Coin: `WEB COIN`
-- Ticker: `WEBC`
-- Native network: the WEBC Layer 1
-- Genesis supply: `10,000,000 WEBC`
-- Precision: 12 decimal places
-- Core implementation language: Rust
-- Browser SDK language: TypeScript
+## Identity (§2)
 
-WEBC is not merely an Ethereum or Solana token. Native WEBC lives on its own network. Bridges will also let users create wrapped WEBC on Ethereum and Solana and return it to native WEBC.
+- Independent custom Layer 1 (not a token on another chain); node software in
+  Rust; TypeScript browser SDK; global, general-purpose audience.
+- 10,000,000 WEBC genesis, 12 decimals, u128 amounts (§7, §15.14).
+- Hybrid state: account-style balances + object-style app state (§8, §15.30).
+- Contracts: deterministic WASM, Rust first, then **Weft** — the decided
+  AI-first authoring language lowering to the same audited framework (§9,
+  §15.41).
 
-## Product goal
+## What makes it distinctive
 
-A website should be able to add WEBC features through a small SDK or widget while users keep control of their keys. The network should support:
+- **AI-native thesis (§6):** machine-readable everything, a component
+  catalog, agent mandates + service registry + HTTP-402 flows (§15.5,
+  §15.32).
+- **Batch-settled native DEX (§15.13, §15.37):** canonical shared pools,
+  disclosed frontend fees, mandatory per-block uniform-price settlement — no
+  sandwich MEV, and MEV is not monetized.
+- **Two-track speed (§15.40, §15.42):** fast path ~0.4–0.8s for single-owner
+  operations (launch scope); consensus ~1s blocks / ~1–2s finality — both
+  engineering targets claimed only after public benchmarks; ~2s / 6–8s stays
+  the conservative public claim meanwhile.
+- **Decided fair-launch distribution (§15.38):** 25% contributors / 5%
+  validator bootstrap / 30% usage subsidies / 15% airdrop (three waves) /
+  15% ecosystem fee credits / 10% strategic reserve; founder paid under the
+  same published rules, disclosed (§15.16).
+- **Oracle with real economics (§15.17):** consumers pay, accuracy-weighted
+  bonded reporters, pull-based updates, free display-only reads.
+- **Frugal validators (§15.23, §15.26):** low stake floor + mid-range
+  hardware, no per-vote fees, official tuned container image.
 
-- browser wallets and website payments;
-- native WEBC, user-created fungible tokens, and NFTs;
-- staking, delegation, and public verification nodes;
-- simple exchange, games (including web games), voting, and website-connected applications;
-- parallel execution so unrelated applications do not block one another;
-- smart contracts that humans, AI-assisted developers, and AI agents can all build easily and safely;
-- a native staked oracle so contracts can use external data without trusting one reporter;
-- short proofs so browsers can verify important chain facts;
-- bidirectional Ethereum and Solana bridges.
+## Scope note
 
-## Technical identity
-
-WEBC combines three design directions:
-
-- Solana-inspired declared state access, parallel scheduling, and localized fees;
-- Sui-inspired objects for NFTs and application-owned state;
-- Mina-inspired compact proofs for lightweight browser verification.
-
-Ordinary money and token balances use a simple account model. NFTs, games, and application state can use owned or shared objects. PoH is not part of the protocol.
-
-Smart contracts run on a restricted, deterministic Rust->WASM foundation. Above it, WEBC provides its own easy high-level authoring language that lowers to an audited Rust framework, so contracts stay as safe as Rust while being simple enough for humans and AI to assemble from documented, audited components. WEBC does not build a second virtual machine or its own compiler backend.
-
-## Website actions
-
-On-chain code cannot directly click buttons, download files, call arbitrary websites, or read a device. Instead it emits a signed on-chain event. A browser or server agent performs the external action and can submit a signed receipt. File data normally stays off-chain; its hash and permission rules can be recorded on-chain.
+Security, cryptography, and robustness are first-class but deliberately live
+in separate documents (`security.md`, ADRs) — the definition covers product,
+economy, experience, and functional design only.
 
 ## Current status
 
-This repository is a research prototype. It is not ready for real money, production validators, or production bridges. See `docs/implementation-status.md` for the exact gap between the current code and the confirmed design.
-
-The authoritative decisions are in `docs/decision-record.md`.
+This repository is a research prototype. It is not ready for real money,
+production validators, or production bridges. See
+`docs/implementation-status.md` for what the code actually does and
+`docs/code-reconciliation-worklist.md` for the code-vs-definition gap.
