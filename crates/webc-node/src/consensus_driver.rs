@@ -48,17 +48,19 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use webc_chain::{
-    apply_block, Block, ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage,
-    FinalityCertificate, SignedProposal, SlashingEvidence, TimeoutKind, ValidatorIdentity,
-    ValidatorSet, MAX_BLOCK_SLASHING_EVIDENCE,
+    apply_block, Block, ChainError, ConsensusAction, ConsensusEvent, ConsensusMachine,
+    ConsensusMessage, FinalityCertificate, SignedProposal, SlashingEvidence, TimeoutKind,
+    ValidatorIdentity, ValidatorSet, MAX_BLOCK_SLASHING_EVIDENCE,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_net::{InboundMessage, NetMessage, NetworkHandle};
-use webc_storage::KvStore;
+use webc_storage::{KvStore, StorageError};
+
+use crate::node::NodeError;
 
 use crate::http::now_ms;
 use crate::mempool::{Mempool, MempoolConfig};
-use crate::node::{Node, NodeError};
+use crate::node::Node;
 
 /// How long the driver waits in each step before firing the matching timeout.
 #[derive(Clone, Copy, Debug)]
@@ -101,6 +103,50 @@ pub struct CommitInfo {
     pub tip: Option<Hash256>,
     /// Number of transactions in the committed block.
     pub tx_count: usize,
+}
+
+/// Why [`ConsensusDriver::run`] stopped (C2: the driver never exits silently).
+///
+/// The caller — node runtime, supervisor, or test — receives this reason and
+/// must log or alarm on it. `CertifiedBlockInvalid` in particular is
+/// cryptographic proof that more than two-thirds of stake certified a state
+/// transition this node rejects (or that local state has diverged): an
+/// emergency to investigate, never a condition to auto-restart past.
+#[derive(Debug, thiserror::Error)]
+pub enum DriverExit {
+    /// The inbound network channel closed — the normal shutdown path.
+    #[error("inbound network channel closed; consensus driver stopped")]
+    NetworkClosed,
+    /// The per-height validator snapshot could not be built from local state.
+    #[error("validator snapshot failed at height {height}: {error}")]
+    SnapshotFailed {
+        /// The height whose snapshot failed.
+        height: u64,
+        /// The underlying chain error.
+        error: ChainError,
+    },
+    /// A block carrying a valid finality certificate failed local
+    /// re-execution — a post-finality consensus emergency, not a shutdown.
+    #[error(
+        "consensus emergency at height {height}: a block with a valid finality \
+         certificate failed local import: {error}"
+    )]
+    CertifiedBlockInvalid {
+        /// The certified height that could not be imported.
+        height: u64,
+        /// The chain-level rejection.
+        error: NodeError,
+    },
+    /// Durable storage kept failing while committing a finalized block, even
+    /// after transient-failure retries. The node cannot safely continue
+    /// without durable commits.
+    #[error("storage failed while committing finalized height {height}: {error}")]
+    StorageFailed {
+        /// The height whose commit failed.
+        height: u64,
+        /// The final storage error after retries.
+        error: NodeError,
+    },
 }
 
 /// A single consensus node: a [`Node`] driven by a [`ConsensusMachine`] over a
@@ -158,17 +204,23 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         }
     }
 
-    /// Runs the consensus loop until the inbound network channel closes.
+    /// Runs the consensus loop until the inbound network channel closes or an
+    /// unrecoverable failure occurs, returning **why** it stopped.
     ///
     /// `inbound` delivers gossiped messages (the driver admits transactions into
     /// its mempool and feeds consensus messages to the machine). `commit_tx`, if
     /// present, receives a [`CommitInfo`] on every committed height, letting a
     /// supervisor or test observe progress.
+    ///
+    /// The returned [`DriverExit`] is the C2 surfacing contract: a failed
+    /// finalized-block import is retried (transient storage) or classified as a
+    /// consensus emergency (certified-but-invalid block) — never a silent
+    /// return. Callers must consume and log the reason.
     pub async fn run(
         mut self,
         mut inbound: mpsc::Receiver<InboundMessage>,
         commit_tx: Option<mpsc::Sender<CommitInfo>>,
-    ) {
+    ) -> DriverExit {
         let (timeout_tx, mut timeout_rx) = mpsc::channel::<(TimeoutKind, u32, u64)>(256);
 
         loop {
@@ -176,7 +228,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             self.checked_proposal_rounds.clear();
             let snapshot = match ValidatorSet::from_state(self.node.state()) {
                 Ok(snapshot) => snapshot,
-                Err(_) => return,
+                Err(error) => return DriverExit::SnapshotFailed { height, error },
             };
             let identity = self.identity_for(&snapshot);
             let is_validator = identity.is_some();
@@ -220,20 +272,22 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             let mut work: VecDeque<ConsensusAction> = initial.into();
             self.pump(&mut machine, &mut work, height, &timeout_tx, &mut decided)
                 .await;
-            if self
+            if let Err(exit) = self
                 .commit_if_decided(height, &mut decided, &commit_tx)
                 .await
             {
-                return;
+                return exit;
             }
 
             while self.node.height() < height {
                 tokio::select! {
                     inbound_message = inbound.recv() => {
                         match inbound_message {
-                            None => return, // network shut down
+                            None => return DriverExit::NetworkClosed,
                             Some(message) => {
-                                self.on_inbound(message, &mut machine, height, &timeout_tx, &mut decided, &mut requested, &commit_tx).await;
+                                if let Err(exit) = self.on_inbound(message, &mut machine, height, &timeout_tx, &mut decided, &mut requested, &commit_tx).await {
+                                    return exit;
+                                }
                             }
                         }
                     }
@@ -250,11 +304,11 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                         }
                     }
                 }
-                if self
+                if let Err(exit) = self
                     .commit_if_decided(height, &mut decided, &commit_tx)
                     .await
                 {
-                    return;
+                    return exit;
                 }
             }
         }
@@ -262,33 +316,61 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
 
     /// Commits a live-finalized block for `height` if the machine decided one and
     /// the node has not already reached that height (e.g. via a synced import).
-    /// Returns `true` on a fatal storage error, signaling the caller to stop.
+    /// An unrecoverable import failure returns the driver-stopping exit reason;
+    /// it is never swallowed (C2).
     async fn commit_if_decided(
         &mut self,
         height: u64,
         decided: &mut Option<Decided>,
         commit_tx: &Option<mpsc::Sender<CommitInfo>>,
-    ) -> bool {
+    ) -> Result<(), DriverExit> {
         let Some((block, certificate)) = decided.take() else {
-            return false;
+            return Ok(());
         };
         // A concurrent sync may have already imported this height.
         if self.node.height() + 1 != block.header.height {
-            return false;
+            return Ok(());
         }
         let tx_count = block.transactions.len();
-        if self
-            .node
-            .import_finalized_block(block, &certificate)
-            .is_err()
-        {
-            return true;
-        }
+        self.import_certified(block, &certificate).await?;
         self.mempool.remove_obsolete(self.node.state());
         self.mempool.prune_expired(now_ms());
         self.prune_pending_evidence();
         self.report_commit(height, tx_count, commit_tx).await;
-        false
+        Ok(())
+    }
+
+    /// Imports a finalized block, retrying transient storage I/O failures with
+    /// a short exponential backoff, and classifying unrecoverable failures
+    /// (C2): a chain-level rejection of a certified block is a consensus
+    /// emergency; a persistent storage failure is an operational fault the
+    /// node cannot safely continue past. Neither is silent.
+    async fn import_certified(
+        &mut self,
+        block: Block,
+        certificate: &FinalityCertificate,
+    ) -> Result<(), DriverExit> {
+        /// Transient I/O retries after the first attempt.
+        const IMPORT_RETRIES: u32 = 3;
+        let height = block.header.height;
+        let mut backoff = Duration::from_millis(50);
+        let mut attempt = 0u32;
+        loop {
+            match self.node.import_finalized_block(block.clone(), certificate) {
+                Ok(()) => return Ok(()),
+                // Only plain I/O faults are plausibly transient; corruption,
+                // inconsistency, and schema failures are not retried.
+                Err(NodeError::Storage(StorageError::Io(_))) if attempt < IMPORT_RETRIES => {
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Err(error @ (NodeError::Chain(_) | NodeError::ChainIdMismatch)) => {
+                    return Err(DriverExit::CertifiedBlockInvalid { height, error });
+                }
+                Err(error) => return Err(DriverExit::StorageFailed { height, error }),
+            }
+        }
     }
 
     /// Sends a [`CommitInfo`] to the observer, if one is attached.
@@ -310,29 +392,42 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
     }
 
     /// Verifies and imports one certified block received during sync. Returns
-    /// whether the node's height advanced.
+    /// whether the node's height advanced; a shape/verification mismatch is
+    /// hostile-or-stale peer input and is ignored, but a block whose
+    /// certificate *verifies* and still fails import is a consensus emergency
+    /// surfaced as a [`DriverExit`] (C2), never swallowed.
     async fn apply_synced_block(
         &mut self,
         response: webc_net::CertifiedBlock,
         commit_tx: &Option<mpsc::Sender<CommitInfo>>,
-    ) -> bool {
+    ) -> Result<bool, DriverExit> {
         let webc_net::CertifiedBlock { block, certificate } = response;
         // Only the exact next block advances the chain.
         if block.header.height != self.node.height() + 1 {
-            return false;
+            return Ok(false);
+        }
+        // Pin the block to this node's exact chain position before anything
+        // expensive: a response for another fork, epoch, or chain is dropped
+        // as hostile/stale input rather than escalated.
+        let expected_parent = self.node.tip_hash().unwrap_or(Hash256([0u8; 32]));
+        if block.header.previous_hash != expected_parent
+            || block.header.epoch != self.node.state().current_epoch
+            || block.header.chain_id != self.node.config().chain_id
+        {
+            return Ok(false);
         }
         // The certificate must be for this exact block.
         let Ok(block_hash) = block.hash() else {
-            return false;
+            return Ok(false);
         };
         if certificate.height != block.header.height || certificate.block_hash != block_hash {
-            return false;
+            return Ok(false);
         }
         // Verify the certificate proves finality against the current validator
         // snapshot (stable within an epoch), then import (which re-executes and
         // enforces linkage). Both must pass.
         let Ok(snapshot) = ValidatorSet::from_state(self.node.state()) else {
-            return false;
+            return Ok(false);
         };
         if certificate
             .verify(
@@ -342,21 +437,15 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             )
             .is_err()
         {
-            return false;
+            return Ok(false);
         }
         let tx_count = block.transactions.len();
         let height = block.header.height;
-        if self
-            .node
-            .import_finalized_block(block, &certificate)
-            .is_err()
-        {
-            return false;
-        }
+        self.import_certified(block, &certificate).await?;
         self.mempool.remove_obsolete(self.node.state());
         self.prune_pending_evidence();
         self.report_commit(height, tx_count, commit_tx).await;
-        true
+        Ok(true)
     }
 
     /// Serves finalized certified blocks for a peer's state-sync request.
@@ -410,7 +499,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         decided: &mut Option<Decided>,
         requested: &mut bool,
         commit_tx: &Option<mpsc::Sender<CommitInfo>>,
-    ) {
+    ) -> Result<(), DriverExit> {
         let event = match message.message {
             // Admit gossiped transactions so this node can include them when it
             // proposes. Admission failures (unknown sender, bad nonce, duplicate)
@@ -419,7 +508,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 let _ = self
                     .mempool
                     .insert(*tx, self.node.state(), self.node.config(), now_ms());
-                return;
+                return Ok(());
             }
             NetMessage::Proposal(proposal) => {
                 self.request_if_behind(proposal.payload.height, height, requested);
@@ -429,7 +518,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 // timeout, so a Byzantine leader can no longer collect a
                 // finality certificate for an unimportable block.
                 if !self.validate_proposal(&proposal, height) {
-                    return;
+                    return Ok(());
                 }
                 ConsensusEvent::Message(ConsensusMessage::Proposal(proposal))
             }
@@ -439,17 +528,19 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             }
             NetMessage::Certificate(certificate) => {
                 self.request_if_behind(certificate.height, height, requested);
-                return;
+                return Ok(());
             }
             // Serve peers that are catching up, even while running consensus.
             NetMessage::BlockRequest { from_height, max } => {
                 self.serve_block_request(from_height, max);
-                return;
+                return Ok(());
             }
             // Import a finalized block from a peer to advance during catch-up.
+            // An import emergency propagates (C2); a mismatched response is
+            // ignored inside.
             NetMessage::BlockResponse(response) => {
-                self.apply_synced_block(*response, commit_tx).await;
-                return;
+                self.apply_synced_block(*response, commit_tx).await?;
+                return Ok(());
             }
         };
         // A hostile or malformed message returns an error; drop it and continue.
@@ -457,6 +548,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         let mut work: VecDeque<ConsensusAction> = actions.into();
         self.pump(machine, &mut work, height, timeout_tx, decided)
             .await;
+        Ok(())
     }
 
     /// If a peer references a height beyond the one this node is working on,

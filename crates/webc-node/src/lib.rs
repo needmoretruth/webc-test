@@ -22,7 +22,7 @@ pub mod mempool;
 pub mod node;
 pub mod service;
 
-pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverTimeouts};
+pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverExit, DriverTimeouts};
 pub use gossip::run_gossip_pump;
 pub use http::{router, serve, AppState, BlockEvent};
 pub use mempool::{InsertOutcome, Mempool, MempoolConfig, MempoolError};
