@@ -706,6 +706,89 @@ trade-off.**
   if sustained benchmarks show comfortable headroom. Status: **decided direction**
   (batch mechanics and limit-order semantics still to be designed).
 
+### 2026-07-16 — Round 4: bandwidth/RAM frugality, airdrop weighting, oracle scaling, storage pricing, validator economics
+
+**15.19 Amount shape confirmed; bandwidth and memory become first-class budgets.**
+Owner confirms 15.14 (u128 + 256-bit multiply intermediates + variable-length
+encoding) — now **decided**. Owner adds: total capacity load must stay low,
+expecting **communication to be the bottleneck** (and RAM size/speed next).
+Adopted frugality principles:
+- **Compression everywhere:** zstd on gossip/wire messages and at the storage
+  layer (standard, cheap, effective on state and blocks).
+- **Never send the same bytes twice:** blocks reference transactions by hash and
+  peers fetch only bodies they lack (compact-block relay), since mempools already
+  hold most transactions.
+- **Aggregate consensus votes:** committee votes travel as aggregated signatures,
+  not per-validator messages, collapsing consensus bandwidth.
+- **RAM:** the protocol must run with state on SSD plus a modest RAM cache —
+  never require the full state in memory. OS-level tricks like zram are a
+  documented *operator option* in node guides, not a protocol dependency.
+- Rationale doubled: bandwidth is also the classic cloud **egress billing bomb**,
+  so frugality protects operators' wallets, not just throughput (see 15.23).
+Status: **decided direction.**
+
+**15.20 Airdrop fame-weighting — recommended against.**
+Owner asked whether publicly known ("named") wallets should receive more.
+Reviewer recommendation: **no fame multiplier.** Reasons: (a) identification is
+unreliable and gameable — wallet labels and name services are self-assigned or
+maintained off-chain, and ownership by a celebrity cannot be verified without
+their cooperation; (b) it rewards the already-rich/famous, the opposite of broad
+distribution, and reads publicly as paying celebrities for association; (c) in
+practice famous holders rarely claim small airdrops. The legitimate version of
+the instinct: **widen breadth instead of deepening for the famous** (more
+eligible wallets, capped amounts each — every claimant is a potential user), and
+if outreach to visible builders/creators is wanted, fund it as explicit
+partnerships from the ecosystem fund (15.12), not as airdrop weighting.
+Status: **recommended; owner to confirm.**
+
+**15.21 Oracle scaling for web-volume reads — one update serves everyone.**
+Owner requirement: fast and cheap under heavy real-time web use; one oracle
+should serve many users of a site. Design: a feed updates **at most once per
+block**, and that single on-chain value is shared by every consumer in that
+block — cost is amortized across all of them (first-needing transaction or the
+app's subscription carries it). Crucially, **display-only reads are free**: a
+website showing live prices to thousands of visitors reads chain state via light
+-client proofs without any transaction; fees apply only when a *transaction*
+consumes the value on-chain (settlement). So per-user cost approaches zero as
+usage grows. Status: **decided direction.**
+
+**15.22 Storage pricing — Sui-style deposit-and-rebate, not Solana-style rent.**
+Owner requirement: storage must be cheap like Sui, not expensive like Solana
+(whose rent-exempt pricing is on the order of several SOL per MB). Adopted:
+- **Storage deposit + deletion rebate:** writing state locks a deposit
+  proportional to bytes; deleting the data refunds most of it. Storage is priced
+  as *occupancy*, not a one-way purchase — this keeps prices low and pays users
+  to clean up.
+- **Hot/cold tiers:** only execution-relevant state stays in the hot tier;
+  history and long-untouched objects move to archive nodes with proofs and can be
+  restored on demand. Bulky content (files, media) already lives off-chain by
+  design (§9) with only hashes on-chain.
+- A dedicated storage chain is **not** needed at this stage; tiering plus
+  off-chain blobs covers the capacity concern with far less complexity.
+Status: **decided direction.**
+
+**15.23 Validator economics — the deliberate middle path; no per-vote fees.**
+Owner's framing, adopted: Ethereum is a paradox (staking ~32 ETH is very
+expensive, hardware trivially cheap); Solana inverted it (negligible stake floor,
+heavy hardware and ~1 SOL/day of vote fees). WEBC takes the middle: **low stake
+barrier (100 WEBC pool / 20 WEBC operator stands) + mid-range hardware target**
+(a decent multi-core server with NVMe and ~1 Gbps — an ordinary cloud instance,
+not a data-center monster, and explicitly *not* a browser device; §12's
+lightweight-device promise applies to users verifying, not validators producing).
+- **Why Solana charges ~1 SOL/day:** its validators vote by submitting ordinary
+  fee-paying transactions every slot (~5000 lamports × ~200k slots/day ≈ 1.1
+  SOL/day). That compensates leaders for processing votes and throttles vote
+  spam, but it imposes a fixed ~400 SOL/year operating tax that prices out small
+  validators. **WEBC does not adopt this:** in a rotating-committee BFT design,
+  votes are aggregated consensus messages, not transactions — participating in
+  consensus costs nothing; only *misbehavior* costs (stake). 
+- **Cloud guidance:** node docs will ship sizing guides and recommend
+  flat-bandwidth providers, with client-side bandwidth budgets/rate limits so an
+  operator on metered egress cannot be surprise-billed (protocol frugality from
+  15.19 is the main defense). Provider/geography diversity remains a selection
+  criterion in the bootstrap program (15.10).
+Status: **decided direction.**
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
