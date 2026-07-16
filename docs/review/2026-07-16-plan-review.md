@@ -249,6 +249,23 @@ chat for the plain-language version with options and a recommendation.
   Phase 5 economics freeze, alongside the already-deferred distribution, bridge-
   trust, and governance-emergency decisions.
 
+### Process observation (not a question — a governance finding)
+
+The single most consequential code change of the last work session — commit
+`a6197ac`, which made the equivocation→slash loop LIVE (80% slash + tombstone) —
+landed together with a test commit (`75d054b`) **without updating any status doc**.
+`continuation-guide.md`, `implementation-status.md`, and `development-plan.md` all
+still said "equivocation is not wired," the exact opposite of the shipped code. A
+review that trusted the docs would have (a) missed that a fund-destroying path is
+live and (b) told the next session to build something that already exists. The
+`AGENTS.md` "keep the two status docs in sync, one decision one home" rule exists
+precisely to prevent this; it was not followed. The concrete recommendation is the
+Definition-of-Done and CI already point at: no consensus/economic change merges
+without the status-doc update in the same change, and — better — a check that
+fails CI when code touching `crates/webc-*/src/{round,consensus,block_builder,
+state}.rs` lands without a same-PR docs touch. This is a stronger argument for the
+earlier-review gate in Q1.
+
 ---
 
 ## 6. Prioritized worklist for the next sessions

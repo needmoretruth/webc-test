@@ -100,9 +100,39 @@ not deeply audited.
     LIVE, finding **C4 is no longer latent** — an honest validator that crashes and
     restarts mid-height and re-votes produces objectively valid `DoubleVoteEvidence`
     that this path will ACTUALLY slash. C4 (durable vote/lock WAL) must be fixed
-    BEFORE this is run on any network where honest restarts happen. (The a6197ac
-    path itself is being independently verified this session — see the
-    equivocation-path verification note when it lands.)
+    BEFORE this is run on any network where honest restarts happen.
+
+- **EQUIVOCATION-PATH VERIFICATION (2026-07-16, independent trace of a6197ac).**
+  Result: **the evidence path implementation is otherwise CORRECT/SAFE, but running
+  it live before C4 is a HIGH/critical operator-fund risk.**
+  - Otherwise-safe (verified): the header binds `evidence_root` (altering/reordering
+    `block.evidence` changes the block id and invalidates any certificate;
+    `apply_block` recomputes the root over the received order and requires
+    `rebuilt.header == block.header`, so no reject-valid-block-by-ordering vector);
+    `MAX_BLOCK_SLASHING_EVIDENCE = 64` is enforced before any signature check;
+    evidence executes before user txs on a clone with whole-block atomic rollback;
+    `apply_slashing_evidence` verifies snapshot membership + both signatures + is
+    replay-protected by order-independent `evidence.hash()` (no double-slash);
+    `pending_evidence` is populated ONLY from the local machine's verified
+    `Equivocation` (no network injection), so a peer with no private key **cannot
+    forge evidence to frame an honest validator**.
+  - The one critical gap (KEY QUESTION answered YES): the machine is rebuilt fresh
+    per height (`consensus_driver.rs:157`, `round.rs:205-214`) with no reload of
+    cast votes / lock state, so an honest validator that crashes mid-height and
+    re-votes emits objectively valid self-equivocation, indistinguishable from
+    malicious. Peers generate and gossip the evidence independently (the victim
+    cannot suppress it), and `apply_slashing_evidence` applies **`double_sign_bps =
+    8000` (80%) + tombstone**. Ordinary operator restarts therefore destroy stake.
+    **Fix (gating dependency, not optional): a durable vote+lock WAL fsync'd before
+    broadcast and replayed on startup; a validator must never sign a second vote for
+    a `(height, round, step)` it already signed — land this BEFORE the live evidence
+    path is exposed to a network.**
+  - Two minor notes: (i) `apply_slashing_evidence` verifies against the *current*
+    validators map / consensus key, not the vote-height snapshot — a key rotation
+    between offense and processing could let an offender escape or gate processing to
+    while-still-a-member (note, not a double-vote blocker); (ii) `pending_evidence`
+    can accumulate one entry per real offender per round during a liveness stall
+    (LOW — each requires a genuine offense, so not a cheap flood).
 - **C5 — MEDIUM — proof-of-lock (rule 28) not carried with re-proposals
   (liveness).** Good: the receiver verifies `valid_round` against locally-recorded
   2f+1 prevotes, not the proposer's claim. But those prevotes are not attached to
