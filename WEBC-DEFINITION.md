@@ -887,6 +887,91 @@ structurally impossible. Status: **decided.**
   skip compression adaptively for incompressible payloads.
 Status: **decided.**
 
+### 2026-07-16 — Round 7: closing the open items
+
+**15.30 Hybrid vs object-only — challenged and confirmed.**
+Owner asked: if hybrid is better, why doesn't Sui use it? Honest answer: Sui
+chose a single uniform model because its entire stack (Move language semantics,
+ownership-based fast path) is built around one abstraction — a defensible bet
+for a Move-ecosystem chain, and simpler to build. The cost Sui pays lands
+exactly on payments: coins are objects, so users accumulate many coin fragments
+that must be selected and merged (a well-known UX tax that SDKs paper over).
+WEBC's #1 product is web payments, so it pays the opposite cost instead: two
+state kinds mean a more complex engine spec, mitigated by keeping both under one
+state tree as two record types. Object-only is viable (Sui proves it); hybrid is
+*better for a payments-first chain*. Status: **confirmed decided.**
+
+**15.31 Airdrop fame-weighting — owner confirmed: none.** 15.20 is now
+**decided**: history-weighted, breadth over depth, no fame multiplier.
+
+**15.32 Agent mandate — plain meaning and concrete spec (reviewer-designed).**
+Plain meaning: a mandate is a **digital permission slip a person gives their AI**
+— like a prepaid card with rules engraved on it. The spec (an on-chain object):
+- `principal` (the owner account) and `agent_key` (the AI's signing key);
+- `budget_total` and `spent` (u128), `expiry` (epoch);
+- `counterparty_policy`: open, or an allowlist of services/registry categories;
+- `per_tx_max`, `rate_limit` (max spends per day);
+- **no re-delegation** — an agent cannot mint sub-mandates from its mandate;
+- **instant revocation** by the principal at any time;
+- every spend references the mandate ID, giving the principal a complete audit
+  trail; any site can verify a mandate's validity on-chain before serving the
+  agent. Status: **decided** (wire format details to implementation).
+
+**15.33 Concrete distribution proposal (reviewer-designed; owner approval pending).**
+Owner invited a from-scratch allocation. Proposal, with rationale:
+
+| Channel | Share | Release shape |
+|---|---|---|
+| Contributor pool (retroactive awards) | 25% | Paid as earned after public announcement; each award vests linearly over 1–2 years |
+| Validator bootstrap grants | 5% ceiling | Stake-locked, vest by proven operation (15.10); unused reverts to contributor pool |
+| Usage subsidies (fee support for real users/apps) | 30% | ~10 years; annual ceiling starts at ~15% of the channel and decays ~×0.85/yr; unspent rolls forward |
+| Cross-chain airdrop | 15% | **Three waves of 5%** (launch, +12mo, +24mo) so later real users still benefit and farmers cannot harvest it all at once; per-wallet caps; unclaimed after 12 months per wave flows into usage subsidies |
+| Ecosystem fund (fee-credit grants, oracle seeding, partnerships) | 15% | Annual budget cap ≈ 1/5 of the channel; published criteria |
+| Strategic reserve | 10% | Governance-locked for unforeseen needs; may only be assigned to an existing channel by public governance; if untouched for 5 years it drains gradually into usage subsidies |
+
+Design logic: the two **usage-linked channels dominate (45%)** because they are
+the least gameable and directly buy adoption; the airdrop is deliberately modest
+and staged because one-shot airdrops leak to farmers; every channel has a
+reversion path so nothing sits dead. Status: **proposed — owner approval or
+adjustment pending.**
+
+**15.34 Batch settlement — the two owner-level choices (everything else
+delegated to reviewer/implementation).**
+1. **Unfilled orders at block end:** (A) cancel immediately — predictable,
+   "failed, try again"; or (B) keep trying for a short window (default ~10s /
+   ~5 blocks), then cancel — higher success rate, slight wait. Reviewer
+   recommends **B as default with per-order override**.
+2. **Is the batch mandatory, or may users pay for an instant bypass?** Reviewer
+   recommends **mandatory**: an instant path reopens exactly the sandwich attacks
+   the batch eliminates and splits liquidity into two lanes. Status: **owner
+   decision pending on both; remaining mechanics delegated.**
+
+**15.35 Initial fee/sponsorship parameters — launch placeholders, tuned by measurement.**
+Consistent with §7's "numbers come from evidence": ordinary-transfer fees target
+"negligible" via resource pricing with a near-zero floor; sponsorship defaults at
+launch: per-user-per-app ~20 sponsored operations/day, per-app daily budget set
+by the site within hard protocol caps, sponsorship limited to simple operations.
+All four knobs are explicitly **testnet-measured parameters**, not promises.
+Status: **decided as method** (values will move with data).
+
+**15.36 Remaining areas — directions sketched for the next planning model.**
+- **Cross-chain UX (§10):** one action ("Send to Ethereum/Solana") with an
+  upfront total-cost-and-time quote, a single status view tracking both chains'
+  finality, and a guaranteed refund path on failure. Details open.
+- **Flagship applications (adoption):** (1) an in-page payment/tipping widget any
+  site embeds in minutes; (2) an HTML-game starter kit with server-managed item
+  economy; (3) the DEX storefront widget (15.13); (4) an AI-agent API
+  marketplace — services list machine-readable prices, agents discover and pay
+  per call via mandates — the showcase of the AI-native thesis. Details open.
+- **Governance minimal process (§11):** public proposals in the open repo, a
+  fixed comment window, reference implementation + testnet trial before
+  adoption, validators and ecosystem signal acceptance; the founder acts as
+  initial maintainer with a published sunset to an elected committee. Details
+  open.
+- **Authoring language (§9):** remains the largest open design; constraints
+  already recorded (lowers to the audited Rust framework, machine-readable docs,
+  compiled). Status: **directions proposed; details open.**
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
@@ -974,23 +1059,32 @@ honesty rule: label everything you produce as confirmed / planned / experimental
 - zk policy: succinct light-client verification yes; optional state compression
   later; never on the consensus critical path (15.25, 15.29).
 
+### Additional decided items (Round 7)
+
+- Hybrid state model re-challenged and confirmed (15.30).
+- Airdrop: **no fame weighting** — owner-confirmed (15.31).
+- Agent mandate object spec: fields, no re-delegation, instant revocation, audit
+  trail (15.32).
+- Fee/sponsorship launch parameters are measurement-tuned placeholders (15.35).
+
 ### Open (design these; priority order)
 
-1. **Distribution numbers:** channel percentages, per-channel caps, and
-   multi-year release curves for the public pool (constraints in 15.11/15.16).
-2. **Airdrop fame-weighting:** reviewer recommends none (15.20) — owner
-   confirmation pending.
-3. **Agent mandate + service registry detailed spec** (fields, revocation flow,
-   discovery format).
-4. **Batch-settlement mechanics:** limit-order/slippage semantics, multi-hop
-   routing across pools, shared-infrastructure pricing (the 15.13 isolation
-   tension).
-5. **Fee curves and sponsorship budget parameters** (§13).
-6. **The high-level authoring language** surface design and component catalog
-   format (§9, §13).
-7. **Cross-chain UX** (§10, §13) — not yet reviewed in §15.
-8. **Adoption strategy / flagship applications** (§13) — not yet reviewed.
-9. **Governance process details** (§11) — proposal/adoption mechanics undefined.
+1. **Distribution numbers:** a concrete allocation and release schedule is on
+   the table (15.33) — owner approval or adjustment pending; once approved, it
+   is decided.
+2. **Batch settlement:** two owner choices pending (unfilled-order default;
+   mandatory batch vs instant bypass — 15.34); all remaining mechanics
+   (limit/slippage semantics, multi-hop routing, shared-infrastructure pricing)
+   are delegated design work within 15.13/15.18.
+3. **The high-level authoring language** surface design and component catalog
+   format (§9, §13) — largest remaining design area.
+4. **Cross-chain UX** (§10) — direction sketched in 15.36; details open.
+5. **Adoption strategy / flagship applications** — four flagship candidates named
+   in 15.36; details open.
+6. **Governance process details** (§11) — minimal process sketched in 15.36;
+   details open.
+7. **Service registry discovery format** (companion to 15.32) — schema design
+   open.
 
 ---
 
