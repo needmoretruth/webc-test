@@ -21,6 +21,13 @@
 //! lagging or newly-joined node catches up without replaying consensus. It also
 //! serves such requests from its own store.
 //!
+//! Block validity (C1, Tendermint's `valid(v)`): the machine never executes
+//! blocks, so the driver re-executes every received proposal's block against a
+//! scratch clone of current state (after the cheap authenticity checks) and
+//! feeds the machine only proposals it could actually import. A Byzantine
+//! leader therefore cannot collect prevotes — let alone a finality certificate
+//! — for an unimportable block.
+//!
 //! Objective equivocation surfaced by the machine is retained by replay-stable
 //! evidence hash and included in a later candidate block. The block header commits
 //! the evidence root and deterministic execution applies the slash before user
@@ -36,14 +43,14 @@
 //! node no longer knows what it signed, so it fails closed and follows that
 //! height as a non-voting observer.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use webc_chain::{
-    Block, ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage,
-    FinalityCertificate, SlashingEvidence, TimeoutKind, ValidatorIdentity, ValidatorSet,
-    MAX_BLOCK_SLASHING_EVIDENCE,
+    apply_block, Block, ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage,
+    FinalityCertificate, SignedProposal, SlashingEvidence, TimeoutKind, ValidatorIdentity,
+    ValidatorSet, MAX_BLOCK_SLASHING_EVIDENCE,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_net::{InboundMessage, NetMessage, NetworkHandle};
@@ -113,6 +120,12 @@ pub struct ConsensusDriver<K: KvStore> {
     /// Verified double-vote evidence awaiting inclusion, keyed by its
     /// order-independent replay hash for deterministic ordering and de-duplication.
     pending_evidence: BTreeMap<Hash256, SlashingEvidence>,
+    /// Rounds of the in-progress height whose first authentic leader proposal
+    /// has already been validity-checked (C1 `valid(v)`); cleared when the
+    /// height advances. Each round's proposal is re-executed at most once, so
+    /// a Byzantine leader cannot burn CPU by spamming distinct signed
+    /// proposals for its round.
+    checked_proposal_rounds: BTreeSet<u32>,
 }
 
 /// Maximum blocks requested per state-sync round.
@@ -141,6 +154,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             timeouts,
             mempool: Mempool::new(mempool_config),
             pending_evidence: BTreeMap::new(),
+            checked_proposal_rounds: BTreeSet::new(),
         }
     }
 
@@ -159,6 +173,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
 
         loop {
             let height = self.node.height() + 1;
+            self.checked_proposal_rounds.clear();
             let snapshot = match ValidatorSet::from_state(self.node.state()) {
                 Ok(snapshot) => snapshot,
                 Err(_) => return,
@@ -408,6 +423,14 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             }
             NetMessage::Proposal(proposal) => {
                 self.request_if_behind(proposal.payload.height, height, requested);
+                // C1 (`valid(v)`): only a proposal whose block re-executes
+                // cleanly at this exact chain position may reach the machine.
+                // A dropped proposal draws a nil prevote via the propose
+                // timeout, so a Byzantine leader can no longer collect a
+                // finality certificate for an unimportable block.
+                if !self.validate_proposal(&proposal, height) {
+                    return;
+                }
                 ConsensusEvent::Message(ConsensusMessage::Proposal(proposal))
             }
             NetMessage::Vote(vote) => {
@@ -452,6 +475,66 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 max: SYNC_BATCH,
             });
         }
+    }
+
+    /// Tendermint's `valid(v)` predicate (C1): decides whether a gossiped
+    /// proposal may reach the consensus machine.
+    ///
+    /// The machine deliberately never executes blocks, so without this gate a
+    /// Byzantine leader could propose a correctly signed but semantically
+    /// invalid block (forged state root, over-budget or invalid transactions,
+    /// bogus evidence); honest nodes would prevote it on signature alone, lock
+    /// it, and hand the attacker a verifying finality certificate for a block
+    /// no node can import.
+    ///
+    /// Order matters for DoS resistance: the cheap authenticity gate
+    /// (signature, scheduled leader, block-hash binding) runs before the
+    /// expensive re-execution, and each round's first authentic proposal is
+    /// checked exactly once — matching the machine's own first-proposal-wins
+    /// rule — so a Byzantine leader cannot make this node re-execute more than
+    /// one block per round it leads.
+    fn validate_proposal(&mut self, proposal: &SignedProposal, height: u64) -> bool {
+        if proposal.payload.height != height {
+            // The machine ignores other heights; skip the execution cost too.
+            return false;
+        }
+        let round = proposal.payload.round;
+        if self.checked_proposal_rounds.contains(&round) {
+            return false;
+        }
+        // Cheap authenticity before any execution: only the scheduled leader's
+        // correctly signed, hash-bound proposal is worth re-executing.
+        let Ok(snapshot) = ValidatorSet::from_state(self.node.state()) else {
+            return false;
+        };
+        if proposal
+            .verify_in_set(
+                &snapshot,
+                self.node.config().protocol_version,
+                &self.node.config().chain_id,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.checked_proposal_rounds.insert(round);
+        // Pin the block to this node's exact chain position. `apply_block`
+        // re-executes against the block's own claimed height/parent/epoch
+        // fields, so they must be compared against local state explicitly or a
+        // block for the wrong position could still "re-execute" cleanly.
+        let header = &proposal.block.header;
+        let expected_parent = self.node.tip_hash().unwrap_or(Hash256([0u8; 32]));
+        if header.height != height
+            || header.previous_hash != expected_parent
+            || header.epoch != self.node.state().current_epoch
+            || header.chain_id != self.node.config().chain_id
+        {
+            return false;
+        }
+        // valid(v): dry-run the full deterministic state transition on a
+        // scratch clone. Only a block this node could import earns a prevote.
+        let mut scratch = self.node.state().clone();
+        apply_block(&mut scratch, self.node.config(), &proposal.block).is_ok()
     }
 
     /// Durably journals the machine's signing state before one of its own
