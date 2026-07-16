@@ -1,74 +1,107 @@
 # WEBC documentation map
 
-This page keeps future development sessions from guessing which document controls a decision.
+This page keeps future development sessions from guessing which document
+controls a decision.
 
 ## Authority order
 
-1. `AGENTS.md` — mandatory working, security, communication, and quality rules
-2. `decision-record.md` — confirmed user decisions and unresolved technical gates
-3. `development-plan.md` — implementation order and completion checks
-4. `implementation-status.md` — what the current code actually implements
-5. `whitepaper.md` — complete design explanation
+1. [`../WEBC-DEFINITION.md`](../WEBC-DEFINITION.md) — the single source of
+   truth for **product, economic, experience, and functional design**
+   (read §16 first; §15 wins over older sections). **Read-only**: report
+   contradictions to the owner; never edit it.
+2. `AGENTS.md` — mandatory working, security, communication, and quality rules.
+3. `decision-record.md` — security-adjacent decisions and implementation
+   gates (the definition's declared scope excludes security; this file owns
+   it). Defers to the definition for everything the definition covers.
+4. `development-plan.md` — implementation order and completion checks.
+5. `implementation-status.md` — what the current code actually implements.
+6. `whitepaper.md` — complete design explanation.
 
-If documents disagree, the higher item in this list wins. Fix the lower document in the same change.
+If documents disagree, the higher item wins. Fix the lower document in the
+same change. Security documents (`security.md`, ADRs) are the authority for
+security content specifically — the definition deliberately does not cover it.
+
+## Definition-alignment artifacts (2026-07-17)
+
+- `definition-gap-analysis.md` — the audit of every doc-vs-definition
+  divergence that drove the 2026-07-17 documentation overhaul.
+- `code-reconciliation-worklist.md` — prioritized code-vs-definition
+  divergences (records only; changes no code).
+
+## System plans (each cites its deciding definition sections)
+
+- `distribution-program.md` — the decided 25/5/30/15/15/10 allocation and
+  channel mechanics (§15.33/15.38)
+- `dex-batch-settlement.md` — canonical pools, mandatory per-block
+  uniform-price batches, chain-native retry, MEV policy (§15.13/15.18/15.37)
+- `oracle-economics.md` — bonded accuracy-weighted reporters, pull-based
+  updates, read fees, seeding (§15.17/15.21)
+- `weft-language-plan.md` — the decided Weft language design and spec plan
+  (§15.41/15.43/15.44)
+- `speed-roadmap.md` — two-track speed strategy, fast path, claim policy,
+  benchmark gates (§15.40/15.42)
+- `validator-operations.md` — middle-path economics, container image,
+  frugality, bootstrap operations (§15.23/15.26/15.28)
+- `agent-commerce.md` — mandate objects, service registry, HTTP-402 flows
+  (§15.5/15.32)
 
 ## Topic documents
 
-- `definition.md` — short product definition
-- `architecture.md` — chain, execution, consensus, proofs, and module boundaries
-- `tokenomics.md` — supply, inflation, fees, staking, and distribution
-- `bridge.md` — bidirectional Ethereum/Solana bridge design
-- `security.md` — threats, invariants, wallet, consensus, proof, and bridge security
+- `definition.md` — one-page summary pointing into `WEBC-DEFINITION.md`
+- `architecture.md` — chain, execution, consensus, proofs, module boundaries
+- `tokenomics.md` — supply, issuance, distribution, fees, staking
+- `bridge.md` — bidirectional Ethereum/Solana bridge design + cross-chain UX
+- `security.md` — threats, invariants, wallet, consensus, proof, bridge security
 - `roadmap.md` — short phase overview; details live in `development-plan.md`
 - `continuation-guide.md` — exact starting point for the next development session
 - `ai-handoff.md` — prevents stale conversation summaries from becoming decisions
-- `session-keys-implementation-plan.md` — constrained on-chain session-key design and staged build order (Phase 2 gate)
-- `session-keys-next-steps.md` — durable resume plan; the ML-DSA signature gate, primary-key recovery/rotation, recovery-root rotation, epoch-boundary pruning, the browser/SDK surface, and durable encrypted permission storage + automatic lane setup are done — only reference-machine benchmarks remain before Phase 3
+- `session-keys-implementation-plan.md` / `session-keys-next-steps.md` —
+  completed session-key gate records (historical; do not redo)
 
 ## Review artifacts (`docs/review/`)
 
-Durable outputs of review sessions. Not authority (the decision record and code
-win), but a session must read them at start so it does not re-derive the map or
-re-discover a known finding.
+Durable outputs of review sessions. Not authority (the definition, decision
+record, and code win), but a session must read them at start so it does not
+re-derive the map or re-discover a known finding.
 
-- `review/codebase-map.md` — where every crate/module/file lives and what it owns
-- `review/2026-07-16-plan-review.md` — the critical plan review: what is sound,
-  decision provenance, the security checklist, architectural gaps, the open owner
-  decisions, and the prioritized P0/P1/P2 worklist
-- `review/findings.md` — reported code-level findings (severity, location, fix
-  direction); reproduce each before fixing
+- `review/codebase-map.md` — where every crate/module/file lives
+- `review/2026-07-16-plan-review.md` — the critical plan review and
+  prioritized P0/P1/P2 worklist
+- `review/findings.md` — reported code-level findings; reproduce each before
+  fixing
 
 ## Editing rule
 
-- A confirmed product/economic change first updates `decision-record.md`, but only after user approval.
-- An implementation change updates code, tests, and `implementation-status.md` together.
+- Product/economic/experience/functional decisions change only through the
+  owner's review process in `WEBC-DEFINITION.md` — never by editing repo docs
+  first. Repo docs then realign, citing the deciding section.
+- A security-adjacent decision updates `decision-record.md`, only with owner
+  approval.
+- An implementation change updates code, tests, and
+  `implementation-status.md` together.
 - A changed phase or completion check updates `development-plan.md`.
-- Supporting documents may explain a decision but must not create a competing decision.
+- Supporting documents may explain a decision but must not create a competing
+  decision.
 
 ## Technical decision records
 
-Implementation-only architecture choices are recorded under [`adr/`](adr/README.md).
-They cannot override confirmed product or economic policy in
-`decision-record.md`.
+Implementation-only architecture choices are recorded under
+[`adr/`](adr/README.md). They cannot override the definition or the decision
+record.
 
 ## Current next action
 
-Phases 0-3 are complete and **Phase 4 (networking and signed BFT consensus) is
-active but not complete or safe.** This page does not restate the phase status
+Phases 0-3 are complete and **Phase 4 (networking and signed BFT consensus)
+is active but not complete or safe.** This page does not restate phase status
 (it rots — see `AGENTS.md` pitfall 8). `continuation-guide.md` and
-`implementation-status.md` are the live owners of "what is done / what is next,"
-and `docs/review/2026-07-16-plan-review.md` §6 holds the prioritized worklist
-(chiefly the reported HIGH-severity consensus findings in
-`docs/review/findings.md`). Do not restart completed amount, inflation, genesis,
-block-atomicity, staking-ratio, access-enforcement, session-key,
-wallet-permission-storage, storage, node, or networking work.
+`implementation-status.md` own "what is done / what is next";
+`docs/review/2026-07-16-plan-review.md` §6 holds the prioritized worklist
+(chiefly the HIGH-severity consensus findings in `docs/review/findings.md`).
+Do not restart completed amount, inflation, genesis, block-atomicity,
+staking-ratio, access-enforcement, session-key, wallet-permission-storage,
+storage, node, or networking work.
 
-The AI-era product direction is now recorded in `decision-record.md`: a WEBC
-high-level contract language that lowers to the audited Rust/WASM layer, a native
-staked oracle, capped fee sponsorship, anti-complexity contract tooling, an
-AI-readable component catalog, and prioritized Ethereum/Solana bridges. These are
-built after consensus is stable; `development-plan.md` phases 6-14 carry them.
-
-This project runs in an ephemeral cloud container: the GitHub repo is the source
-of truth, so commit and push every step. `target/`, `node_modules/`, and `dist/`
-are git-ignored but regenerable from the committed lock files and toolchain pins.
+This project runs in an ephemeral cloud container: the GitHub repo is the
+source of truth, so commit and push every step. `target/`, `node_modules/`,
+and `dist/` are git-ignored but regenerable from the committed lock files and
+toolchain pins.
