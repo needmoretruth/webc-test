@@ -61,7 +61,7 @@ pub use protocol::{
 };
 pub use round::{
     ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage, ConsensusWalRecord, Step,
-    TimeoutKind, ValidatorIdentity,
+    TimeoutKind, ValidatorIdentity, MAX_FUTURE_ROUNDS, MAX_PAST_ROUNDS,
 };
 pub use scheduler::parallel_batches;
 pub use session_key::{

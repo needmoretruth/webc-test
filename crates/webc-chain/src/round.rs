@@ -45,6 +45,13 @@
 //! safety. If the journal cannot be read or fails validation, the driver must
 //! fail closed and run the height without a voting identity.
 //!
+//! Memory bounds (C3): every per-round map is keyed by a peer-chosen `u32`
+//! round, so ingestion ignores messages more than [`MAX_FUTURE_ROUNDS`] above
+//! the current round and each round change evicts storage more than
+//! [`MAX_PAST_ROUNDS`] below it. A staked attacker can therefore never size
+//! this machine's memory with signed votes or full-block proposals for
+//! arbitrary rounds; the machine holds at most a fixed window of rounds.
+//!
 //! Deferred: dynamic timeout durations, gossiping the full vote set for faster
 //! catch-up, and sub-committee sampling are driver/refinement concerns, not part
 //! of this safety core.
@@ -59,6 +66,29 @@ use webc_crypto::{Address, Hash256, Keypair};
 
 /// The reserved sentinel identifying a nil vote (a vote for "no block").
 const NIL: Hash256 = Hash256::ZERO;
+
+/// How far above the current round a received consensus message may be before
+/// it is ignored (C3 memory bound).
+///
+/// Vote and proposal storage is keyed by a peer-chosen `u32` round; without a
+/// horizon, any snapshot member could sign votes for rounds `0..2^32` (and a
+/// scheduled leader full-block proposals for its slots) and exhaust memory.
+/// The window must stay large enough for the `f+1` round catch-up (rule 55) to
+/// function across ordinary delays; a node that falls further behind within
+/// one height recovers at the next height via certificate-verified state sync
+/// instead. Rounds only ever increase, so the horizon slides forward.
+pub const MAX_FUTURE_ROUNDS: u32 = 32;
+
+/// How many rounds below the current round remain stored (C3 memory bound).
+///
+/// Past-round votes are kept so a quorum that completes late can still decide
+/// an earlier round (paper rule 49); keeping a bounded window instead of
+/// everything caps memory at `MAX_PAST_ROUNDS + MAX_FUTURE_ROUNDS + 1` rounds
+/// per validator. A decide missed because its round was evicted is recovered
+/// via state sync from peers that did decide. The node's own lock and valid
+/// value live in dedicated fields and are never evicted, so lock safety does
+/// not depend on this window.
+pub const MAX_PAST_ROUNDS: u32 = 32;
 
 /// The BFT step this node occupies within its current round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -495,7 +525,9 @@ impl ConsensusMachine {
         }
         match event {
             ConsensusEvent::Message(ConsensusMessage::Proposal(signed)) => {
-                if signed.payload.height != self.height {
+                if signed.payload.height != self.height
+                    || self.beyond_future_horizon(signed.payload.round)
+                {
                     return Ok(actions);
                 }
                 signed.verify_in_set(&self.set, self.protocol_version, &self.chain_id)?;
@@ -505,7 +537,9 @@ impl ConsensusMachine {
                     .or_insert(*signed);
             }
             ConsensusEvent::Message(ConsensusMessage::Vote(vote)) => {
-                if vote.payload.height != self.height {
+                if vote.payload.height != self.height
+                    || self.beyond_future_horizon(vote.payload.round)
+                {
                     return Ok(actions);
                 }
                 self.set
@@ -522,6 +556,29 @@ impl ConsensusMachine {
         Ok(actions)
     }
 
+    /// Whether a message's round is too far above the current round to store
+    /// (C3): storage keyed by a peer-chosen round must stay inside a sliding
+    /// window or a staked attacker can exhaust memory with valid signatures.
+    fn beyond_future_horizon(&self, round: u32) -> bool {
+        round > self.round.saturating_add(MAX_FUTURE_ROUNDS)
+    }
+
+    /// Drops per-round storage for rounds below the past window (C3). Rounds
+    /// only ever increase, and this node signs only at `self.round`, so
+    /// evicted guards can never re-enable signing an old step; the lock and
+    /// valid value live in dedicated fields and are untouched. The cost of
+    /// eviction is only that a quorum completing extremely late cannot decide
+    /// that old round locally — state sync recovers the height instead.
+    fn evict_stale_rounds(&mut self) {
+        let keep_from = self.round.saturating_sub(MAX_PAST_ROUNDS);
+        self.proposals.retain(|round, _| *round >= keep_from);
+        self.prevotes.retain(|(round, _), _| *round >= keep_from);
+        self.precommits.retain(|(round, _), _| *round >= keep_from);
+        self.reported_equivocators
+            .retain(|(round, _, _)| *round >= keep_from);
+        self.guards.retain(|(_, round)| *round >= keep_from);
+    }
+
     /// Begins a round: resets the step and either proposes (if this node leads and
     /// has a value) or arms the propose timeout.
     fn start_round(
@@ -531,6 +588,7 @@ impl ConsensusMachine {
     ) -> Result<(), ChainError> {
         self.round = round;
         self.step = Step::Propose;
+        self.evict_stale_rounds();
         if self.is_proposer(round) {
             match self.valid_value.clone() {
                 // Re-propose a value that already reached a prevote quorum, citing
@@ -2193,6 +2251,134 @@ mod tests {
             })
             .unwrap();
         assert!(started.restore(empty).is_err());
+    }
+
+    /// C3: per-height memory must not be sizeable by an attacker-chosen round
+    /// number. A snapshot member can sign votes (and, for its leader slots,
+    /// full-block proposals) for any of the 2^32 rounds; only a bounded window
+    /// around the current round may be stored.
+    #[test]
+    fn far_future_rounds_are_ignored_and_stale_rounds_are_evicted() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let mut machine = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            1,
+            Some(identity(&a)),
+        );
+        machine.start().unwrap();
+
+        // A hostile-but-staked validator sprays validly signed votes across
+        // absurd future rounds. None beyond the horizon may be stored.
+        let hash = Hash256::digest(b"attack");
+        for round in [
+            MAX_FUTURE_ROUNDS + 1,
+            MAX_FUTURE_ROUNDS + 2,
+            1 << 16,
+            1 << 24,
+            u32::MAX,
+        ] {
+            machine
+                .on_event(ConsensusEvent::Message(ConsensusMessage::Vote(sign_vote(
+                    &b,
+                    1,
+                    round,
+                    VoteType::Prevote,
+                    hash,
+                ))))
+                .unwrap();
+            machine
+                .on_event(ConsensusEvent::Message(ConsensusMessage::Vote(sign_vote(
+                    &b,
+                    1,
+                    round,
+                    VoteType::Precommit,
+                    hash,
+                ))))
+                .unwrap();
+        }
+        assert!(
+            machine.prevotes.is_empty() && machine.precommits.is_empty(),
+            "votes beyond the future-round horizon must not be stored \
+             (prevotes: {}, precommits: {})",
+            machine.prevotes.len(),
+            machine.precommits.len()
+        );
+
+        // A vote at exactly the horizon IS stored: catch-up must keep working.
+        machine
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Vote(sign_vote(
+                &b,
+                1,
+                MAX_FUTURE_ROUNDS,
+                VoteType::Prevote,
+                hash,
+            ))))
+            .unwrap();
+        assert_eq!(machine.prevotes.len(), 1, "in-horizon votes are kept");
+
+        // Full-block proposals for far-future leader slots must be dropped
+        // before they are stored (the largest per-round object).
+        let far_leader_round = (MAX_FUTURE_ROUNDS + 1..)
+            .find(|round| set.proposer_for(1, *round) == Some(b.address()))
+            .unwrap();
+        let far_block = candidate_block(b.address(), 1, 7);
+        machine
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(
+                    SignedProposal::sign(
+                        CURRENT_PROTOCOL_VERSION,
+                        ChainId::devnet(),
+                        1,
+                        far_leader_round,
+                        None,
+                        far_block,
+                        b.address(),
+                        &b,
+                    )
+                    .unwrap(),
+                ),
+            )))
+            .unwrap();
+        assert!(
+            !machine.proposals.contains_key(&far_leader_round),
+            "a proposal beyond the future-round horizon must not be stored"
+        );
+
+        // Eviction: after the round advances beyond the past window, stale
+        // round entries are dropped so long-lived heights stay bounded.
+        let mut round = machine.round();
+        while round < MAX_PAST_ROUNDS + 5 {
+            machine
+                .on_event(ConsensusEvent::Timeout {
+                    kind: TimeoutKind::Precommit,
+                    round,
+                })
+                .unwrap();
+            round = machine.round();
+        }
+        assert!(
+            machine
+                .prevotes
+                .keys()
+                .all(|(r, _)| *r + MAX_PAST_ROUNDS >= machine.round),
+            "rounds below the past window must be evicted"
+        );
+
+        // Total stored rounds stay within the fixed window no matter what
+        // arrives, which is the memory bound this test exists to pin.
+        let mut stored: BTreeSet<u32> = BTreeSet::new();
+        stored.extend(machine.proposals.keys().copied());
+        stored.extend(machine.prevotes.keys().map(|(r, _)| *r));
+        stored.extend(machine.precommits.keys().map(|(r, _)| *r));
+        assert!(
+            stored.len() as u32 <= MAX_PAST_ROUNDS + MAX_FUTURE_ROUNDS + 1,
+            "stored round count exceeds the documented bound"
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@ use tokio::sync::mpsc;
 use webc_chain::{
     apply_block, Block, ChainError, ConsensusAction, ConsensusEvent, ConsensusMachine,
     ConsensusMessage, FinalityCertificate, SignedProposal, SlashingEvidence, TimeoutKind,
-    ValidatorIdentity, ValidatorSet, MAX_BLOCK_SLASHING_EVIDENCE,
+    ValidatorIdentity, ValidatorSet, MAX_BLOCK_SLASHING_EVIDENCE, MAX_FUTURE_ROUNDS,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_net::{InboundMessage, NetMessage, NetworkHandle};
@@ -517,7 +517,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 // A dropped proposal draws a nil prevote via the propose
                 // timeout, so a Byzantine leader can no longer collect a
                 // finality certificate for an unimportable block.
-                if !self.validate_proposal(&proposal, height) {
+                if !self.validate_proposal(&proposal, height, machine.round()) {
                     return Ok(());
                 }
                 ConsensusEvent::Message(ConsensusMessage::Proposal(proposal))
@@ -585,12 +585,23 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
     /// checked exactly once — matching the machine's own first-proposal-wins
     /// rule — so a Byzantine leader cannot make this node re-execute more than
     /// one block per round it leads.
-    fn validate_proposal(&mut self, proposal: &SignedProposal, height: u64) -> bool {
+    fn validate_proposal(
+        &mut self,
+        proposal: &SignedProposal,
+        height: u64,
+        current_round: u32,
+    ) -> bool {
         if proposal.payload.height != height {
             // The machine ignores other heights; skip the execution cost too.
             return false;
         }
         let round = proposal.payload.round;
+        // C3: the machine ignores rounds beyond its future horizon, so a
+        // proposal out there must not cost this node a block re-execution or a
+        // `checked_proposal_rounds` entry either.
+        if round > current_round.saturating_add(MAX_FUTURE_ROUNDS) {
+            return false;
+        }
         if self.checked_proposal_rounds.contains(&round) {
             return false;
         }
