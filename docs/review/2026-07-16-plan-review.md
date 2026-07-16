@@ -224,24 +224,24 @@ forces schema or protocol churn.
 
 ## 5. Decisions that need the owner (to be asked in chat, batched)
 
-Only genuinely owner-owned, design-shaping choices are raised. See the session
-chat for the plain-language version with options and a recommendation.
+Only genuinely owner-owned, design-shaping choices are raised.
 
-- **Q1 — Review/process gate.** Given a security-critical chain implemented by
-  alternating AI sessions, insert an **earlier independent security-review gate**
-  for the consensus + crypto + economics core (before the contract/ZK/bridge
-  layers are stacked), rather than only the Phase-13 mainnet audits? (Owner-owned:
-  cost, ambition, risk tolerance.) Recommendation: yes — schedule a core-freeze +
-  external review after Phase 5.
+- **Q1 — Review/process gate. RESOLVED 2026-07-16: owner chose (A)** — insert an
+  earlier independent security-review gate for the consensus + crypto + economics
+  core before the contract/ZK/bridge layers stack on it, additional to the Phase-13
+  mainnet audits. Recorded in `docs/decision-record.md` ("Security review process")
+  and scheduled as **Phase 5.5** in `docs/development-plan.md`.
 
-- **Q2 — Contract language sequencing.** Reaffirm building the bespoke WEBC
-  high-level language on the current schedule, or first ship an interim
-  "WASM + Rust-eDSL/SDK" path so contracts are possible sooner while the language
-  is a later, separately-resourced project? (Owner-owned: it is your product
-  decision; you are owed the feasibility/cost picture.) Recommendation: keep the
-  decision, but explicitly stage it — WASM+SDK first, bespoke language after the
-  runtime and tooling are proven — and record the off-chain-compilation invariant
-  from §4.4.
+- **Q2 — Contract language sequencing. RESOLVED 2026-07-16: owner chose (A)** —
+  ship an interim Rust-eDSL/SDK → off-chain-WASM authoring path first; the bespoke
+  WEBC language is a later, separately-resourced project. **Owner added a
+  requirement:** design the interim structure to be flexible/replaceable so the
+  WEBC language mounts later with minimal rework (a stable contract ABI + a
+  versioned, swappable "authoring front-end → lowering → audited Rust framework →
+  WASM" seam; the language is one more front-end over the same target, never a
+  runtime rewrite). Recorded in `docs/decision-record.md`, `docs/architecture.md`,
+  and staged as Phase 7a/7b in `docs/development-plan.md`. The off-chain-compilation
+  invariant (§4.4) stands.
 
 - **Deferred, not asked now (recorded so it is not lost):** slashing severity
   percentages and downtime-penalty schedule are economic policy of the same class

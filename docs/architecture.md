@@ -90,6 +90,18 @@ Rust compiler must never run inside block execution: doing so would destroy
 determinism and create an enormous attack surface. The high-level language is an
 off-chain authoring/SDK layer, not an on-chain interpreter.
 
+**Sequencing and pluggable authoring front-end (owner-confirmed 2026-07-16).** The
+bespoke WEBC high-level language ships **later**, as a separate project; an interim
+Rust embedded-DSL / SDK authoring path ships first so contracts are possible before
+the language exists. The interim architecture must be built so the language plugs
+in later with minimal rework: freeze a stable contract **ABI** and a stable
+**"authoring front-end → lowering → audited Rust framework → WASM" seam**, and treat
+the authoring front-end as a **versioned, replaceable boundary** like the
+crypto/storage/proof seams. The Rust-eDSL is the first front-end over this seam; the
+WEBC language is a later front-end over the *same* lowering/ABI target — never a
+rewrite of the runtime or the framework. See `docs/decision-record.md` and
+`docs/development-plan.md` Phase 7a/7b.
+
 Contracts cannot access websites, files, device randomness, or wall-clock time directly. They communicate with browser or server agents through events and signed receipts, and read external data through a native staked oracle (reporters stake, values are aggregated, wrong reports are slashed) so every node computes the same result.
 
 ## Proofs and browser clients

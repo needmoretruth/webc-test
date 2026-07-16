@@ -225,6 +225,35 @@ Goal: complete the economic-security rules before public incentivization.
 - reward totals reconcile exactly;
 - economic simulations document centralization and attack-cost scenarios.
 
+## Phase 5.5: core freeze and independent security review (owner-confirmed gate)
+
+Goal: an earlier independent security-review gate for the security-critical core,
+recorded in `docs/decision-record.md` (owner-confirmed 2026-07-16), before the
+contract/ZK/bridge/platform layers stack on top of it. This is additional to the
+Phase-13 pre-mainnet audits, not a replacement.
+
+### Tasks
+
+- freeze the consensus + cryptography + economics core (versioned interfaces, no
+  behavior changes in flight);
+- resolve every open blocking finding from `docs/review/findings.md` first — at
+  minimum the CONFIRMED HIGH/critical items (C1–C4 consensus, the C4 vote/lock WAL
+  that the now-live slash loop makes urgent, F1 reward-dust supply leak, E1 epoch
+  wiring), each with a reproduction test then a fix;
+- add the supply-chain CI gate (`cargo-deny` advisories/licenses/bans + a JS
+  advisory scan) and stand up fuzz targets (wire decode, canonical encoding,
+  mempool admission, tx execution) as part of the freeze evidence;
+- prepare an audit package: threat model, invariants, the consensus safety
+  argument (including committee sampling if adopted), and the economic model;
+- obtain an independent/external review of the frozen core.
+
+### Acceptance
+
+- no open HIGH/critical finding remains in `docs/review/findings.md` for the core;
+- the supply-chain and fuzz gates run in CI and are green;
+- the external review's blocking findings are resolved before Phase 6+ builds on the
+  core.
+
 ## Phase 6: parallel execution and localized fees
 
 Goal: unrelated sites and applications do not block each other at the state scheduler or localized fee layer.
@@ -259,22 +288,32 @@ Measure simple transfers, conflicting transfers, independent applications, token
 - sustained simple-transfer benchmark reaches staged 100/500/1,000/2,000+ TPS gates before any claim is published;
 - deterministic roots match across thread counts and machines.
 
-## Phase 7: contract runtime, WEBC language, and native oracle
+## Phase 7: contract runtime, native oracle (interim authoring), then the WEBC language
 
-Goal: ship the parallel contract runtime on the chosen Rust->WASM foundation, the
-WEBC high-level authoring language above it, the tooling that keeps contracts
-maintainable, and the native staked oracle that feeds contracts external data
-deterministically.
+Goal: ship the parallel contract runtime on the chosen Rust->WASM foundation and
+the native staked oracle. **Sequencing (owner-confirmed 2026-07-16): the bespoke
+WEBC high-level language is a LATER, separately-resourced project (Phase 7b); an
+interim Rust-eDSL/SDK authoring path ships first (Phase 7a) so contracts become
+possible before the language exists.**
 
-### Execution foundation (decided)
+### Phase 7a — runtime + interim Rust authoring (ships first)
 
 - restricted deterministic WebAssembly, Rust-first, is the execution engine;
 - Move VM and EVM are not the native runtime; Ethereum/Solana compatibility is delivered by the bridges in Phase 11/14, not by running their bytecode here;
-- benchmark the WASM runtime against the reference applications below to validate throughput, determinism, and parallel access enforcement before freezing the ABI.
+- benchmark the WASM runtime against the reference applications below to validate throughput, determinism, and parallel access enforcement before freezing the ABI;
+- contracts are authored in Rust (an embedded-DSL / SDK over the audited framework) and compiled **off-chain** to deterministic WASM;
+- **design for the language to plug in later (owner requirement):** freeze a stable
+  contract **ABI** and a stable **"authoring front-end → lowering → audited Rust
+  framework → WASM" seam**, and treat the authoring front-end as a *versioned,
+  swappable boundary* (like the crypto/storage/proof seams). The Rust-eDSL is the
+  first front-end over this seam; the WEBC language is a later front-end over the
+  **same** lowering/ABI target — adding it must never require rewriting the runtime
+  or the framework. Keep the off-chain-compilation invariant: the chain only ever
+  accepts deterministic WASM + metadata (see `architecture.md`).
 
-### WEBC high-level authoring language and tooling
+### Phase 7b — WEBC high-level authoring language and tooling (later, separate project)
 
-- build the WEBC high-level contract language as a front end (parser + lowering) that transpiles to the audited Rust framework and its components, inheriting Rust/WASM safety and determinism; do not build a second VM or an independent compiler backend;
+- build the WEBC high-level contract language as a front end (parser + lowering) that transpiles to the audited Rust framework and its components, inheriting Rust/WASM safety and determinism; do not build a second VM or an independent compiler backend; it plugs into the Phase-7a authoring seam rather than replacing the runtime;
 - ship a component catalog and machine-readable documentation so AI agents, AI-assisted developers, and human-only developers can all assemble contracts from documented, audited building blocks;
 - enforce an opinionated, uniform contract structure and small composable components instead of monoliths;
 - ship a contract linter/analyzer (a WEBC clippy) plus a pre-deploy review step (including automated/AI review) that block long functions, missing access declarations, and unsafe patterns before deployment;
