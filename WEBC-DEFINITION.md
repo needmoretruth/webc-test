@@ -946,6 +946,15 @@ delegated to reviewer/implementation).**
    the batch eliminates and splits liquidity into two lanes. Status: **owner
    decision pending on both; remaining mechanics delegated.**
 
+*Update (same day):* choice 1 is **decided** — orders that cannot fill at the
+block's clearing price within the user's limit **retry by default** for a short
+window (~10s) before cancelling, and the behavior is user-selectable per order
+(owner-confirmed). Choice 2 (mandatory batch vs instant bypass) remains pending;
+the plain-language analysis for the owner: a bypass lane would let bots execute
+against the pool *around* the visible batch, re-enabling sandwich extraction
+against everyone in the batch, while the only users who benefit from ~1s-faster
+execution are those same bots — ordinary users already wait ~6–8s for finality.
+
 **15.35 Initial fee/sponsorship parameters — launch placeholders, tuned by measurement.**
 Consistent with §7's "numbers come from evidence": ordinary-transfer fees target
 "negligible" via resource pricing with a near-zero floor; sponsorship defaults at
