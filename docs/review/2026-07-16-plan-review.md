@@ -206,6 +206,16 @@ forces schema or protocol churn.
    syncing nodes) is not yet specified. Action: an ADR on epoch/validator-set
    transition + weak-subjectivity checkpoint before Phase 5 economics.
 
+6. **Epoch advancement is not wired into the real block path (confirmed).** The
+   epoch machinery (`finish_epoch`, reward distribution, unbonding maturation,
+   session-key expiry) is only invoked by the demo, never by `produce_block` /
+   `import_validated` / the consensus commit path. So a running node never advances
+   epochs. The fix is not just "call it" — the rollover trigger must be a
+   deterministic height-derived function executed identically inside `apply_block`
+   on every node, or honest nodes diverge on the state root at the boundary. This
+   is both a "the feature is dead in the real path" bug (E1) and a consensus-design
+   decision (how epoch length maps to height); record it in the consensus/epoch ADR.
+
 ---
 
 ## 5. Decisions that need the owner (to be asked in chat, batched)
@@ -241,10 +251,25 @@ chat for the plain-language version with options and a recommendation.
 
 Ordered so value survives an interruption. (P0 = do before building more on top.)
 
+- **P0** Fix the CONFIRMED consensus safety/liveness/DoS findings before building
+  on consensus: C1 (validate a block before prevote/lock/finalize), C2 (no silent
+  halt on failed import), C3 (bound per-height round memory), C4 (durable vote/lock
+  WAL — a prerequisite for the slash-wiring below). See `findings.md`.
+- **P0** Wire epoch advancement deterministically into the real block path (E1):
+  today `finish_epoch`'s only caller is the demo, so a running node never advances
+  epochs (rewards/unbonding/expiry are dead), and however it gets wired MUST be a
+  height-derived function inside `apply_block` or nodes fork at the boundary.
 - **P0** Wire consensus-detected equivocation to an applied slash (ADR + header
-  evidence path or auto-submit + end-to-end slash test). §4.3.
+  evidence path or auto-submit + end-to-end slash test), AFTER C4. §4.3.
 - **P0** Add the multi-node Byzantine safety test (<1/3 power cannot finalize
   conflicting blocks). Owed Phase 4 acceptance item.
+- **P1** Pin the genesis total supply (G1): assert `minted_supply ==
+  Amount::from_webc(10_000_000)` in `from_genesis` — the current invariant is a
+  tautology that would accept a wrong total. Cheap, high-value.
+- **P1** Fix `slash_locked` to respect the slashable window and not penalize
+  matured/withdrawable stake (U1). Economic-security correctness.
+- **P1** Make the scheduler serializable-order-preserving before the Phase-6
+  executor consumes it (SC1); validate the block timestamp (E2).
 - **P1** Add `cargo-deny` (advisories/licenses/bans) + JS advisory scan to CI.
   §3.5.
 - **P1** Stand up `cargo-fuzz` targets for wire decode, canonical encoding,
