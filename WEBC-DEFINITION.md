@@ -1189,6 +1189,51 @@ compatibility architecture.**
      within an edition.
 Status: **decided** (grammar/spec writing proceeds within these commitments).
 
+### 2026-07-16 — Round 12: Weft AI-first reinforcements; definition completion
+
+**15.44 Weft — the WASM question answered, and AI-first commitments deepened.**
+- **"If we only target WASM, does that limit where Weft can be used?" — No,
+  for three reasons.** (1) WASM is the most portable executable format in
+  existence — it runs in every browser, on servers, and at the edge; targeting
+  it *widens* where compiled Weft can run (e.g. the same contract logic can be
+  simulated client-side). (2) Weft is deliberately a domain language for WEBC
+  applications, not a general-purpose language — focused DSLs win their domain
+  (SQL did; bloated ones lose their reason to exist); websites and off-chain
+  apps use the TypeScript SDK by design (§2). (3) The toolchain can additionally
+  emit native builds for local testing/simulation, so development never depends
+  on a chain node.
+- **AI-first reinforcements (added to 15.41/15.43):**
+  - **One-file components:** a component is fully defined in a single file with
+    explicit imports — no hidden state or cross-file magic — so an AI (or
+    human) reading one file has the complete truth of that component, sized to
+    fit comfortably in a model's working context.
+  - **Small, regular grammar:** few keywords, no syntactic synonyms, one way to
+    express each construct — pattern-predictable for models, skimmable for
+    humans.
+  - **Docs-as-data:** every language construct and every catalog component ships
+    a machine-readable spec entry plus canonical examples; the documentation
+    bundle is published in an LLM-ingestible flat format alongside the human
+    site, and the examples corpus is the normative reference (models learn by
+    pattern; the spec's examples are guaranteed-compiling and tested in CI).
+  - **Error-driven convergence:** compiler diagnostics carry structured fix
+    suggestions (machine-parseable), so an agent's write→check→fix loop
+    converges in few iterations; `weft check` is fast enough to run on every
+    edit.
+  - **Framework quality bar:** the standard framework exposes the catalog's
+    building blocks (tokens, escrow, memberships, swaps, mandates…) behind
+    small, uniform interfaces with the same naming conventions everywhere —
+    "read one component, understood them all."
+Status: **decided.**
+
+**15.45 Definition completion statement.**
+As of Round 12, every owner-level decision in this document's scope (product,
+economy, experience, functional design) is closed; §16 lists the remaining
+delegated design work, which is implementation planning rather than definition.
+Within its declared scope, **this definition is complete and ready for
+handoff.** Outside its scope by design: security/cryptography/robustness
+documents, the actual build, and the public benchmarks that turn engineering
+targets into claims.
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
