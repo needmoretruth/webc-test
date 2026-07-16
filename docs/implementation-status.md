@@ -426,15 +426,20 @@ it, and the driver applies the same horizon before its C1 block re-execution.
 A staked attacker can no longer size per-height memory (or CPU) with signed
 votes/proposals for arbitrary rounds.
 
-**All four P0 consensus findings (C1–C4) are now resolved.** Genuinely
-remaining Phase 4 items: the P1 findings C5–C7 (proof-of-lock carried with
-re-proposals, round-scaled timeouts, gated/directed state-sync replies); the
-CI supply-chain (`cargo-deny`) and fuzz gates; a reference-machine
-finality-timing number (this cloud container cannot produce it honestly); and,
-optionally, a multi-node-over-TCP Byzantine integration test (the
-machine-level property is now tested). Fork choice is covered by the
-finality-certificate design (a node follows the certified chain and commits
-only finalized blocks).
+**All four P0 consensus findings (C1–C4) are resolved, plus C6 and C7.** C6
+(commit `90ae433`) round-scales step timeouts (`base + round·increment`) for
+partial-synchrony liveness. C7 (commit `0813e7c`) makes state-sync replies
+directed to the requester (new `NetworkHandle::send_to`; the transport no longer
+refloods a `BlockResponse`) and gates sync requests on a finality certificate
+for a higher height that verifies against the current snapshot (the driver
+gossips the certificate on commit). Genuinely remaining Phase 4 items: the P1
+finding **C5** (attach the 2f+1 proof-of-lock prevote set to re-proposals — a
+wire-format change needing a version bump and cross-language fixtures); the CI
+supply-chain (`cargo-deny`) and fuzz gates; a reference-machine finality-timing
+number (this cloud container cannot produce it honestly); and, optionally, a
+multi-node-over-TCP Byzantine integration test (the machine-level property is
+now tested). Fork choice is covered by the finality-certificate design (a node
+follows the certified chain and commits only finalized blocks).
 
 ## Phase 3: local restartable node, storage, and developer APIs
 

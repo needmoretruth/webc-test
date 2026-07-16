@@ -176,17 +176,24 @@ not deeply audited.
   `vr` can never satisfy the guard and prevotes nil forever while the lock holder
   re-proposes. Fix: attach the 2f+1 prevote set (PoL certificate) to re-proposals
   and verify it, or gossip vote sets.
-- **C6 — MEDIUM — constant (1s) timeouts instead of round-scaled.** `consensus_
-  driver.rs` (~57-66, 460-467). Tendermint partial-synchrony liveness needs
-  `timeout(r) = init + r·delta`; a fixed timeout below real delay fails every
-  round identically (permanent liveness failure). Fix: scale each timeout by the
-  round.
-- **C7 — MEDIUM — state-sync bandwidth amplification.** `consensus_driver.rs`
-  (~315-331) answers a `BlockRequest` via network-wide `broadcast`, not a directed
-  reply; `request_if_behind` triggers on any message claiming a higher height with
-  no proof. One spoofed high-height vote makes a node blast sync requests; one
-  small request causes up to 16 full blocks broadcast to everyone. Fix: reply to
-  the requesting peer only; gate sync on a verified higher-height certificate.
+- **C6 — MEDIUM — RESOLVED (commit `90ae433`) — constant timeouts instead of
+  round-scaled.** `DriverTimeouts` now carries an `increment` and `for_kind`
+  computes `base + round·increment` (saturating), the standard Tendermint
+  `timeout(r) = init + r·delta`, so some round eventually outlasts any finite
+  delay and liveness is restored once the network stabilizes. Unit-tested for
+  linear scaling and overflow saturation.
+- **C7 — MEDIUM — RESOLVED (commit `0813e7c`) — state-sync bandwidth
+  amplification.** The driver answered a `BlockRequest` via network-wide
+  `broadcast` and requested sync on any higher-height claim. **Fix:**
+  `NetworkHandle::send_to` delivers a directed reply and the transport no longer
+  refloods a `BlockResponse` (point-to-point, not gossip); `serve_block_request`
+  replies only to the requesting peer; sync is requested solely by
+  `request_if_certified_ahead`, which fires only on a `FinalityCertificate` for
+  a higher height that verifies against the current validator snapshot (the
+  driver now gossips the certificate on commit so behind nodes learn of finality
+  with proof). Cross-epoch certificate anchoring stays E4. Tests:
+  `webc-net::send_to_reaches_only_the_named_peer` and
+  `webc-node/tests/consensus_sync_gating.rs`.
 - **C8 — LOW — `has_two_thirds_power` threshold arithmetic is correct but
   fragile/undocumented.** `consensus.rs:170-178`. The nonstandard form
   `(total/3)*2 + ((total%3)*2)/3` is actually a strict >2/3 test and avoids the
