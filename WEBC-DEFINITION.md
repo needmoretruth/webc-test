@@ -1011,6 +1011,47 @@ Status: **decided as method** (values will move with data).
   user-acquisition feature worth more than the extraction revenue.
 Status: **decided.**
 
+### 2026-07-16 — Round 9: distribution approved; latency clarified
+
+**15.38 Distribution allocation — owner approved.** The 15.33 table
+(25 / 5 / 30 / 15 / 15 / 10 with its release shapes and reversion paths) is now
+**decided**.
+
+**15.39 Latency, throughput, and perceived speed — clarification and design
+consequences.**
+Owner worry: "~8s finality means one trade per ~8 seconds — a bottleneck for
+fast swaps and web activity." That is a conflation of three different numbers,
+and the conclusion does not follow:
+- **Throughput ≠ latency.** Finality time is how long one transaction takes to
+  become irreversible, not how often you may transact. Transactions pipeline:
+  a user (and the same wallet across several sites — §8's independent lanes) can
+  have many transactions in flight at once; thousands of swaps settle every
+  block network-wide. Highway analogy: an 8-second travel time does not mean one
+  car per 8 seconds.
+- **The UX ladder:** at ~2s (next block) a transaction has *executed* — the
+  swap price is known, balances updated, and the app shows "done." At ~6–8s it
+  is *irreversible*. Web apps show results at execution and treat finality as a
+  background upgrade; only high-value, hard-to-reverse actions (large
+  withdrawals, bridge exits) should gate on finality.
+- **The ~10s retry window adds zero latency to normal swaps.** A normal order
+  fills in its first batch (~1–2s). The window matters only when the user's
+  price limit was not met — where the alternative is *failing instantly*, not
+  succeeding faster.
+- **Competitive context:** Ethereum executes in ~12s and finalizes in ~13
+  minutes. Solana *feels* sub-second because UIs show optimistic confirmation,
+  but its full finality (32 slots) is ~6–13s — i.e., WEBC's 6–8s target is at
+  parity on real finality while being honest about it. Sui achieves sub-second
+  finality for owned-object operations via a consensusless fast path.
+- **Design consequence (future, benchmark-gated):** because WEBC already models
+  owned objects (§8), a **Sui-style fast path for owned-object operations**
+  (simple transfers, in-game item moves) is a natural later upgrade that could
+  bring those specific actions to sub-second finality without touching the
+  batch/consensus path. Recorded as a phase-2 candidate under the honesty rule —
+  a possibility, not a promise. For rapid in-game actions, session keys and
+  app-level aggregation (commit outcomes at checkpoints rather than per click)
+  are the supported patterns today.
+Status: **clarification decided; fast path recorded as phase-2 candidate.**
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
@@ -1108,9 +1149,10 @@ honesty rule: label everything you produce as confirmed / planned / experimental
 
 ### Open (design these; priority order)
 
-1. **Distribution numbers:** a concrete allocation and release schedule is on
-   the table (15.33) — owner approval or adjustment pending; once approved, it
-   is decided.
+1. **Distribution numbers:** **decided** — the 15.33 allocation was owner-
+   approved (15.38): 25% contributors / 5% validator bootstrap / 30% usage
+   subsidies / 15% airdrop in three waves / 15% ecosystem fund / 10% strategic
+   reserve, with the recorded release shapes and reversion paths.
 2. **Batch settlement:** both owner choices are now decided (mandatory batch;
    chain-native retry-by-default with per-order user control — 15.37); the
    remaining mechanics (limit/slippage details, multi-hop routing,
