@@ -53,15 +53,20 @@ not deeply audited.
   not even express a failure): persistent-failure typed exit after retries,
   transient-failure survival, and a genuinely certified (3-of-4 keys) invalid
   block surfacing as `CertifiedBlockInvalid`.
-- **C3 — HIGH — unbounded per-height memory keyed by attacker-chosen round
-  (OOM).** `round.rs` stores `prevotes`/`precommits` keyed `(u32 round, Address)`
-  and a **full Block** per round in `proposals`, with no window around
-  `self.round`. Any snapshot member can sign valid votes for rounds `0..2^32`; a
-  staked validator is the legitimate leader of ~p·2^32 rounds so its proposals
-  pass `verify_in_set`. `rule_catch_up` and `has_one_third_participation` also
-  iterate all keys per event (quadratic CPU). Fix: reject/park messages with
-  `round > current_round + K`, cap stored future rounds, evict rounds below the
-  decision round.
+- **C3 — HIGH — RESOLVED (commit `bc3869b`) — unbounded per-height memory keyed
+  by attacker-chosen round (OOM).** `round.rs` stored `prevotes`/`precommits`
+  keyed `(u32 round, Address)` and a **full Block** per round in `proposals`,
+  with no window around `self.round`; any snapshot member could sign valid
+  votes for rounds `0..2^32`. **Reproduced first** by
+  `round.rs::far_future_rounds_are_ignored_and_stale_rounds_are_evicted`.
+  **Fix:** a sliding round window — ingestion ignores messages more than
+  `MAX_FUTURE_ROUNDS` (32) above the current round, each round change evicts
+  storage more than `MAX_PAST_ROUNDS` (32) below it (lock/valid value live in
+  dedicated fields and are never evicted; signing only happens at the current
+  round so evicted guards cannot re-enable an old step), and the driver applies
+  the same horizon before its C1 block re-execution so far-future leader
+  proposals cannot burn CPU. Beyond-window nodes recover via next-height state
+  sync.
 - **C4 — HIGH — RESOLVED (commit `90c28ac`) — no durable WAL
   of own votes/locks → crash-restart self-equivocation.** The machine was
   in-memory and the driver rebuilt a fresh machine per height from the seed. A

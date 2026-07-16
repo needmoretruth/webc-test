@@ -419,12 +419,22 @@ certified-but-unimportable block is surfaced as a consensus emergency
 (`CertifiedBlockInvalid`) from both the live-commit and state-sync paths.
 Tests: `tests/consensus_import_failure.rs`.
 
-Genuinely remaining Phase 4 items: a reference-machine finality-timing number
-(this cloud container cannot produce it honestly); the CONFIRMED review finding
-C3 (then C5–C7 and the CI supply-chain/fuzz gates); and, optionally, a
-multi-node-over-TCP Byzantine integration test (the machine-level property is
-now tested). Fork choice is covered by the finality-certificate design (a node
-follows the certified chain and commits only finalized blocks).
+**C3 is fixed (commit `bc3869b`):** the machine now keeps a sliding window of
+rounds — ingestion ignores messages beyond `MAX_FUTURE_ROUNDS` (32) above the
+current round, round changes evict storage beyond `MAX_PAST_ROUNDS` (32) below
+it, and the driver applies the same horizon before its C1 block re-execution.
+A staked attacker can no longer size per-height memory (or CPU) with signed
+votes/proposals for arbitrary rounds.
+
+**All four P0 consensus findings (C1–C4) are now resolved.** Genuinely
+remaining Phase 4 items: the P1 findings C5–C7 (proof-of-lock carried with
+re-proposals, round-scaled timeouts, gated/directed state-sync replies); the
+CI supply-chain (`cargo-deny`) and fuzz gates; a reference-machine
+finality-timing number (this cloud container cannot produce it honestly); and,
+optionally, a multi-node-over-TCP Byzantine integration test (the
+machine-level property is now tested). Fork choice is covered by the
+finality-certificate design (a node follows the certified chain and commits
+only finalized blocks).
 
 ## Phase 3: local restartable node, storage, and developer APIs
 

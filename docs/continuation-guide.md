@@ -106,11 +106,14 @@ finding resolved in `docs/review/findings.md` with the commit hash
    storage I/O retries with backoff; a certified-but-unimportable block is a
    surfaced consensus emergency; tests in
    `webc-node/tests/consensus_import_failure.rs`.
-4. **C3 — bound per-height consensus memory** (round window, cap future
-   rounds, evict decided rounds). ← **NEXT**
-5. Then C5/C6 (proof-of-lock with re-proposals, round-scaled timeouts), C7
+4. ~~**C3 — bound per-height consensus memory.**~~ **DONE (commit
+   `bc3869b`).** Sliding round window (`MAX_FUTURE_ROUNDS`/`MAX_PAST_ROUNDS`
+   = 32) at machine ingestion + eviction on round change + the same horizon
+   in the driver before block re-execution.
+5. C5/C6 (proof-of-lock with re-proposals, round-scaled timeouts), C7
    (state-sync replies gated on a verified higher-height certificate), and
    the CI gates (`cargo-deny` + fuzz targets — plan review §3.5–3.6).
+   ← **NEXT**
 
 Full context: `docs/review/findings.md` (C1–C8) and
 `docs/review/2026-07-16-plan-review.md` §6. The session decides autonomously
