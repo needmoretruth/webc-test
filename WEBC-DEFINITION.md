@@ -789,6 +789,86 @@ lightweight-device promise applies to users verifying, not validators producing)
   criterion in the bootstrap program (15.10).
 Status: **decided direction.**
 
+### 2026-07-16 — Round 5: compression vs verification, zk usage policy, node environment, Walrus-style blobs, vote spam control
+
+**15.24 Compression does not break verification — confirmed feasible.**
+Owner asked whether zstd-compressed data can still be verified. Yes, because
+compression lives only in the **envelope**, never in the content: hashes and
+signatures are always computed over the canonical (uncompressed) bytes; a node
+receives compressed bytes, decompresses, then verifies exactly as before. Two
+peers compressing differently (or not at all) still agree on every hash. The
+same applies at rest — the database compresses pages internally while the state
+root is computed over logical values. This is standard practice across major
+chains and databases. Status: **decided.**
+
+**15.25 Where zk fits (and where it does not).**
+Clarification: Solana's "ZK Compression" uses validity proofs to keep masses of
+small accounts *out of expensive state* — it is state compression, not a
+consensus-bandwidth mechanism. WEBC's policy:
+- **Yes — light verification (already core, §8):** browsers and light clients
+  verify succinct proofs of finalized checkpoints instead of downloading the
+  chain. This is where zk-style succinctness pays off: prove once, verify
+  millions of times cheaply.
+- **Yes (later, optional) — compressed state:** a ZK-Compression-like feature for
+  applications with huge numbers of tiny objects (game items, tickets), keeping
+  them provable without bloating hot state.
+- **No — validator-to-validator consensus:** validators must execute transactions
+  anyway, and generating a zk proof costs orders of magnitude more compute than
+  simply executing; putting proving on the block-production critical path would
+  wreck the 2-second target. Consensus bandwidth is reduced by 15.19's methods
+  (aggregation, compact relay, zstd), not by zk. Status: **decided direction.**
+
+**15.26 Node environment — official image, spec floor/recommended split, spec roadmap.**
+- **zram as a protocol requirement makes no sense technically** — memory
+  configuration is invisible to consensus (compatibility is determined by the
+  execution engine, and honesty cannot be checked from outside), so it cannot be
+  a consensus rule. The owner's underlying intent is right, though, and is
+  adopted as: WEBC ships an **official container image** (the standard way to run
+  a validator) with zram, zstd, and kernel/database tuning **on by default** —
+  everyone gets the same tuned environment without a protocol mandate.
+- **Minimum vs recommended spec are split deliberately** (owner-decided): a low
+  floor so entry stays broad, a higher recommended profile for comfortable
+  operation.
+- **The floor rises over time** (owner-decided): initial floor ~1 GbE + NVMe SSD
+  + modest RAM; later governance (or automatic, benchmark-triggered rules) may
+  raise it — more RAM, 10 GbE, optionally allowing GPU acceleration (useful for
+  batch signature verification and erasure coding; never consensus-mandatory
+  without a governance decision). Validators are not promised to stay
+  lightweight forever; *users* are (§12).
+- Reviewer guardrail: every floor raise must cite **measured demand** (sustained
+  utilization/benchmarks), because each raise prices out operators and is a
+  centralization pressure; a multi-year hardware roadmap is published so
+  operators can plan. Status: **decided direction.**
+
+**15.27 Bulk data — Walrus-style erasure-coded blob layer (owner-referenced).**
+Adopted phasing for large content (files, media, game assets):
+- Now: unchanged — content off-chain, hashes/permissions on-chain (§9).
+- Later: a **Walrus-style blob network** as a companion layer: blobs are
+  erasure-coded into slivers spread across storage nodes, so each node stores a
+  small fraction yet the whole remains recoverable from a subset; total overhead
+  is a few × the data size (vs. every-node-stores-everything), capacity scales
+  with node count, availability is certified on-chain, and storage is paid in
+  WEBC. This gives cheap big-data storage without burdening validators or
+  needing a separate chain. Status: **decided direction (phase 2).**
+
+**15.28 Vote spam without vote fees — why it cannot happen.**
+Owner asked: if votes are not fee-paying transactions, what stops vote spam?
+Votes are **permissioned, bounded messages**, unlike transactions:
+1. Only the current committee's known keys may vote in a given round; any other
+   "vote" fails one cheap signature check at the network edge and is dropped
+   before touching consensus.
+2. Each member gets **one vote per round** — duplicates are discarded on sight.
+   Total vote traffic is therefore fixed by protocol (committee size × rounds),
+   not by demand; there is nothing to flood.
+3. Voting twice *differently* (equivocation) is provable misbehavior and costs
+   stake.
+4. Peers that persistently send invalid messages are scored down and banned at
+   the p2p layer (standard practice).
+So spam control comes from admission + quotas + punishment. Solana needs vote
+fees partly because nearly anyone can register and vote; WEBC's stake-gated
+rotating committee makes honest participation free and outsider spam
+structurally impossible. Status: **decided.**
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
