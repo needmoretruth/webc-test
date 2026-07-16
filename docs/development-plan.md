@@ -17,11 +17,14 @@ change under a silent proposer, and the lock-safety property). The async
 the driver feeds its mempool into proposals, and certificate-verified state sync
 lets a late-joining node catch up — proven by loopback tests (three validators
 finalize one chain, a gossiped transfer is finalized by all, a late node catches
-up via sync). Phase 4's consensus mechanism is complete except that
-consensus-detected equivocation is not yet wired to an applied slash; the rest of
-the remainder is validation (a reference finality-timing number and a multi-node
-Byzantine test). This marker records progress and does not weaken any acceptance
-criterion below.
+up via sync). **Phase 4's consensus mechanism is NOT complete or safe:** beyond the
+already-known equivocation-to-slash wiring, a 2026-07-16 read-only review reported
+HIGH-severity consensus safety/liveness/DoS gaps (no `valid(v)` re-execution before
+prevote/lock/finalize, a silent halt on failed import, unbounded attacker-round
+memory, and no vote/lock WAL → crash-restart self-equivocation — see
+`docs/review/findings.md` C1–C4 and the P0 list in the remaining-work section
+below). This marker records progress and does not weaken any acceptance criterion
+below.
 
 This plan is written so a new development session can continue without inventing product decisions. Read `AGENTS.md`, `docs/decision-record.md`, this file, `docs/whitepaper.md`, and `docs/implementation-status.md` before changing protocol code.
 
@@ -500,20 +503,40 @@ active**. A-1, the A-2 consensus core, and the A-3 deterministic core are done:
    BlockRequest/BlockResponse wire messages, and a unified live-or-sync per-height
    loop) lets a late-joining node catch up — proven by a loopback test — done.
 
-The remaining Phase 4 work:
+The remaining Phase 4 work (P0 items first, from the 2026-07-16 plan review —
+`docs/review/findings.md` C1–C8 and `docs/review/2026-07-16-plan-review.md` §6;
+reproduce each finding with a failing test before fixing it):
 
-10. publish a reference-machine finality-timing number (cannot be produced in this
+10. **(P0, C1) validate a proposed block before prevoting/locking/finalizing it** —
+    the driver must dry-run `apply_block` against current state (the `valid(v)`
+    predicate) so a Byzantine leader cannot obtain a finality certificate for an
+    unimportable block;
+11. **(P0, C2) never halt silently on a failed finalized-block import** —
+    distinguish an invalid block (a post-finality emergency) from a transient
+    storage error (retry/surface); do not treat it as a clean exit;
+12. **(P0, C3) bound per-height consensus memory** — reject/park messages beyond
+    `current_round + K`, cap stored future rounds, evict decided rounds, so an
+    attacker-chosen `u32` round cannot OOM the node;
+13. **(P0, C4) persist a durable WAL of own votes/locks before broadcasting** — so
+    a crash-restart cannot make an honest validator self-equivocate. This MUST land
+    before item 15 (equivocation → slash), or honest restarts get slashed;
+14. publish a reference-machine finality-timing number (cannot be produced in this
     cloud container);
-11. wire consensus-detected equivocation to an applied slash — the machine detects
+15. wire consensus-detected equivocation to an applied slash — the machine detects
     it and emits verifiable `DoubleVoteEvidence`, but the driver does not act on
     it: `block.evidence` is neither committed by the header nor executed, and
     slashing applies only via an `Operation::SubmitSlashingEvidence` transaction,
     so close the loop (an authenticated block-evidence path or an auto-submitted
-    evidence transaction) and add an end-to-end slash test;
-12. add a multi-node Byzantine test that <1/3 power cannot finalize conflicting
+    evidence transaction) and add an end-to-end slash test (depends on item 13);
+16. add a multi-node Byzantine test that <1/3 power cannot finalize conflicting
     blocks (the lock-safety property is unit-tested today);
-13. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
-    every completed item.
+17. carry a proof-of-lock certificate with re-proposals and scale timeouts by round
+    (C5/C6 liveness), and make state-sync a directed reply gated on a verified
+    higher-height certificate (C7);
+18. add supply-chain (`cargo-deny`) and fuzz-target CI gates (plan review §3.5–3.6);
+19. update `docs/implementation-status.md` and `docs/continuation-guide.md` after
+    every completed item, and mark the resolved `docs/review/findings.md` entry
+    with its commit hash.
 
 Only after consensus is stable should the contract runtime, the WEBC high-level
 language and tooling, the native oracle, the web platform, and the bridges be
