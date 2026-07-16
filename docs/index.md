@@ -25,6 +25,19 @@ If documents disagree, the higher item in this list wins. Fix the lower document
 - `session-keys-implementation-plan.md` — constrained on-chain session-key design and staged build order (Phase 2 gate)
 - `session-keys-next-steps.md` — durable resume plan; the ML-DSA signature gate, primary-key recovery/rotation, recovery-root rotation, epoch-boundary pruning, the browser/SDK surface, and durable encrypted permission storage + automatic lane setup are done — only reference-machine benchmarks remain before Phase 3
 
+## Review artifacts (`docs/review/`)
+
+Durable outputs of review sessions. Not authority (the decision record and code
+win), but a session must read them at start so it does not re-derive the map or
+re-discover a known finding.
+
+- `review/codebase-map.md` — where every crate/module/file lives and what it owns
+- `review/2026-07-16-plan-review.md` — the critical plan review: what is sound,
+  decision provenance, the security checklist, architectural gaps, the open owner
+  decisions, and the prioritized P0/P1/P2 worklist
+- `review/findings.md` — reported code-level findings (severity, location, fix
+  direction); reproduce each before fixing
+
 ## Editing rule
 
 - A confirmed product/economic change first updates `decision-record.md`, but only after user approval.

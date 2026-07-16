@@ -164,16 +164,26 @@ height 1 from the persisted redb store.
 ## Phase 4: networking and signed consensus (in progress)
 
 Phase 4 is split into three stages: **A-1 networking plumbing**, **A-2 signed BFT
-consensus core**, **A-3 robustness**. **A-1 and A-2 are complete; A-3 is in place
-except that consensus-detected equivocation is not yet wired to an applied slash.**
-A-3 covers received-block validation, the multi-round Tendermint machine with
-locking and round changes, equivocation *detection*, the async consensus driver
-with mempool-fed proposals, and certificate-verified state sync — proven by
-loopback tests where three validator nodes finalize the same chain, a gossiped
-transfer is finalized by all, and a late-joining node catches up purely via sync.
-The remaining Phase 4 items (the equivocation-to-slash wiring, a reference
-finality-timing number, and a multi-node Byzantine test) are detailed at the end
-of the A-3 section.
+consensus core**, **A-3 robustness**. The happy-path mechanism of all three exists
+and converges in loopback tests, but **Phase 4 is NOT complete or safe**: A-1 and
+A-2 landed, and A-3 covers received-block validation, the multi-round Tendermint
+machine with locking and round changes, equivocation *detection*, the async
+consensus driver with mempool-fed proposals, and certificate-verified state sync —
+proven by loopback tests where three validator nodes finalize the same chain, a
+gossiped transfer is finalized by all, and a late-joining node catches up purely
+via sync.
+
+**2026-07-16 plan-review correction:** a read-only review reported HIGH-severity
+consensus safety/liveness/DoS gaps that must be reproduced and fixed before Phase
+4 can be called done — see `docs/review/findings.md` C1–C8: no `valid(v)`
+re-execution before prevote/lock/finalize (a Byzantine leader can certify an
+unimportable block — C1), a silent node halt on failed import (C2), unbounded
+attacker-chosen-round memory (C3), and no vote/lock WAL so a crash-restart
+self-equivocates (C4, which must be fixed before equivocation is wired to a
+slash). The previously-listed remaining items (equivocation-to-slash wiring, a
+reference finality-timing number, and a multi-node Byzantine test) still stand and
+are detailed at the end of the A-3 section; the full worklist is
+`docs/review/2026-07-16-plan-review.md` §6.
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
 

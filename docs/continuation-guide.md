@@ -28,26 +28,44 @@ Use simple Korean when speaking to the user, address them as 관리자 (administ
 ## Current verified checkpoint
 
 Phases 0, 1, 2, and 3 are complete; **Phase 4 (networking + signed BFT consensus)
-has its full mechanism in place — A-1 (networking plumbing), the A-2 consensus
-core, and A-3 (received-block validation, a multi-round Tendermint machine with
-locking and safe round changes, objective equivocation detection, the async
-`ConsensusDriver` with mempool-fed proposals, and certificate-verified state
-sync) are all done.** Loopback integration tests prove three validator nodes
-finalize one chain, a gossiped transfer is finalized by all, and a late-joining
-node catches up purely via state sync. Honest remaining Phase 4 items: (a) a
-reference-machine finality-timing number; (b) **wiring consensus-detected
-equivocation to an applied slash** — the machine detects it and produces
-verifiable `DoubleVoteEvidence`, but the driver does NOT yet slash: `block.evidence`
-is neither committed by the header nor executed, and slashing applies only via an
-`Operation::SubmitSlashingEvidence` transaction, so closing this needs an
-authenticated evidence path or an auto-submitted evidence transaction plus a test;
-and (c) a multi-node Byzantine test that <1/3 power cannot finalize conflicting
-blocks (the lock-safety property is unit-tested today). Always use
-`git log` to discover the current branch tip;
-the checkpoint list below names implementation history, not an instruction to
-reset or return to an older commit. (The prototype remains unsafe for real funds,
-and reference-machine benchmark numbers are still owed before any performance
-claim.)
+has the happy-path mechanism in place but is NOT yet safe or complete** — A-1
+(networking plumbing), the A-2 consensus core, and A-3 (received-block validation,
+a multi-round Tendermint machine with locking and safe round changes, objective
+equivocation *detection*, the async `ConsensusDriver` with mempool-fed proposals,
+and certificate-verified state sync) all exist and converge in loopback tests
+(three validator nodes finalize one chain, a gossiped transfer is finalized by
+all, and a late-joining node catches up purely via state sync).
+
+**Correction from the 2026-07-16 plan review (do not call Phase 4 "done"):** a
+read-only review reported HIGH-severity consensus safety/liveness/DoS gaps that
+must be reproduced and fixed before the mechanism can be trusted. See
+`docs/review/findings.md` C1–C8, chiefly:
+- **C1** — a proposal is prevoted/locked/finalized without re-executing the block
+  (`valid(v)` predicate missing), so a Byzantine leader can obtain a valid
+  finality certificate for an unimportable block. This is a safety-relevant gap.
+- **C2** — the driver treats a failed finalized-block import as a silent clean
+  exit, so one bad proposer can halt honest nodes.
+- **C3** — per-height vote/proposal maps are keyed by an attacker-chosen `u32`
+  round with no window → OOM.
+- **C4** — no durable WAL of own votes/locks → a crash-restart makes an honest
+  validator self-equivocate (this must be fixed BEFORE wiring equivocation to a
+  slash, or honest restarts get slashed).
+
+Previously-listed honest remaining items still stand and now sit AFTER C1–C4 in
+priority: (a) a reference-machine finality-timing number; (b) **wiring
+consensus-detected equivocation to an applied slash** — the machine detects it and
+produces verifiable `DoubleVoteEvidence`, but the driver does NOT yet slash:
+`block.evidence` is neither committed by the header nor executed, and slashing
+applies only via an `Operation::SubmitSlashingEvidence` transaction, so closing
+this needs an authenticated evidence path or an auto-submitted evidence
+transaction plus a test (and depends on C4); and (c) a multi-node Byzantine test
+that <1/3 power cannot finalize conflicting blocks (the lock-safety property is
+unit-tested today). The full prioritized worklist is
+`docs/review/2026-07-16-plan-review.md` §6. Always use `git log` to discover the
+current branch tip; the checkpoint list below names implementation history, not an
+instruction to reset or return to an older commit. (The prototype remains unsafe
+for real funds, and reference-machine benchmark numbers are still owed before any
+performance claim.)
 
 Completed Phase 1 work, in implementation order:
 
