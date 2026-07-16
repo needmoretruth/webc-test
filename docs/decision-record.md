@@ -140,6 +140,8 @@ This file is the authoritative short record of decisions made with the project o
 - The smart-contract execution foundation is chosen: deterministic, restricted WebAssembly, with Rust as the first authoring language compiled to WASM. This is the safety/speed engine, not the language most developers write by hand.
 - Above that foundation WEBC provides its own high-level contract language and framework, designed to be easy and intuitive for humans and AI. It is implemented as a safe authoring layer that lowers (transpiles) to the audited Rust framework and its components; it does not add a second from-scratch VM or a hand-written compiler backend, so it inherits Rust/WASM safety, determinism, and performance. WEBC builds the language front end (parser + lowering), and reuses the Rust/LLVM toolchain for the hard optimization/codegen work.
 - The earlier caution against "inventing a new language" refers to a new low-level VM or an independent compiler backend, which WEBC does not build. A high-level authoring language that lowers to the audited Rust layer is explicitly wanted.
+- **Sequencing (owner-confirmed 2026-07-16):** the bespoke WEBC high-level language is built **later, as a separately-resourced project.** An interim path ships first: contracts are authored in Rust (a Rust embedded-DSL / SDK over the audited framework) and compiled off-chain to deterministic WASM, so contracts become possible before the language exists. This stages the risk (prove the runtime, ABI, and tooling first) without changing the decision to build the language.
+- **Pluggable-frontend requirement (owner-confirmed 2026-07-16):** the interim architecture must be designed as a **flexible, replaceable structure so the bespoke WEBC language can be mounted later with minimal rework.** Concretely: freeze a stable contract ABI and a stable "authoring front-end → lowering → audited Rust framework → WASM" seam, so the WEBC language is added as one more front-end over the *same* lowering/ABI target — never a rewrite of the runtime or the framework. Treat the authoring front-end as a versioned, swappable boundary like the crypto/storage/proof seams. The off-chain-compilation invariant still holds: the chain only ever accepts deterministic WASM + metadata (see `architecture.md`).
 - Design leanings for that language, recorded to guide the future design (the final surface syntax is the administrator's decision, made when the language is designed): optimize for AI to write and to read, and ship AI-oriented language documentation, while staying easy for human developers; compiled, not interpreted (do not follow Python's interpreted model); take ergonomic cues from Go and from the Solana/Sui contract languages (the Rust/Move family) rather than from Solidity; ease of writing matters, but never at the cost of clean, optimized, fast output.
 - Move VM and EVM/Solidity are not the native WEBC runtime. Ethereum/Solana compatibility is delivered through bridges (see the bridge section), not by executing their bytecode natively.
 - AI-native development is a design goal: the language, framework, and documentation are machine-readable and composable so an AI agent can read a component catalog and assemble a contract from documented, audited building blocks. The same catalog serves human-only and human-with-AI developers.
@@ -190,6 +192,21 @@ This file is the authoritative short record of decisions made with the project o
 - Account-based stealth addresses are technically possible and should be researched using scheme-versioned announcements and viewing keys.
 - Bitcoin Silent Payments cannot be copied directly because it relies on Bitcoin UTXO inputs and quantum-vulnerable elliptic-curve key agreement.
 - A mainnet stealth-address scheme must be evaluated for browser scanning cost, spam resistance, recovery, and post-quantum compatibility.
+
+## Security review process (owner-confirmed 2026-07-16)
+
+- Because the protocol is implemented by alternating AI sessions, an **earlier
+  independent security-review gate** is required for the security-critical core —
+  consensus, cryptography, and economics — **before** the contract runtime, ZK,
+  bridge, and platform layers are stacked on top of it. This is in addition to the
+  Phase-13 pre-mainnet audits, not a replacement.
+- The gate: after the economics phase (Phase 5) the consensus + crypto + economics
+  core is **frozen** and submitted to an independent/external review; higher layers
+  do not build on the core until that review's blocking findings are resolved.
+- Motivation is on record: the 2026-07-16 plan review (`docs/review/`) found
+  fund-destroying and consensus-safety defects that "green" tests did not catch,
+  and a case where shipped code and the status docs disagreed. See
+  `docs/development-plan.md` for where this gate sits in the phase order.
 
 ## Explicitly not decided yet
 
