@@ -14,8 +14,14 @@ existing one, or restarting after a context compaction. If the user says only
 2. Read `docs/decision-record.md` — confirmed user decisions; it wins over any code, comment, or summary that disagrees.
 3. Read `docs/continuation-guide.md` — the verified checkpoint and the **exact next task**. This is the live "what to do next" pointer.
 4. Read `docs/implementation-status.md` — what the code actually implements today (vs. what is still missing or unsafe).
-5. Run `git log --oneline -15` and `git status --short --branch` to see the real current state on disk and the branch.
-6. For the specific task, read the one topic document it needs (see **Required reading order** below and `docs/index.md`).
+5. Read `docs/review/` — the durable review artifacts a session must not re-derive:
+   `codebase-map.md` (where everything lives), `2026-07-16-plan-review.md` (the
+   critical review, owner-decision list, and prioritized worklist), and
+   `findings.md` (reported code findings). **Before touching consensus, the
+   network layer, the mempool, or the faucet, read `findings.md` first** so you do
+   not re-discover a known gap or re-introduce a fixed one.
+6. Run `git log --oneline -15` and `git status --short --branch` to see the real current state on disk and the branch.
+7. For the specific task, read the one topic document it needs (see **Required reading order** below and `docs/index.md`).
 
 Then **resume the first incomplete item named in `docs/continuation-guide.md`** and keep going, without asking the user to restate decisions or rules already recorded here.
 
@@ -107,10 +113,15 @@ The existing prototype still uses old assumptions. Do not treat passing legacy t
 Known mismatches include:
 
 - objective evidence exists only for double votes; other slashing classes remain disabled;
+- consensus-detected equivocation is NOT yet wired to an applied slash (the detector runs, the penalty does not);
+- the finality "committee" is the whole validator set — the confirmed rotating stake-weighted sub-committee is unbuilt;
+- `ChainStore` keeps latest-only state — no historical state for proofs/sync yet;
 - localized congestion fee markets are incomplete;
 - trusted-relayer bridge logic that is only a mock/prototype.
 
-Read `docs/implementation-status.md` for the audit summary.
+Read `docs/implementation-status.md` for the audit summary and
+`docs/review/findings.md` for reported code-level gaps (including HIGH-severity
+consensus/network items a review flagged but has not yet reproduced).
 
 ## Development principles
 
@@ -132,6 +143,87 @@ Read `docs/implementation-status.md` for the audit summary.
 16. Update `docs/implementation-status.md` after each material implementation milestone.
 17. Record any changed product decision in `docs/decision-record.md` only with the user's approval.
 18. **Reuse over reinvention** (see the dedicated section below): prefer an existing, maintained, license-compatible crate/module over hand-writing equivalent machinery.
+
+## Common implementer pitfalls — read before writing code
+
+Two different models (Claude Opus 4.8 and GPT-5.6 Sol) take turns implementing
+this project. These are the mistakes that break a crypto chain and that a
+confident model is most likely to make. Treat each as a hard rule, not advice.
+
+1. **Never call something "complete" without running its acceptance test.** A
+   passing unit test on the happy path is not completion. A phase item is done
+   only when the `development-plan.md` acceptance condition for it is demonstrated
+   by a repeatable test, and `docs/implementation-status.md` says exactly what is
+   and is not covered. Overstating status is a security defect here: it hides
+   unbuilt safety mechanisms. (Live example: consensus was described as
+   essentially complete, but a review found HIGH-severity safety/liveness/DoS gaps
+   — see `docs/review/findings.md`. Do not repeat that.)
+2. **Never weaken a check, edit a committed test vector, or relax an assertion to
+   make a test pass.** If a cross-language fixture or a consensus vector fails,
+   the code is wrong until proven otherwise — never the frozen bytes. Changing a
+   vector requires a written reason and, if it is a wire/consensus format, a
+   version bump.
+3. **Never introduce nondeterminism into a state transition.** No `HashMap`/
+   `HashSet` iteration in any hashed/consensus path (use `BTreeMap`/`BTreeSet` —
+   the state maps already do), no wall-clock (`SystemTime`, `Instant`), no
+   `Instant::now`, no thread timing, no `f64`/`f32` in canonical/consensus values
+   (the canonical encoder rejects floats — keep it that way), no RNG inside
+   `apply`/`build_block`/verification. Time enters consensus only as an event fed
+   in by a driver, never read by the machine.
+4. **Validate hostile input before allocating or looping on it.** Every network
+   frame, wallet request, and stored record is hostile. Check length/bounds/magic/
+   version before decoding, before `Vec::with_capacity`, before recursion. An
+   attacker-controlled length prefix or round number must never size an
+   allocation or an unbounded map (see findings C3, N6).
+5. **Never put a secret in argv, an env var that leaks, a log line, `Debug`, or
+   `Serialize`.** Validator/consensus/wallet key material loads from a permissioned
+   keystore file, never a command-line flag (visible in `ps`). Secret types stay
+   non-`Debug`/`Serialize`/`Clone` (the code already does this — preserve it).
+6. **`unwrap`/`expect`/panic are forbidden on any path reachable by untrusted
+   input or consensus.** Return a typed `Result`. `unwrap` is allowed only in
+   `#[cfg(test)]`.
+7. **Reproduce before you fix a review finding.** For any item in
+   `docs/review/findings.md`, write a failing test that demonstrates it first, then
+   fix, then keep the test. A static-review finding can be a false positive — do
+   not "fix" phantom bugs, and do not trust one without a repro.
+8. **Do not duplicate live status into multiple documents.** Phase/checkpoint
+   facts live ONLY in `docs/continuation-guide.md` and
+   `docs/implementation-status.md`. Do not copy them into `AGENTS.md`,
+   `ai-handoff.md`, or a new summary file — duplicated status rots into
+   contradictory sources. Update the two owners; point everything else at them.
+9. **Stay inside the phase gate.** Do not jump ahead to the contract runtime, the
+   WEBC language, ZK, or real-fund bridges before their phase and its acceptance
+   gate. Building ahead of the gate creates unaudited surface that looks done.
+10. **Commit and push after every coherent, tested step.** This is an ephemeral
+    cloud container; unpushed work is lost work. Never end a turn with valuable
+    uncommitted or committed-but-unpushed changes.
+
+## Conventions for alternating implementers
+
+So two models produce one consistent codebase:
+
+- **Commit messages:** `type(scope): summary` (e.g. `feat(consensus): …`,
+  `fix(node): …`, `docs(review): …`, `test(mempool): …`). Explain *why* in the
+  body when the change is non-obvious or security-relevant. Record the reason when
+  deleting or reversing prior work.
+- **Wire/consensus formats are versioned and domain-separated.** New signed or
+  hashed payloads get a `WEBC_*_V<n>` domain constant; changing an existing format
+  bumps its version and updates the shared Rust/TypeScript fixture in the same
+  commit.
+- **Every new source file opens with the module comment from
+  `docs/code-documentation-template.md`** (purpose, responsibilities,
+  non-responsibilities, data flow, security boundary).
+- **New wrapper types over raw integers/bytes** for any value that must not be
+  mixed (`Amount`, `BlockHeight`, `Epoch`, `Nonce`, `ChainId`, `AssetId`,
+  `ValidatorId`, `PeerId`, …). Do not pass bare `u64`/`u128`/`[u8; N]` across
+  module boundaries for such values.
+- **One decision, one home:** product/economic changes → `docs/decision-record.md`
+  (owner-approved only); implementation-architecture choices → a numbered ADR
+  under `docs/adr/`; status → the two status docs above.
+- **When you finish an item,** update `docs/continuation-guide.md` and
+  `docs/implementation-status.md`, and, if you resolved a `findings.md` item, mark
+  it resolved there with the commit hash. Leave the next session an unambiguous
+  "exact next task."
 
 ## Reuse over reinvention — standing rule
 
@@ -226,12 +318,17 @@ future session.
 
 ## Definition of done for a code change
 
+A change is done only when ALL of these hold — not when the feature's happy path
+runs:
+
 - Module, function, and type documentation describes the final behavior.
-- Relevant unit, integration, property, malformed-input, adversarial, and regression tests pass.
-- Formatting, strict linting, and documentation generation pass without unexplained warnings.
-- Consensus changes include deterministic test vectors and cross-language byte fixtures when TypeScript shares the format.
+- Relevant unit, integration, property, malformed-input, adversarial, and regression tests pass — including the failure, rollback, restart, duplicate, race, and abuse paths, not only success.
+- The specific `development-plan.md` acceptance condition for the item is demonstrated by a repeatable test (see pitfall 1).
+- The full gate passes locally with no unexplained warnings (see **Validation expectations** for the exact commands): `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps`, `cargo run -p webc-node -- demo`; and for SDK/wire changes `pnpm install --frozen-lockfile && pnpm check`.
+- Consensus/wire changes include deterministic test vectors and cross-language byte fixtures when TypeScript shares the format, updated in the same commit, with a version bump if the format changed.
 - Security assumptions and remaining limitations are recorded in code and the relevant document.
-- `docs/implementation-status.md` accurately states what is implemented and what remains missing.
+- `docs/implementation-status.md` and `docs/continuation-guide.md` accurately state what is implemented and what remains missing, and any resolved `docs/review/findings.md` item is marked resolved with its commit hash.
+- The change is committed and pushed to the designated branch.
 
 ## Communication with the user
 
@@ -382,62 +479,21 @@ For TypeScript packages, run package build/tests after every SDK or wire change.
 
 ## Immediate next work
 
-Follow `docs/development-plan.md`.
+Follow `docs/development-plan.md` for the phase order, and read
+`docs/continuation-guide.md` for the verified checkpoint and the **exact next
+task** — that file and `docs/implementation-status.md` are the single live owners
+of "what is done / what is next." This section deliberately does NOT restate the
+phase status, because a second copy rots into a contradiction (see pitfall 8).
 
-Phase 0 and Phase 1 are complete, and Phase 2 is active. The exact verified checkpoint and next
-unfinished task are maintained in `docs/continuation-guide.md` and
-`docs/implementation-status.md`. Continue from there; do not restart completed work.
-
-The versioned on-chain account authorization gate is now **implemented**: policy
-+ post-quantum root field, a real ML-DSA-65 root-**signature** gate on session-key
-install/revoke, constrained session keys (budgets, lane binding, epoch expiry with
-epoch-boundary pruning), primary active-key recovery/rotation, recovery-root
-rotation, the browser/SDK operation + subkey surface with cross-language fixtures,
-and an indicative `webc-node bench`. The only remaining session-key item is
-reference-machine benchmark numbers (this cloud container is not a reference
-machine). See `docs/session-keys-next-steps.md`.
-
-Durable encrypted per-origin wallet **permission storage** and **automatic
-authorization-lane setup** are now implemented too (`sdk/webc-js/src/permission-store.ts`
-and the `persistence`/`restoredGrants` wiring in `wallet-service.ts`), which was
-the last outstanding Phase 2 wallet-wire/secret-isolation gate. With the
-session-key gate, Phase 2's acceptance conditions are met except reference-machine
-benchmarks.
-
-**Phase 3 is largely complete on the Rust node side** (`crates/webc-storage` +
-`crates/webc-node`): the `KvStore` storage seam with an in-memory backend and a
-durable crash-safe `RedbKvStore` (redb, reused not hand-rolled), a typed
-`ChainStore` with atomic per-block commits and startup consistency checks, a
-restartable single-proposer `Node`, a validating fee-priority `Mempool`, a
-transport-independent `NodeService`, an axum/tokio HTTP+WebSocket API under `/v1`
-with a devnet faucet, and a `webc-node run` command (redb-backed, auto-sealing,
-restart-recovery smoke-tested). Rust gate: 176 tests.
-
-The browser side is done too: `sdk/webc-js/src/node-client.ts` (`WebcNodeClient`,
-a typed HTTP/WS client for `/v1`) and `sdk/webc-js/demo/index.html` (a static
-reference site: create wallet → faucet → proof → signed transfer → live finality
-over WebSocket). Verified end to end against a running node.
-
-**Phase 3 is complete. Phase 4 (networking + signed BFT consensus) is in
-progress**, split into three stages: A-1 networking plumbing, A-2 signed BFT
-consensus core, A-3 robustness.
-
-**Phase 4 A-1 is complete**: a new `crates/webc-net` crate (the swappable
-transport seam) with the WEBC gossip wire format, mutual challenge/response peer
-authentication over Ed25519 identity keys, and authenticated TCP flood gossip
-behind a `NetworkHandle` (reusing tokio + tokio-util framing, owning the protocol
-pieces), plus node glue (`admit_network_transaction`, `AppState::with_network`,
-`run_gossip_pump`, and `webc-node run --p2p-listen/--peer`). A transaction
-submitted to one node reaches every peer's mempool. Rust gate: 192 tests.
-
-**The next step is Phase 4 A-2 (signed BFT consensus core)** in
-`docs/development-plan.md`: extend `NetMessage` with proposals/votes/certs, a
-deterministic leader schedule over a persisted stake snapshot (activating the
-already-wired `Table::ValidatorSets` writer), and signed prevote/precommit
-producing a finality certificate. Do not skip to contract runtime, ZK, or real
-bridges before their own gates. The only broad open item across phases is
-reference-machine benchmark numbers (this cloud container cannot produce them
-honestly). See `docs/continuation-guide.md` for the exact next step.
+At the time of the 2026-07-16 plan review the highest-priority work is the P0/P1
+list in `docs/review/2026-07-16-plan-review.md` §6 — chiefly the reported
+HIGH-severity consensus gaps in `docs/review/findings.md` (C1 block-validity
+before prevote, C2 silent halt on failed import, C3 unbounded round memory, C4
+crash-restart self-equivocation), wiring equivocation detection to an applied
+slash, the multi-node Byzantine safety test, and adding supply-chain
+(`cargo-deny`) + fuzz gates to CI. Reproduce each finding before fixing it.
+Do not skip ahead to the contract runtime, the WEBC language, ZK, or real-fund
+bridges before their own phase gates.
 
 ## User decisions still required later
 
@@ -446,6 +502,16 @@ Do not ask prematurely. Ask only when the relevant phase is ready to freeze:
 - final public distribution/anti-duplicate-account specification;
 - production bridge trust/proof model for real funds;
 - any change to confirmed genesis distribution or monetary policy;
-- any mainnet governance emergency-power design.
+- any mainnet governance emergency-power design;
+- **slashing severity percentages and the downtime-penalty schedule** — economic
+  policy of the same class as inflation; bring numbers with a threat model at the
+  Phase 5 economics freeze, not before;
+- **contract-language sequencing** and whether an interim "WASM + Rust-eDSL/SDK"
+  path ships before the bespoke WEBC language (see the plan review; the decision to
+  build the language is confirmed, only its timing is open).
 
-Technical gates such as epoch duration, committee size, fee constants, VM, proof backend, and block limits should be decided with specifications, benchmarks, threat models, and tests rather than pushed to the user without evidence.
+See `docs/review/2026-07-16-plan-review.md` §5 for the framing of the open owner
+decisions. Technical gates such as epoch duration, committee size, fee constants,
+VM, proof backend, and block limits should be decided with specifications,
+benchmarks, threat models, and tests rather than pushed to the user without
+evidence.
