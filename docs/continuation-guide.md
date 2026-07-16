@@ -101,11 +101,13 @@ finding resolved in `docs/review/findings.md` with the commit hash
    cheap authenticity gate and a chain-position pin) before any proposal
    reaches the machine; reproduced first by
    `webc-node/tests/consensus_byzantine_proposal.rs`.
-3. **C2 — no silent halt on failed finalized-block import** (invalid block =
-   post-finality emergency, surfaced; transient storage error = retry).
-   ← **NEXT**
+3. ~~**C2 — no silent halt on failed finalized-block import.**~~ **DONE
+   (commit `5ca197d`).** `run()` returns a typed `DriverExit`; transient
+   storage I/O retries with backoff; a certified-but-unimportable block is a
+   surfaced consensus emergency; tests in
+   `webc-node/tests/consensus_import_failure.rs`.
 4. **C3 — bound per-height consensus memory** (round window, cap future
-   rounds, evict decided rounds).
+   rounds, evict decided rounds). ← **NEXT**
 5. Then C5/C6 (proof-of-lock with re-proposals, round-scaled timeouts), C7
    (state-sync replies gated on a verified higher-height certificate), and
    the CI gates (`cargo-deny` + fuzz targets — plan review §3.5–3.6).

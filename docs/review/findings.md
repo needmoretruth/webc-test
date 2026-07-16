@@ -39,14 +39,20 @@ not deeply audited.
   full `apply_block` dry-run on a scratch state clone; only an importable
   proposal reaches the machine, and each round's first authentic proposal is
   re-executed at most once (leader CPU-spam bounded).
-- **C2 — HIGH — node silently terminates on a failed finalized-block import.**
-  `consensus_driver.rs` `commit_if_decided` (~232-238) returns `true` on any
-  `import_finalized_block` error and `run()` (~176-210) treats that as a clean
-  exit — no log, no retry. With C1, one malicious proposer halts every honest
-  node (all "finalize" the invalid block, all fail import, all exit). Even alone,
-  a transient storage error kills the node. Fix: distinguish "block invalid"
-  (post-finality this is a consensus emergency, not a shutdown) from storage
-  errors (retry/surface); never exit silently.
+- **C2 — HIGH — RESOLVED (commit `5ca197d`) — node silently terminates on a
+  failed finalized-block import.** `commit_if_decided` returned `true` on any
+  `import_finalized_block` error and `run()` treated that as a clean exit — no
+  log, no retry; the sync path swallowed the error entirely. **Fix:** `run()`
+  now returns a typed `DriverExit` (`NetworkClosed` / `StorageFailed` /
+  `CertifiedBlockInvalid` / `SnapshotFailed`); transient storage I/O is
+  retried with backoff before giving up, corruption/inconsistency fail closed
+  immediately, and a certified-but-unimportable block is surfaced as a
+  consensus emergency from both the live and sync paths (the sync path also
+  pins responses to the local chain position first). Tests
+  (`tests/consensus_import_failure.rs`, written first — the pre-fix API could
+  not even express a failure): persistent-failure typed exit after retries,
+  transient-failure survival, and a genuinely certified (3-of-4 keys) invalid
+  block surfacing as `CertifiedBlockInvalid`.
 - **C3 — HIGH — unbounded per-height memory keyed by attacker-chosen round
   (OOM).** `round.rs` stores `prevotes`/`precommits` keyed `(u32 round, Address)`
   and a **full Block** per round in `proposals`, with no window around

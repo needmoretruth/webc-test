@@ -412,9 +412,16 @@ at most once. Reproduced first by
 collected an honest prevote+precommit and a fully verifying finality
 certificate).
 
+**C2 is fixed (commit `5ca197d`):** `ConsensusDriver::run` now returns a typed
+`DriverExit` instead of exiting silently — transient storage I/O is retried
+with backoff, corruption fails closed immediately, and a
+certified-but-unimportable block is surfaced as a consensus emergency
+(`CertifiedBlockInvalid`) from both the live-commit and state-sync paths.
+Tests: `tests/consensus_import_failure.rs`.
+
 Genuinely remaining Phase 4 items: a reference-machine finality-timing number
-(this cloud container cannot produce it honestly); the CONFIRMED review findings
-C2–C3 (then C5–C7 and the CI supply-chain/fuzz gates); and, optionally, a
+(this cloud container cannot produce it honestly); the CONFIRMED review finding
+C3 (then C5–C7 and the CI supply-chain/fuzz gates); and, optionally, a
 multi-node-over-TCP Byzantine integration test (the machine-level property is
 now tested). Fork choice is covered by the finality-certificate design (a node
 follows the certified chain and commits only finalized blocks).
