@@ -91,13 +91,14 @@ For each: reproduce with a failing test FIRST, then fix, then mark the
 finding resolved in `docs/review/findings.md` with the commit hash
 (AGENTS.md pitfall 7).
 
-1. **C4 — durable WAL of own votes/locks before broadcasting.** Most urgent:
-   the equivocation→slash loop is live (`a6197ac`), so an honest validator
-   that crashes and restarts mid-height can self-equivocate and be slashed
-   today. Land this before any network run with honest restarts.
+1. ~~**C4 — durable WAL of own votes/locks before broadcasting.**~~ **DONE
+   (commit `90c28ac`).** The driver journals every own signed message durably
+   before broadcast (`Table::ConsensusWal`) and replays the journal on
+   restart (`ConsensusMachine::restore`); reproduced first by
+   `webc-node/tests/consensus_restart.rs`.
 2. **C1 — validate a proposed block before prevote/lock/finalize** (`valid(v)`
    dry-run of `apply_block`), so a Byzantine leader cannot get a certificate
-   for an unimportable block.
+   for an unimportable block. ← **NEXT**
 3. **C2 — no silent halt on failed finalized-block import** (invalid block =
    post-finality emergency, surfaced; transient storage error = retry).
 4. **C3 — bound per-height consensus memory** (round window, cap future

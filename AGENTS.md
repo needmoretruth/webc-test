@@ -139,7 +139,7 @@ The existing prototype still uses old assumptions. Do not treat passing legacy t
 Known mismatches include:
 
 - objective evidence exists only for double votes; other slashing classes remain disabled;
-- consensus-detected equivocation IS wired to an applied slash (commit `a6197ac`), but with no durable vote/lock WAL (review finding C4) an honest validator restart can self-equivocate and be slashed — treat the slash path as live-but-unsafe until the WAL lands;
+- consensus-detected equivocation IS wired to an applied slash (commit `a6197ac`); the crash-restart self-equivocation hazard (review finding C4) is fixed by the durable vote/lock WAL (commit `90c28ac`) — the driver journals every own signed message before broadcast and replays the journal on restart;
 - the finality "committee" is the whole validator set — the confirmed rotating stake-weighted sub-committee is unbuilt;
 - `ChainStore` keeps latest-only state — no historical state for proofs/sync yet;
 - localized congestion fee markets are incomplete;

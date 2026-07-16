@@ -48,16 +48,33 @@ not deeply audited.
   iterate all keys per event (quadratic CPU). Fix: reject/park messages with
   `round > current_round + K`, cap stored future rounds, evict rounds below the
   decision round.
-- **C4 — HIGH — no durable WAL of own votes/locks → crash-restart
-  self-equivocation.** The machine is in-memory and the driver rebuilds a fresh
-  machine per height from the seed. A validator restarting mid-height forgets it
-  already prevoted/precommitted and re-votes (and `build_candidate` uses wall
-  time, so a re-proposal differs), producing two signed conflicting votes =
-  objective `DoubleVoteEvidence` → self-slash/tombstone once slashing is wired.
-  Tendermint requires persisting `(height, round, step, lock, last-signed vote)`
-  before broadcast. Fix: a durable vote/lock WAL consulted before signing.
-  **Interaction: this makes the "wire equivocation to slash" work (plan §4.3)
-  dangerous until C4 is fixed — you would slash honest nodes that restarted.**
+- **C4 — HIGH — RESOLVED (commit `90c28ac`) — no durable WAL
+  of own votes/locks → crash-restart self-equivocation.** The machine was
+  in-memory and the driver rebuilt a fresh machine per height from the seed. A
+  validator restarting mid-height forgot it already prevoted/precommitted and
+  re-voted (and `build_candidate` uses wall time, so a re-proposal differed),
+  producing two signed conflicting votes = objective `DoubleVoteEvidence` →
+  self-slash/tombstone via the live a6197ac slash loop.
+  **Reproduced first** (per AGENTS.md pitfall 7) by
+  `webc-node/tests/consensus_restart.rs::a_restarted_validator_never_signs_a_conflicting_vote`:
+  pre-fix, the restarted round-0 proposer re-proposed a different-timestamp
+  block and re-prevoted it, and the conflicting pair verified as objective
+  slashable evidence. **Fix:** `ConsensusWalRecord` (own signed
+  proposals/votes + locked/valid state) journaled by the machine
+  (`ConsensusMachine::wal_record`), persisted durably by the driver **before
+  every own broadcast** (`Node::persist_consensus_wal` →
+  `ChainStore::put_consensus_wal`, new `Table::ConsensusWal`, pruned
+  atomically when the height commits), and replayed on restart
+  (`ConsensusMachine::restore`) so a restored machine re-enters the journaled
+  round, never re-signs a recorded step, and keeps its lock. Journal write
+  failure fails closed (message never broadcast); an unreadable/invalid
+  journal drops the height to non-voting observer mode. Covered by the
+  restart integration test plus machine tests (`restart_without_journal_
+  replay_self_equivocates`, `restored_machine_never_resigns_a_recorded_step`,
+  `restore_preserves_the_lock_across_a_restart`,
+  `restored_proposer_does_not_repropose_its_recorded_round`,
+  `restore_rejects_corrupt_or_foreign_journals`) and storage round-trip/prune/
+  redb-restart tests.
 
 - **ADVERSARIAL VERIFICATION (2026-07-16 workflow): C1, C2, C3, C4 are all
   CONFIRMED** by a second independent read of the exact code:

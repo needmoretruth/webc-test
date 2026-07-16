@@ -388,16 +388,26 @@ added the `less_than_one_third_byzantine_power_cannot_finalize_conflicting_block
 machine-level test. The `Operation::SubmitSlashingEvidence` transaction path also
 still exists.
 
-Because the slash loop is now live, review finding **C4 (no durable vote/lock WAL)
-is an ACTIVE danger**: an honest validator that crashes and restarts mid-height can
-self-equivocate and be slashed — fix the WAL before running this on a network (see
-`docs/review/findings.md`). Genuinely remaining Phase 4 items: a reference-machine
-finality-timing number (this cloud container cannot produce it honestly); the
-CONFIRMED review findings C1–C4; and, optionally, a multi-node-over-TCP Byzantine
-integration test (the machine-level property is now tested). Fork choice is covered
-by the finality-certificate design (a node follows the certified chain and commits
-only finalized blocks). The a6197ac evidence path is being independently verified
-this session.
+**C4 is fixed (commit `90c28ac`, 2026-07-16 session):** the driver now journals
+the machine's own signed proposals/votes plus lock state durably
+(`Table::ConsensusWal`, one fsync-backed commit per own broadcast, pruned
+atomically when the height commits) **before** any own message reaches the wire,
+and replays the journal into the rebuilt machine on restart
+(`ConsensusMachine::restore`) — the restored machine re-enters the journaled
+round, never re-signs a recorded step, and keeps its lock. Journal write failure
+fails closed (the message is never broadcast); an unreadable/invalid journal
+drops the height to non-voting observer mode. Reproduced first
+(`tests/consensus_restart.rs`: the restarted proposer re-proposed and
+re-prevoted a different block, verifying as objective slashable evidence), then
+fixed; machine/storage/integration tests cover replay, lock preservation,
+corrupt-journal rejection, prune-on-commit, and redb restart survival.
+
+Genuinely remaining Phase 4 items: a reference-machine finality-timing number
+(this cloud container cannot produce it honestly); the CONFIRMED review findings
+C1–C3 (then C5–C7 and the CI supply-chain/fuzz gates); and, optionally, a
+multi-node-over-TCP Byzantine integration test (the machine-level property is
+now tested). Fork choice is covered by the finality-certificate design (a node
+follows the certified chain and commits only finalized blocks).
 
 ## Phase 3: local restartable node, storage, and developer APIs
 
