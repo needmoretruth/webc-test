@@ -7,6 +7,10 @@ members = [
     "crates/webc-net",
     "crates/webc-node",
 ]
+# The fuzz crate builds only under nightly + cargo-fuzz (libFuzzer), so it is
+# not a workspace member: `cargo build/test --workspace` on stable must not try
+# to compile it. CI's fuzz-smoke job builds it separately.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2021"

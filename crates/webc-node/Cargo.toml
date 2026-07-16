@@ -1,6 +1,8 @@
 [package]
 name = "webc-node"
 version = "0.1.0"
+# Not published to crates.io: an internal workspace prototype crate.
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
