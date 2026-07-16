@@ -20,7 +20,12 @@ use crate::error::NetError;
 pub const NET_PROTOCOL_MAGIC: [u8; 4] = *b"WEBC";
 
 /// Current peer-to-peer wire version. Bumped on any breaking frame change.
-pub const NET_PROTOCOL_VERSION: u16 = 1;
+///
+/// v2 (C5): `SignedProposal` gained a `proof_of_lock` prevote set, changing the
+/// bincode layout of `NetMessage::Proposal`, so a v1 node cannot decode a v2
+/// proposal frame. The handshake pins this version, so mismatched peers refuse
+/// to connect rather than misparse.
+pub const NET_PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum size of a single decoded frame payload, in bytes.
 ///

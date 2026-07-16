@@ -379,7 +379,9 @@ impl Proposal {
     }
 }
 
-/// A [`Proposal`] plus the carried block and the proposer's consensus signature.
+/// A [`Proposal`] plus the carried block, the proposer's consensus signature,
+/// and — for a re-proposal — the proof-of-lock that authenticates its
+/// `valid_round`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedProposal {
     /// Domain-separated payload covered by `signature`.
@@ -388,13 +390,27 @@ pub struct SignedProposal {
     pub block: Block,
     /// Ed25519 signature from the proposer's registered consensus key.
     pub signature: SignatureBytes,
+    /// The prevote quorum proving `payload.valid_round` legitimately locked
+    /// `payload.block_hash` (the proof-of-lock, Tendermint rule 28). Empty for a
+    /// fresh proposal (`valid_round == None`); for a re-proposal it carries a
+    /// strictly-over-two-thirds set of prevotes for `(height, valid_round,
+    /// block_hash)`. Each prevote is independently signed, so this set is
+    /// self-authenticating and is deliberately **not** covered by the proposer's
+    /// signature — a relay cannot forge it (that needs 2f+1 real signatures) and
+    /// cannot repoint it (verification binds it to the signed `valid_round` and
+    /// `block_hash`). Carrying it lets a node that missed round `valid_round`
+    /// still follow the lock instead of prevoting nil forever (the C5 liveness
+    /// fix).
+    #[serde(default)]
+    pub proof_of_lock: Vec<SignedVote>,
 }
 
 impl SignedProposal {
-    /// Signs a block proposal with the proposer's consensus key.
+    /// Signs a fresh block proposal (no proof-of-lock) with the proposer's key.
     ///
-    /// Fails if the block cannot be hashed. The caller is responsible for having
-    /// built a valid block; this only binds the proposer's signature to it.
+    /// Use this only for a first proposal (`valid_round == None`). A re-proposal
+    /// must carry its lock proof via [`Self::sign_with_proof_of_lock`], or
+    /// [`Self::verify_in_set`] rejects it.
     #[allow(clippy::too_many_arguments)]
     pub fn sign(
         protocol_version: ProtocolVersion,
@@ -405,6 +421,35 @@ impl SignedProposal {
         block: Block,
         proposer: Address,
         consensus_key: &Keypair,
+    ) -> Result<Self, ChainError> {
+        Self::sign_with_proof_of_lock(
+            protocol_version,
+            chain_id,
+            height,
+            round,
+            valid_round,
+            block,
+            proposer,
+            consensus_key,
+            Vec::new(),
+        )
+    }
+
+    /// Signs a proposal that carries a proof-of-lock prevote set (a re-proposal).
+    ///
+    /// The prevotes authenticate `valid_round`; they are self-signed and are not
+    /// covered by the proposer's signature (see the field docs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_with_proof_of_lock(
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        height: u64,
+        round: u32,
+        valid_round: Option<u32>,
+        block: Block,
+        proposer: Address,
+        consensus_key: &Keypair,
+        proof_of_lock: Vec<SignedVote>,
     ) -> Result<Self, ChainError> {
         let block_hash = block.hash()?;
         let payload = Proposal {
@@ -421,13 +466,16 @@ impl SignedProposal {
             payload,
             block,
             signature,
+            proof_of_lock,
         })
     }
 
     /// Verifies the proposal against a snapshot: configuration match, that the
     /// carried block hashes to `payload.block_hash`, that the proposer is the
-    /// scheduled leader for `(height, round)`, and that the signature matches the
-    /// proposer's registered consensus key.
+    /// scheduled leader for `(height, round)`, that the signature matches the
+    /// proposer's registered consensus key, and that the proof-of-lock is
+    /// consistent with `valid_round` (empty iff `None`, else a real 2f+1 prevote
+    /// quorum for the cited round and this block).
     pub fn verify_in_set(
         &self,
         set: &ValidatorSet,
@@ -452,7 +500,65 @@ impl SignedProposal {
             .consensus_key_of(self.payload.proposer)
             .ok_or(ChainError::ConsensusValidatorNotInSet)?;
         verify_signature(&key, &self.payload.signing_bytes()?, &self.signature)
-            .map_err(|_| ChainError::ConsensusSignatureInvalid)
+            .map_err(|_| ChainError::ConsensusSignatureInvalid)?;
+        self.verify_proof_of_lock(set, expected_protocol_version, expected_chain_id)
+    }
+
+    /// Verifies the proof-of-lock invariant (C5).
+    ///
+    /// A fresh proposal (`valid_round == None`) must carry no prevotes. A
+    /// re-proposal (`valid_round == Some(vr)`) must cite an earlier round
+    /// (`vr < round`) and attach a strictly-over-two-thirds prevote quorum for
+    /// exactly `(height, vr, block_hash)`, each prevote from a distinct snapshot
+    /// member with a valid signature.
+    fn verify_proof_of_lock(
+        &self,
+        set: &ValidatorSet,
+        expected_protocol_version: ProtocolVersion,
+        expected_chain_id: &ChainId,
+    ) -> Result<(), ChainError> {
+        match self.payload.valid_round {
+            None => {
+                if self.proof_of_lock.is_empty() {
+                    Ok(())
+                } else {
+                    // A first proposal has nothing to prove; a non-empty set is
+                    // a malformed proposal.
+                    Err(ChainError::ConsensusProofOfLockInvalid)
+                }
+            }
+            Some(valid_round) => {
+                if valid_round >= self.payload.round {
+                    return Err(ChainError::ConsensusProofOfLockInvalid);
+                }
+                let mut seen = BTreeSet::new();
+                let mut power = Amount::ZERO;
+                for vote in &self.proof_of_lock {
+                    if vote.payload.vote_type != VoteType::Prevote
+                        || vote.payload.height != self.payload.height
+                        || vote.payload.round != valid_round
+                        || vote.payload.block_hash != self.payload.block_hash
+                        || vote.payload.protocol_version != expected_protocol_version
+                        || &vote.payload.chain_id != expected_chain_id
+                    {
+                        return Err(ChainError::ConsensusProofOfLockInvalid);
+                    }
+                    set.verify_vote(vote, expected_protocol_version, expected_chain_id)
+                        .map_err(|_| ChainError::ConsensusProofOfLockInvalid)?;
+                    if !seen.insert(vote.payload.validator) {
+                        // A duplicated validator cannot pad the lock power.
+                        return Err(ChainError::ConsensusProofOfLockInvalid);
+                    }
+                    power = power
+                        .checked_add(set.power_of(vote.payload.validator))
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                }
+                if !set.has_two_thirds_power(power) {
+                    return Err(ChainError::ConsensusProofOfLockInvalid);
+                }
+                Ok(())
+            }
+        }
     }
 }
 

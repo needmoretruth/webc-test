@@ -300,6 +300,11 @@ pub enum ChainError {
     ConsensusHeightRoundMismatch,
     #[error("consensus proposal was not signed by the scheduled leader for this height and round")]
     ConsensusProposalNotFromLeader,
+    #[error(
+        "consensus re-proposal carries an invalid proof-of-lock (missing, mismatched, \
+         or sub-quorum prevote set for the cited valid_round)"
+    )]
+    ConsensusProofOfLockInvalid,
     #[error("consensus proposal block hash does not match its carried block")]
     ConsensusProposalBlockMismatch,
     #[error("consensus message came from a validator absent from the height's snapshot")]

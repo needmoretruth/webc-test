@@ -531,6 +531,12 @@ impl ConsensusMachine {
                     return Ok(actions);
                 }
                 signed.verify_in_set(&self.set, self.protocol_version, &self.chain_id)?;
+                // C5: a re-proposal carries a verified proof-of-lock — the 2f+1
+                // prevotes for its `valid_round`. Absorb them into this node's
+                // own prevote tally (they are already snapshot-verified) so a
+                // node that missed those prevotes can now satisfy the rule-28
+                // guard and follow the lock instead of prevoting nil forever.
+                self.absorb_proof_of_lock(&signed.proof_of_lock);
                 // Keep one proposal per round (the first from its valid leader).
                 self.proposals
                     .entry(signed.payload.round)
@@ -610,6 +616,13 @@ impl ConsensusMachine {
     }
 
     /// Signs, stores, and broadcasts this node's proposal for `round`.
+    ///
+    /// For a re-proposal (`valid_round = Some(vr)`) this attaches the
+    /// proof-of-lock: the 2f+1 prevotes this node recorded for `(vr, block)`
+    /// (C5). A fresh proposal (`valid_round = None`) carries no lock proof. If
+    /// the lock prevotes are somehow unavailable (they always are for a value
+    /// this node marked valid), it degrades to a fresh proposal rather than
+    /// emitting an unprovable re-proposal.
     fn emit_proposal(
         &mut self,
         round: u32,
@@ -621,7 +634,23 @@ impl ConsensusMachine {
             .identity
             .as_ref()
             .ok_or(ChainError::ConsensusProposalNotFromLeader)?;
-        let signed = SignedProposal::sign(
+        let block_hash = block.hash()?;
+        // Assemble the proof-of-lock for a re-proposal. `valid_round` is a round
+        // this node observed reach a prevote quorum, so it holds the prevotes.
+        let (valid_round, proof_of_lock) = match valid_round {
+            Some(vr) => {
+                let prevotes = self.prevote_quorum_for(vr, block_hash);
+                if self.set.has_two_thirds_power(self.prevote_power(&prevotes)) {
+                    (Some(vr), prevotes)
+                } else {
+                    // Cannot prove the lock; propose fresh rather than emit an
+                    // unverifiable re-proposal every peer would reject.
+                    (None, Vec::new())
+                }
+            }
+            None => (None, Vec::new()),
+        };
+        let signed = SignedProposal::sign_with_proof_of_lock(
             self.protocol_version,
             self.chain_id.clone(),
             self.height,
@@ -630,6 +659,7 @@ impl ConsensusMachine {
             block,
             identity.address,
             &identity.consensus_key,
+            proof_of_lock,
         )?;
         // Journal before queueing the broadcast: the driver persists
         // `wal_record()` durably before this message reaches the wire.
@@ -639,6 +669,49 @@ impl ConsensusMachine {
             Box::new(signed),
         )));
         Ok(())
+    }
+
+    /// Collects this node's recorded prevotes for `(round, block_hash)`, one per
+    /// validator — the raw material for a proof-of-lock (C5).
+    fn prevote_quorum_for(&self, round: u32, block_hash: Hash256) -> Vec<SignedVote> {
+        self.prevotes
+            .iter()
+            .filter(|((r, _), vote)| *r == round && vote.payload.block_hash == block_hash)
+            .map(|(_, vote)| vote.clone())
+            .collect()
+    }
+
+    /// Sums the snapshot power of the distinct validators behind `prevotes`.
+    fn prevote_power(&self, prevotes: &[SignedVote]) -> crate::Amount {
+        let mut seen = BTreeSet::new();
+        let mut power = crate::Amount::ZERO;
+        for vote in prevotes {
+            if seen.insert(vote.payload.validator) {
+                match power.checked_add(self.set.power_of(vote.payload.validator)) {
+                    Some(next) => power = next,
+                    None => return crate::Amount::ZERO,
+                }
+            }
+        }
+        power
+    }
+
+    /// Records the verified prevotes carried by a re-proposal's proof-of-lock
+    /// into this node's own prevote tally, first-vote-wins per (round,
+    /// validator) (C5). The prevotes were already snapshot-verified by
+    /// [`SignedProposal::verify_in_set`], so this only needs to insert absent
+    /// entries; it never overwrites a locally-observed vote and never emits
+    /// equivocation evidence (that path stays owned by live vote ingestion).
+    fn absorb_proof_of_lock(&mut self, prevotes: &[SignedVote]) {
+        for vote in prevotes {
+            // Ignore anything outside the retained round window so this cannot
+            // reintroduce evicted state (C3 bound).
+            if self.beyond_future_horizon(vote.payload.round) {
+                continue;
+            }
+            let key = (vote.payload.round, vote.payload.validator);
+            self.prevotes.entry(key).or_insert_with(|| vote.clone());
+        }
     }
 
     /// Handles a fired timeout for its round and step.
@@ -2379,6 +2452,164 @@ mod tests {
             stored.len() as u32 <= MAX_PAST_ROUNDS + MAX_FUTURE_ROUNDS + 1,
             "stored round count exceeds the documented bound"
         );
+    }
+
+    /// C5: a node that never saw round-`vr` prevotes must still be able to
+    /// prevote a re-proposal, because the re-proposal carries the proof-of-lock
+    /// (the 2f+1 prevotes) that authenticates its `valid_round`. Without the
+    /// attached proof, the node can never satisfy the rule-28 guard and prevotes
+    /// nil forever while the lock holder re-proposes (the liveness bug).
+    #[test]
+    fn a_reproposal_with_proof_of_lock_is_followed_by_a_node_that_missed_the_round() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let d = Keypair::from_seed([4u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1), (&d, 1)]);
+
+        // Node D is our subject: it will be TOTALLY unaware of round 0 (it saw
+        // no round-0 proposal or prevotes) and must still follow a round-1
+        // re-proposal that cites round 0 as its proof-of-lock.
+        let mut node_d = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            1,
+            Some(identity(&d)),
+        );
+        node_d.start().unwrap();
+
+        // Build a real block X and a genuine round-0 prevote quorum for it from
+        // A, B, C (3 of 4 > 2/3) — the material for a proof-of-lock.
+        let leader0 = set.proposer_for(1, 0).unwrap();
+        let block_x = candidate_block(leader0, 1, 1);
+        let hash_x = block_x.hash().unwrap();
+        let pol: Vec<SignedVote> = [&a, &b, &c]
+            .iter()
+            .map(|k| sign_vote(k, 1, 0, VoteType::Prevote, hash_x))
+            .collect();
+
+        // The round-1 leader re-proposes X citing valid_round 0 with the PoL.
+        let leader1 = set.proposer_for(1, 1).unwrap();
+        let leader1_key = [&a, &b, &c, &d]
+            .into_iter()
+            .find(|k| k.address() == leader1)
+            .unwrap();
+        let reproposal = SignedProposal::sign_with_proof_of_lock(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            1,
+            1,
+            Some(0),
+            block_x,
+            leader1,
+            leader1_key,
+            pol,
+        )
+        .unwrap();
+
+        // Advance D to round 1 (it timed out round 0 having seen nothing).
+        node_d
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Propose,
+                round: 0,
+            })
+            .unwrap();
+        node_d
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Prevote,
+                round: 0,
+            })
+            .unwrap();
+        node_d
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Precommit,
+                round: 0,
+            })
+            .unwrap();
+        assert_eq!(node_d.round(), 1);
+
+        // Deliver the round-1 re-proposal. D never saw round 0, so without the
+        // attached PoL it would prevote nil; with it, it must prevote X.
+        let actions = node_d
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(reproposal),
+            )))
+            .unwrap();
+        let round1_prevotes: Vec<Hash256> = vote_broadcasts(&actions)
+            .into_iter()
+            .filter(|v| v.payload.round == 1 && v.payload.vote_type == VoteType::Prevote)
+            .map(|v| v.payload.block_hash)
+            .collect();
+        assert_eq!(
+            round1_prevotes,
+            vec![hash_x],
+            "a node that missed round 0 must follow the re-proposal via its proof-of-lock"
+        );
+    }
+
+    #[test]
+    fn a_reproposal_without_a_valid_proof_of_lock_is_rejected() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let d = Keypair::from_seed([4u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1), (&d, 1)]);
+        let mut node = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            1,
+            Some(identity(&d)),
+        );
+        node.start().unwrap();
+        let leader1 = set.proposer_for(1, 1).unwrap();
+        let leader1_key = [&a, &b, &c, &d]
+            .into_iter()
+            .find(|k| k.address() == leader1)
+            .unwrap();
+        let block_y = candidate_block(leader1, 1, 9);
+        let hash_y = block_y.hash().unwrap();
+
+        // A re-proposal citing valid_round 0 but attaching only ONE prevote
+        // (far below quorum) must be rejected outright.
+        let weak_pol = vec![sign_vote(&a, 1, 0, VoteType::Prevote, hash_y)];
+        let bad = SignedProposal::sign_with_proof_of_lock(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            1,
+            1,
+            Some(0),
+            block_y.clone(),
+            leader1,
+            leader1_key,
+            weak_pol,
+        )
+        .unwrap();
+        assert!(matches!(
+            bad.verify_in_set(&set, CURRENT_PROTOCOL_VERSION, &ChainId::devnet()),
+            Err(ChainError::ConsensusProofOfLockInvalid)
+        ));
+
+        // A fresh proposal (valid_round None) that nonetheless carries prevotes
+        // is malformed and rejected.
+        let stray_pol = vec![sign_vote(&a, 1, 0, VoteType::Prevote, hash_y)];
+        let malformed = SignedProposal::sign_with_proof_of_lock(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            1,
+            1,
+            None,
+            block_y,
+            leader1,
+            leader1_key,
+            stray_pol,
+        )
+        .unwrap();
+        assert!(matches!(
+            malformed.verify_in_set(&set, CURRENT_PROTOCOL_VERSION, &ChainId::devnet()),
+            Err(ChainError::ConsensusProofOfLockInvalid)
+        ));
     }
 
     #[test]
