@@ -1052,6 +1052,64 @@ and the conclusion does not follow:
   are the supported patterns today.
 Status: **clarification decided; fast path recorded as phase-2 candidate.**
 
+### 2026-07-16 — Round 10: speed strategy and the authoring language
+
+**15.40 Speed competitiveness — corrected facts and a two-track strategy.**
+Facts first: Solana's ~400ms is **block production**, not finality — optimistic
+confirmation arrives at ~1–2s and full finality at ~6–13s (32 slots). However,
+honesty cuts both ways: Solana's approved **Alpenglow** consensus upgrade
+targets finality on the order of ~150ms, and Sui's Mysticeti-class consensus
+commits in well under a second, with a consensusless fast path for owned
+objects below that. The frontier is sub-second; WEBC's 6–8s target is honest
+but not frontier, so a roadmap is required rather than complacency. Adopted
+two-track strategy:
+- **Track 1 — fast path for single-owner operations, promoted from phase-2
+  candidate to launch-scope engineering target.** Operations that touch only
+  state a single party controls (paying from one's own balance — credits to the
+  receiver are commutative — moving one's own objects/items) do not need global
+  ordering: validators individually verify and countersign, and a quorum of
+  signatures acts as a certificate of effective finality at **sub-second**
+  latency (the FastPay/Sui-fast-path technique, production-proven). Consensus
+  then checkpoints these certificates. This covers WEBC's #1 product — payments
+  — precisely. Contended/shared state (pools, batch settlement, multi-party
+  contracts) stays on the consensus path.
+- **Track 2 — consensus stretch targets, benchmark-gated.** Published claims
+  stay at ~2s blocks / 6–8s finality until proven; with a Mysticeti-class
+  DAG-BFT reference design and the decided mid-range hardware floor, stretch
+  targets of ~1s blocks / ~2–3s consensus finality are recorded as goals to be
+  claimed only after sustained public benchmarks (per §11 honesty).
+Status: **decided direction.**
+
+**15.41 The authoring language — designed and decided (working name: Weft).**
+Constraints from §9 hold (a front end lowering to the audited Rust/WASM
+framework; compiled; humans and AI both first-class). Decided shape:
+- **Working name "Weft"** (the thread woven across a web); owner may rename at
+  any time — the name is the only cosmetic item here.
+- **Surface:** brace-style syntax familiar to the TypeScript/JavaScript
+  mainstream (the largest shared corpus for both human developers and AI
+  models), with Rust-grade semantics underneath.
+- **Money and assets are special:** a built-in money type on u128 base units
+  with decimal literals (`1.5 WEBC` compiles to exact base units — floats do not
+  exist in the language); each asset is its own type (adding TOKEN_A to TOKEN_B
+  is a compile error); asset values are **linear** (Move's proven insight):
+  they cannot be duplicated or silently dropped, only moved — the compiler
+  rejects code that loses money.
+- **Predictability:** immutable by default; no null (Option) and no exceptions
+  (Result); loops over unbounded data must declare bounds; every entrypoint
+  declares what state it reads/writes (aligning source-level truth with §8's
+  declared access sets); no macros or metaprogramming.
+- **AI-native mechanics:** one canonical formatter (a single valid formatting,
+  gofmt-style); compiler emits a **machine-readable interface manifest**
+  (entrypoints, types, events, errors) consumed by the component catalog and by
+  agents; structured doc-comments (params / effects / failure modes) are
+  compiler-enforced; compiler errors are written as actionable fix suggestions
+  so models converge in fewer iterations; small stdlib plus catalog components
+  instead of ecosystem sprawl.
+- **Reproducibility:** language version pinned per contract; reproducible
+  builds.
+Status: **decided** (full grammar specification is implementation work within
+these decisions).
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
@@ -1158,14 +1216,21 @@ honesty rule: label everything you produce as confirmed / planned / experimental
    remaining mechanics (limit/slippage details, multi-hop routing,
    shared-infrastructure pricing) are delegated design work within
    15.13/15.18/15.37.
-3. **The high-level authoring language** surface design and component catalog
-   format (§9, §13) — largest remaining design area.
-4. **Cross-chain UX** (§10) — direction sketched in 15.36; details open.
-5. **Adoption strategy / flagship applications** — four flagship candidates named
+3. **The authoring language:** **decided** — "Weft" (working name,
+   owner-renamable): TS-familiar surface, Rust semantics, typed linear assets,
+   built-in exact money type, no null/exceptions/floats/macros, declared state
+   access, canonical formatter, compiler-emitted machine manifest (15.41). Full
+   grammar spec is implementation work within those decisions.
+4. **Speed roadmap:** **decided direction** — sub-second fast path for
+   single-owner operations at launch scope; benchmark-gated consensus stretch
+   targets (~1s blocks / ~2–3s finality) (15.40). Protocol design of the fast
+   path is engineering work.
+5. **Cross-chain UX** (§10) — direction sketched in 15.36; details open.
+6. **Adoption strategy / flagship applications** — four flagship candidates named
    in 15.36; details open.
-6. **Governance process details** (§11) — minimal process sketched in 15.36;
+7. **Governance process details** (§11) — minimal process sketched in 15.36;
    details open.
-7. **Service registry discovery format** (companion to 15.32) — schema design
+8. **Service registry discovery format** (companion to 15.32) — schema design
    open.
 
 ---
