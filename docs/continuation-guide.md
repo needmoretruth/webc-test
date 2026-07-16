@@ -115,9 +115,20 @@ finding resolved in `docs/review/findings.md` with the commit hash
    `0813e7c`).** ~~**CI gates — `cargo-deny` + fuzz targets.**~~ **DONE (commit
    `91760e2`:** `deny.toml` + cargo-deny job, `pnpm audit --prod` job, and a
    `fuzz/` crate with four libFuzzer targets run by a `fuzz-smoke` CI job).
-   **Remaining P1 consensus finding: C5** (attach the 2f+1 proof-of-lock
-   prevote set to re-proposals — a wire-format change with a version bump and
-   cross-language fixtures) ← **NEXT**.
+6. ~~**C5 — carry proof-of-lock with re-proposals.**~~ **DONE (commit
+   `3b2b460`).** `SignedProposal` carries a `proof_of_lock` prevote set; a node
+   that missed round `vr` now follows a re-proposal via its attached 2f+1
+   prevotes (wire bumped to `NET_PROTOCOL_VERSION = 2`, Rust-only format).
+
+**All consensus review findings C1–C7 are now resolved**, plus the CI
+supply-chain (`cargo-deny`), JS advisory (`pnpm audit --prod`), and fuzz gates.
+The **next work** is the remaining Phase 4 acceptance items that are not code
+findings: a reference-machine finality-timing number (needs real hardware —
+this cloud container cannot produce it honestly) and, optionally, a
+multi-node-over-TCP Byzantine integration test (the machine-level property is
+already tested). C8 is a LOW documentation/property-test item on the quorum
+arithmetic. After those, Phase 4 can be declared done and the path is Phase 5
+economics.
 
 Full context: `docs/review/findings.md` (C1–C8) and
 `docs/review/2026-07-16-plan-review.md` §6. The session decides autonomously

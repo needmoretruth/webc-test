@@ -169,13 +169,18 @@ not deeply audited.
     while-still-a-member (note, not a double-vote blocker); (ii) `pending_evidence`
     can accumulate one entry per real offender per round during a liveness stall
     (LOW — each requires a genuine offense, so not a cheap flood).
-- **C5 — MEDIUM — proof-of-lock (rule 28) not carried with re-proposals
-  (liveness).** Good: the receiver verifies `valid_round` against locally-recorded
-  2f+1 prevotes, not the proposer's claim. But those prevotes are not attached to
-  the re-proposal and there is no vote-set gossip yet, so a node that missed round
-  `vr` can never satisfy the guard and prevotes nil forever while the lock holder
-  re-proposes. Fix: attach the 2f+1 prevote set (PoL certificate) to re-proposals
-  and verify it, or gossip vote sets.
+- **C5 — MEDIUM — RESOLVED (commit `3b2b460`) — proof-of-lock (rule 28) not
+  carried with re-proposals (liveness).** A node that missed round `vr` could
+  never satisfy the local 2f+1-prevote guard and prevoted nil forever while the
+  lock holder re-proposed. **Fix:** `SignedProposal` now carries a
+  `proof_of_lock: Vec<SignedVote>` — empty for a fresh proposal, the 2f+1
+  prevotes for `(height, valid_round, block_hash)` on a re-proposal. The
+  prevotes are self-signed (not covered by the proposer's signature, so
+  unforgeable and un-repointable); `verify_in_set` rejects a missing/sub-quorum/
+  mismatched/padded PoL (`ConsensusProofOfLockInvalid`); the machine absorbs the
+  verified PoL prevotes into its tally so the rule-28 guard passes for a node
+  that missed the round. Wire bumped to `NET_PROTOCOL_VERSION = 2` (Rust-only
+  consensus format, no cross-language fixture). Tests in `round.rs`.
 - **C6 — MEDIUM — RESOLVED (commit `90ae433`) — constant timeouts instead of
   round-scaled.** `DriverTimeouts` now carries an `increment` and `for_kind`
   computes `base + round·increment` (saturating), the standard Tendermint

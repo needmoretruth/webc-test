@@ -435,13 +435,14 @@ for a higher height that verifies against the current snapshot (the driver
 gossips the certificate on commit). The CI supply-chain and fuzz gates are in
 (commit `91760e2`): `deny.toml` + a cargo-deny job, a `pnpm audit --prod` job
 (findings D1/D2), and a `fuzz/` crate with four libFuzzer targets run by a
-`fuzz-smoke` CI job. Genuinely remaining Phase 4 items: the P1 finding **C5**
-(attach the 2f+1 proof-of-lock prevote set to re-proposals — a wire-format
-change needing a version bump and cross-language fixtures); a reference-machine
-finality-timing number (this cloud container cannot produce it honestly); and,
-optionally, a multi-node-over-TCP Byzantine integration test (the machine-level
-property is now tested). Fork choice is covered by the finality-certificate
-design (a node
+`fuzz-smoke` CI job. C5 (commit `3b2b460`) attaches a `proof_of_lock` prevote
+set to re-proposals so a node that missed round `vr` follows the lock holder
+instead of stalling (wire bumped to `NET_PROTOCOL_VERSION = 2`). **All
+consensus review findings C1–C7 are now resolved.** Genuinely remaining Phase 4
+items are no longer code findings: a reference-machine finality-timing number
+(this cloud container cannot produce it honestly) and, optionally, a
+multi-node-over-TCP Byzantine integration test (the machine-level property is
+now tested). Fork choice is covered by the finality-certificate design (a node
 follows the certified chain and commits only finalized blocks).
 
 ## Phase 3: local restartable node, storage, and developer APIs

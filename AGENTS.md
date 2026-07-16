@@ -513,17 +513,18 @@ phase status, because a second copy rots into a contradiction (see pitfall 8).
 
 The 2026-07-17 documentation overhaul realigned every document to
 `WEBC-DEFINITION.md` and rebuilt the development plan (19 phases; 0–7 keep
-their historical numbers). The next session **resumes implementation work
-autonomously** from `docs/continuation-guide.md` "Exact next work" — at the
-time of writing, the Phase 4 P0 consensus findings in
-`docs/review/findings.md` (C4 vote/lock WAL first — the live slash loop makes
-it urgent — then C1 block-validity before prevote, C2 non-silent import
-failure, C3 bounded round memory), then C5–C7 and the supply-chain
-(`cargo-deny`) + fuzz CI gates. Reproduce each finding with a failing test
-before fixing it. The session chooses and sequences work within the plan on
-its own; it does not stop to ask permission between items. Do not skip ahead
-to the contract runtime, Weft, the DEX, the oracle, ZK, or real-fund bridges
-before their own phase gates.
+their historical numbers). The **Phase 4 consensus review findings C1–C7 are
+now all resolved** (see `docs/review/findings.md` for the per-finding commit
+hashes), along with the `cargo-deny` supply-chain gate, the `pnpm audit`
+JS-advisory gate, and the `cargo-fuzz` targets. The next session **resumes
+implementation work autonomously** from `docs/continuation-guide.md` "Exact
+next work" — the remaining Phase 4 items are a reference-machine finality
+benchmark (needs real hardware) and an optional multi-node-over-TCP Byzantine
+integration test, after which Phase 4 is done and Phase 5 economics begins.
+Reproduce each finding with a failing test before fixing it. The session
+chooses and sequences work within the plan on its own; it does not stop to ask
+permission between items. Do not skip ahead to the contract runtime, Weft, the
+DEX, the oracle, ZK, or real-fund bridges before their own phase gates.
 
 ## User decisions still required later
 
