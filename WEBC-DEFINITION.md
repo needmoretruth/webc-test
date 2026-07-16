@@ -532,6 +532,89 @@ exchange experience. Reviewer critique and refinement:
 Status: **proposed** (direction approved in spirit by owner; fragmentation
 refinement pending owner view).
 
+### 2026-07-16 — Round 2: u128 costs quantified, bootstrap grants, DEX architecture
+
+**15.9 u128 cost quantification (extends 15.1).**
+Owner asked for concrete impact numbers. Estimated deltas versus u64:
+- **Compute:** 128-bit add/subtract is ~2 CPU instructions; multiply/divide lower
+  to library routines in WASM (~5–20× a u64 op). A transfer performs tens of
+  amount operations (nanoseconds total), while verifying its signature alone costs
+  tens of microseconds — amount arithmetic is well under ~0.1% of transaction CPU.
+  No measurable TPS effect.
+- **Speed/finality:** block time and finality are set by network and consensus
+  (seconds); arithmetic contributes nothing perceptible.
+- **State size:** +8 bytes per stored amount. Balance-heavy records grow roughly
+  5–10%; most other state is unaffected.
+- **Bandwidth and fees:** encode amounts as variable-length integers on the wire
+  (small values stay small), so transaction size grows ~0–2%; the fee impact is
+  limited to the storage component — a few percent at worst.
+- **Precedent:** Ethereum computes all value in 256-bit words at global scale;
+  128-bit is half that width.
+Conclusion: the only real cost is ~8 extra bytes per stored amount; everything
+else is noise. Status: **recommended; awaiting owner confirmation** (owner
+leaning yes).
+
+**15.10 Bootstrap validator grants — owner proposal, adopted with refinements.**
+Owner's shape: split the 30% contributor pool into **25% general contributions +
+up to 5% validator-bootstrap grants**. Operators first prove themselves on the
+test network; at mainnet genesis they receive **stake-locked coins** (usable only
+for staking) to run validators; after a period the coins become their own.
+Reviewer refinements folded into the working design:
+1. **Vest by operation, not by calendar:** the grant unlocks gradually per epoch
+   of provably correct validation (target horizon 1–2 years); quitting early or
+   misbehaving forfeits the remainder.
+2. **Select on sustained correct operation over weeks, not raw computing power**
+   — compute is rentable; reliability is the scarce, honest signal.
+3. A small **personal co-stake**, ramping over time, so operators have their own
+   money at risk beyond the gift.
+4. **Per-operator cap plus diversity criteria** (hosting provider, geography) so
+   the validator set is not concentrated on one cloud; sybil applicants gain
+   little because grants are capped per identity and forfeitable.
+5. Grants **count as the operator's own share** for the ≥20 WEBC / ≥20%-of-pool
+   activation rule.
+6. The 5% is a **ceiling, not a target** — unused budget returns to the general
+   contributor pool.
+7. **Phase-0 honesty:** founder-run nodes at genesis are acceptable if labeled
+   temporary, with published criteria for retiring them.
+Status: **decided direction** (parameter details open).
+
+**15.11 Distribution, restated simply (extends 15.3).** There is no known way to
+hand out free coins to strangers that sybils cannot game. WEBC therefore promises
+"public rules, equal access, no insider privilege" — not "equal amount per
+human" — and uses several capped, stoppable channels instead of betting on one.
+Two owner decisions remain **pending**: (a) founder compensation — an explicit
+small vested allocation, or zero allocation with pre-published rules for valuing
+the founder's contributions; (b) whether recurring open auctions are acceptable
+as one distribution channel.
+
+**15.12 Ecosystem fund — upgraded to decided.** Owner approved 15.7 as refined:
+grant program with applications against published criteria; grants paid as
+non-transferable fee credits; the distribution split restated explicitly;
+founder-judged initially (stated honestly), migrating to community review.
+
+**15.13 DEX architecture round 2 — owner additions folded in.**
+Owner keeps small pools, wants small pools able to **contribute to big pools**, a
+structure that **uses trust**, and one that **exploits parallelism**. Working
+architecture:
+- **Three participation modes per site:** (1) *storefront* — embed a swap widget
+  over the canonical shared pool and add a disclosed frontend fee; (2) *liquidity
+  contributor* — the site's small pool deposits into the canonical pool and earns
+  a share of its fees (the owner's "small pool feeds the big pool"); (3)
+  *independent pool* — for niche or custom markets (e.g. a game's item economy).
+- **Trust as an on-chain track record:** the pool/storefront registry records
+  age, volume, fee history, and incident flags; wallets and aggregators filter on
+  it. A storefront built over the canonical pool inherits the pool's trust and
+  only needs to earn a reputation for honest fees — users never have to trust a
+  small site's own liquidity.
+- **Parallelism via per-block batch settlement:** swaps are submitted as intents
+  (parallel-friendly, fits declared read/write sets), and each ~2-second block
+  settles all intents on a pair at **one uniform clearing price**. This removes
+  the serial hot-object bottleneck *and* makes sandwich/front-running attacks
+  meaningless (ordering inside a block no longer matters) — most chains retrofit
+  this; WEBC can make it the native default. Liquidity sharding stays a later
+  option for extreme pairs.
+Status: **decided direction** (mechanics open).
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
