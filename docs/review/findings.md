@@ -468,15 +468,19 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 ## Dependency supply chain
 
-- **D1 — HIGH — no `cargo-deny`/`cargo-audit` gate in CI.** `.github/workflows/
-  ci.yml`: fmt/clippy/test/doc only; no advisory (RUSTSEC/yanked) scan, no license
-  policy enforcement (the Apache-compatible-only rule is manual), no ban on
-  unexpected/duplicate crates or non-crates.io sources. CONFIRMED. Fix: add a
-  `cargo-deny check` job (advisories + bans + licenses allow-list + sources
-  crates.io-only).
-- **D2 — MEDIUM — no JS advisory scan in CI.** No `pnpm audit`/OSV step; the JS
-  crypto deps (`@noble/*`, `@scure/*`, `micro-key-producer`) are pinned but
-  unscanned. Fix: `pnpm audit --audit-level=high` or OSV-scanner.
+- **D1 — HIGH — RESOLVED (commit `91760e2`) — no `cargo-deny`/`cargo-audit` gate
+  in CI.** **Fix:** `deny.toml` + a `cargo-deny` CI job enforce advisories
+  (RUSTSEC + yanked), a permissive-only license allow-list, no wildcard
+  versions, and crates.io-only sources. The bincode 1.3.3 UNMAINTAINED advisory
+  is ignored with a documented reason (frozen 1.x behind the codec/storage seam;
+  finding D4) and a removal condition. Internal crates marked `publish = false`
+  so their path deps are not read as public-crate wildcards. Passes locally
+  (`advisories ok, bans ok, licenses ok, sources ok`).
+- **D2 — MEDIUM — RESOLVED (commit `91760e2`) — no JS advisory scan in CI.**
+  **Fix:** a `pnpm audit --audit-level=high --prod` CI job scans the shipped SDK
+  dependencies (`@noble/*`, `@scure/*`, `micro-key-producer`); production deps
+  are clean today. Scoped to production so dev-only tooling advisories
+  (vitest/esbuild dev server) do not block the merge gate.
 - **D3 — LOW — duplicate major versions in the lock** (getrandom 0.2/0.3,
   rand_core 0.6/0.9, thiserror 1/2, tokio-tungstenite 0.24/0.29). Align where
   feasible; enforce with cargo-deny bans.
@@ -599,7 +603,13 @@ Still NOT audited / owed:
 - The completeness-critic areas E1–E8 above were surfaced, not fully audited.
 - Crypto primitive correctness of `ed25519-dalek`/`fips204` and RNG quality
   (trusted as reviewed upstream libraries).
-- **No dynamic testing, fuzzing, or reproduction — static review only.** Every
-  HIGH/CONFIRMED finding deserves a dedicated reproduction test before a fix
-  (per `AGENTS.md` pitfall 7). CONFIRMED verdicts mean two independent reads agreed
-  on the code facts, not that a runtime exploit was demonstrated.
+- **Static review only for the original pass.** CONFIRMED verdicts meant two
+  independent reads agreed on the code facts, not that a runtime exploit was
+  demonstrated. **Update (commits `90c28ac`, `45f7396`, `5ca197d`, `bc3869b`,
+  `90ae433`, `0813e7c`, `91760e2`):** the consensus P0/P1 findings C1–C4, C6,
+  and C7 were each reproduced with a failing test first, then fixed and kept
+  (per `AGENTS.md` pitfall 7); and continuous fuzz harnesses now exist for the
+  wire decoder, canonical encoder, transaction decode/verify, and mempool
+  admission (`fuzz/`, run in CI's `fuzz-smoke` job). Remaining consensus finding:
+  C5 (proof-of-lock re-proposals). The other under-covered areas (E1–E8, redb
+  fault injection, crypto primitives) are still owed.

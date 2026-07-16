@@ -112,10 +112,12 @@ finding resolved in `docs/review/findings.md` with the commit hash
    in the driver before block re-execution.
 5. ~~**C6 — round-scaled timeouts.**~~ **DONE (commit `90ae433`).**
    ~~**C7 — directed + certificate-gated state sync.**~~ **DONE (commit
-   `0813e7c`).** Remaining: **C5** (attach the 2f+1 proof-of-lock prevote set
-   to re-proposals — a wire-format change with a version bump and cross-language
-   fixtures) ← **NEXT**, then the CI gates (`cargo-deny` + fuzz targets — plan
-   review §3.5–3.6).
+   `0813e7c`).** ~~**CI gates — `cargo-deny` + fuzz targets.**~~ **DONE (commit
+   `91760e2`:** `deny.toml` + cargo-deny job, `pnpm audit --prod` job, and a
+   `fuzz/` crate with four libFuzzer targets run by a `fuzz-smoke` CI job).
+   **Remaining P1 consensus finding: C5** (attach the 2f+1 proof-of-lock
+   prevote set to re-proposals — a wire-format change with a version bump and
+   cross-language fixtures) ← **NEXT**.
 
 Full context: `docs/review/findings.md` (C1–C8) and
 `docs/review/2026-07-16-plan-review.md` §6. The session decides autonomously
