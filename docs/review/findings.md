@@ -22,15 +22,23 @@ not deeply audited.
 
 ## webc-chain / webc-node — consensus (round.rs, consensus.rs, consensus_driver.rs)
 
-- **C1 — HIGH — no block-validity check before prevoting.** `round.rs`
-  (rule_propose, ~436-476) prevotes any hash-consistent, leader-signed proposal;
-  `consensus_driver.rs` (~376-378) feeds proposals to the machine without
+- **C1 — HIGH — RESOLVED (commit `45f7396`) — no block-validity check before
+  prevoting.** `round.rs` (rule_propose) prevoted any hash-consistent,
+  leader-signed proposal; the driver fed proposals to the machine without
   re-executing the block. Tendermint Alg.1 (lines 22/28) requires the `valid(v)`
-  predicate. A Byzantine leader can propose a semantically invalid block (bad
-  state root, over-budget txs, bogus evidence); honest nodes prevote → lock →
-  precommit it and produce a **valid FinalityCertificate for an unimportable
-  block**. Fix: the driver must dry-run `apply_block` against current state before
-  delivering the proposal event, or the machine must expose a validity hook.
+  predicate. A Byzantine leader could propose a semantically invalid block (bad
+  state root, over-budget txs, bogus evidence); honest nodes prevoted → locked →
+  precommitted it and produced a **valid FinalityCertificate for an unimportable
+  block**. **Reproduced first** by
+  `webc-node/tests/consensus_byzantine_proposal.rs`: pre-fix, the honest driver
+  prevoted+precommitted a forged-state-root block and the harness assembled a
+  fully verifying certificate for it. **Fix:**
+  `ConsensusDriver::validate_proposal` — cheap authenticity gate
+  (`verify_in_set`) first, then a local chain-position pin (height, parent,
+  epoch, chain id — fields `apply_block` takes from the block itself), then a
+  full `apply_block` dry-run on a scratch state clone; only an importable
+  proposal reaches the machine, and each round's first authentic proposal is
+  re-executed at most once (leader CPU-spam bounded).
 - **C2 — HIGH — node silently terminates on a failed finalized-block import.**
   `consensus_driver.rs` `commit_if_decided` (~232-238) returns `true` on any
   `import_finalized_block` error and `run()` (~176-210) treats that as a clean

@@ -402,9 +402,19 @@ re-prevoted a different block, verifying as objective slashable evidence), then
 fixed; machine/storage/integration tests cover replay, lock preservation,
 corrupt-journal rejection, prune-on-commit, and redb restart survival.
 
+**C1 is fixed (commit `45f7396`):** the driver now implements Tendermint's
+`valid(v)` — after the cheap authenticity gate it pins the proposal's block to
+the local chain position (height/parent/epoch/chain id) and dry-runs the full
+`apply_block` state transition on a scratch clone; only an importable proposal
+reaches the machine, and each round's first authentic proposal is re-executed
+at most once. Reproduced first by
+`tests/consensus_byzantine_proposal.rs` (pre-fix, a forged-state-root proposal
+collected an honest prevote+precommit and a fully verifying finality
+certificate).
+
 Genuinely remaining Phase 4 items: a reference-machine finality-timing number
 (this cloud container cannot produce it honestly); the CONFIRMED review findings
-C1–C3 (then C5–C7 and the CI supply-chain/fuzz gates); and, optionally, a
+C2–C3 (then C5–C7 and the CI supply-chain/fuzz gates); and, optionally, a
 multi-node-over-TCP Byzantine integration test (the machine-level property is
 now tested). Fork choice is covered by the finality-certificate design (a node
 follows the certified chain and commits only finalized blocks).

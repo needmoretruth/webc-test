@@ -96,11 +96,14 @@ finding resolved in `docs/review/findings.md` with the commit hash
    before broadcast (`Table::ConsensusWal`) and replays the journal on
    restart (`ConsensusMachine::restore`); reproduced first by
    `webc-node/tests/consensus_restart.rs`.
-2. **C1 — validate a proposed block before prevote/lock/finalize** (`valid(v)`
-   dry-run of `apply_block`), so a Byzantine leader cannot get a certificate
-   for an unimportable block. ← **NEXT**
+2. ~~**C1 — validate a proposed block before prevote/lock/finalize.**~~
+   **DONE (commit `45f7396`).** The driver dry-runs `apply_block` (after the
+   cheap authenticity gate and a chain-position pin) before any proposal
+   reaches the machine; reproduced first by
+   `webc-node/tests/consensus_byzantine_proposal.rs`.
 3. **C2 — no silent halt on failed finalized-block import** (invalid block =
    post-finality emergency, surfaced; transient storage error = retry).
+   ← **NEXT**
 4. **C3 — bound per-height consensus memory** (round window, cap future
    rounds, evict decided rounds).
 5. Then C5/C6 (proof-of-lock with re-proposals, round-scaled timeouts), C7
