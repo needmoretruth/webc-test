@@ -511,15 +511,19 @@ task** — that file and `docs/implementation-status.md` are the single live own
 of "what is done / what is next." This section deliberately does NOT restate the
 phase status, because a second copy rots into a contradiction (see pitfall 8).
 
-At the time of the 2026-07-16 plan review the highest-priority work is the P0/P1
-list in `docs/review/2026-07-16-plan-review.md` §6 — chiefly the reported
-HIGH-severity consensus gaps in `docs/review/findings.md` (C1 block-validity
-before prevote, C2 silent halt on failed import, C3 unbounded round memory, C4
-crash-restart self-equivocation), wiring equivocation detection to an applied
-slash, the multi-node Byzantine safety test, and adding supply-chain
-(`cargo-deny`) + fuzz gates to CI. Reproduce each finding before fixing it.
-Do not skip ahead to the contract runtime, the WEBC language, ZK, or real-fund
-bridges before their own phase gates.
+The 2026-07-17 documentation overhaul realigned every document to
+`WEBC-DEFINITION.md` and rebuilt the development plan (19 phases; 0–7 keep
+their historical numbers). The next session **resumes implementation work
+autonomously** from `docs/continuation-guide.md` "Exact next work" — at the
+time of writing, the Phase 4 P0 consensus findings in
+`docs/review/findings.md` (C4 vote/lock WAL first — the live slash loop makes
+it urgent — then C1 block-validity before prevote, C2 non-silent import
+failure, C3 bounded round memory), then C5–C7 and the supply-chain
+(`cargo-deny`) + fuzz CI gates. Reproduce each finding with a failing test
+before fixing it. The session chooses and sequences work within the plan on
+its own; it does not stop to ask permission between items. Do not skip ahead
+to the contract runtime, Weft, the DEX, the oracle, ZK, or real-fund bridges
+before their own phase gates.
 
 ## User decisions still required later
 

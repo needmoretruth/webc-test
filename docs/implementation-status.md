@@ -1,6 +1,10 @@
 # WEBC implementation status
 
-Last documentation audit: 2026-07-13
+Last documentation audit: 2026-07-13 (code facts) · 2026-07-17 (definition
+alignment: all docs realigned to `WEBC-DEFINITION.md`; no code changed —
+see `definition-gap-analysis.md` for the audit and
+`code-reconciliation-worklist.md` for the prioritized code-vs-definition
+divergences)
 
 ## Summary
 
