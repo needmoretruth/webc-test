@@ -869,6 +869,24 @@ fees partly because nearly anyone can register and vote; WEBC's stake-gated
 rotating committee makes honest participation free and outsider spam
 structurally impossible. Status: **decided.**
 
+### 2026-07-16 — Round 6: model clarifications and handoff preparation
+
+**15.29 Clarifications recorded.**
+- **State model is hybrid, not purely object-centric** (§8 stands): account-style
+  balances for coins/tokens/staking/payments, object-style state for NFTs, game
+  items, escrows, sessions, and app data. Sui is the primary reference for the
+  object side; Solana remains a reference for throughput engineering.
+- **zk state compression is optional and low-priority** given the hybrid/object
+  model plus storage deposits/rebates (15.22): it becomes worthwhile only if
+  applications with millions of near-identical tiny objects emerge. It stays a
+  phase-2 option, never a launch dependency.
+- **Confirmed as decided:** the validator/node software is written in Rust
+  (already §2); an official container (Docker) image is the default way to run a
+  validator (15.26); zstd compression is **on by default** across wire and
+  storage (15.19/15.24) — its CPU cost is negligible and the implementation may
+  skip compression adaptively for incompressible payloads.
+Status: **decided.**
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
@@ -879,6 +897,100 @@ structurally impossible. Status: **decided.**
   welcome at any time; the reviewer must review the owner's ideas critically, not
   deferentially, and must present pros/cons for every option when asking for a
   decision.
+
+---
+
+## 16. Handoff summary (read this first if you are the next planning model)
+
+This section exists because a subsequent model will use this document to rebuild
+the project's plans. Rules of engagement: **(1) items listed under "Decided" are
+settled — do not re-litigate or reinterpret them; plan within them. (2) Items
+under "Open" are yours to design, within the constraints recorded in §15. (3)
+Where this summary and a §15 entry differ in detail, the §15 entry is
+authoritative; where §15 and §1–§13 differ, §15 (newer) wins. (4) Preserve the
+honesty rule: label everything you produce as confirmed / planned / experimental
+/ not-yet-built.**
+
+### Decided (as of 2026-07-16)
+
+**Identity & runtime**
+- Independent L1; node software in Rust; contracts on a deterministic WASM engine,
+  authored in Rust first, later a friendly language lowering to the same framework
+  (§2, §9).
+- Hybrid state model: account-style balances + object-style app state; Sui is the
+  primary object-model reference, Solana a throughput reference (§8, 15.29).
+- ~2s blocks, ~6–8s finality, rotating stake-weighted BFT committee, parallel
+  execution via declared read/write sets + owned objects, per-app namespaces,
+  browser-grade light verification (§8).
+
+**Money & amounts**
+- 10,000,000 WEBC genesis, 12 decimals; issuance 10%/yr decaying ×0.8/yr to a 1%
+  floor; 50/50 fee burn/reward split (§7).
+- Amounts: u128 storage/compute; 256-bit intermediates for multiply/divide paths;
+  variable-length integer encoding at rest and on the wire (15.14, 15.19).
+
+**Distribution & launch**
+- 25% contributor pool + up to 5% validator-bootstrap grants (stake-locked,
+  vesting by proven operation, personal co-stake, diversity criteria, unused
+  budget reverts) (15.10, 15.15).
+- Public pool channels: usage-linked fee subsidies; cross-chain (Solana/Ethereum)
+  wallet airdrop weighted by costly-to-fake history with unannounced snapshot and
+  per-wallet caps; ecosystem fund (~10–15%, restated explicitly in the split) paid
+  as non-transferable fee credits via published-criteria grants (15.12, 15.16).
+- Rejected channels: mining, identity verification, sales/auctions (15.16).
+- Founder: paid under the same published contribution rules as everyone, with the
+  expectation disclosed; measurement starts only after public announcement
+  (15.16).
+- Fairness definition: public rules, equal access, no insider privilege — not
+  equal-per-human (15.11).
+
+**Fees, storage, oracle, DEX, agents**
+- Storage: deposit + deletion rebate (Sui-style), hot/cold tiering; Walrus-style
+  erasure-coded blob layer as phase 2 (15.22, 15.27).
+- Oracle: consumers pay → accuracy-weighted, bonded reporters; pull-based
+  updates (at most once per block, shared by all consumers); optional first-party
+  publishers; seeded from the ecosystem fund with usage-proportional,
+  accuracy-gated, sunsetting subsidies; small per-fresh-read fees + app
+  subscriptions; display-only reads free via light clients (15.17, 15.21).
+- DEX: canonical shared pool per pair + three site modes (storefront / liquidity
+  contributor / independent pool); all fees on-chain-disclosed; trust via
+  on-chain track-record registry; per-block uniform-price batch settlement as the
+  native default (MEV-resistant; precedents: CoW Protocol, Penumbra) (15.13,
+  15.18).
+- AI-agent commerce: revocable mandate objects (budget, expiry, allowlist,
+  per-tx limits), on-chain service registry, HTTP-402-style payment flow
+  compatibility (15.5).
+
+**Validators & networking**
+- Middle path: low stake floor (100 WEBC pool / 20 WEBC operator) + mid-range
+  hardware; no per-vote fees — votes are permissioned aggregated consensus
+  messages, spam-controlled by admission/quotas/slashing (15.23, 15.28).
+- Official tuned container image (zram, zstd, kernel/DB defaults) as the standard
+  validator environment; min/recommended spec split; floor raisable over time by
+  governance with measured-demand justification and a published hardware roadmap
+  (15.26).
+- Bandwidth frugality: zstd by default everywhere, compact-block relay, vote
+  aggregation, SSD-first state with modest RAM (15.19, 15.24, 15.29).
+- zk policy: succinct light-client verification yes; optional state compression
+  later; never on the consensus critical path (15.25, 15.29).
+
+### Open (design these; priority order)
+
+1. **Distribution numbers:** channel percentages, per-channel caps, and
+   multi-year release curves for the public pool (constraints in 15.11/15.16).
+2. **Airdrop fame-weighting:** reviewer recommends none (15.20) — owner
+   confirmation pending.
+3. **Agent mandate + service registry detailed spec** (fields, revocation flow,
+   discovery format).
+4. **Batch-settlement mechanics:** limit-order/slippage semantics, multi-hop
+   routing across pools, shared-infrastructure pricing (the 15.13 isolation
+   tension).
+5. **Fee curves and sponsorship budget parameters** (§13).
+6. **The high-level authoring language** surface design and component catalog
+   format (§9, §13).
+7. **Cross-chain UX** (§10, §13) — not yet reviewed in §15.
+8. **Adoption strategy / flagship applications** (§13) — not yet reviewed.
+9. **Governance process details** (§11) — proposal/adoption mechanics undefined.
 
 ---
 
