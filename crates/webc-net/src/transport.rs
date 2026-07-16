@@ -116,6 +116,19 @@ impl NetworkHandle {
             .map_err(|_| NetError::WorkerStopped)
     }
 
+    /// Sends a message to exactly one peer (best-effort), not the whole mesh.
+    ///
+    /// Used for point-to-point replies — chiefly state-sync `BlockResponse`s —
+    /// so answering one peer's request does not broadcast full blocks to the
+    /// entire network (the C7 amplification the flood path would otherwise
+    /// cause). If the peer is not currently connected the message is dropped.
+    /// Returns [`NetError::WorkerStopped`] only if the worker has shut down.
+    pub fn send_to(&self, peer: PeerId, message: NetMessage) -> Result<(), NetError> {
+        self.commands
+            .send(Command::SendTo(peer, Box::new(message)))
+            .map_err(|_| NetError::WorkerStopped)
+    }
+
     /// This node's own authenticated peer identity.
     pub fn local_peer_id(&self) -> PeerId {
         self.local_peer_id
@@ -135,6 +148,7 @@ impl NetworkHandle {
 /// Commands sent from a [`NetworkHandle`] to the worker.
 enum Command {
     Broadcast(Box<NetMessage>),
+    SendTo(PeerId, Box<NetMessage>),
 }
 
 /// Events sent from connection/listener tasks to the worker.
@@ -366,6 +380,13 @@ async fn worker(
                             }
                         }
                     }
+                    Some(Command::SendTo(peer, message)) => {
+                        // Point-to-point delivery to one peer; never flooded, so a
+                        // sync reply does not fan out full blocks to the mesh.
+                        if let Ok(bytes) = encode_message(&message) {
+                            send_to_peer(&peers, peer, Arc::new(bytes));
+                        }
+                    }
                     None => break, // every handle dropped → shut down
                 }
             }
@@ -388,9 +409,16 @@ async fn worker(
                         }
                         // A malformed frame from a peer is dropped, not fatal.
                         if let Ok(message) = decode_message(&bytes) {
+                            // A state-sync response is a point-to-point reply, not
+                            // gossip: deliver it locally but never reflood it, or
+                            // one node's directed answer would still fan full
+                            // blocks across the whole mesh (C7).
+                            let is_directed = matches!(message, NetMessage::BlockResponse(_));
                             let _ = inbound_tx.try_send(InboundMessage { from, message });
-                            // Continue the flood to everyone except the sender.
-                            flood(&peers, Some(from), Arc::new(bytes));
+                            if !is_directed {
+                                // Continue the flood to everyone except the sender.
+                                flood(&peers, Some(from), Arc::new(bytes));
+                            }
                         }
                     }
                     None => break,
@@ -412,6 +440,17 @@ fn flood(
         }
         // Best-effort: a full or closed peer queue drops this frame for that peer.
         let _ = outbound.try_send(frame.clone());
+    }
+}
+
+/// Sends an encoded frame to exactly one peer, if it is connected (best-effort).
+fn send_to_peer(
+    peers: &[(PeerId, mpsc::Sender<Arc<Vec<u8>>>)],
+    target: PeerId,
+    frame: Arc<Vec<u8>>,
+) {
+    if let Some((_, outbound)) = peers.iter().find(|(peer, _)| *peer == target) {
+        let _ = outbound.try_send(frame);
     }
 }
 
@@ -567,6 +606,68 @@ mod tests {
         assert!(
             second.is_err(),
             "duplicate frame must not be delivered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_reaches_only_the_named_peer() {
+        // A central node connected to two peers must be able to send a message
+        // to exactly one of them (directed reply), not both (C7).
+        let chain = ChainId::devnet();
+        let (hub, mut hub_rx, hub_addr) = spawn_listener(11, chain.clone()).await;
+        let (b_handle, mut b_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([12u8; 32]),
+            chain.clone(),
+            Some(loopback()),
+            vec![hub_addr],
+        ))
+        .await
+        .unwrap();
+        // `_c_handle` stays bound (not dropped) so C's connection persists.
+        let (_c_handle, mut c_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([13u8; 32]),
+            chain,
+            Some(loopback()),
+            vec![hub_addr],
+        ))
+        .await
+        .unwrap();
+        // Wait until the hub sees both peers.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while hub.connected_peers() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "hub did not gain two peers"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // B announces itself so the hub learns B's peer id (from an inbound
+        // frame); then the hub sends a message directed only at B.
+        b_handle
+            .broadcast(NetMessage::Transaction(Box::new(sample_tx(80))))
+            .unwrap();
+        let from_b = tokio::time::timeout(Duration::from_secs(5), hub_rx.recv())
+            .await
+            .expect("hub receives B's announcement")
+            .expect("channel open");
+        let b_peer = from_b.from;
+        // Drain any reflood of B's tx that reached C, so the next assertion is clean.
+        let _ = tokio::time::timeout(Duration::from_millis(300), c_rx.recv()).await;
+
+        hub.send_to(b_peer, NetMessage::Transaction(Box::new(sample_tx(90))))
+            .unwrap();
+
+        // B receives the directed message; C must not.
+        let b_got = tokio::time::timeout(Duration::from_secs(5), b_rx.recv())
+            .await
+            .expect("B receives the directed message")
+            .expect("channel open");
+        assert!(matches!(b_got.message, NetMessage::Transaction(_)));
+        let c_got = tokio::time::timeout(Duration::from_millis(600), c_rx.recv()).await;
+        assert!(
+            c_got.is_err(),
+            "a directed send must not reach a non-target peer"
         );
     }
 

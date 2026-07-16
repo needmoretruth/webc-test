@@ -350,6 +350,12 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         self.mempool.remove_obsolete(self.node.state());
         self.mempool.prune_expired(now_ms());
         self.prune_pending_evidence();
+        // Gossip the finality certificate so peers learn this height is final
+        // with cryptographic proof. A behind node syncs only on such a verified
+        // certificate (C7), never on an unproven higher-height claim.
+        let _ = self
+            .network
+            .broadcast(NetMessage::Certificate(Box::new(certificate)));
         self.report_commit(height, tx_count, commit_tx).await;
         Ok(())
     }
@@ -462,8 +468,12 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         Ok(true)
     }
 
-    /// Serves finalized certified blocks for a peer's state-sync request.
-    fn serve_block_request(&self, from_height: u64, max: u32) {
+    /// Serves finalized certified blocks back to the requesting peer only.
+    ///
+    /// Directed, not broadcast (C7): answering with up to `SYNC_BATCH` full
+    /// blocks must reach the one peer that asked, not the whole mesh, so a
+    /// single small request cannot amplify into a network-wide flood of blocks.
+    fn serve_block_request(&self, requester: webc_net::PeerId, from_height: u64, max: u32) {
         let local = self.node.height();
         let count = u64::from(max.min(SYNC_BATCH));
         let mut height = from_height;
@@ -473,7 +483,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                     let response = webc_net::CertifiedBlock { block, certificate };
                     let _ = self
                         .network
-                        .broadcast(NetMessage::BlockResponse(Box::new(response)));
+                        .send_to(requester, NetMessage::BlockResponse(Box::new(response)));
                 }
                 _ => break, // a missing block ends the servable run
             }
@@ -499,10 +509,11 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
     /// Live consensus and state sync share this path: consensus messages feed the
     /// machine (which may emit a live `Commit` into `decided`), a `BlockResponse`
     /// imports a finalized block during catch-up, and a `BlockRequest` is served
-    /// from this node's store. When a message shows the network is at a higher
-    /// height, this node requests the finalized block for the height it is on
-    /// (once per height, tracked by `requested`), so a node missing votes can
-    /// still advance by importing the certified block instead of stalling.
+    /// directly back to the requesting peer from this node's store. A behind node
+    /// requests sync only when it sees a **verified** finality certificate for a
+    /// higher height (C7), so a spoofed higher-height vote/proposal cannot make
+    /// it blast sync requests, and the reply goes to the one requester rather
+    /// than the whole mesh.
     #[allow(clippy::too_many_arguments)]
     async fn on_inbound(
         &mut self,
@@ -514,6 +525,7 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         requested: &mut bool,
         commit_tx: &Option<mpsc::Sender<CommitInfo>>,
     ) -> Result<(), DriverExit> {
+        let from = message.from;
         let event = match message.message {
             // Admit gossiped transactions so this node can include them when it
             // proposes. Admission failures (unknown sender, bad nonce, duplicate)
@@ -525,7 +537,6 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 return Ok(());
             }
             NetMessage::Proposal(proposal) => {
-                self.request_if_behind(proposal.payload.height, height, requested);
                 // C1 (`valid(v)`): only a proposal whose block re-executes
                 // cleanly at this exact chain position may reach the machine.
                 // A dropped proposal draws a nil prevote via the propose
@@ -536,17 +547,17 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 }
                 ConsensusEvent::Message(ConsensusMessage::Proposal(proposal))
             }
-            NetMessage::Vote(vote) => {
-                self.request_if_behind(vote.payload.height, height, requested);
-                ConsensusEvent::Message(ConsensusMessage::Vote(*vote))
-            }
+            NetMessage::Vote(vote) => ConsensusEvent::Message(ConsensusMessage::Vote(*vote)),
+            // A verified finality certificate for a higher height is the only
+            // trigger for state sync (C7): it is cryptographic proof the network
+            // finalized past us, so a spoofed vote cannot induce sync traffic.
             NetMessage::Certificate(certificate) => {
-                self.request_if_behind(certificate.height, height, requested);
+                self.request_if_certified_ahead(&certificate, height, requested);
                 return Ok(());
             }
-            // Serve peers that are catching up, even while running consensus.
+            // Serve a catching-up peer directly (never broadcast — C7).
             NetMessage::BlockRequest { from_height, max } => {
-                self.serve_block_request(from_height, max);
+                self.serve_block_request(from, from_height, max);
                 return Ok(());
             }
             // Import a finalized block from a peer to advance during catch-up.
@@ -565,22 +576,42 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         Ok(())
     }
 
-    /// If a peer references a height beyond the one this node is working on,
-    /// request the finalized block for the current height once, so a node that
-    /// missed its votes can catch up by import instead of stalling.
-    fn request_if_behind(
+    /// Requests state sync only on proof the network finalized past this node
+    /// (C7): a finality certificate for a height beyond the one being worked on
+    /// that **verifies** against the current validator snapshot.
+    ///
+    /// Gating on a verified certificate — not any higher-height vote or
+    /// proposal — means a single spoofed message can no longer make this node
+    /// blast sync requests. Verifying against the current snapshot is correct
+    /// while the validator set is stable within an epoch; cross-epoch anchoring
+    /// (weak subjectivity) is tracked separately (finding E4).
+    fn request_if_certified_ahead(
         &mut self,
-        message_height: u64,
+        certificate: &FinalityCertificate,
         working_height: u64,
         requested: &mut bool,
     ) {
-        if message_height > working_height && !*requested {
-            *requested = true;
-            let _ = self.network.broadcast(NetMessage::BlockRequest {
-                from_height: self.node.height() + 1,
-                max: SYNC_BATCH,
-            });
+        if certificate.height <= working_height || *requested {
+            return;
         }
+        let Ok(snapshot) = ValidatorSet::from_state(self.node.state()) else {
+            return;
+        };
+        if certificate
+            .verify(
+                &snapshot,
+                self.node.config().protocol_version,
+                &self.node.config().chain_id,
+            )
+            .is_err()
+        {
+            return;
+        }
+        *requested = true;
+        let _ = self.network.broadcast(NetMessage::BlockRequest {
+            from_height: self.node.height() + 1,
+            max: SYNC_BATCH,
+        });
     }
 
     /// Tendermint's `valid(v)` predicate (C1): decides whether a gossiped
