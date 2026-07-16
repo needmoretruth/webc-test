@@ -160,6 +160,7 @@ async fn an_honest_node_never_votes_for_an_unimportable_block() {
         propose: Duration::from_millis(700),
         prevote: Duration::from_millis(200),
         precommit: Duration::from_millis(200),
+        increment: Duration::from_millis(150),
     };
     let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
     let (commit_tx, mut commit_rx) = mpsc::channel(16);

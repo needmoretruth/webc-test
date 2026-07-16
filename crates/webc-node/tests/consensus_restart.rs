@@ -148,6 +148,7 @@ async fn a_restarted_validator_never_signs_a_conflicting_vote() {
         propose: Duration::from_millis(200),
         prevote: Duration::from_millis(200),
         precommit: Duration::from_millis(200),
+        increment: Duration::from_millis(150),
     };
 
     // First life: run the validator until the harness has observed its round-0

@@ -112,6 +112,7 @@ async fn three_validators_converge_on_one_finalized_chain() {
         propose: Duration::from_millis(400),
         prevote: Duration::from_millis(400),
         precommit: Duration::from_millis(400),
+        increment: Duration::from_millis(200),
     };
 
     let handles = [h0, h1, h2];
@@ -191,6 +192,7 @@ async fn a_late_joining_node_catches_up_via_state_sync() {
         propose: Duration::from_millis(300),
         prevote: Duration::from_millis(300),
         precommit: Duration::from_millis(300),
+        increment: Duration::from_millis(200),
     };
 
     // Bring up the three validator networks first and remember their addresses,
@@ -384,6 +386,7 @@ async fn a_gossiped_transaction_is_included_in_a_finalized_block() {
         propose: Duration::from_millis(400),
         prevote: Duration::from_millis(400),
         precommit: Duration::from_millis(400),
+        increment: Duration::from_millis(200),
     };
     let handles = [h0, h1, h2];
     let inbounds = [in0, in1, in2];
@@ -535,6 +538,7 @@ async fn consensus_detected_equivocation_is_finalized_and_slashed_once() {
         propose: Duration::from_millis(300),
         prevote: Duration::from_millis(300),
         precommit: Duration::from_millis(300),
+        increment: Duration::from_millis(200),
     };
     let honest_handles: Vec<_> = handles.drain(..3).collect();
     let honest_inbounds: Vec<_> = inbounds.drain(..3).collect();

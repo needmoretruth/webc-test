@@ -63,14 +63,24 @@ use crate::mempool::{Mempool, MempoolConfig};
 use crate::node::Node;
 
 /// How long the driver waits in each step before firing the matching timeout.
+///
+/// Timeouts scale with the round (C6): under partial synchrony the true message
+/// delay is unknown, so a fixed timeout below it fails every round identically
+/// and the height never decides. Tendermint requires `timeout(r) = base +
+/// r·increment`, which eventually exceeds any finite delay and restores
+/// liveness once the network stabilizes. `base` is the round-0 wait; each later
+/// round adds `increment`.
 #[derive(Clone, Copy, Debug)]
 pub struct DriverTimeouts {
-    /// Wait for a proposal before prevoting nil.
+    /// Round-0 wait for a proposal before prevoting nil.
     pub propose: Duration,
-    /// Wait after a prevote quorum before precommitting nil.
+    /// Round-0 wait after a prevote quorum before precommitting nil.
     pub prevote: Duration,
-    /// Wait after a precommit quorum before changing round.
+    /// Round-0 wait after a precommit quorum before changing round.
     pub precommit: Duration,
+    /// Per-round increment added to every step's timeout (the `r·increment`
+    /// term). A round-`r` timeout is `base + r·increment`.
+    pub increment: Duration,
 }
 
 impl Default for DriverTimeouts {
@@ -80,17 +90,21 @@ impl Default for DriverTimeouts {
             propose: Duration::from_millis(1_000),
             prevote: Duration::from_millis(1_000),
             precommit: Duration::from_millis(1_000),
+            increment: Duration::from_millis(500),
         }
     }
 }
 
 impl DriverTimeouts {
-    fn for_kind(&self, kind: TimeoutKind) -> Duration {
-        match kind {
+    /// The wait for `kind` at `round`: `base(kind) + round·increment`
+    /// (saturating, so a pathological round can never panic on overflow).
+    fn for_kind(&self, kind: TimeoutKind, round: u32) -> Duration {
+        let base = match kind {
             TimeoutKind::Propose => self.propose,
             TimeoutKind::Prevote => self.prevote,
             TimeoutKind::Precommit => self.precommit,
-        }
+        };
+        base.saturating_add(self.increment.saturating_mul(round))
     }
 }
 
@@ -708,7 +722,9 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 }
                 ConsensusAction::ScheduleTimeout { kind, round } => {
                     let sender = timeout_tx.clone();
-                    let delay = self.timeouts.for_kind(kind);
+                    // C6: scale the wait by the round so a stuck height's later
+                    // rounds eventually outlast the real message delay.
+                    let delay = self.timeouts.for_kind(kind, round);
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
                         let _ = sender.send((kind, round, height)).await;
@@ -761,5 +777,57 @@ fn to_net_message(message: ConsensusMessage) -> NetMessage {
     match message {
         ConsensusMessage::Proposal(proposal) => NetMessage::Proposal(proposal),
         ConsensusMessage::Vote(vote) => NetMessage::Vote(Box::new(vote)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_scale_linearly_with_the_round() {
+        let timeouts = DriverTimeouts {
+            propose: Duration::from_millis(1_000),
+            prevote: Duration::from_millis(800),
+            precommit: Duration::from_millis(600),
+            increment: Duration::from_millis(500),
+        };
+        // Round 0 is the base wait.
+        assert_eq!(
+            timeouts.for_kind(TimeoutKind::Propose, 0),
+            Duration::from_millis(1_000)
+        );
+        // Each later round adds one increment to every step (base + r·incr).
+        assert_eq!(
+            timeouts.for_kind(TimeoutKind::Propose, 3),
+            Duration::from_millis(1_000 + 3 * 500)
+        );
+        assert_eq!(
+            timeouts.for_kind(TimeoutKind::Prevote, 2),
+            Duration::from_millis(800 + 2 * 500)
+        );
+        assert_eq!(
+            timeouts.for_kind(TimeoutKind::Precommit, 1),
+            Duration::from_millis(600 + 500)
+        );
+        // A later round is strictly longer, which is the liveness property:
+        // some round eventually exceeds any finite message delay.
+        assert!(
+            timeouts.for_kind(TimeoutKind::Precommit, 5)
+                > timeouts.for_kind(TimeoutKind::Precommit, 4)
+        );
+    }
+
+    #[test]
+    fn timeout_scaling_saturates_instead_of_overflowing() {
+        let timeouts = DriverTimeouts {
+            propose: Duration::from_secs(1),
+            prevote: Duration::from_secs(1),
+            precommit: Duration::from_secs(1),
+            increment: Duration::from_secs(1),
+        };
+        // A pathological round must never panic on overflow; saturation caps it.
+        let huge = timeouts.for_kind(TimeoutKind::Propose, u32::MAX);
+        assert!(huge >= timeouts.for_kind(TimeoutKind::Propose, 0));
     }
 }
