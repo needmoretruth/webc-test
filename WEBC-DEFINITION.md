@@ -615,6 +615,97 @@ architecture:
   option for extreme pairs.
 Status: **decided direction** (mechanics open).
 
+### 2026-07-16 — Round 3: amount encoding final shape, airdrop channel, oracle upgrades, batch settlement feasibility
+
+**15.14 Amount representation — final recommended shape (closes 15.1/15.9).**
+Owner asked: why not 256-bit like Ethereum, and can stored data be smaller?
+- **Why not 256-bit:** Ethereum's 256-bit word is an EVM design artifact (one word
+  fits a hash/address), not a monetary need — ETH balances themselves fit in ~87
+  bits. Adopting 256-bit everywhere doubles u128's storage cost and slows math for
+  zero benefit at WEBC's scale (max supply ~10^19 base units vs u128's ~3.4 ×
+  10^38 ceiling).
+- **The one real 128-bit hazard:** multiplying two large amounts (e.g. AMM x·y
+  math) can reach ~10^38, at the edge of u128. Standard fix: store and add in
+  u128, but compute multiplication/division intermediates in 256-bit ("widening
+  arithmetic"). Best of both, used routinely in Rust financial code.
+- **Data reduction (answers the +5–10% concern):** encode amounts with
+  **variable-length integers** on disk and on the wire — small values take as few
+  bytes as they need, so typical records cost the same as (or less than) fixed
+  u64, and only very large balances pay full width. The fixed 16-byte cost exists
+  only in RAM during execution, which is cheap. Combined with storage-growth
+  pricing (already in §7) and ordinary block compression at the database layer,
+  the earlier "+5–10%" worst case effectively disappears for typical state.
+Final shape: **u128 storage/compute + 256-bit multiply intermediates +
+variable-length encoding at rest and in transit.** Status: **recommended-final;
+owner confirmation pending** (owner holds u128 as primary candidate).
+
+**15.15 Bootstrap validator grants — confirmed decided.** Owner approved 15.10
+("문제2는 ㅇㅋ").
+
+**15.16 Distribution channels and founder rule — owner decisions recorded.**
+- Owner rejects: mining (hardware identity conflict), identity verification, and
+  open auctions/sales (money-for-coins is out).
+- Owner proposes and reviewer accepts as a capped channel: **cross-chain wallet
+  airdrop** — users prove control of an existing Solana or Ethereum wallet and
+  claim WEBC. Anti-farming rules that make this survivable: (a) eligibility
+  weighted by **past, costly-to-fake history** (wallet age, cumulative gas spent,
+  staking history), never by wallet count — creating a wallet is free, so "has a
+  wallet = gets coins" is instantly bot-farmed; (b) snapshot taken at an
+  **unannounced or already-past date** so farmers cannot prepare; (c) per-wallet
+  caps with diminishing weight; (d) awareness that professional farmers hold
+  thousands of aged wallets — caps and quality-weighting bound their take rather
+  than pretending to eliminate them.
+- Working portfolio for the public pool is therefore: usage-linked fee subsidies +
+  cross-chain history-weighted airdrop + ecosystem fee-credit grants (15.12).
+- **Founder compensation — decided (owner):** the founder is paid under the same
+  published contribution rules as everyone, with no special allocation; the
+  document may state plainly that early on the founder is likely the main
+  contributor and will therefore earn a meaningful share; contribution
+  measurement begins only after a public announcement, not at first launch.
+
+**15.17 Oracle — economics confirmed, two upgrades, seed-abuse guards, read-fee
+trade-off.**
+- The three-part economics (consumers pay → accuracy-weighted reporter revenue →
+  bonded reporters) is the industry-converged design; nothing strictly better is
+  known. Two upgrades adopted for WEBC's cheap/fast/accurate goals: (a)
+  **pull-based updates** — a feed updates on demand when a transaction needs
+  fresh data and that transaction carries the update cost, instead of paying for
+  constant pushes nobody reads; (b) an optional **first-party publisher class** —
+  original data owners (e.g. exchanges) may report directly for higher accuracy.
+- Seed-funding abuse guards (for the cold-start subsidy from the ecosystem fund):
+  pay in proportion to *actual reads served*, gate on accuracy, cap per feed and
+  per reporter, and auto-sunset feeds that attract no consumers.
+- **Read fees (runtime-enforced) — trade-off:** Pros: sustainable reporter pay
+  without inflation; solves free-riding; usage-aligned; uniquely possible because
+  WEBC controls its runtime. Cons: adds friction to composability and
+  experimentation; feels like double-charging on top of tx fees; meterable-read
+  plumbing adds runtime complexity; and values can be re-published after one paid
+  read — though for fast feeds a copied value goes stale in seconds, making
+  republication self-defeating. Verdict: small flat per-fresh-read fee plus cheap
+  app-level subscriptions; accept leakage on slow-moving feeds and treat those
+  closer to public goods. Status: **decided direction.**
+
+**15.18 Per-block batch settlement — feasibility and the block-time question.**
+- **Is it real?** Yes. Uniform-price frequent batch auctions are established
+  market-design research and run in production: CoW Protocol settles batched
+  orders at uniform clearing prices on Ethereum, and Penumbra implements
+  per-block batch swaps natively at the protocol level. WEBC would be among the
+  first general-purpose L1s to make it the *default* swap semantics.
+- **Do Solana or Sui do this?** No — their DEXes execute swaps sequentially per
+  transaction; sandwich-style extraction demonstrably occurs on Solana in
+  practice. This is a differentiator, not a copy.
+- **Latency cost, honestly:** a swap waits for the end of the current ~2s block —
+  on average ~1s added. But a payment is only *final* at ~6–8s anyway, so batch
+  settlement adds little to perceived completion time, and UIs can show the
+  pending order instantly.
+- **Why not just make blocks faster than ~2s?** Global round-trip latency is
+  ~200–300ms; BFT voting needs multiple round trips per block. Pushing well below
+  ~1–2s forces validators into high-end, well-connected data centers (the Solana
+  path), which conflicts with WEBC's lightweight-hardware decentralization
+  principle. ~2s is the chosen balance; per the honesty rule it can be revisited
+  if sustained benchmarks show comfortable headroom. Status: **decided direction**
+  (batch mechanics and limit-order semantics still to be designed).
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
