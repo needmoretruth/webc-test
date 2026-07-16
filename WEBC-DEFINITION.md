@@ -381,6 +381,170 @@ product, economic, and experience questions, not security questions.
 
 ---
 
+## 15. Improvement log (living section)
+
+This section records the ongoing improvement review between the owner and the
+reviewing model. Each entry carries a status: **decided**, **recommended**
+(reviewer recommends, owner has not confirmed), **proposed** (a concrete design
+sketch, open to challenge), or **open** (unsolved). Sessions are ephemeral; this
+section is the persistent memory of the review. Newest entries last.
+
+### 2026-07-16 — Round 1: economics, distribution, agents, oracle, DEX
+
+**15.1 Base-unit integer width — recommended: u128, keep 12 decimals, keep 10M supply.**
+Finding: 10,000,000 WEBC × 10^12 base units = 10^19, which already uses 54% of a
+u64's range (~1.845 × 10^19). Under the issuance schedule (10% decaying ×0.8/yr to a
+1% floor), total supply reaches ~15.6M WEBC by year ~11 and overflows u64 around
+year ~28 (fee burn may delay this but cannot be guaranteed to). Options compared:
+
+| Option | Overflow horizon | Pros | Cons |
+|---|---|---|---|
+| u128 amounts, 12 dp, 10M supply | ~4,500 years | No economic change; finest granularity for AI micropayments | Amount fields double to 16 bytes; 128-bit math is compiler-emulated in WASM (minor cost); JS needs BigInt (needed for u64 anyway) |
+| u64, 9 dp, 10M supply | ~750 years | Smallest state, native u64 speed, Solana-standard precision | If WEBC price exceeds ~$1,000 (a ~$10B cap), the smallest unit exceeds a micro-dollar — coarse for per-request AI payments in success scenarios |
+| u64, 12 dp, 1M supply | ~290 years | Keeps 12 dp on u64 | Pure re-denomination (no real economic change); high sticker price per coin deters retail psychologically; weakest headroom |
+
+On "any fixed-width integer eventually overflows under a perpetual 1% floor": true
+in the limit, but u128 pushes the horizon to ~4,500 years, fee burn can make net
+growth ≤ 0, and a re-denomination hard fork centuries out is acceptable. The
+practical bar is "never within the protocol's meaningful lifetime," which u128
+clears by orders of magnitude. Recommendation: **u128 everywhere an amount is
+stored or computed** (balances, supply counters, reward math), keeping the decided
+12-dp / 10M-supply economics untouched. Status: **recommended** (owner leaning,
+not confirmed).
+
+**15.2 Genesis bootstrap for a fair-launch PoS — proposed path.**
+Problem: validators need stake, but at a fair launch nobody holds coins, and
+distribution needs a running network. Precedents: nearly every PoS L1 (Cosmos,
+Polkadot, Solana, Avalanche, Cardano, Celestia…) bootstrapped from sale/investor/
+foundation allocations — unavailable to WEBC by principle. Pure-PoS fair launches
+are rare and cautionary (Nxt 2013: genesis distributed to 73 buyers → extreme
+concentration). PoW chains fair-launch easily because work is external to the
+chain; several chains (Peercoin, Decred, Ethereum in spirit) used PoW *first* to
+distribute, then PoS — but mining contradicts WEBC's lightweight-device identity.
+Proposed WEBC path, consistent with the existing 30% contributor pool and the
+"testnet earns nothing before the announced program" rule:
+1. Publicly announce the participation program; run an **incentivized validator
+   recruitment program on the test network** as its first contribution track.
+2. At genesis, allocate earned rewards from the 30% pool to those proven operators
+   → day one starts with a real, distributed validator set that owns stake.
+3. A labeled **bootstrap phase** with issuance keyed to *staked amount* (reward
+   budget = rate × total stake, capped by the schedule's % of total supply), so a
+   tiny early staking base cannot capture outsized absolute issuance.
+4. Published sunset criteria (validator count, stake dispersion, distribution
+   progress) for exiting the bootstrap phase.
+Status: **proposed**.
+
+**15.3 Public distribution (the 70%) — fee-cashback rejected; "fair" reframed.**
+The reviewer's earlier fee-cashback idea fails the owner's critique: rebate > fee
+makes spam profitable; rebate = fee makes spam free; rebate < fee is merely a fee
+discount, not distribution. Per-account diminishing returns do not survive sybil
+account farms. General lesson adopted: **any giveaway keyed to a resource sybils
+can manufacture (accounts, transactions, uptime) is gameable; distribution must
+key to something genuinely scarce** — capital, verified identity, or hard-to-fake
+work. A further tension is unique to WEBC: an AI-native chain that welcomes
+autonomous agents as first-class users cannot coherently gate rewards on "proof of
+being human." Therefore the document's working definition of *fair* becomes:
+**open access under public rules with no privileged insiders — not equal-per-human.**
+Working portfolio (each channel capped, monitored, individually stoppable, spread
+over ~10 years): (a) usage-linked fee subsidies (honest framing: subsidized
+acquisition, not free money — ungameable because spam always net-costs);
+(b) recurring **open public auctions** with proceeds burned or routed to the
+ecosystem fund — sybil-proof by construction, equal access, but in tension with
+"fair launch" optics since it resembles a sale: flagged for owner judgment;
+(c) optional privacy-preserving identity-gated claims as an experimental slice.
+Status: **open** (highest-value unsolved problem; portfolio approach proposed).
+
+**15.4 Founder compensation — honesty gap flagged.**
+The project has a solo founder who will plausibly earn a meaningful share of the
+30% contributor pool through genuine, verifiable work. If that happens without
+being stated up front, "fair launch, no founder allocation" becomes misleading in
+substance even if true in form — reputationally worse than an explicit allocation.
+Options: (a) declare a modest explicit founder allocation with long vesting, or
+(b) keep zero allocation but pre-publish the rules by which founder contributions
+are valued and paid from the 30% pool, ideally with some review not controlled by
+the founder alone. Either is defensible; silence is not. Status: **open — owner
+decision required.**
+
+**15.5 AI-agent commerce primitives — adopted direction.**
+Three protocol-level standards: (a) a **mandate** object — an on-chain, instantly
+revocable authorization a principal grants an agent, carrying total budget,
+expiry, counterparty allowlist, and per-transaction limits; (b) an on-chain
+**service registry** where services publish machine-readable prices and
+interfaces for agent discovery (the commerce counterpart of the component
+catalog); (c) compatibility with **HTTP 402-style web payment flows** so an agent
+can pay for a resource inside an ordinary web request cycle. Status: **decided
+direction** (owner approved; detailed design pending).
+
+**15.6 Oracle reporter economics — proposed.**
+The definition specifies aggregation (median of many reporters) but no reason for
+reporters to exist. Proposal: reporters register per feed with a stake; consuming
+applications pay per-read or subscription fees; fees are distributed to reporters
+weighted by accuracy (closeness to the accepted aggregate) and liveness;
+persistent outliers lose standing (slashing mechanics belong to the security
+docs). Feed creation is permissionless for a fee, with a canonical feed registry.
+Two honest open issues: (a) cold start — before apps pay fees, reporter rewards
+need seeding from issuance or the ecosystem fund, with a sunset; (b) free-riding —
+once a value is on-chain anyone can read it; either enforce read-fees at the
+runtime level (possible since WEBC controls the execution engine) or accept
+partial public-good funding. Status: **proposed**.
+
+**15.7 Ecosystem fund — proposed (owner-amended shape).**
+Owner direction: not an automatic carve-out per site, but a **grant program** —
+projects committing to build on WEBC apply and receive support, primarily as
+sponsored-fee underwriting, funded by ~10–20% taken from the 70% public pool.
+Reviewer refinements: (a) pay grants as **non-transferable fee credits** rather
+than liquid coins — they cannot be dumped on the market and are spendable only as
+usage, which aligns the grant with real adoption; (b) restate the distribution
+split explicitly (e.g. 30% contributors / 55–60% public / 10–15% ecosystem) rather
+than hiding the fund inside "70% public" — otherwise the fair-launch accounting
+becomes misleading; (c) name the grant decision process: initially transparent
+public applications against published criteria (with the founder deciding, stated
+honestly), migrating to community review as governance matures — an undefined
+decider is a centralization and credibility hole. Status: **proposed**.
+
+**15.8 Native per-site liquidity pools and a WEBC DEX layer — owner idea, refined.**
+Owner concept: any site can trivially create its own liquidity pool, set fees at
+fine granularity, expose it for others to use; other sites can route through an
+existing site's pool and add their own surcharge; aggregators arise that pick the
+best pool across sites; combined with bridges this yields a fast, cheap, web-native
+exchange experience. Reviewer critique and refinement:
+- **Real strength:** "an exchange as an embeddable website component" fits WEBC's
+  web-native identity and the surcharge model is a natural site-level revenue
+  share. An in-protocol swap building block is already in §9's target list.
+- **Main flaw — liquidity fragmentation:** thousands of small per-site pools give
+  worse prices, higher slippage, and easy arbitrage extraction against stale small
+  pools; aggregation only partially compensates. Precedent: virtually all DEX
+  volume consolidates into a few deep pools per pair (Uniswap-style), with many
+  *frontends* charging interface fees (the proven shape of the owner's surcharge
+  idea).
+- **Refined model:** separate **liquidity** from **storefront**. Default: one
+  canonical, shared, deep pool per asset pair in a public registry; any site
+  embeds a swap component against shared pools and attaches its own **disclosed**
+  frontend fee (surcharges must be on-chain-visible so users see the full fee
+  breakdown; silent markup stacking is a user-harm and trust risk). Custom
+  private per-site pools remain possible as the exception (e.g. a game's item
+  economy), not the default.
+- **Isolation tension to resolve:** §8 promises per-application namespaces and
+  localized fee pricing, but shared pools are by definition shared hot objects
+  across applications; routing a swap through several pools touches several
+  namespaces. The pricing/scheduling model needs an explicit answer for
+  intentionally-shared infrastructure objects.
+Status: **proposed** (direction approved in spirit by owner; fragmentation
+refinement pending owner view).
+
+### Process notes (owner-decided, 2026-07-16)
+
+- All work happens on `main`; no side branches. Every review round commits its
+  results to this file (this section), because working sessions are ephemeral.
+- Stale work branches were merged or discarded on 2026-07-16; this repository's
+  `main` is the single line of history.
+- Owner stance: decided points are the owner's, but better-argued alternatives are
+  welcome at any time; the reviewer must review the owner's ideas critically, not
+  deferentially, and must present pros/cons for every option when asking for a
+  decision.
+
+---
+
 *Scope reminder: this briefing intentionally omits security, cryptography, and
 robustness topics, which WEBC treats as first-class but defines elsewhere. Use this
 document to reason about WEBC as a product, an economy, and an experience — and to
