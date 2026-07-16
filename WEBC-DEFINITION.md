@@ -1110,6 +1110,85 @@ framework; compiled; humans and AI both first-class). Decided shape:
 Status: **decided** (full grammar specification is implementation work within
 these decisions).
 
+### 2026-07-16 — Round 11: finality targets lowered; Weft designed in full
+
+**15.42 Finality targets lowered (owner-decided; supersedes §8's timing numbers).**
+Owner direction: with Sui already sub-second on its fast path and Solana's
+approved upgrade targeting ~150ms, an 8-second headline is not acceptable.
+New engineering targets (all remain claims-only-after-public-benchmarks, per
+the honesty rule):
+- **Fast path (single-owner operations — payments, own-object moves):
+  ~0.4–0.8s effective finality** via quorum certificates (15.40 track 1),
+  launch scope.
+- **Consensus path (shared state — pools, batch settlement, multi-party
+  contracts): ~1s blocks, ~1–2s finality normal, ≤4s degraded**, using a
+  Mysticeti-class DAG-BFT reference design.
+- §8's ~2s / 6–8s figures become the **conservative fallback claim** until
+  benchmarks prove the new targets; public claims track measured reality.
+- Guardrail: the mid-range hardware floor (15.23/15.26) is unchanged. If
+  benchmarks show these targets require a higher floor, that trade-off returns
+  to the owner/governance explicitly — it must not be bought by silently
+  raising hardware requirements. Status: **decided.**
+
+**15.43 Weft — name check, full design commitments, and the never-break
+compatibility architecture.**
+- **Name:** no major programming language or developer tool collides with
+  "Weft" as of this review (the closest finds are an obscure discontinued
+  qualitative-analysis tool and small libraries); the name is short, typable,
+  and file extension `.weft` is clean. Verdict: safe to use as the language
+  name, with one due-diligence step before public branding: a trademark/domain
+  search. Fallback if a conflict surfaces: "Weftlang" for branding, `.weft`
+  unchanged.
+- **Type system:** primitives (`bool`, `u8`–`u128`, `bytes`, `text`), structs,
+  tagged enums with exhaustive `match`, `Option`/`Result`, limited generics
+  (monomorphized at compile time), interfaces for component contracts; no
+  inheritance, no reflection, no floats.
+- **Assets:** `Amount<T>` parameterized by asset type; linear semantics (cannot
+  be copied or dropped — every value must be deposited, returned, or explicitly
+  burned); decimal literals compile to exact u128 base units.
+- **Entrypoints declare effects** — `reads`/`writes` clauses on each entry are
+  the source-level mirror of §8's declared access sets and are checked by the
+  compiler. Determinism: no wall clock (block time/epoch provided), no ambient
+  randomness (VRF/oracle components only), bounded iteration.
+- **Events and errors are typed enums**, emitted into the machine manifest.
+- **Illustrative shape** (non-normative):
+
+  ```
+  component tip_jar v1 {
+    state balances: Map<Address, Amount<WEBC>>
+
+    entry tip(from: signer, to: Address, amount: Amount<WEBC>)
+      reads balances[to] writes balances[to]
+    {
+      let coin = withdraw(from, amount)?   // linear: must be deposited or returned
+      deposit(to, coin)
+      emit Tipped { from: from.address, to, amount }
+    }
+  }
+  ```
+
+- **Toolchain (single binary):** `weft fmt` (the one canonical format),
+  `weft check`, `weft test` (unit + property tests + local chain simulation),
+  `weft build` (WASM + manifest), LSP server; structured doc-comments enforced
+  at build.
+- **The never-break architecture (owner requirement):**
+  1. **Deployed apps cannot be broken by language changes, by construction:**
+     the chain runs WASM artifacts, never Weft source — a deployed contract
+     keeps running bit-identically forever regardless of what the language
+     becomes.
+  2. **Editions:** breaking language changes ship only as a new edition (Rust's
+     model); every contract pins its edition; old editions keep compiling
+     indefinitely; an automated migration tool (`weft migrate`) moves source
+     forward mechanically.
+  3. **Stable ABI at the WASM boundary:** contracts interoperate through the
+     versioned manifest/ABI, so an edition-1 contract and an edition-3 contract
+     call each other without either knowing.
+  4. **Reproducible builds:** the compiler version hash is recorded at deploy;
+     anyone can rebuild the source and verify it matches the on-chain artifact.
+  5. **Stdlib stability:** deprecations get long windows and never removal
+     within an edition.
+Status: **decided** (grammar/spec writing proceeds within these commitments).
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
@@ -1221,10 +1300,12 @@ honesty rule: label everything you produce as confirmed / planned / experimental
    built-in exact money type, no null/exceptions/floats/macros, declared state
    access, canonical formatter, compiler-emitted machine manifest (15.41). Full
    grammar spec is implementation work within those decisions.
-4. **Speed roadmap:** **decided direction** — sub-second fast path for
-   single-owner operations at launch scope; benchmark-gated consensus stretch
-   targets (~1s blocks / ~2–3s finality) (15.40). Protocol design of the fast
-   path is engineering work.
+4. **Speed roadmap:** **decided** — targets lowered (15.42, supersedes §8
+   timing): fast path ~0.4–0.8s for single-owner ops (launch scope); consensus
+   ~1s blocks / ~1–2s finality (≤4s degraded); §8's 2s / 6–8s remain the
+   conservative public claim until benchmarks prove the new targets. Fast-path
+   protocol design is engineering work; hardware-floor trade-offs return to the
+   owner explicitly.
 5. **Cross-chain UX** (§10) — direction sketched in 15.36; details open.
 6. **Adoption strategy / flagship applications** — four flagship candidates named
    in 15.36; details open.
