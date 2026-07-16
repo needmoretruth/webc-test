@@ -931,6 +931,13 @@ and adversarial testing pass.
 
 ## 16. References
 
+> Line numbers below are an indicative snapshot from when this plan was written and
+> drift whenever a referenced file is edited (for example, `AGENTS.md` was
+> restructured in the 2026-07-16 review). Treat the **section titles and symbol
+> names** as authoritative and the line numbers as a hint only; do not trust a bare
+> line number without confirming the target still matches. New cross-references
+> should cite a section or symbol, not a line range.
+
 **Confirmed decisions and rules**
 
 - `AGENTS.md` — session-key gate and do-not-skip-ahead rule (lines 280-285), no

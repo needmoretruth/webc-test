@@ -256,6 +256,11 @@ Ordered so value survives an interruption. (P0 = do before building more on top.
 - **P2** ADR: epoch validator-set transition + weak-subjectivity checkpoint. §4.5.
 - **P2** Record the off-chain contract-compilation invariant in architecture +
   Phase 7. §4.4.
+- **P2 (doc hygiene)** Replace cross-document **line-number** references with
+  section/symbol references. `session-keys-implementation-plan.md` cites
+  `AGENTS.md`/ADR/plan line ranges that rot on any edit (the 2026-07-16 AGENTS.md
+  restructure already invalidated its `AGENTS.md lines …` citations; a caveat was
+  added, but new docs should cite sections, not lines).
 - **Ongoing** reference-machine benchmarks (needs real hardware, not this cloud).
 
 See `docs/review/findings.md` for the line-level code findings from this session.
