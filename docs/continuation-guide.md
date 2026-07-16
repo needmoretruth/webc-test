@@ -51,16 +51,26 @@ must be reproduced and fixed before the mechanism can be trusted. See
   validator self-equivocate (this must be fixed BEFORE wiring equivocation to a
   slash, or honest restarts get slashed).
 
-Previously-listed honest remaining items still stand and now sit AFTER C1–C4 in
-priority: (a) a reference-machine finality-timing number; (b) **wiring
-consensus-detected equivocation to an applied slash** — the machine detects it and
-produces verifiable `DoubleVoteEvidence`, but the driver does NOT yet slash:
-`block.evidence` is neither committed by the header nor executed, and slashing
-applies only via an `Operation::SubmitSlashingEvidence` transaction, so closing
-this needs an authenticated evidence path or an auto-submitted evidence
-transaction plus a test (and depends on C4); and (c) a multi-node Byzantine test
-that <1/3 power cannot finalize conflicting blocks (the lock-safety property is
-unit-tested today). The full prioritized worklist is
+**Doc-vs-code correction (2026-07-16):** two commits by the GPT implementer landed
+on 2026-07-15 AFTER this guide was last written and were not reflected in it, so
+two items this guide previously listed as "remaining" are in fact DONE in code:
+- `a6197ac` **wired equivocation-to-slash end to end** — the header commits an
+  `evidence_root`, the block carries `evidence`, `build_block`/`apply_block`
+  execute `apply_block_slashing_evidence` atomically before user txs, and the
+  driver auto-includes machine-detected equivocation into its next candidate
+  (`pending_evidence` + `build_candidate`). So this is no longer a "remaining
+  item." **However, because the slash loop is now live, finding C4 (no vote/lock
+  WAL) is now an ACTIVE danger: an honest validator that restarts mid-height can
+  self-equivocate and be slashed. Fix C4 before running this on a network.**
+- `75d054b` **added the Byzantine safety test**
+  `less_than_one_third_byzantine_power_cannot_finalize_conflicting_blocks`
+  (machine-level; a multi-node-over-TCP version may still be wanted).
+
+Genuinely still remaining after that reconciliation: (a) a reference-machine
+finality-timing number; and the CONFIRMED review findings C1–C4 (validity check
+before prevote, non-silent import failure, bounded round memory, and the C4 WAL
+that the now-live slash loop makes urgent). The a6197ac evidence path itself is
+being independently verified this session. The full prioritized worklist is
 `docs/review/2026-07-16-plan-review.md` §6. Always use `git log` to discover the
 current branch tip; the checkpoint list below names implementation history, not an
 instruction to reset or return to an older commit. (The prototype remains unsafe

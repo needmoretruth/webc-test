@@ -77,6 +77,32 @@ not deeply audited.
   - C4 CONFIRMED — `consensus_driver.rs:150-172` builds a fresh
     `ConsensusMachine` each height off committed height with no persisted vote/lock
     state; `round.rs` module doc: "performs no networking or persistence."
+
+- **DOC-vs-CODE RECONCILIATION (important).** The status docs (continuation-guide,
+  implementation-status, development-plan) said equivocation-to-slash was NOT wired
+  and a Byzantine test was owed. Two commits by the GPT implementer landed on
+  2026-07-15 AFTER those docs were last written and were NOT reflected in them:
+  - `a6197ac feat(consensus): apply header-committed equivocation slashes` — the
+    block header now commits an `evidence_root` (`block.rs:45`), the block body
+    carries `evidence: Vec<SlashingEvidence>`, `build_block`/`apply_block` execute
+    `apply_block_slashing_evidence` before user txs inside the atomic overlay
+    (`block_builder.rs:66-78,171`), and the driver auto-includes machine-detected
+    equivocation (`consensus_driver.rs:481-502`, `pending_evidence` +
+    `build_candidate(..., evidence, ...)` + `prune_pending_evidence`). So the
+    **equivocation → slash loop is wired end to end** (with a
+    `header_committed_evidence_slashes_and_imports_deterministically` test), not
+    missing. The docs were stale; they have been corrected.
+  - `75d054b test(consensus): reject sub-third conflicting finality` — adds
+    `round.rs::less_than_one_third_byzantine_power_cannot_finalize_conflicting_blocks`
+    (machine-level; a full multi-NODE-over-TCP Byzantine integration test may still
+    be wanted, but the core safety property is now tested).
+  - **Safety escalation from this reconciliation:** because the slash loop is now
+    LIVE, finding **C4 is no longer latent** — an honest validator that crashes and
+    restarts mid-height and re-votes produces objectively valid `DoubleVoteEvidence`
+    that this path will ACTUALLY slash. C4 (durable vote/lock WAL) must be fixed
+    BEFORE this is run on any network where honest restarts happen. (The a6197ac
+    path itself is being independently verified this session — see the
+    equivocation-path verification note when it lands.)
 - **C5 — MEDIUM — proof-of-lock (rule 28) not carried with re-proposals
   (liveness).** Good: the receiver verifies `valid_round` against locally-recorded
   2f+1 prevotes, not the proposer's claim. But those prevotes are not attached to
@@ -286,12 +312,45 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
   exploitability bounded by the outer frame/body limits). Fix: a bounded-hex
   deserializer / `MAX_BRIDGE_RECIPIENT_BYTES` cap rejecting over-length at decode.
 
-> Note: the deeper fund-arithmetic review (transfer/fee-split/reward/inflation
-> internals) was delegated to a separate agent that did not return; the areas above
-> were covered by the execution and staking/genesis/bridge dimensions. A dedicated
-> fund-arithmetic pass (fee `split_fee`, `fees.rs` dynamics, reward accrual,
-> `inflation.rs` rounding at the floor) remains owed and is listed under coverage
-> limits.
+### Fund arithmetic (dedicated pass — completed)
+
+- **F1 — HIGH — epoch reward distribution silently drops the cross-validator
+  division remainder, breaking supply conservation.** `state.rs:740-818`
+  `apply_epoch_rewards`: `total_reward = inflation + validator_fee_pool`; each
+  validator gets `floor(total_reward * validator_stake / total_active_stake)`. The
+  **inner** dust (within a validator's own stakers) is recaptured to the validator
+  (correct), but the **outer** remainder `total_reward − Σ validator_share` is
+  assigned to no one, while `minted_supply += inflation` (full) and
+  `validator_fee_pool = 0` unconditionally. Net: the supply invariant
+  (`accounted == minted_supply`) breaks by the outer dust (0..num_validators−1 base
+  units) EVERY epoch, cumulatively — real fee-pool units are destroyed (not burned,
+  not credited) and `minted_supply` over-counts claimable supply. Only ever loses
+  units, never creates. **Invisible with a single active validator** (`mul_ratio`
+  is exact, dust = 0), so single-validator tests miss it; it manifests with ≥2
+  validators. If a future epoch path enforces `SupplyInvariantReport.balanced` this
+  becomes CRITICAL (state-root divergence / halt). It is currently latent because
+  epoch rewards are not yet wired into the real block path (E1). Fix: retain
+  `leftover = total_reward − Σ validator_share` in `validator_fee_pool` (carry
+  forward) instead of zeroing it — mirroring the inner-dust handling — so
+  `accounted_new = accounted_old + inflation = minted_supply_new`.
+- **F2 — LOW — `floor_rate_bps == 0` passes `InflationSchedule::validate`.**
+  `inflation.rs:106-115`: a zero floor drives the rate loop to an
+  `ArithmeticOverflow` error at large years instead of converging (fail-closed, not
+  fund loss). Fix: reject `floor_rate_bps == 0`, or short-circuit when the numerator
+  reaches 0.
+- **Verified correct (fund arithmetic):** the 50/50 fee split conserves exactly
+  with one documented odd-unit rule (odd dust → validator reward; `fees.rs:50-52`,
+  `amount.rs:85`); dynamic base fee is all-checked u128 with `try_from` narrowing,
+  no float (`fees.rs:66`); inflation `max(1%, 10%·0.8^year)` uses pure
+  integer/rational math and a telescoping cumulative-integer per-period budget that
+  distributes exactly the annual units with no drift (`inflation.rs:48-104`); the
+  `Amount` type is fully checked (`checked_mul_bps`/`checked_mul_ratio` split
+  whole/remainder to avoid intermediate overflow and compute exact floors), with no
+  unchecked `as` narrowing anywhere; reward accrual is `checked_add`-only with the
+  claim path zeroing on payout (no double-credit).
+- Not traced by this pass: `effective_fee_per_unit`, `required_units`,
+  `debit_native`, `total_stake()`/`is_active()` bodies, the reward claim/withdraw
+  path beyond grep confirmation, and `Amount`'s `Deserialize`.
 
 ## webc-storage — durability
 
@@ -457,12 +516,11 @@ storage durability contract, scheduler determinism, transaction wire strictness,
 staking/unbonding lifecycle, genesis accounting, dependency supply chain, and
 cross-language byte-parity — plus adversarial re-verification of consensus C1–C4.
 
+Now also covered: fund arithmetic (fee split, base fee, inflation, reward
+distribution, `Amount`) — see the "Fund arithmetic" subsection above (one HIGH
+supply-conservation bug F1; the rest verified correct).
+
 Still NOT audited / owed:
-- **Fund arithmetic internals** — the dedicated agent for `state.rs` transfer/fee-
-  split (`split_fee`), `fees.rs` dynamic base-fee, reward accrual, and
-  `inflation.rs` rounding at the 1% floor did not return; this pass is still owed
-  (checked-arithmetic discipline was confirmed elsewhere, but the exact split/
-  reward/inflation math was not independently traced).
 - redb crash-atomicity across the block+state+cert+validator-set tuple (contract
   read, not fault-injected).
 - The completeness-critic areas E1–E8 above were surfaced, not fully audited.
