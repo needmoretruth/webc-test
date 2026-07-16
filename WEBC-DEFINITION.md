@@ -981,6 +981,36 @@ Status: **decided as method** (values will move with data).
   already recorded (lowers to the audited Rust framework, machine-readable docs,
   compiled). Status: **directions proposed; details open.**
 
+### 2026-07-16 — Round 8: batch finalized, chain-native retry, MEV revenue policy
+
+**15.37 Batch settlement finalized; retry semantics; MEV stance.**
+- **Mandatory batch — owner-decided.** No instant-bypass lane; every swap on a
+  pair settles in the per-block batch at the uniform clearing price. Both
+  owner-level choices of 15.34 are now closed.
+- **Retry is chain-native, and defaults do not reduce freedom.** An order is a
+  short-lived on-chain intent carrying the user's limit price, a deadline
+  (default ~10s, user-set), and a fill-or-cancel flag. The *protocol* keeps it in
+  subsequent batches until filled, cancelled, or expired — the user's device
+  need not stay online and nothing is re-signed. Freedom is preserved three
+  ways: the default is only what happens when the user doesn't choose (both
+  behaviors remain selectable per order); a retried order can never fill worse
+  than the user's own limit; and a pending order is cancellable at any moment
+  within its window.
+- **MEV revenue policy — WEBC does not fund validators with MEV.** On Solana and
+  Ethereum, extractive MEV (tips for favorable ordering) is indeed a major
+  validator revenue stream — but that money is not created, it is **taken from
+  the chain's own users** (sandwich victims pay it). Monetizing it means selling
+  your users to bots. WEBC validators are paid by design through issuance
+  (10%→1% floor), 50% of base fees, and priority fees; if that ever proves
+  insufficient, the honest lever is adjusting those parameters by governance —
+  not re-opening user exploitation. Note the precise scope: batch settlement
+  kills *intra-block ordering games* (sandwiches, front-running); benign MEV
+  such as cross-venue arbitrage that keeps pool prices aligned with the wider
+  market remains possible and welcome — it pays ordinary fees like any other
+  activity, and "the chain where you don't get sandwiched" is itself a
+  user-acquisition feature worth more than the extraction revenue.
+Status: **decided.**
+
 ### Process notes (owner-decided, 2026-07-16)
 
 - All work happens on `main`; no side branches. Every review round commits its
@@ -1081,10 +1111,11 @@ honesty rule: label everything you produce as confirmed / planned / experimental
 1. **Distribution numbers:** a concrete allocation and release schedule is on
    the table (15.33) — owner approval or adjustment pending; once approved, it
    is decided.
-2. **Batch settlement:** two owner choices pending (unfilled-order default;
-   mandatory batch vs instant bypass — 15.34); all remaining mechanics
-   (limit/slippage semantics, multi-hop routing, shared-infrastructure pricing)
-   are delegated design work within 15.13/15.18.
+2. **Batch settlement:** both owner choices are now decided (mandatory batch;
+   chain-native retry-by-default with per-order user control — 15.37); the
+   remaining mechanics (limit/slippage details, multi-hop routing,
+   shared-infrastructure pricing) are delegated design work within
+   15.13/15.18/15.37.
 3. **The high-level authoring language** surface design and component catalog
    format (§9, §13) — largest remaining design area.
 4. **Cross-chain UX** (§10) — direction sketched in 15.36; details open.
