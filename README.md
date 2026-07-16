@@ -77,7 +77,7 @@ docs/
 The code remains a prototype with important incomplete boundaries, including:
 
 - BFT consensus has the happy-path mechanism but a 2026-07-16 review reported HIGH-severity safety/liveness/DoS gaps (see `docs/review/findings.md`); it is not complete or safe;
-- consensus-detected equivocation is not yet wired to an applied slash;
+- consensus-detected equivocation IS wired to an applied slash (commit a6197ac), but the no-vote-WAL gap (finding C4) means an honest validator restart can self-equivocate and be slashed — fix that before running on a network;
 - wallet isolation, recovery, and post-quantum authorization are incomplete;
 - slashing classes beyond objective double-vote evidence are disabled;
 - localized congestion fee markets and a public contract runtime are incomplete;

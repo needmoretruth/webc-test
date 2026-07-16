@@ -175,18 +175,22 @@ forces schema or protocol churn.
    archival / historical-state / snapshot strategy as a storage ADR **before**
    Phase 8 (proofs), ideally scoped in Phase 6.
 
-3. **Equivocation-to-slash is unwired (the core PoS security loop).** The machine
-   detects double-votes and emits verifiable `DoubleVoteEvidence`, but the driver
-   never applies it: `block.evidence` is neither committed by the header nor
-   executed, and slashing only fires via an `Operation::SubmitSlashingEvidence`
-   transaction. PoS security *is* slashing; an un-actuated detector is not
-   security. Under-specified sub-questions: who submits evidence (proposer duty
-   vs. permissionless bounty), is there a whistleblower reward, is evidence
-   committed by an evidence-root in the header, what is the dedup/expiry window,
-   and how does it interact with the unbonding slashable window. Action: an ADR
-   for the evidence pipeline before implementing, plus an end-to-end "offender's
-   stake is actually reduced" test. Note the **slash severity percentages are
-   economic policy the owner must eventually set** (§5).
+3. **Equivocation-to-slash is now WIRED (updated after finding commit `a6197ac`).**
+   This item originally read "unwired"; that was true of the docs but not of the
+   code — the GPT implementer had wired it on 2026-07-15 without updating the status
+   docs. The block header commits an `evidence_root`, the block body carries
+   `evidence` executed atomically in `build_block`/`apply_block`, and the driver
+   auto-includes machine-detected equivocation (`pending_evidence` +
+   `build_candidate`). **The live gap is now the reverse risk: with no durable
+   vote/lock WAL (C4), the live slash loop can slash an honest validator that
+   crashed and restarted mid-height.** Actions: (a) fix C4 *before* this runs on a
+   network; (b) independently adversarially review the a6197ac evidence path
+   (verification in progress this session) — confirm evidence is signature/snapshot-
+   verified before slashing, is replay-protected (no double-slash), is bounded, and
+   cannot be used to slash an honest peer; (c) still-open policy sub-questions:
+   dedup/expiry window and interaction with the unbonding slashable window, and the
+   **slash severity percentages, which are economic policy the owner must eventually
+   set** (§5).
 
 4. **Contract compilation boundary (safety-critical invariant, currently
    implicit).** The confirmed design ("high-level language lowers to a Rust
@@ -259,8 +263,11 @@ Ordered so value survives an interruption. (P0 = do before building more on top.
   today `finish_epoch`'s only caller is the demo, so a running node never advances
   epochs (rewards/unbonding/expiry are dead), and however it gets wired MUST be a
   height-derived function inside `apply_block` or nodes fork at the boundary.
-- **P0** Wire consensus-detected equivocation to an applied slash (ADR + header
-  evidence path or auto-submit + end-to-end slash test), AFTER C4. §4.3.
+- **P0** Equivocation-to-slash is already wired (commit `a6197ac`), so the P0 here
+  is: (a) fix C4 (vote/lock WAL) BEFORE this live slash loop is exposed to a network
+  with honest restarts, and (b) adversarially verify the a6197ac evidence path
+  (signature/snapshot verification before slashing, replay protection, bounds,
+  no-slash-of-honest-peer). §4.3.
 - **P0** Add the multi-node Byzantine safety test (<1/3 power cannot finalize
   conflicting blocks). Owed Phase 4 acceptance item.
 - **P1** Pin the genesis total supply (G1): assert `minted_supply ==

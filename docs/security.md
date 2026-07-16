@@ -125,9 +125,13 @@ test before it is fixed.
   write-ahead log of a validator's own votes/locks, so a crash-restart can make an
   honest validator self-equivocate (C4) — this must be fixed before equivocation is
   wired to a slash.
-- **Slashing is detected but not applied.** Objective double-vote evidence is
-  produced by the consensus machine but the driver never actuates a penalty; PoS
-  economic security is therefore not yet in force.
+- **Slashing is now applied, which makes the C4 WAL gap dangerous.** Commit
+  `a6197ac` wired equivocation-to-slash end to end (header `evidence_root` + block
+  evidence executed atomically; the driver auto-includes machine-detected
+  equivocation). Because that loop is live, finding C4 (no durable vote/lock WAL)
+  means an honest validator that crashes and restarts mid-height can self-
+  equivocate and be slashed — the WAL must land before this runs on a network. The
+  a6197ac evidence path also still needs an independent adversarial review.
 - **The finality "committee" is the whole validator set.** The confirmed rotating
   stake-weighted sub-committee is unbuilt; whole-set voting does not scale to an
   uncapped validator set and is a first-step approximation only.

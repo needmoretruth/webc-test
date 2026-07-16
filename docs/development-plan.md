@@ -518,18 +518,21 @@ reproduce each finding with a failing test before fixing it):
     `current_round + K`, cap stored future rounds, evict decided rounds, so an
     attacker-chosen `u32` round cannot OOM the node;
 13. **(P0, C4) persist a durable WAL of own votes/locks before broadcasting** — so
-    a crash-restart cannot make an honest validator self-equivocate. This MUST land
-    before item 15 (equivocation → slash), or honest restarts get slashed;
+    a crash-restart cannot make an honest validator self-equivocate. **Now urgent:
+    the equivocation→slash loop is already live (item 15 is DONE), so an honest
+    restart today can actually be slashed. This must land before this runs on any
+    network with honest restarts;**
 14. publish a reference-machine finality-timing number (cannot be produced in this
     cloud container);
-15. wire consensus-detected equivocation to an applied slash — the machine detects
-    it and emits verifiable `DoubleVoteEvidence`, but the driver does not act on
-    it: `block.evidence` is neither committed by the header nor executed, and
-    slashing applies only via an `Operation::SubmitSlashingEvidence` transaction,
-    so close the loop (an authenticated block-evidence path or an auto-submitted
-    evidence transaction) and add an end-to-end slash test (depends on item 13);
-16. add a multi-node Byzantine test that <1/3 power cannot finalize conflicting
-    blocks (the lock-safety property is unit-tested today);
+15. **DONE (commit `a6197ac`)** — consensus-detected equivocation is wired to an
+    applied slash: header `evidence_root` + block `evidence` executed atomically in
+    `build_block`/`apply_block`, the driver auto-includes machine-detected
+    equivocation, and a determinism test exists. (Independently verified this
+    session; the `SubmitSlashingEvidence` transaction path also remains.) Ordering
+    note preserved: item 13 (C4 WAL) should have preceded this and is now urgent;
+16. **Largely DONE (commit `75d054b`)** — the machine-level
+    `less_than_one_third_byzantine_power_cannot_finalize_conflicting_blocks` test
+    exists; a multi-node-over-TCP integration version is optional follow-up;
 17. carry a proof-of-lock certificate with re-proposals and scale timeouts by round
     (C5/C6 liveness), and make state-sync a directed reply gated on a verified
     higher-height certificate (C7);

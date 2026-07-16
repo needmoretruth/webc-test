@@ -179,10 +179,18 @@ consensus safety/liveness/DoS gaps that must be reproduced and fixed before Phas
 re-execution before prevote/lock/finalize (a Byzantine leader can certify an
 unimportable block — C1), a silent node halt on failed import (C2), unbounded
 attacker-chosen-round memory (C3), and no vote/lock WAL so a crash-restart
-self-equivocates (C4, which must be fixed before equivocation is wired to a
-slash). The previously-listed remaining items (equivocation-to-slash wiring, a
-reference finality-timing number, and a multi-node Byzantine test) still stand and
-are detailed at the end of the A-3 section; the full worklist is
+self-equivocates (C4).
+
+Also corrected in the same review: two commits by the GPT implementer
+(`a6197ac`, `75d054b`) landed 2026-07-15 without updating this file, so two items
+this document previously listed as remaining are in fact DONE — **equivocation-to-
+slash is wired** (header `evidence_root` + block `evidence` executed atomically in
+`build_block`/`apply_block`, driver auto-includes machine-detected equivocation)
+and a **Byzantine `less_than_one_third_..._cannot_finalize_conflicting_blocks`
+test** exists. Because the slash loop is now live, C4 is no longer latent: an
+honest restart can self-equivocate and be slashed, so the vote/lock WAL is urgent.
+Genuinely remaining: a reference finality-timing number, C1–C4, and (optionally) a
+multi-node-over-TCP Byzantine test. Full worklist:
 `docs/review/2026-07-16-plan-review.md` §6.
 
 ### Phase 4 A-1: peer-to-peer networking plumbing — complete
@@ -363,21 +371,29 @@ The safety-critical, deterministic parts of A-3 are implemented and gate-verifie
   observer joins and catches up to height 3 purely via state sync, its finalized
   tips matching the validators' at every height.
 
-Remaining Phase 4 items: a reference-machine finality-timing number (this cloud
-container cannot produce it honestly); **wiring consensus-detected equivocation to
-an applied slash** — the machine detects equivocation and emits verifiable
-`DoubleVoteEvidence` (whose `SlashingEvidence::verify` passes), but the driver does
-NOT apply it. `block.evidence` is neither committed by the block header (there is
-no evidence root) nor executed by `build_block`/`apply_block`; slashing is applied
-only through an `Operation::SubmitSlashingEvidence` transaction (implemented and
-tested in Phase 1). Closing the loop needs either an authenticated block-evidence
-path (an evidence root in the header + block-evidence execution) or the driver
-auto-submitting a `SubmitSlashingEvidence` transaction, plus an end-to-end test
-that an offender's stake is actually reduced. Also remaining: a multi-node
-Byzantine test that <1/3 power cannot finalize conflicting blocks (the lock-safety
-property is unit-tested in `webc-chain::round`). Fork choice is covered by the
-finality-certificate design (a node follows the certified chain and commits only
-finalized blocks).
+**Update (2026-07-16, reconciled with commits `a6197ac`/`75d054b` that this file
+had not caught up to): consensus-detected equivocation IS now wired to an applied
+slash.** `a6197ac` added an `evidence_root` to the block header, an `evidence:
+Vec<SlashingEvidence>` block body, and `build_block`/`apply_block` execution of
+`apply_block_slashing_evidence` (bounded by `MAX_BLOCK_SLASHING_EVIDENCE`, before
+user txs, inside the atomic overlay); the driver auto-includes machine-detected
+equivocation via `pending_evidence` + `build_candidate` +
+`prune_pending_evidence`; there is a
+`header_committed_evidence_slashes_and_imports_deterministically` test. `75d054b`
+added the `less_than_one_third_byzantine_power_cannot_finalize_conflicting_blocks`
+machine-level test. The `Operation::SubmitSlashingEvidence` transaction path also
+still exists.
+
+Because the slash loop is now live, review finding **C4 (no durable vote/lock WAL)
+is an ACTIVE danger**: an honest validator that crashes and restarts mid-height can
+self-equivocate and be slashed — fix the WAL before running this on a network (see
+`docs/review/findings.md`). Genuinely remaining Phase 4 items: a reference-machine
+finality-timing number (this cloud container cannot produce it honestly); the
+CONFIRMED review findings C1–C4; and, optionally, a multi-node-over-TCP Byzantine
+integration test (the machine-level property is now tested). Fork choice is covered
+by the finality-certificate design (a node follows the certified chain and commits
+only finalized blocks). The a6197ac evidence path is being independently verified
+this session.
 
 ## Phase 3: local restartable node, storage, and developer APIs
 
