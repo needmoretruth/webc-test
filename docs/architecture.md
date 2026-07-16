@@ -49,6 +49,21 @@ The target is permissionless delegated Proof of Stake with BFT-style finality:
 
 Committee size, epoch length, message timeouts, and block limits are technical values to choose through simulations, fault tests, and public testnet measurements.
 
+**Two structural gaps to resolve before they get expensive (2026-07-16 review):**
+- *Committee sampling is unbuilt.* The confirmed design has a rotating
+  stake-weighted sub-committee vote per block (so not every validator votes) with
+  no global validator cap. The current finality certificate requires >2/3 of the
+  **whole** active validator-set snapshot — a correct first step, but O(N) votes /
+  O(N²) gossip that cannot meet "not everyone votes" or scale. Sub-committee
+  sampling needs its own ADR and a security argument (the sampled committee must
+  itself hold an honest super-majority with high probability), and the finality
+  path should be committee-parameterized so the later change is not a rewrite.
+- *Historical state.* `ChainStore` keeps latest-only state. The Mina-style light
+  client and account/object proofs, and later ZK checkpoints, need historical state
+  commitments. Decide the archival / snapshot / state-delta strategy in a storage
+  ADR before the proofs phase; retrofitting it after a frozen mainnet schema is
+  costly. See `docs/review/2026-07-16-plan-review.md` §4.
+
 Stake changes are snapshotted at epoch boundaries. Delegation exits pass through
 versioned pending, queued, cooling, and withdrawable states plus a global bounded
 FIFO churn queue. A pool that would fail the next 100 WEBC / 20 WEBC / 20% rules
@@ -65,6 +80,15 @@ The scheduler may execute independent work concurrently, but consensus commits o
 ## Smart-contract path
 
 Security-critical operations begin as audited Rust native modules. The contract execution foundation is restricted, deterministic WASM with Rust as the first authoring language. Above it, WEBC provides its own high-level authoring language that lowers (transpiles) to an audited Rust framework, inheriting Rust/WASM safety and performance without a second VM or a hand-written compiler backend. Move VM and EVM are not the native runtime; Ethereum/Solana compatibility comes through bridges. A contract linter/analyzer and a pre-deploy review keep contracts small and maintainable.
+
+**Compilation-boundary invariant (permanent).** The chain accepts and stores only
+deterministic WASM bytecode plus metadata. All compilation — WEBC high-level
+source → Rust framework → WASM — happens **off-chain and untrusted** (developer
+machine or SDK, reusing the Rust/LLVM toolchain). On-chain validation is limited to
+WASM validation, gas metering, and access-list enforcement. A source-language or
+Rust compiler must never run inside block execution: doing so would destroy
+determinism and create an enormous attack surface. The high-level language is an
+off-chain authoring/SDK layer, not an on-chain interpreter.
 
 Contracts cannot access websites, files, device randomness, or wall-clock time directly. They communicate with browser or server agents through events and signed receipts, and read external data through a native staked oracle (reporters stake, values are aggregated, wrong reports are slashed) so every node computes the same result.
 

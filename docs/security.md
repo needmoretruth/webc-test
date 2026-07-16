@@ -109,6 +109,37 @@ Bridges are a separate high-risk system. Required controls include exact asset i
 
 Generic token support does not make malicious or unusual tokens safe. Real bridge funds remain disabled until the production trust/proof model is approved.
 
+## Known gaps from the 2026-07-16 plan review
+
+A read-only review reported gaps that are not yet fixed. These are recorded here
+so the security model does not read as stronger than the code. Full detail and
+line references are in `docs/review/findings.md`; the prioritized fix order is in
+`docs/review/2026-07-16-plan-review.md` §6. Each finding must be reproduced with a
+test before it is fixed.
+
+- **Consensus is not yet safe (HIGH).** A proposed block is prevoted, locked, and
+  finalized without re-executing it, so a Byzantine leader can obtain a valid
+  finality certificate for an unimportable block (findings C1). A failed
+  finalized-block import silently halts the node (C2). Per-height consensus memory
+  is keyed by an attacker-chosen round with no bound (C3, OOM). There is no durable
+  write-ahead log of a validator's own votes/locks, so a crash-restart can make an
+  honest validator self-equivocate (C4) — this must be fixed before equivocation is
+  wired to a slash.
+- **Slashing is detected but not applied.** Objective double-vote evidence is
+  produced by the consensus machine but the driver never actuates a penalty; PoS
+  economic security is therefore not yet in force.
+- **The finality "committee" is the whole validator set.** The confirmed rotating
+  stake-weighted sub-committee is unbuilt; whole-set voting does not scale to an
+  uncapped validator set and is a first-step approximation only.
+- **Node/network hardening gaps (devnet surface).** No handshake timeout, unbounded
+  inbound connections and peer table, faucet drainable via unlimited fresh
+  addresses, and unbounded WebSocket subscriptions (findings N1–N3, H1, H3).
+- **No production validator-key provisioning yet.** Devnet uses fresh per-process
+  and hardcoded devnet keys; a permissioned keystore path (no key material in
+  argv) must exist before mainnet.
+- **No automated supply-chain gate.** `cargo-deny` (advisories/licenses/bans) and a
+  JS advisory scan are not yet in CI.
+
 ## Test strategy
 
 Testing must include unit and property tests, malformed input, randomized state-machine sequences, parallel/serial equivalence, network partitions, validator equivocation, restart recovery, database corruption, wallet-origin attacks, bridge replay, supply reconciliation, and long-running public testnets.
