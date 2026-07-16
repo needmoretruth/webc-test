@@ -10,8 +10,9 @@ The authoritative detailed roadmap is [`development-plan.md`](development-plan.m
 4. Add durable storage, node APIs, and restart-safe operation.
 5. Build networking and stake-based BFT consensus.
 6. Implement correct staking, delegation, rewards, unbonding, and slashing.
+6.5. Freeze the consensus + crypto + economics core and pass an earlier independent security review before stacking higher layers (Phase 5.5; owner-confirmed 2026-07-16 gate).
 7. Add enforced access lists, parallel execution, app isolation, and localized fees.
-8. Build the contract runtime on the chosen Rust->WASM foundation, then the WEBC high-level authoring language (lowering to the audited Rust framework), its anti-complexity tooling, AI-readable component catalog, and the native staked oracle.
+8. Build the contract runtime on the chosen Rust->WASM foundation with an interim Rust-eDSL/SDK authoring path over a stable ABI + swappable authoring-front-end seam (Phase 7a), plus the native staked oracle; the bespoke WEBC high-level authoring language and its anti-complexity tooling / AI-readable catalog come later as a front-end over that same seam (Phase 7b). (Owner-confirmed 2026-07-16 sequencing.)
 9. Add compact browser proofs and versioned post-quantum authorization.
 10. Complete the browser wallet, SDK, widget, and site-agent protocol.
 11. Add native tokens, NFTs, application rules, and optional token governance.
