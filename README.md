@@ -56,9 +56,11 @@ WEBC combines selected ideas rather than copying one chain wholesale:
 
 ```text
 crates/
-  webc-crypto/      existing cryptographic prototype
-  webc-chain/       existing state-transition prototype
-  webc-node/        existing CLI demo
+  webc-crypto/      cryptographic primitives (Ed25519, ML-DSA seam, hash, merkle)
+  webc-chain/       deterministic state-transition core (the protocol heart)
+  webc-storage/     KvStore seam + redb backend + ChainStore
+  webc-net/         async P2P transport seam (tokio)
+  webc-node/        runnable node: mempool, service, HTTP/WS, consensus driver, CLI
 sdk/
   webc-js/          browser SDK prototype
   webc-widget/      embedded widget prototype
@@ -66,12 +68,16 @@ docs/
   decision-record.md   confirmed decisions and technical gates
   development-plan.md  authoritative phased work plan
   whitepaper.md        protocol/product design draft
+  index.md             documentation map (authority order; links docs/review/)
+  review/              review-session artifacts (codebase map, plan review, findings)
 ```
 
 ## Important warning about current code
 
 The code remains a prototype with important incomplete boundaries, including:
 
+- BFT consensus has the happy-path mechanism but a 2026-07-16 review reported HIGH-severity safety/liveness/DoS gaps (see `docs/review/findings.md`); it is not complete or safe;
+- consensus-detected equivocation is not yet wired to an applied slash;
 - wallet isolation, recovery, and post-quantum authorization are incomplete;
 - slashing classes beyond objective double-vote evidence are disabled;
 - localized congestion fee markets and a public contract runtime are incomplete;
@@ -79,7 +85,8 @@ The code remains a prototype with important incomplete boundaries, including:
 - PoH has been removed from authoritative block data and hashing;
 - a trusted-relayer bridge prototype that is not safe for real assets.
 
-See [`docs/implementation-status.md`](docs/implementation-status.md) before reusing any module.
+See [`docs/implementation-status.md`](docs/implementation-status.md) and
+[`docs/review/findings.md`](docs/review/findings.md) before reusing any module.
 
 ## Legacy prototype commands
 
@@ -92,4 +99,8 @@ cargo test --workspace
 cargo run -p webc-node -- demo
 ```
 
-The immediate milestone is the remainder of Phase 1 in [`docs/development-plan.md`](docs/development-plan.md), not RPC or bridge expansion.
+Phases 0–3 are complete and Phase 4 (networking + signed BFT consensus) is active
+but not yet safe. This README does not restate detailed status (it rots); see
+[`docs/continuation-guide.md`](docs/continuation-guide.md) for the verified
+checkpoint and next task, and [`docs/review/2026-07-16-plan-review.md`](docs/review/2026-07-16-plan-review.md)
+for the prioritized worklist.
