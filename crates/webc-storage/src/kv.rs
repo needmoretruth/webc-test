@@ -48,18 +48,24 @@ pub enum Table {
     /// Finality certificates keyed by 8-byte big-endian height, so a node can
     /// prove a served block was finalized during state sync.
     Certificates,
+    /// The validator's own consensus write-ahead journal keyed by 8-byte
+    /// big-endian height: everything this node signed at the in-progress
+    /// height, persisted before each broadcast so a crash-restart can never
+    /// re-sign a conflicting message (objective self-equivocation).
+    ConsensusWal,
 }
 
 impl Table {
     /// Stable ordered list of every table. Backends iterate this to allocate
     /// one physical namespace per table; tests iterate it to assert coverage.
-    pub const ALL: [Table; 6] = [
+    pub const ALL: [Table; 7] = [
         Table::Meta,
         Table::Blocks,
         Table::StateSnapshots,
         Table::BlockHashIndex,
         Table::ValidatorSets,
         Table::Certificates,
+        Table::ConsensusWal,
     ];
 
     /// A stable, compact byte tag identifying the table in a serialized batch.
@@ -75,6 +81,7 @@ impl Table {
             Table::BlockHashIndex => 3,
             Table::ValidatorSets => 4,
             Table::Certificates => 5,
+            Table::ConsensusWal => 6,
         }
     }
 }

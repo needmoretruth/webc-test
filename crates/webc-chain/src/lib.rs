@@ -60,8 +60,8 @@ pub use protocol::{
     ProtocolVersion, ValidatorId, CURRENT_PROTOCOL_VERSION,
 };
 pub use round::{
-    ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage, Step, TimeoutKind,
-    ValidatorIdentity,
+    ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage, ConsensusWalRecord, Step,
+    TimeoutKind, ValidatorIdentity,
 };
 pub use scheduler::parallel_batches;
 pub use session_key::{
@@ -310,6 +310,12 @@ pub enum ChainError {
     FinalityQuorumNotReached,
     #[error("imported block does not match local re-execution of its transactions")]
     ImportedBlockMismatch,
+    #[error(
+        "consensus write-ahead journal is inconsistent with this validator height; \
+         refusing to vote (a journal that cannot be trusted means the node no longer \
+         knows what it already signed)"
+    )]
+    ConsensusWalMismatch,
 }
 
 impl From<bincode::Error> for ChainError {

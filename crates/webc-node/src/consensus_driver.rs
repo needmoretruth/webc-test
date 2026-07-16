@@ -25,6 +25,16 @@
 //! evidence hash and included in a later candidate block. The block header commits
 //! the evidence root and deterministic execution applies the slash before user
 //! transactions, so every importing node reaches the same penalized state.
+//!
+//! Crash safety (C4): because the slash path above is live, a validator that
+//! forgets what it already signed and re-signs differently after a restart
+//! destroys its own stake. The driver therefore journals the machine's signing
+//! state durably ([`Node::persist_consensus_wal`]) **before** broadcasting any
+//! message the local machine signed, and replays the journal
+//! ([`ConsensusMachine::restore`]) when it rebuilds a machine for an
+//! in-progress height. A journal that cannot be read or validated means the
+//! node no longer knows what it signed, so it fails closed and follows that
+//! height as a non-voting observer.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -41,7 +51,7 @@ use webc_storage::KvStore;
 
 use crate::http::now_ms;
 use crate::mempool::{Mempool, MempoolConfig};
-use crate::node::Node;
+use crate::node::{Node, NodeError};
 
 /// How long the driver waits in each step before firing the matching timeout.
 #[derive(Clone, Copy, Debug)]
@@ -154,13 +164,36 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                 Err(_) => return,
             };
             let identity = self.identity_for(&snapshot);
+            let is_validator = identity.is_some();
             let mut machine = ConsensusMachine::new(
                 self.node.config().protocol_version,
                 self.node.config().chain_id.clone(),
-                snapshot,
+                snapshot.clone(),
                 height,
                 identity,
             );
+            // C4 crash safety: if this node already signed something at this
+            // height before a restart, replay the journal so the machine never
+            // re-signs a recorded step and keeps its lock. An unreadable or
+            // invalid journal means the node no longer knows what it signed —
+            // fail closed and follow this height as a non-voting observer (an
+            // observer cannot equivocate).
+            if is_validator {
+                let journal_safe = match self.node.consensus_wal(height) {
+                    Ok(None) => true,
+                    Ok(Some(record)) => machine.restore(record).is_ok(),
+                    Err(_) => false,
+                };
+                if !journal_safe {
+                    machine = ConsensusMachine::new(
+                        self.node.config().protocol_version,
+                        self.node.config().chain_id.clone(),
+                        snapshot,
+                        height,
+                        None,
+                    );
+                }
+            }
 
             // The height advances by either path: this node finalizes it live
             // (the machine emits a Commit), or it imports the finalized block from
@@ -421,6 +454,27 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         }
     }
 
+    /// Durably journals the machine's signing state before one of its own
+    /// messages is broadcast (the C4 write-ahead journal). Messages this node
+    /// did not sign pass through without a journal write.
+    fn journal_own_message(
+        &mut self,
+        machine: &ConsensusMachine,
+        message: &ConsensusMessage,
+    ) -> Result<(), NodeError> {
+        let own = match (self.consensus_address, message) {
+            (Some(address), ConsensusMessage::Proposal(proposal)) => {
+                proposal.payload.proposer == address
+            }
+            (Some(address), ConsensusMessage::Vote(vote)) => vote.payload.validator == address,
+            (None, _) => false,
+        };
+        if !own {
+            return Ok(());
+        }
+        self.node.persist_consensus_wal(&machine.wal_record())
+    }
+
     /// Drops evidence already committed or no longer verifiable against current
     /// validator state, preventing one stale item from stalling proposal creation.
     fn prune_pending_evidence(&mut self) {
@@ -455,6 +509,15 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         while let Some(action) = work.pop_front() {
             match action {
                 ConsensusAction::Broadcast(message) => {
+                    // C4: a message this node signed must be journaled durably
+                    // before it can reach the wire — a vote peers saw but the
+                    // journal forgot is exactly the crash-restart
+                    // self-equivocation window. Fail closed: if the journal
+                    // write fails, the message is dropped (never broadcast),
+                    // costing liveness but never safety.
+                    if self.journal_own_message(machine, &message).is_err() {
+                        continue;
+                    }
                     let _ = self.network.broadcast(to_net_message(message));
                 }
                 ConsensusAction::ScheduleTimeout { kind, round } => {

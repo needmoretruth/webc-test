@@ -26,7 +26,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use webc_chain::{Block, BlockHeader, ChainState, FinalityCertificate, ValidatorSet};
+use webc_chain::{
+    Block, BlockHeader, ChainState, ConsensusWalRecord, FinalityCertificate, ValidatorSet,
+};
 use webc_crypto::Hash256;
 
 use crate::error::StorageError;
@@ -283,6 +285,11 @@ impl<K: KvStore> ChainStore<K> {
                 bincode::serialize(certificate)?,
             );
         }
+        // The consensus journal for this height is obsolete the moment the
+        // height commits (a machine is never rebuilt for a committed height),
+        // so prune it in the same atomic batch. Deleting an absent key is a
+        // no-op, so this is safe for non-validators too.
+        batch.delete(Table::ConsensusWal, be(header.height).to_vec());
         // The tip advances in the same batch, so it is never observable ahead of
         // its block or state.
         batch.put(Table::Meta, META_TIP, bincode::serialize(&new_tip)?);
@@ -351,6 +358,34 @@ impl<K: KvStore> ChainStore<K> {
     /// Returns the finality certificate recorded for `height`, or `None`.
     pub fn certificate(&self, height: u64) -> Result<Option<FinalityCertificate>, StorageError> {
         match self.store.get(Table::Certificates, &be(height))? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+        }
+    }
+
+    /// Durably records the validator's own consensus write-ahead journal for
+    /// `record.height`, replacing any previous journal for that height.
+    ///
+    /// This MUST complete (with its fsync-class durability barrier) before the
+    /// message that extended the journal is broadcast; a vote on the wire that
+    /// is not in the journal is exactly the crash-restart self-equivocation
+    /// window this journal closes. The journal is pruned automatically when its
+    /// height commits (see [`Self::commit_block`]).
+    pub fn put_consensus_wal(&mut self, record: &ConsensusWalRecord) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Table::ConsensusWal,
+            be(record.height).to_vec(),
+            bincode::serialize(record)?,
+        );
+        self.store.commit(batch)
+    }
+
+    /// Returns the consensus write-ahead journal recorded for `height`, or
+    /// `None` when this node signed nothing at that height (or already
+    /// committed it).
+    pub fn consensus_wal(&self, height: u64) -> Result<Option<ConsensusWalRecord>, StorageError> {
+        match self.store.get(Table::ConsensusWal, &be(height))? {
             None => Ok(None),
             Some(bytes) => Ok(Some(decode(&bytes)?)),
         }
@@ -644,6 +679,63 @@ mod tests {
         backend.commit(batch).unwrap();
         let err = ChainStore::open(backend).unwrap_err();
         assert!(matches!(err, StorageError::Inconsistent(_)));
+    }
+
+    /// A minimal consensus journal for `height` (structure round-trips are what
+    /// storage owns; journal *content* validation is the consensus machine's).
+    fn wal_record(height: u64) -> ConsensusWalRecord {
+        ConsensusWalRecord {
+            height,
+            proposals: Vec::new(),
+            votes: Vec::new(),
+            locked_round: None,
+            locked_value: None,
+            valid_round: None,
+            valid_value: None,
+        }
+    }
+
+    #[test]
+    fn consensus_wal_roundtrips_overwrites_and_prunes_on_commit() {
+        let mut store = ChainStore::open(MemoryKvStore::new()).unwrap();
+        store.initialize_genesis(&state_at_epoch(0)).unwrap();
+
+        // Round trip.
+        let record = wal_record(1);
+        store.put_consensus_wal(&record).unwrap();
+        assert_eq!(store.consensus_wal(1).unwrap(), Some(record.clone()));
+
+        // A later write for the same height replaces the journal (the driver
+        // persists the full accumulated record on every own broadcast).
+        let mut updated = record.clone();
+        updated.locked_round = Some(0);
+        updated.locked_value = Some(block_for(&state_at_epoch(1), 1, Hash256([0u8; 32])));
+        store.put_consensus_wal(&updated).unwrap();
+        assert_eq!(store.consensus_wal(1).unwrap(), Some(updated));
+
+        // Committing height 1 prunes its journal in the same atomic batch; a
+        // journal for a future height is untouched.
+        store.put_consensus_wal(&wal_record(2)).unwrap();
+        let state1 = state_at_epoch(1);
+        let block1 = block_for(&state1, 1, Hash256([0u8; 32]));
+        commit(&mut store, &block1, &state1);
+        assert!(store.consensus_wal(1).unwrap().is_none());
+        assert_eq!(store.consensus_wal(2).unwrap(), Some(wal_record(2)));
+    }
+
+    #[test]
+    fn consensus_wal_survives_redb_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.redb");
+        {
+            let mut store = ChainStore::open(RedbKvStore::open(&path).unwrap()).unwrap();
+            store.initialize_genesis(&state_at_epoch(0)).unwrap();
+            store.put_consensus_wal(&wal_record(1)).unwrap();
+        }
+        // The journal must survive a process restart — that survival is the
+        // entire point of journaling before broadcast.
+        let reopened = ChainStore::open(RedbKvStore::open(&path).unwrap()).unwrap();
+        assert_eq!(reopened.consensus_wal(1).unwrap(), Some(wal_record(1)));
     }
 
     #[test]

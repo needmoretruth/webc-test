@@ -32,6 +32,19 @@
 //! `apply_block`) before feeding it, and the committing node re-validates on
 //! import. This keeps the consensus machine free of execution.
 //!
+//! Crash safety (the C4 write-ahead journal): signing the same (height, round,
+//! step) twice with different content is objective, slashable equivocation, so
+//! a validator must never forget what it already signed. The machine itself
+//! stays free of I/O; instead it exposes its own signed messages and lock state
+//! as a [`ConsensusWalRecord`] via [`ConsensusMachine::wal_record`], and the
+//! driver MUST persist that record durably *before* broadcasting each own
+//! message and feed it back through [`ConsensusMachine::restore`] when it
+//! rebuilds a machine for the same height after a restart. A restored machine
+//! re-enters the journaled round, never re-signs a recorded step, and keeps its
+//! lock, so an honest restart can neither self-equivocate nor violate lock
+//! safety. If the journal cannot be read or fails validation, the driver must
+//! fail closed and run the height without a voting identity.
+//!
 //! Deferred: dynamic timeout durations, gossiping the full vote set for faster
 //! catch-up, and sub-committee sampling are driver/refinement concerns, not part
 //! of this safety core.
@@ -40,6 +53,7 @@ use crate::{
     Block, ChainError, ChainId, DoubleVoteEvidence, FinalityCertificate, ProtocolVersion,
     SignedProposal, SignedVote, ValidatorSet, Vote, VoteType,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256, Keypair};
 
@@ -132,6 +146,37 @@ pub enum ConsensusAction {
     Equivocation(Box<DoubleVoteEvidence>),
 }
 
+/// Everything a validator must remember across a crash to avoid signing a
+/// conflicting consensus message for a step it already signed (the C4
+/// write-ahead journal, following Tendermint's persisted
+/// `(height, round, step, lock, last-signed vote)` requirement).
+///
+/// The driver persists this record durably **before** broadcasting each own
+/// signed message and replays it into a fresh machine for the same height via
+/// [`ConsensusMachine::restore`]. All fields are this validator's *own*
+/// artifacts; peer votes are deliberately excluded (losing them costs liveness
+/// only, never safety). Invariant: `votes` never contains two entries for one
+/// `(round, vote_type)` with different block hashes — `restore` rejects such a
+/// journal as corrupt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusWalRecord {
+    /// The single consensus height this journal covers.
+    pub height: u64,
+    /// Every proposal this validator signed at this height, in signing order.
+    pub proposals: Vec<SignedProposal>,
+    /// Every vote this validator signed at this height, in signing order.
+    pub votes: Vec<SignedVote>,
+    /// The round this node locked in, if any (present iff `locked_value` is).
+    pub locked_round: Option<u32>,
+    /// The block this node locked (precommitted), if any.
+    pub locked_value: Option<Block>,
+    /// The round of the latest observed prevote quorum, if any (present iff
+    /// `valid_value` is).
+    pub valid_round: Option<u32>,
+    /// The latest block observed to reach a prevote quorum, if any.
+    pub valid_value: Option<Block>,
+}
+
 /// Which votes a power tally counts: any hash, or exactly one hash.
 #[derive(Clone, Copy)]
 enum HashFilter {
@@ -180,6 +225,16 @@ pub struct ConsensusMachine {
     /// Fired once-only rule guards.
     guards: BTreeSet<(Guard, u32)>,
 
+    /// Every proposal this node signed at this height, in signing order — the
+    /// proposal half of the crash-safety journal (see [`ConsensusWalRecord`]).
+    own_proposals: Vec<SignedProposal>,
+    /// Every vote this node signed at this height, in signing order — the vote
+    /// half of the crash-safety journal.
+    own_votes: Vec<SignedVote>,
+    /// Whether this machine was rebuilt from a journal; [`Self::start`] then
+    /// re-enters the journaled round instead of starting round 0 fresh.
+    restored: bool,
+
     /// The finalized block and its certificate, once decided.
     decision: Option<(Block, FinalityCertificate)>,
 }
@@ -213,15 +268,164 @@ impl ConsensusMachine {
             precommits: BTreeMap::new(),
             reported_equivocators: BTreeSet::new(),
             guards: BTreeSet::new(),
+            own_proposals: Vec::new(),
+            own_votes: Vec::new(),
+            restored: false,
             decision: None,
         }
     }
 
-    /// Emits the startup actions for round 0. Call exactly once after [`Self::new`].
+    /// Emits the startup actions. Call exactly once after [`Self::new`] (and
+    /// after [`Self::restore`], when a journal exists).
+    ///
+    /// Fresh machine: starts round 0 (propose or arm the propose timeout).
+    /// Restored machine: re-enters the journaled round *without signing
+    /// anything new for it* and arms a precommit timeout, so the node moves to
+    /// the next (fresh) round if the network cannot re-complete the journaled
+    /// one. Never re-proposing or re-voting a journaled step is exactly the
+    /// anti-self-equivocation guarantee of the journal.
     pub fn start(&mut self) -> Result<Vec<ConsensusAction>, ChainError> {
         let mut actions = Vec::new();
+        if self.restored {
+            actions.push(ConsensusAction::ScheduleTimeout {
+                kind: TimeoutKind::Precommit,
+                round: self.round,
+            });
+            self.drive(&mut actions)?;
+            return Ok(actions);
+        }
         self.start_round(0, &mut actions)?;
         Ok(actions)
+    }
+
+    /// Snapshot of everything this node has signed at this height plus its lock
+    /// state — the crash-safety journal a driver must persist durably before
+    /// each own broadcast. See [`ConsensusWalRecord`].
+    pub fn wal_record(&self) -> ConsensusWalRecord {
+        ConsensusWalRecord {
+            height: self.height,
+            proposals: self.own_proposals.clone(),
+            votes: self.own_votes.clone(),
+            locked_round: self.locked_round,
+            locked_value: self.locked_value.clone(),
+            valid_round: self.valid_round,
+            valid_value: self.valid_value.clone(),
+        }
+    }
+
+    /// Replays a persisted journal into a freshly created machine, so a
+    /// validator restarting mid-height never signs a conflicting message for a
+    /// (round, step) it already signed and never abandons its lock.
+    ///
+    /// Call after [`Self::new`] and before [`Self::start`], only on a machine
+    /// with a voting identity. The journal is validated as hostile input even
+    /// though it is local storage: every entry must be this validator's own,
+    /// signature-verified message for exactly this height, the journal must not
+    /// itself contain conflicting votes, and the lock/valid pairs must be
+    /// internally consistent. Any violation returns
+    /// [`ChainError::ConsensusWalMismatch`] with the machine unchanged; the
+    /// caller must then fail closed (run the height without a voting identity),
+    /// because a journal that cannot be trusted means the node no longer knows
+    /// what it already signed.
+    pub fn restore(&mut self, record: ConsensusWalRecord) -> Result<(), ChainError> {
+        // Only a machine that has done nothing yet can be restored: replaying
+        // into a live machine could erase signing guards.
+        if self.restored
+            || self.decision.is_some()
+            || self.round != 0
+            || self.step != Step::Propose
+            || !self.own_proposals.is_empty()
+            || !self.own_votes.is_empty()
+        {
+            return Err(ChainError::ConsensusWalMismatch);
+        }
+        if record.height != self.height {
+            return Err(ChainError::ConsensusWalMismatch);
+        }
+        let identity_address = self
+            .identity
+            .as_ref()
+            .map(|identity| identity.address)
+            .ok_or(ChainError::ConsensusWalMismatch)?;
+
+        // Validate everything before mutating anything, so a corrupt journal
+        // leaves the machine untouched.
+        for proposal in &record.proposals {
+            if proposal.payload.height != self.height
+                || proposal.payload.proposer != identity_address
+            {
+                return Err(ChainError::ConsensusWalMismatch);
+            }
+            proposal.verify_in_set(&self.set, self.protocol_version, &self.chain_id)?;
+        }
+        let mut first_hash_per_step: BTreeMap<(u32, VoteType), Hash256> = BTreeMap::new();
+        for vote in &record.votes {
+            if vote.payload.height != self.height || vote.payload.validator != identity_address {
+                return Err(ChainError::ConsensusWalMismatch);
+            }
+            self.set
+                .verify_vote(vote, self.protocol_version, &self.chain_id)?;
+            // A journal that already contains two conflicting votes for one
+            // step records an equivocation that has already happened; nothing
+            // safe can be replayed from it.
+            match first_hash_per_step.entry((vote.payload.round, vote.payload.vote_type)) {
+                std::collections::btree_map::Entry::Occupied(existing) => {
+                    if *existing.get() != vote.payload.block_hash {
+                        return Err(ChainError::ConsensusWalMismatch);
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(vote.payload.block_hash);
+                }
+            }
+        }
+        if record.locked_round.is_some() != record.locked_value.is_some()
+            || record.valid_round.is_some() != record.valid_value.is_some()
+        {
+            return Err(ChainError::ConsensusWalMismatch);
+        }
+
+        // Apply: re-insert own messages so tallies still count this node, and
+        // re-arm the per-round "already signed" guards so no recorded step can
+        // be signed again.
+        let mut max_round = 0u32;
+        let mut any_activity = false;
+        for proposal in record.proposals {
+            max_round = max_round.max(proposal.payload.round);
+            any_activity = true;
+            self.own_proposals.push(proposal.clone());
+            self.proposals
+                .entry(proposal.payload.round)
+                .or_insert(proposal);
+        }
+        for vote in record.votes {
+            let round = vote.payload.round;
+            max_round = max_round.max(round);
+            any_activity = true;
+            let guard = match vote.payload.vote_type {
+                VoteType::Prevote => Guard::PrevoteSent,
+                VoteType::Precommit => Guard::PrecommitSent,
+            };
+            self.guards.insert((guard, round));
+            self.own_votes.push(vote.clone());
+            let _ = self.record_vote(vote);
+        }
+        self.locked_value = record.locked_value;
+        self.locked_round = record.locked_round;
+        self.valid_value = record.valid_value;
+        self.valid_round = record.valid_round;
+        if any_activity {
+            self.round = max_round;
+            self.step = if self.guards.contains(&(Guard::PrecommitSent, max_round)) {
+                Step::Precommit
+            } else if self.guards.contains(&(Guard::PrevoteSent, max_round)) {
+                Step::Prevote
+            } else {
+                Step::Propose
+            };
+        }
+        self.restored = true;
+        Ok(())
     }
 
     /// The address scheduled to propose `round`.
@@ -369,6 +573,9 @@ impl ConsensusMachine {
             identity.address,
             &identity.consensus_key,
         )?;
+        // Journal before queueing the broadcast: the driver persists
+        // `wal_record()` durably before this message reaches the wire.
+        self.own_proposals.push(signed.clone());
         self.proposals.insert(round, signed.clone());
         actions.push(ConsensusAction::Broadcast(ConsensusMessage::Proposal(
             Box::new(signed),
@@ -692,6 +899,10 @@ impl ConsensusMachine {
             &identity.consensus_key,
         )?;
         self.set_guard(guard);
+        // Journal before queueing the broadcast: the driver persists
+        // `wal_record()` durably before this vote reaches the wire, so a crash
+        // can never forget a vote that peers may have seen.
+        self.own_votes.push(vote.clone());
         // Count our own vote locally so single-validator sets can reach quorum.
         let _ = self.record_vote(vote.clone());
         actions.push(ConsensusAction::Broadcast(ConsensusMessage::Vote(vote)));
@@ -1556,6 +1767,432 @@ mod tests {
                 .all(|machine| machine.decided_block().is_none()),
             "no honest machine may finalize the conflicting Y1 block"
         );
+    }
+
+    /// Signs a fresh round-0 proposal for `block` by `leader`.
+    fn sign_proposal(
+        leader_key: &Keypair,
+        height: u64,
+        round: u32,
+        block: Block,
+    ) -> SignedProposal {
+        SignedProposal::sign(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            height,
+            round,
+            None,
+            block,
+            leader_key.address(),
+            leader_key,
+        )
+        .unwrap()
+    }
+
+    fn sign_vote(
+        key: &Keypair,
+        height: u64,
+        round: u32,
+        vote_type: VoteType,
+        hash: Hash256,
+    ) -> SignedVote {
+        SignedVote::sign(
+            Vote {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height,
+                round,
+                vote_type,
+                block_hash: hash,
+                validator: key.address(),
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    /// Collects every vote broadcast in `actions`.
+    fn vote_broadcasts(actions: &[ConsensusAction]) -> Vec<SignedVote> {
+        broadcasts(actions)
+            .into_iter()
+            .filter_map(|m| match m {
+                ConsensusMessage::Vote(v) => Some(v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Documents the exact danger the write-ahead journal exists to prevent:
+    /// a machine rebuilt WITHOUT journal replay happily signs a conflicting
+    /// vote for a step its previous life already signed, and the pair verifies
+    /// as objective, slashable double-vote evidence.
+    #[test]
+    fn restart_without_journal_replay_self_equivocates() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let height = (1..=4_096)
+            .find(|h| set.proposer_for(*h, 0) != Some(a.address()))
+            .unwrap();
+        let leader = set.proposer_for(height, 0).unwrap();
+        let leader_key = [&a, &b, &c]
+            .into_iter()
+            .find(|k| k.address() == leader)
+            .unwrap();
+
+        let mut first_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(&a)),
+        );
+        first_life.start().unwrap();
+        let block_x = candidate_block(leader, height, 1);
+        let hash_x = block_x.hash().unwrap();
+        let actions = first_life
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(sign_proposal(leader_key, height, 0, block_x)),
+            )))
+            .unwrap();
+        let first_vote = vote_broadcasts(&actions)
+            .into_iter()
+            .find(|v| v.payload.block_hash == hash_x)
+            .expect("first life prevotes X");
+
+        // "Restart" with no journal: a fresh machine, as the driver did pre-C4.
+        let mut second_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(&a)),
+        );
+        second_life.start().unwrap();
+        let block_y = candidate_block(leader, height, 9);
+        let hash_y = block_y.hash().unwrap();
+        assert_ne!(hash_x, hash_y);
+        let actions = second_life
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(sign_proposal(leader_key, height, 0, block_y)),
+            )))
+            .unwrap();
+        let second_vote = vote_broadcasts(&actions)
+            .into_iter()
+            .find(|v| v.payload.block_hash == hash_y)
+            .expect("an unjournaled restart re-prevotes the new proposal");
+
+        // The two honest lives produced objective slashable evidence.
+        let evidence = crate::SlashingEvidence::DoubleVote(DoubleVoteEvidence {
+            first: first_vote,
+            second: second_vote,
+        });
+        assert!(evidence
+            .verify(
+                CURRENT_PROTOCOL_VERSION,
+                &ChainId::devnet(),
+                &a.public_key()
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn restored_machine_never_resigns_a_recorded_step() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let height = (1..=4_096)
+            .find(|h| set.proposer_for(*h, 0) != Some(a.address()))
+            .unwrap();
+        let leader = set.proposer_for(height, 0).unwrap();
+        let leader_key = [&a, &b, &c]
+            .into_iter()
+            .find(|k| k.address() == leader)
+            .unwrap();
+
+        let mut first_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(&a)),
+        );
+        first_life.start().unwrap();
+        let block_x = candidate_block(leader, height, 1);
+        let hash_x = block_x.hash().unwrap();
+        first_life
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(sign_proposal(leader_key, height, 0, block_x)),
+            )))
+            .unwrap();
+        let journal = first_life.wal_record();
+        assert_eq!(journal.votes.len(), 1, "first life journaled its prevote");
+
+        // Restart with journal replay.
+        let mut second_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(&a)),
+        );
+        second_life.restore(journal.clone()).unwrap();
+        let start_actions = second_life.start().unwrap();
+
+        // An equivocating leader now offers a conflicting round-0 proposal.
+        let block_y = candidate_block(leader, height, 9);
+        let hash_y = block_y.hash().unwrap();
+        assert_ne!(hash_x, hash_y);
+        let more = second_life
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(sign_proposal(leader_key, height, 0, block_y)),
+            )))
+            .unwrap();
+
+        // The restored machine must not sign anything new for round 0.
+        for vote in vote_broadcasts(&start_actions)
+            .into_iter()
+            .chain(vote_broadcasts(&more))
+        {
+            assert_ne!(
+                vote.payload.round, 0,
+                "restored machine re-signed a journaled round"
+            );
+        }
+        // The journal itself is unchanged by the replay.
+        assert_eq!(second_life.wal_record(), journal);
+    }
+
+    #[test]
+    fn restore_preserves_the_lock_across_a_restart() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        // A must lead neither round 0 nor round 1, so both proposals come from
+        // peers and the lock decision is A's alone.
+        let height = (1..=4_096)
+            .find(|h| {
+                set.proposer_for(*h, 0) != Some(a.address())
+                    && set.proposer_for(*h, 1) != Some(a.address())
+            })
+            .unwrap();
+        let leader0 = set.proposer_for(height, 0).unwrap();
+        let leader0_key = [&a, &b, &c]
+            .into_iter()
+            .find(|k| k.address() == leader0)
+            .unwrap();
+        let leader1 = set.proposer_for(height, 1).unwrap();
+        let leader1_key = [&a, &b, &c]
+            .into_iter()
+            .find(|k| k.address() == leader1)
+            .unwrap();
+
+        // First life: A locks X (proposal + full prevote quorum) and precommits.
+        let mut first_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(&a)),
+        );
+        first_life.start().unwrap();
+        let block_x = candidate_block(leader0, height, 1);
+        let hash_x = block_x.hash().unwrap();
+        first_life
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(sign_proposal(leader0_key, height, 0, block_x)),
+            )))
+            .unwrap();
+        for key in [&b, &c] {
+            first_life
+                .on_event(ConsensusEvent::Message(ConsensusMessage::Vote(sign_vote(
+                    key,
+                    height,
+                    0,
+                    VoteType::Prevote,
+                    hash_x,
+                ))))
+                .unwrap();
+        }
+        let journal = first_life.wal_record();
+        assert_eq!(journal.locked_round, Some(0), "first life locked X");
+
+        // Restart: the restored machine re-enters round 0 (Precommit step) and
+        // moves on when the journaled round cannot complete.
+        let mut second_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(&a)),
+        );
+        second_life.restore(journal).unwrap();
+        second_life.start().unwrap();
+        second_life
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Precommit,
+                round: 0,
+            })
+            .unwrap();
+        assert_eq!(second_life.round(), 1);
+
+        // A fresh round-1 proposal for a conflicting Y (no proof-of-lock) must
+        // draw a nil prevote: the lock survived the crash.
+        let block_y = candidate_block(leader1, height, 9);
+        let hash_y = block_y.hash().unwrap();
+        assert_ne!(hash_x, hash_y);
+        let actions = second_life
+            .on_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                Box::new(sign_proposal(leader1_key, height, 1, block_y)),
+            )))
+            .unwrap();
+        let round1_prevotes: Vec<Hash256> = vote_broadcasts(&actions)
+            .into_iter()
+            .filter(|v| v.payload.round == 1 && v.payload.vote_type == VoteType::Prevote)
+            .map(|v| v.payload.block_hash)
+            .collect();
+        assert!(
+            !round1_prevotes.is_empty(),
+            "the restored machine keeps participating in fresh rounds"
+        );
+        assert!(
+            round1_prevotes.iter().all(|h| *h == NIL),
+            "a restart must not erase the lock: prevote for conflicting Y observed"
+        );
+    }
+
+    #[test]
+    fn restored_proposer_does_not_repropose_its_recorded_round() {
+        let keys = [
+            Keypair::from_seed([1u8; 32]),
+            Keypair::from_seed([2u8; 32]),
+            Keypair::from_seed([3u8; 32]),
+        ];
+        let set = set_with_keys(&[(&keys[0], 1), (&keys[1], 1), (&keys[2], 1)]);
+        let height = 1;
+        let leader = set.proposer_for(height, 0).unwrap();
+        let leader_key = keys.iter().find(|k| k.address() == leader).unwrap();
+
+        // First life: the leader proposes and prevotes its own block.
+        let mut first_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            height,
+            Some(identity(leader_key)),
+        );
+        let actions = first_life.start().unwrap();
+        assert!(matches!(
+            actions.first(),
+            Some(ConsensusAction::NeedProposalBlock { round: 0 })
+        ));
+        first_life
+            .provide_block(0, candidate_block(leader, height, 1))
+            .unwrap();
+        let journal = first_life.wal_record();
+        assert_eq!(journal.proposals.len(), 1);
+
+        // Restart: the restored leader must not build or sign a second round-0
+        // proposal (a re-built block would differ and equivocate).
+        let mut second_life = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set,
+            height,
+            Some(identity(leader_key)),
+        );
+        second_life.restore(journal).unwrap();
+        let actions = second_life.start().unwrap();
+        for action in &actions {
+            assert!(
+                !matches!(
+                    action,
+                    ConsensusAction::NeedProposalBlock { .. }
+                        | ConsensusAction::Broadcast(ConsensusMessage::Proposal(_))
+                ),
+                "restored proposer re-proposed its journaled round: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_or_foreign_journals() {
+        let a = Keypair::from_seed([1u8; 32]);
+        let b = Keypair::from_seed([2u8; 32]);
+        let c = Keypair::from_seed([3u8; 32]);
+        let set = set_with_keys(&[(&a, 1), (&b, 1), (&c, 1)]);
+        let fresh = || {
+            ConsensusMachine::new(
+                CURRENT_PROTOCOL_VERSION,
+                ChainId::devnet(),
+                set.clone(),
+                1,
+                Some(identity(&a)),
+            )
+        };
+        let empty = ConsensusWalRecord {
+            height: 1,
+            proposals: Vec::new(),
+            votes: Vec::new(),
+            locked_round: None,
+            locked_value: None,
+            valid_round: None,
+            valid_value: None,
+        };
+
+        // Wrong height.
+        let mut journal = empty.clone();
+        journal.height = 2;
+        assert!(fresh().restore(journal).is_err());
+
+        // A vote signed by another validator can never be "our own" journal.
+        let mut journal = empty.clone();
+        journal.votes = vec![sign_vote(
+            &b,
+            1,
+            0,
+            VoteType::Prevote,
+            Hash256::digest(b"x"),
+        )];
+        assert!(fresh().restore(journal).is_err());
+
+        // A journal that already records our own conflicting votes for one
+        // step is evidence of past equivocation; nothing safe can be replayed.
+        let mut journal = empty.clone();
+        journal.votes = vec![
+            sign_vote(&a, 1, 0, VoteType::Prevote, Hash256::digest(b"x")),
+            sign_vote(&a, 1, 0, VoteType::Prevote, Hash256::digest(b"y")),
+        ];
+        assert!(fresh().restore(journal).is_err());
+
+        // Lock fields must come in consistent pairs.
+        let mut journal = empty.clone();
+        journal.locked_round = Some(0);
+        assert!(fresh().restore(journal).is_err());
+
+        // An observer has no signing identity to restore.
+        let mut observer = ConsensusMachine::new(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            set.clone(),
+            1,
+            None,
+        );
+        assert!(observer.restore(empty.clone()).is_err());
+
+        // A machine that already acted cannot be restored over.
+        let mut started = fresh();
+        started.start().unwrap();
+        started
+            .on_event(ConsensusEvent::Timeout {
+                kind: TimeoutKind::Propose,
+                round: 0,
+            })
+            .unwrap();
+        assert!(started.restore(empty).is_err());
     }
 
     #[test]

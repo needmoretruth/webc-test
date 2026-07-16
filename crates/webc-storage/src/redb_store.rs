@@ -40,6 +40,7 @@ fn table_def(table: Table) -> TableDefinition<'static, &'static [u8], &'static [
         Table::BlockHashIndex => "webc_block_hash_index",
         Table::ValidatorSets => "webc_validator_sets",
         Table::Certificates => "webc_certificates",
+        Table::ConsensusWal => "webc_consensus_wal",
     };
     TableDefinition::new(name)
 }

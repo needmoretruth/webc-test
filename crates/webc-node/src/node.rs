@@ -24,7 +24,8 @@
 
 use webc_chain::{
     apply_block, build_block, Block, BlockBuildInput, ChainConfig, ChainError, ChainState,
-    FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction, ValidatorSet,
+    ConsensusWalRecord, FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction,
+    ValidatorSet,
 };
 use webc_crypto::{Address, Hash256};
 use webc_storage::{BlockCommit, ChainStore, KvStore, StorageError};
@@ -176,6 +177,22 @@ impl<K: KvStore> Node<K> {
         // Storage committed durably; only now adopt the new state.
         self.state = next_state;
         Ok(block)
+    }
+
+    /// Durably journals this node's own consensus votes, proposals, and lock
+    /// state for the in-progress height (the C4 write-ahead journal).
+    ///
+    /// The consensus driver calls this **before** broadcasting each message the
+    /// local machine signed; only after `Ok` may the message reach the wire.
+    /// The journal is pruned atomically when its height commits.
+    pub fn persist_consensus_wal(&mut self, record: &ConsensusWalRecord) -> Result<(), NodeError> {
+        Ok(self.store.put_consensus_wal(record)?)
+    }
+
+    /// Returns the journaled consensus record for `height`, or `None` when this
+    /// node signed nothing at that height (or the height already committed).
+    pub fn consensus_wal(&self, height: u64) -> Result<Option<ConsensusWalRecord>, NodeError> {
+        Ok(self.store.consensus_wal(height)?)
     }
 
     /// Returns a finalized block together with its stored finality certificate,
