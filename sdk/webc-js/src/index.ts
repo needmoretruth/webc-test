@@ -12,6 +12,7 @@ export * from "./block.js";
 export * from "./clients/common.js";
 export * from "./clients/agent-commerce.js";
 export * from "./clients/governance.js";
+export * from "./clients/token.js";
 export * from "./canonical.js";
 export * from "./hex.js";
 export * from "./http402.js";
