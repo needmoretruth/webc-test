@@ -432,11 +432,12 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
   `leftover = total_reward − Σ validator_share` in `validator_fee_pool` (carry
   forward) instead of zeroing it — mirroring the inner-dust handling — so
   `accounted_new = accounted_old + inflation = minted_supply_new`.
-- **F2 — LOW — `floor_rate_bps == 0` passes `InflationSchedule::validate`.**
-  `inflation.rs:106-115`: a zero floor drives the rate loop to an
-  `ArithmeticOverflow` error at large years instead of converging (fail-closed, not
-  fund loss). Fix: reject `floor_rate_bps == 0`, or short-circuit when the numerator
-  reaches 0.
+- **F2 — LOW — RESOLVED (commit `5a0e460`) — `floor_rate_bps == 0` passes
+  `InflationSchedule::validate`.** `inflation.rs:106-115`: a zero floor drives the
+  rate loop to an `ArithmeticOverflow` error at large years instead of converging
+  (fail-closed, not fund loss). **Fix:** `validate` now rejects
+  `floor_rate_bps == 0` (WEBC always has a positive floor, §7). Reproduced first by
+  `zero_floor_rate_is_rejected`.
 - **Verified correct (fund arithmetic):** the 50/50 fee split conserves exactly
   with one documented odd-unit rule (odd dust → validator reward; `fees.rs:50-52`,
   `amount.rs:85`); dynamic base fee is all-checked u128 with `try_from` narrowing,
@@ -466,19 +467,20 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 ## webc-chain — scheduler determinism
 
-- **SC1 — HIGH (latent) — greedy first-fit batching is not serializable-order
-  preserving.** `scheduler.rs:20-32`: each tx is placed in the FIRST
-  non-conflicting batch, so a later tx can land in an EARLIER batch than an earlier
-  tx it conflicts with, reversing their commit order. CONFIRMED. **Severity is
-  latent**: `scheduler.rs` returns only `Vec<Vec<usize>>` with no executor wired
-  yet, so there is no state-root divergence today — but it must be fixed before the
-  Phase-6 parallel executor consumes it. Fix: place each tx only in a batch at or
-  after every earlier conflicting tx's batch (highest-conflicting-batch rule).
-- **SC2 — LOW — conflict detection keys on the full versioned `StateKey`.**
-  `state_key.rs:89`: `version` is part of `Eq`/`Ord`, so two keys with the same
-  logical `kind` but different `version` are treated as non-conflicting and could
-  share a parallel batch. Fix: scope conflict detection on the version-independent
-  logical identity, or assert all keys are `CURRENT_PROTOCOL_VERSION`.
+- **SC1 — HIGH (latent) — RESOLVED (commit `5a0e460`) — greedy first-fit batching
+  is not serializable-order preserving.** `scheduler.rs:20-32`: each tx was placed
+  in the FIRST non-conflicting batch, so a later tx could land in an EARLIER batch
+  than an earlier tx it conflicts with, reversing their commit order. CONFIRMED.
+  Latent (no executor wired yet), but a Phase-6 divergence source. **Fix:**
+  `parallel_batches` now places each tx in the first batch at or after every
+  earlier batch it conflicts with (highest-conflicting-batch rule). Reproduced
+  first by `conflicting_pairs_keep_their_commit_order_across_batches`.
+- **SC2 — LOW — RESOLVED (commit `5a0e460`) — conflict detection keys on the full
+  versioned `StateKey`.** `state_key.rs:89`: `version` is part of `Eq`/`Ord`, so
+  two keys with the same logical `kind` but different `version` were treated as
+  non-conflicting and could share a parallel batch. **Fix:** the scheduler now keys
+  conflict detection on the version-independent `StateKeyKind`. Reproduced first by
+  `keys_conflict_on_logical_identity_regardless_of_version`.
 - Verified good: batch formation itself is deterministic (ordered `Vec` +
   `BTreeSet<StateKey>`; per-tx access lists collected into `BTreeSet` so input
   order/dupes don't matter); no wall-clock/RNG.
@@ -571,12 +573,19 @@ These were surfaced but not fully audited; several are latent-but-serious.
   clock-driven, honest nodes diverge on the state root at the boundary (a fork).
   Fix: derive epoch from height deterministically and run reward+unbonding+expiry
   inside the state transition, ordered identically everywhere.
-- **E2 — MEDIUM (latent) — block timestamp is unvalidated.** `timestamp_ms` is
-  proposer-supplied, copied verbatim (`block_builder.rs:112`), and `apply_block`/
-  `import_validated` never check monotonicity vs parent or a future-drift ceiling.
-  Benign only while nothing consensus-visible reads time; a stake-griefing/reward-
-  manipulation vector the moment epoch/expiry/fee logic keys off it. Fix: enforce
-  `timestamp > parent.timestamp` and a bounded drift now, before the coupling.
+- **E2 — MEDIUM (latent) — RESOLVED (commit `392018d`) — block timestamp is
+  unvalidated.** `timestamp_ms` was proposer-supplied, copied verbatim
+  (`block_builder.rs:112`), and `apply_block`/`import_validated` never checked
+  monotonicity vs parent or a future-drift ceiling. **Fix:** deterministic
+  monotonicity is now a state-transition rule — `ChainState.last_block_timestamp_ms`
+  (committed by `state_root`, domain bumped to `WEBC_STATE_COMMITMENT_V7`) and
+  `build_block` rejects a non-increasing timestamp via
+  `ChainError::NonMonotonicBlockTimestamp`; producers clamp to `max(supplied,
+  parent+1)`. A clock-based future-drift bound (30 s) rejects far-future proposals
+  in the driver's `validate_proposal`. Reproduced first by
+  `block_timestamps_must_strictly_increase`,
+  `produce_block_clamps_timestamp_to_stay_monotonic`, and
+  `future_drift_bound_tolerates_skew_and_rejects_gross_drift`.
 - **E3 — MEDIUM — Merkle proof DoS + leaf/internal domain separation.**
   `merkle.rs:88` `verify_merkle_proof` loops over `proof.steps` with no length
   bound (browser/light clients verify node-supplied proofs → a huge proof pins
