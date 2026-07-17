@@ -519,18 +519,48 @@ e51e7de. A follow-up (75519c6) added the Rust `dex_operations_have_stable_wire_v
 test so DEX — previously the one family with no Rust vector — now has real
 Rust↔TS byte parity.
 
-### In progress — HTTP-402 agent-payment flow (Phase 9 §4, agent-commerce flagship)
+### HTTP-402 agent-payment flow — DONE (Phase 9 §4, agent-commerce flagship)
 
-An SDK helper (`sdk/webc-js/src/http402.ts`) for the agent-commerce showcase: an
-agent validates a `402` challenge against the on-chain registry entry (price +
-pay-to must match, defeating a compromised endpoint), pays via
-`SpendUnderMandateToService` under its mandate, and retries with a verifiable
-payment reference. Registry entry is caller-provided (decoupled from node-API
-gaps); tested with mock challenges + all failure modes. After this, the next
-autonomous candidates are node read-APIs for the new state (token balances / NFT
-ownership / governance proposals / service registry — needed so apps can QUERY
-these, touches `webc-node`) and more fuzz/property hardening of the fund-moving
-op decoders. Everything beyond stays owner-gated/external per the list above.
+An SDK helper (`sdk/webc-js/src/http402.ts`, merged e8e8463): an agent validates a
+`402` challenge against the on-chain registry entry (price + pay-to must match,
+defeating a compromised endpoint), pays via `SpendUnderMandateToService` under its
+mandate, and retries with a verifiable payment reference. 29 tests covering every
+failure mode.
+
+### Node read-APIs — DONE (merged 0c0cb7f)
+
+Additive GET-only endpoints so apps and the SDK can QUERY the Phase 9/13 state:
+`/v1/tokens/{id}(+/balances/{addr},/supply)`, `/v1/nft/collections/{id}(+/items/
+{serial})`, `/v1/services/{id}` (closes the 402 registry-fetch loop),
+`/v1/governance/instances/{id}`, `/v1/governance/proposals/{id}`, `/v1/mandates/
+{id}`. Nine `NodeService` read accessors; unknown id → 404, known-token/no-holder
+→ 200 zero.
+
+### Automated invariant evidence — DONE (merged 4223daa)
+
+`crates/webc-chain/tests/native_ops_invariants.rs`: a proptest driving random
+seeded sequences of all fund-moving ops (tokens/NFT/mandate/governance/DEX, with
+epoch advancement) through `execute_transaction`, re-asserting the native supply
+invariant, per-token and per-collection supply invariants, and fail-closed
+rollback after EVERY applied or rejected step. No violation found; non-vacuous.
+
+### Boundary reached — app-facing surface complete; remainder is owner-gated
+
+The decided, autonomous app-layer arc is DONE end-to-end on `main`: construct any
+native op (SDK, 38 ops), submit it (`POST /v1/transactions`), query the resulting
+state (node read-APIs), and run the agent-commerce 402 flow — with adversarial
+review + proptest evidence behind the fund-moving code. **Remaining work needs the
+owner or external resources** and must NOT be decided autonomously: ADR-0012
+slashing severity numbers + inactivity-leak consensus wiring; ADR-0011 weak-
+subjectivity trust anchor; ADR-0014 WASM engine + manifest trust; the production-
+bridge trust model (Phase 14/18); mainnet governance emergency powers; the Weft
+rename; founder compensation (§15.4); Phase 10 succinct-proof/PQ backend choice;
+Phase 11 fast-path DAG-BFT adoption + real-hardware benchmarks; Phase 16 testnet /
+Phase 17 mainnet launch gates; and an independent security audit before any real
+funds. Optional low-value autonomous polish that could still be picked up: SDK
+node-client read-method parsers + high-level client wrappers, node list/pagination
+endpoints, and the DEX delegated mechanics (AMM/multi-hop, a design-within-scope
+refinement). A separate transaction-system goal runs on `codex/transaction-system`.
 
 ### Original Phase 13 rationale — native tokens / NFTs / app governance
 
