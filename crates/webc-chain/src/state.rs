@@ -18,6 +18,10 @@ use crate::contract::{
     ContractStateValue, GasMeter, CONTRACT_LEAF_DOMAIN, CONTRACT_STATE_LEAF_DOMAIN,
     MAX_CONTRACT_INPUT_BYTES,
 };
+use crate::dex::{
+    prorata_fills, uniform_clearing_price, DexConfig, Order, OrderId, OrderSide, Price,
+    TradingPair, DEX_ORDER_LEAF_DOMAIN,
+};
 use crate::fees::{
     next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
     StoragePricing, NAMESPACE_FEE_LEAF_DOMAIN,
@@ -90,6 +94,13 @@ pub struct ChainConfig {
     /// the launch values are measurement-tuned placeholders (§15.35 method).
     #[serde(default)]
     pub oracle: OracleConfig,
+    /// Native DEX parameters (§15.13/§15.18/§15.37): minimum order size, default
+    /// retry-deadline window, and the optional per-fill fee.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before the DEX decodable; the
+    /// launch values are measurement-tuned placeholders (§15.35 method).
+    #[serde(default)]
+    pub dex: DexConfig,
     /// Interim contract runtime parameters (Phase 7a, ADR-0014): the flat, burned
     /// contract-registration fee.
     ///
@@ -137,6 +148,7 @@ impl Default for ChainConfig {
             storage_pricing: StoragePricing::default(),
             sponsorship: SponsorshipConfig::default(),
             oracle: OracleConfig::default(),
+            dex: DexConfig::default(),
             contracts: ContractRuntimeConfig::default(),
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
@@ -144,6 +156,17 @@ impl Default for ChainConfig {
             inactivity_leak: None,
         }
     }
+}
+
+/// Why a DEX order left the live order set (carried in [`Event::OrderClosed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderCloseReason {
+    /// The owner submitted an explicit `CancelOrder`.
+    Cancelled,
+    /// An immediate-or-cancel order had an unfilled remainder after its batch.
+    FillOrCancel,
+    /// The order's `deadline_height` passed with an unfilled remainder.
+    Expired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +296,59 @@ pub enum Event {
         distributed: Amount,
         /// Native base units carried forward in the pool (division remainder).
         carried: Amount,
+    },
+    /// A DEX order intent was submitted and its input locked (§15.37).
+    OrderSubmitted {
+        /// New order identity.
+        order_id: OrderId,
+        /// Account that submitted and locked the order's input.
+        owner: Address,
+        /// Oriented pair the order trades on.
+        pair: TradingPair,
+        /// Buy or sell.
+        side: OrderSide,
+        /// Order size in base-asset base units.
+        amount: Amount,
+        /// Limit price in quote base-units per base base-unit.
+        limit_price: Price,
+        /// Effective deadline height after which the order auto-cancels.
+        deadline_height: u64,
+    },
+    /// A DEX order was (partially or fully) filled in a block's batch (§15.37).
+    ///
+    /// Every order filled in the same pair's batch trades at the identical
+    /// `clearing_price`, so no participant is ordered ahead of another. `filled` is
+    /// this batch's base fill; `remaining` is what is left to retry afterward
+    /// (`0` when fully filled and the order is then closed).
+    OrderFilled {
+        /// Order that filled.
+        order_id: OrderId,
+        /// Pair whose batch settled.
+        pair: TradingPair,
+        /// Buy or sell.
+        side: OrderSide,
+        /// Uniform clearing price for this pair's batch this block.
+        clearing_price: Price,
+        /// Base units filled this batch.
+        filled: Amount,
+        /// Base units still to fill after this batch.
+        remaining: Amount,
+        /// Quote base units the order paid (buy) or received net of fee (sell).
+        quote: Amount,
+    },
+    /// A DEX order was cancelled and its remaining lock refunded (§15.37).
+    ///
+    /// Covers owner-requested cancels, immediate-or-cancel remainders, and
+    /// deadline expiries; `reason` distinguishes them.
+    OrderClosed {
+        /// Order that was closed.
+        order_id: OrderId,
+        /// Account the remaining lock was refunded to.
+        owner: Address,
+        /// Why the order closed.
+        reason: OrderCloseReason,
+        /// Base units of the order left unfilled at closure.
+        unfilled: Amount,
     },
     /// An interim Rust-authored contract was registered (Phase 7a, ADR-0014).
     ContractRegistered {
@@ -600,6 +676,29 @@ pub struct ChainState {
     /// committed by the state root as a scalar.
     #[serde(default)]
     pub oracle_revenue: Amount,
+    /// Native DEX live order intents, keyed by [`OrderId`] (§15.13/§15.18/§15.37).
+    ///
+    /// Each [`Order`] holds its owner, oriented pair, side, original and remaining
+    /// size, limit price, deadline, and flags. An order exists only between a
+    /// [`Operation::SubmitOrder`] and the batch/cancel/expiry that closes it. The
+    /// per-block batch pass ([`ChainState::settle_dex_batch`]) settles all orders on
+    /// a pair at one uniform clearing price. Committed by the state root through a
+    /// dedicated Merkle sub-root (`DEX_ORDER_LEAF_DOMAIN`), so any submit/fill/
+    /// cancel/expire changes the state root. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub dex_orders: BTreeMap<OrderId, Order>,
+    /// Refundable native units locked across every live DEX order (§15.37).
+    ///
+    /// Sum of every order's native locked leg (a buy locks `remaining × limit_price`
+    /// quote, a sell locks `remaining` base; only the native leg counts here — a
+    /// non-native leg is held out of the owner's `asset_balances`). `SubmitOrder`
+    /// moves units here from the owner's liquid balance; settlement moves them out
+    /// to counterparties plus an optional fee split; cancel/expiry returns them.
+    /// Reconciled by [`SupplyInvariantReport`] as a locked bucket and committed by
+    /// the state root as a scalar (mirroring `oracle_bonds`/`sponsor_budgets`).
+    #[serde(default)]
+    pub dex_escrow: Amount,
     /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
     ///
     /// Each [`ContractManifest`] describes one registered contract (its identity,
@@ -647,6 +746,13 @@ pub struct ChainState {
     pub inflation_year_start_supply: Amount,
     pub current_base_fee_per_unit: u64,
     pub current_epoch: u64,
+    /// Height of the block currently being built/imported, set at the start of
+    /// `build_block` before transactions execute so height-dependent logic (DEX
+    /// order deadlines, §15.37) reads a stable committed value on both build and
+    /// import. Genesis leaves it `0` (the genesis "height"); the first block sets
+    /// it to `1`. Committed by the state root so all nodes agree.
+    #[serde(default)]
+    pub current_height: u64,
     pub bridge_nonce: u64,
     /// Consensus timestamp (Unix ms) of the most recently applied block.
     ///
@@ -688,6 +794,8 @@ pub struct SupplyInvariantReport {
     pub oracle_bonds: Amount,
     /// Native units locked across every feed's accrued read-fee revenue (§15.17).
     pub oracle_revenue: Amount,
+    /// Native units locked across every live DEX order (§15.37).
+    pub dex_escrow: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -765,6 +873,8 @@ impl Default for ChainState {
             oracle_reporters: BTreeMap::new(),
             oracle_bonds: Amount::ZERO,
             oracle_revenue: Amount::ZERO,
+            dex_orders: BTreeMap::new(),
+            dex_escrow: Amount::ZERO,
             contracts: BTreeMap::new(),
             contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
@@ -773,6 +883,7 @@ impl Default for ChainState {
             inflation_year_start_supply: Amount::ZERO,
             current_base_fee_per_unit: 0,
             current_epoch: 0,
+            current_height: 0,
             bridge_nonce: 0,
             last_block_timestamp_ms: 0,
         }
@@ -812,6 +923,9 @@ impl ChainState {
         // Reject a malformed oracle config (zero settlement cadence or liveness
         // window) so settlement never divides by zero and liveness is well-defined.
         genesis.chain.oracle.validate()?;
+        // Reject a malformed DEX config (per-fill fee above 100%) so settlement can
+        // never carve more than the proceeds and underflow.
+        genesis.chain.dex.validate()?;
 
         for account in &genesis.accounts {
             if state.accounts.contains_key(&account.address) {
@@ -954,6 +1068,7 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(self.sponsor_budgets))
             .and_then(|amount| amount.checked_add(self.oracle_bonds))
             .and_then(|amount| amount.checked_add(self.oracle_revenue))
+            .and_then(|amount| amount.checked_add(self.dex_escrow))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -971,6 +1086,7 @@ impl ChainState {
             sponsor_budgets: self.sponsor_budgets,
             oracle_bonds: self.oracle_bonds,
             oracle_revenue: self.oracle_revenue,
+            dex_escrow: self.dex_escrow,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -1504,6 +1620,7 @@ impl ChainState {
             namespace_root: Hash256,
             oracle_feed_root: Hash256,
             oracle_reporter_root: Hash256,
+            dex_order_root: Hash256,
             contract_root: Hash256,
             contract_state_root: Hash256,
             namespace_fee_root: Hash256,
@@ -1513,16 +1630,28 @@ impl ChainState {
             sponsor_budgets: Amount,
             oracle_bonds: Amount,
             oracle_revenue: Amount,
+            dex_escrow: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
             current_base_fee_per_unit: u64,
             current_epoch: u64,
+            current_height: u64,
             bridge_nonce: u64,
             last_block_timestamp_ms: u64,
         }
 
         let commitment = StateCommitment {
+            // V14 adds the native DEX (Phase 8, §15.13/§15.18/§15.37): the
+            // `dex_order_root` sub-root commits every live order intent (owner, pair,
+            // side, amount/remaining, limit price, deadline, flags), and the
+            // `dex_escrow` scalar commits the aggregate locked native bucket
+            // (mirroring how `oracle_bonds`/`sponsor_budgets` pair with their
+            // sub-roots). So a submit / partial-or-full fill / cancel / expire always
+            // changes the state root, and the deterministic per-block batch pass is
+            // therefore consensus-bound identically on build and import. The domain
+            // bump is a deliberate consensus-format change; no external fixture pins a
+            // prior root.
             // V13 adds the interim contract runtime (Phase 7a, ADR-0014): the
             // `contract_root` sub-root commits every registered contract manifest
             // (identity, namespace, footprint, ABI/gas-schedule versions, handler)
@@ -1556,7 +1685,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V13",
+            domain: "WEBC_STATE_COMMITMENT_V14",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1616,6 +1745,11 @@ impl ChainState {
                 ORACLE_REPORTER_LEAF_DOMAIN,
                 self.oracle_reporters.iter(),
             )?,
+            // Native DEX order registry committed by its own ordered sub-root
+            // (§15.37): a submit, a partial/full fill, a cancel, or an expiry changes
+            // this root and therefore the state root, binding the per-block batch pass
+            // to consensus.
+            dex_order_root: ordered_value_root(DEX_ORDER_LEAF_DOMAIN, self.dex_orders.iter())?,
             // Interim contract runtime committed by its own ordered sub-roots (Phase
             // 7a, ADR-0014): registering a contract changes `contract_root`; any
             // contract state write changes `contract_state_root`; either changes the
@@ -1638,11 +1772,13 @@ impl ChainState {
             sponsor_budgets: self.sponsor_budgets,
             oracle_bonds: self.oracle_bonds,
             oracle_revenue: self.oracle_revenue,
+            dex_escrow: self.dex_escrow,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
             current_base_fee_per_unit: self.current_base_fee_per_unit,
             current_epoch: self.current_epoch,
+            current_height: self.current_height,
             bridge_nonce: self.bridge_nonce,
             last_block_timestamp_ms: self.last_block_timestamp_ms,
         };
@@ -3187,6 +3323,103 @@ impl ChainState {
                     amount: *amount,
                 });
             }
+            Operation::SubmitOrder {
+                order_id,
+                pair,
+                side,
+                amount,
+                limit_price,
+                deadline_height,
+                fill_or_cancel,
+            } => {
+                // Default lane only: the order's input is locked from the sender's
+                // liquid balance (native leg -> dex_escrow) or asset balance
+                // (non-native leg). The block-level batch pass later settles/refunds
+                // it; that pass is not access-list-bound (like epoch settlement).
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::DexRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::dex_order(*order_id))?;
+                // Validate the hostile order intent before touching any supply.
+                pair.validate()?;
+                if amount.is_zero() || *amount < config.dex.min_order_amount {
+                    return Err(ChainError::DexOrderAmountTooSmall);
+                }
+                if limit_price.is_zero() {
+                    return Err(ChainError::DexOrderPriceZero);
+                }
+                if self.dex_orders.contains_key(order_id) {
+                    return Err(ChainError::DexOrderAlreadyExists);
+                }
+                // Resolve the effective deadline: 0 is the "use the default window"
+                // sentinel; an explicit deadline must not already be in the past.
+                let effective_deadline = if *deadline_height == 0 {
+                    self.current_height
+                        .checked_add(config.dex.default_deadline_blocks)
+                        .ok_or(ChainError::ArithmeticOverflow)?
+                } else {
+                    if *deadline_height < self.current_height {
+                        return Err(ChainError::DexOrderDeadlineInPast);
+                    }
+                    *deadline_height
+                };
+                // The locked leg and its asset: a buy locks quote = amount*price, a
+                // sell locks base = amount. Compute the quote lock overflow-safely.
+                let (locked_asset, locked_amount) = match side {
+                    OrderSide::Buy => (
+                        pair.quote.clone(),
+                        limit_price
+                            .quote_for(*amount)
+                            .ok_or(ChainError::ArithmeticOverflow)?,
+                    ),
+                    OrderSide::Sell => (pair.base.clone(), *amount),
+                };
+                if locked_asset != AssetId::NativeWebc {
+                    access.write(StateKey::asset_balance(locked_asset.clone(), tx.sender))?;
+                }
+                self.dex_lock(tx.sender, &locked_asset, locked_amount)?;
+                let order = Order {
+                    owner: tx.sender,
+                    pair: pair.clone(),
+                    side: *side,
+                    amount: *amount,
+                    remaining: *amount,
+                    limit_price: *limit_price,
+                    deadline_height: effective_deadline,
+                    fill_or_cancel: *fill_or_cancel,
+                    cancel_requested: false,
+                };
+                self.dex_orders.insert(*order_id, order);
+                events.push(Event::OrderSubmitted {
+                    order_id: *order_id,
+                    owner: tx.sender,
+                    pair: pair.clone(),
+                    side: *side,
+                    amount: *amount,
+                    limit_price: *limit_price,
+                    deadline_height: effective_deadline,
+                });
+            }
+            Operation::CancelOrder { order_id } => {
+                // Default lane only. Only marks the order for the block-level batch
+                // pass, which performs the refund (possibly a non-native asset the
+                // access list cannot name) and removal. Marking is a write to the
+                // order's own state key; the fee already touches the account.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::DexRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::dex_order(*order_id))?;
+                let order = self
+                    .dex_orders
+                    .get_mut(order_id)
+                    .ok_or(ChainError::DexOrderNotFound)?;
+                if order.owner != tx.sender {
+                    return Err(ChainError::DexOrderNotOwner);
+                }
+                order.cancel_requested = true;
+            }
             Operation::RegisterContract { manifest } => {
                 // Default lane only: the registration fee draws from and burns
                 // liquid (supply-neutral, like feed creation). The manifest record
@@ -3941,6 +4174,358 @@ impl ChainState {
         );
         Ok(())
     }
+
+    // ----- native DEX escrow + batch settlement (§15.13/§15.18/§15.37) -----
+
+    /// Locks `amount` of `asset` from `owner` into DEX escrow (a `SubmitOrder`).
+    ///
+    /// Native leg: debit the owner's liquid balance and grow `dex_escrow`
+    /// (supply-neutral: liquid -> dex_escrow). Non-native leg: debit the owner's
+    /// asset balance (held out of circulation; a non-native asset has no native
+    /// supply bucket). Fails closed on an insufficient balance or overflow.
+    fn dex_lock(
+        &mut self,
+        owner: Address,
+        asset: &AssetId,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        self.debit_asset_or_native(owner, asset, amount)?;
+        if *asset == AssetId::NativeWebc {
+            self.dex_escrow = self
+                .dex_escrow
+                .checked_add(amount)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        Ok(())
+    }
+
+    /// Releases `amount` of `asset` from DEX escrow to `recipient`.
+    ///
+    /// Used both for refunds (recipient is the original owner) and for settlement
+    /// legs (recipient is a counterparty), since escrow-out is the same operation
+    /// either way. Native leg: shrink `dex_escrow` and credit the recipient's
+    /// liquid balance. Non-native leg: credit the recipient's asset balance. The
+    /// native decrement is checked, so an accounting bug fails closed rather than
+    /// silently under-flowing the supply invariant.
+    fn dex_release(
+        &mut self,
+        recipient: Address,
+        asset: &AssetId,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        if *asset == AssetId::NativeWebc {
+            self.dex_escrow = self
+                .dex_escrow
+                .checked_sub(amount)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        self.credit_asset_or_native(recipient, asset, amount)
+    }
+
+    /// Removes `amount` of native quote from DEX escrow as the protocol per-fill
+    /// fee, split 50/50 burn/validator by [`split_fee`] (only ever called when the
+    /// pair's quote leg is native WEBC). Supply-neutral: dex_escrow -> burned +
+    /// validator pool. A zero fee is a no-op.
+    fn dex_take_native_fee(&mut self, amount: Amount) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        self.dex_escrow = self
+            .dex_escrow
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let split = split_fee(amount);
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(split.burned)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.validator_fee_pool = self
+            .validator_fee_pool
+            .checked_add(split.validator_reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// Refunds an order's remaining locked input to its owner and removes it.
+    ///
+    /// Used by owner cancellation, immediate-or-cancel remainders, and deadline
+    /// expiry. Supply-neutral: the currently-locked leg (a buy's
+    /// `remaining * limit_price` quote, a sell's `remaining` base) returns to the
+    /// owner via [`ChainState::dex_release`]. A fully-filled order carries no lock
+    /// and is removed elsewhere without a refund.
+    fn close_dex_order(
+        &mut self,
+        order_id: OrderId,
+        reason: OrderCloseReason,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
+        let order = self
+            .dex_orders
+            .get(&order_id)
+            .ok_or(ChainError::DexOrderNotFound)?
+            .clone();
+        let (asset, amount) = order.locked_input().ok_or(ChainError::ArithmeticOverflow)?;
+        self.dex_release(order.owner, &asset, amount)?;
+        self.dex_orders.remove(&order_id);
+        events.push(Event::OrderClosed {
+            order_id,
+            owner: order.owner,
+            reason,
+            unfilled: order.remaining,
+        });
+        Ok(())
+    }
+
+    /// Runs the mandatory per-block uniform-price batch settlement (§15.37).
+    ///
+    /// Deterministic and a pure function of the committed order map and
+    /// `self.current_height`, so it runs identically on `build_block` and
+    /// `apply_block` (the `dex_order_root`/`dex_escrow` commitment binds it). Whole
+    /// step is atomic with the block: any failure rolls the block back.
+    ///
+    /// Ordering (all deterministic, sorted iteration):
+    /// 1. Honor owner cancellations — a cancel included in this block takes effect
+    ///    before this block's batch (doc §3.1).
+    /// 2. Expire orders whose `deadline_height` has passed (refund + remove).
+    /// 3. Settle each pair (sorted) at one uniform clearing price.
+    /// 4. Close immediate-or-cancel orders still carrying an unfilled remainder.
+    ///
+    /// Supply-neutral in native units across every step.
+    pub(crate) fn settle_dex_batch(
+        &mut self,
+        config: &ChainConfig,
+    ) -> Result<Vec<Event>, ChainError> {
+        let mut events = Vec::new();
+        let height = self.current_height;
+
+        // 1. Owner-requested cancellations.
+        let cancelled: Vec<OrderId> = self
+            .dex_orders
+            .iter()
+            .filter(|(_, order)| order.cancel_requested)
+            .map(|(id, _)| *id)
+            .collect();
+        for order_id in cancelled {
+            self.close_dex_order(order_id, OrderCloseReason::Cancelled, &mut events)?;
+        }
+
+        // 2. Deadline expiries: the retry window is inclusive of `deadline_height`,
+        // so an order is expired only once the block height strictly passes it.
+        let expired: Vec<OrderId> = self
+            .dex_orders
+            .iter()
+            .filter(|(_, order)| height > order.deadline_height)
+            .map(|(id, _)| *id)
+            .collect();
+        for order_id in expired {
+            self.close_dex_order(order_id, OrderCloseReason::Expired, &mut events)?;
+        }
+
+        // 3. Settle each pair independently at its own uniform clearing price. Two
+        // disjoint pairs never interact. `BTreeSet` keeps the pair order deterministic.
+        let pairs: BTreeSet<TradingPair> = self
+            .dex_orders
+            .values()
+            .map(|order| order.pair.clone())
+            .collect();
+        for pair in pairs {
+            self.settle_dex_pair(&pair, config, &mut events)?;
+        }
+
+        // 4. Immediate-or-cancel: any FoC order with a surviving remainder cancels
+        // this block instead of retrying (§15.37). A fully-filled FoC order was
+        // already removed during matching.
+        let fill_or_cancel: Vec<OrderId> = self
+            .dex_orders
+            .iter()
+            .filter(|(_, order)| order.fill_or_cancel && !order.remaining.is_zero())
+            .map(|(id, _)| *id)
+            .collect();
+        for order_id in fill_or_cancel {
+            self.close_dex_order(order_id, OrderCloseReason::FillOrCancel, &mut events)?;
+        }
+
+        Ok(events)
+    }
+
+    /// Settles all live orders on one pair at a single uniform clearing price.
+    ///
+    /// The clearing price and matched volume come from the pure
+    /// [`uniform_clearing_price`]; the surplus side is rationed by the dust-free
+    /// [`prorata_fills`]; every filled order trades at the identical price, so no
+    /// order is ordered ahead of another (no intra-block MEV). Base and quote are
+    /// each conserved exactly (integer prices make the value leg exact; the pro-rata
+    /// quantity leg is dust-free), and an optional per-fill fee on a native quote
+    /// leg is split by [`split_fee`]. Fully-filled orders are removed; partial
+    /// remainders retry in the next block's batch.
+    fn settle_dex_pair(
+        &mut self,
+        pair: &TradingPair,
+        config: &ChainConfig,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
+        // Gather this pair's live buys and sells in sorted OrderId order (BTreeMap
+        // iteration), so scoring, eligibility, and pro-rata are all deterministic.
+        let mut buy_ids: Vec<OrderId> = Vec::new();
+        let mut buys: Vec<(Price, Amount)> = Vec::new();
+        let mut sell_ids: Vec<OrderId> = Vec::new();
+        let mut sells: Vec<(Price, Amount)> = Vec::new();
+        for (id, order) in &self.dex_orders {
+            if &order.pair != pair || order.remaining.is_zero() {
+                continue;
+            }
+            match order.side {
+                OrderSide::Buy => {
+                    buy_ids.push(*id);
+                    buys.push((order.limit_price, order.remaining));
+                }
+                OrderSide::Sell => {
+                    sell_ids.push(*id);
+                    sells.push((order.limit_price, order.remaining));
+                }
+            }
+        }
+        let Some((clearing, _volume)) = uniform_clearing_price(&buys, &sells) else {
+            // The books did not cross: every order stays pending for the next batch.
+            return Ok(());
+        };
+
+        // Eligible orders at the clearing price, keeping the sorted OrderId order.
+        let mut eligible_buys: Vec<(OrderId, Amount)> = Vec::new();
+        for id in &buy_ids {
+            let order = &self.dex_orders[id];
+            if order.limit_price.get() >= clearing.get() {
+                eligible_buys.push((*id, order.remaining));
+            }
+        }
+        let mut eligible_sells: Vec<(OrderId, Amount)> = Vec::new();
+        for id in &sell_ids {
+            let order = &self.dex_orders[id];
+            if order.limit_price.get() <= clearing.get() {
+                eligible_sells.push((*id, order.remaining));
+            }
+        }
+        let demand = eligible_buys
+            .iter()
+            .try_fold(Amount::ZERO, |sum, (_, remaining)| {
+                sum.checked_add(*remaining)
+            })
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let supply = eligible_sells
+            .iter()
+            .try_fold(Amount::ZERO, |sum, (_, remaining)| {
+                sum.checked_add(*remaining)
+            })
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if demand.is_zero() || supply.is_zero() {
+            return Ok(());
+        }
+
+        // The short side fills fully; the long (surplus) side is rationed pro-rata
+        // to the short side's total, so total filled base is min(demand, supply).
+        let (buy_fills, sell_fills) = if demand.0 <= supply.0 {
+            let buy_fills: Vec<Amount> = eligible_buys.iter().map(|(_, r)| *r).collect();
+            let sell_remainings: Vec<Amount> = eligible_sells.iter().map(|(_, r)| *r).collect();
+            let sell_fills = prorata_fills(&sell_remainings, demand)?;
+            (buy_fills, sell_fills)
+        } else {
+            let buy_remainings: Vec<Amount> = eligible_buys.iter().map(|(_, r)| *r).collect();
+            let buy_fills = prorata_fills(&buy_remainings, supply)?;
+            let sell_fills: Vec<Amount> = eligible_sells.iter().map(|(_, r)| *r).collect();
+            (buy_fills, sell_fills)
+        };
+
+        // Whether a native-quote per-fill fee applies (external-asset quote fee
+        // routing is deferred, so a non-native quote leg carries no protocol fee).
+        let native_quote = pair.quote == AssetId::NativeWebc;
+        let fee_bps = if native_quote { config.dex.fee_bps } else { 0 };
+
+        // Buy legs: each filled buyer receives base and is refunded the price
+        // improvement (they locked at their own limit but pay only the clearing
+        // price). The clearing-price quote they pay stays in escrow for the sellers.
+        for ((order_id, _), fill) in eligible_buys.iter().zip(buy_fills.iter()) {
+            if fill.is_zero() {
+                continue;
+            }
+            let owner = self.dex_orders[order_id].owner;
+            let limit = self.dex_orders[order_id].limit_price;
+            // Buyer receives `fill` base out of escrow (put there by the sellers).
+            self.dex_release(owner, &pair.base, *fill)?;
+            // Price-improvement refund: fill * (limit - clearing) of quote.
+            let improvement = Price::new(limit.get() - clearing.get())
+                .quote_for(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            self.dex_release(owner, &pair.quote, improvement)?;
+            let paid = clearing
+                .quote_for(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let order = self
+                .dex_orders
+                .get_mut(order_id)
+                .ok_or(ChainError::DexOrderNotFound)?;
+            order.remaining = order
+                .remaining
+                .checked_sub(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let remaining = order.remaining;
+            events.push(Event::OrderFilled {
+                order_id: *order_id,
+                pair: pair.clone(),
+                side: OrderSide::Buy,
+                clearing_price: clearing,
+                filled: *fill,
+                remaining,
+                quote: paid,
+            });
+            if remaining.is_zero() {
+                self.dex_orders.remove(order_id);
+            }
+        }
+
+        // Sell legs: each filled seller delivers base (already released to buyers
+        // above, so it only reduces the seller's remaining) and receives the
+        // clearing-price quote net of any protocol fee.
+        for ((order_id, _), fill) in eligible_sells.iter().zip(sell_fills.iter()) {
+            if fill.is_zero() {
+                continue;
+            }
+            let gross = clearing
+                .quote_for(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let fee = gross
+                .checked_mul_bps(fee_bps)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let net = gross
+                .checked_sub(fee)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let owner = self.dex_orders[order_id].owner;
+            self.dex_release(owner, &pair.quote, net)?;
+            self.dex_take_native_fee(fee)?;
+            let order = self
+                .dex_orders
+                .get_mut(order_id)
+                .ok_or(ChainError::DexOrderNotFound)?;
+            order.remaining = order
+                .remaining
+                .checked_sub(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let remaining = order.remaining;
+            events.push(Event::OrderFilled {
+                order_id: *order_id,
+                pair: pair.clone(),
+                side: OrderSide::Sell,
+                clearing_price: clearing,
+                filled: *fill,
+                remaining,
+                quote: net,
+            });
+            if remaining.is_zero() {
+                self.dex_orders.remove(order_id);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn validate_owned_object(
@@ -4497,6 +5082,9 @@ mod tests {
             ("oracle_revenue", |s| {
                 s.oracle_revenue = Amount::from_units(s.oracle_revenue.0 + 1)
             }),
+            ("dex_escrow", |s| {
+                s.dex_escrow = Amount::from_units(s.dex_escrow.0 + 1)
+            }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
             }),
@@ -4511,6 +5099,7 @@ mod tests {
                 s.current_base_fee_per_unit += 1
             }),
             ("current_epoch", |s| s.current_epoch += 1),
+            ("current_height", |s| s.current_height += 1),
             ("bridge_nonce", |s| s.bridge_nonce += 1),
             ("last_block_timestamp_ms", |s| {
                 s.last_block_timestamp_ms += 1
@@ -11350,5 +11939,1010 @@ mod tests {
             build(),
             "identical inputs produce an identical root"
         );
+    }
+
+    // ----- native DEX batch settlement (Phase 8, §15.13/§15.18/§15.37) -----
+
+    use crate::block_builder::{apply_block, build_block, BlockBuildInput};
+    use crate::dex::{OrderId, OrderSide, Price, TradingPair};
+    use crate::Block;
+
+    /// One external (bridged) asset used as a DEX pair leg in tests.
+    fn ext_asset(tag: u8) -> AssetId {
+        AssetId::External {
+            origin_chain: ExternalChain::Ethereum,
+            symbol: format!("EXT{tag}"),
+            contract_or_mint: format!("0x{tag:02x}"),
+        }
+    }
+
+    fn order_id(tag: u8) -> OrderId {
+        OrderId::new(Hash256([tag; 32]))
+    }
+
+    /// A DEX-tuned config: no epoch rollover noise, an optional per-fill fee.
+    fn dex_config(fee_bps: u16) -> ChainConfig {
+        let mut config = ChainConfig {
+            dex: DexConfig {
+                min_order_amount: Amount::ZERO,
+                default_deadline_blocks: 5,
+                fee_bps,
+            },
+            ..ChainConfig::default()
+        };
+        // Disable the height-boundary epoch rollover so a DEX block advances only
+        // DEX state (no reward minting), keeping the supply-invariant assertions
+        // about exactly the order flow.
+        config.staking.blocks_per_epoch = 0;
+        config
+    }
+
+    /// Genesis funding four native accounts and seeding each with `ext_units` of
+    /// two external assets, so any of them can be a buyer (locks native) or a
+    /// seller (locks the external base).
+    fn dex_fixture(
+        config: &ChainConfig,
+        ext_units: u128,
+    ) -> (ChainState, Keypair, Keypair, Keypair, Keypair) {
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let carol = Keypair::from_seed([3u8; 32]);
+        let dave = Keypair::from_seed([4u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: [&alice, &bob, &carol, &dave]
+                .iter()
+                .map(|kp| GenesisAccount {
+                    address: kp.address(),
+                    balance: Amount::from_webc(1_000),
+                })
+                .collect(),
+            validators: Vec::new(),
+        };
+        let mut state = ChainState::from_genesis(&genesis).expect("dex genesis");
+        // Seed external-asset balances directly (bridged assets are not part of the
+        // native supply invariant, so this does not disturb `balanced`).
+        for kp in [&alice, &bob, &carol, &dave] {
+            for tag in [1u8, 2] {
+                state.asset_balances.insert(
+                    (ext_asset(tag), kp.address()),
+                    Amount::from_units(ext_units),
+                );
+            }
+        }
+        (state, alice, bob, carol, dave)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_order(
+        keypair: &Keypair,
+        nonce: u64,
+        id: OrderId,
+        pair: TradingPair,
+        side: OrderSide,
+        amount: u128,
+        price: u128,
+        deadline_height: u64,
+        fill_or_cancel: bool,
+    ) -> Transaction {
+        Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::SubmitOrder {
+                order_id: id,
+                pair,
+                side,
+                amount: Amount::from_units(amount),
+                limit_price: Price::new(price),
+                deadline_height,
+                fill_or_cancel,
+            },
+            FeeBid {
+                gas_limit: 20_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("submit order signs")
+    }
+
+    fn cancel_order(keypair: &Keypair, nonce: u64, id: OrderId) -> Transaction {
+        Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::CancelOrder { order_id: id },
+            FeeBid {
+                gas_limit: 20_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("cancel order signs")
+    }
+
+    /// Builds one block at `height` carrying `txs`, running the DEX batch pass.
+    fn dex_block(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        height: u64,
+        txs: Vec<Transaction>,
+    ) -> Result<Block, ChainError> {
+        build_block(
+            state,
+            config,
+            BlockBuildInput {
+                chain_id: config.chain_id.clone(),
+                height,
+                epoch: 0,
+                previous_hash: Hash256::ZERO,
+                proposer: Keypair::from_seed([1u8; 32]).address(),
+                timestamp_ms: height.saturating_mul(1_000).max(1),
+            },
+            txs,
+            Vec::new(),
+        )
+    }
+
+    fn native_balance(state: &ChainState, addr: Address) -> Amount {
+        state
+            .accounts
+            .get(&addr)
+            .map(|a| a.balance)
+            .unwrap_or(Amount::ZERO)
+    }
+
+    fn ext_balance(state: &ChainState, asset: &AssetId, addr: Address) -> Amount {
+        state
+            .asset_balances
+            .get(&(asset.clone(), addr))
+            .copied()
+            .unwrap_or(Amount::ZERO)
+    }
+
+    #[test]
+    fn crossing_orders_fill_at_one_uniform_price_and_supply_balances() {
+        // Pair (base = EXT1, quote = native WEBC): a buyer locks native, a seller
+        // locks EXT. A buy 100 @ 10 and a sell 100 @ 8 cross; the marginal spread
+        // [8, 10] clears at the midpoint 9, both fully fill in the same block.
+        // Driven through `settle_dex_batch` directly so the settlement events can be
+        // inspected (the block path discards them like oracle-settlement events).
+        let config = dex_config(0);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 1_000);
+        state.current_height = 1;
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let alice_native_before = native_balance(&state, alice.address());
+        let bob_native_before = native_balance(&state, bob.address());
+
+        state
+            .execute_transaction(
+                &submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                &config,
+            )
+            .expect("alice submits");
+        state
+            .execute_transaction(
+                &submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+                &config,
+            )
+            .expect("bob submits");
+        let events = state.settle_dex_batch(&config).expect("batch settles");
+
+        // Both orders fully filled and removed.
+        assert!(state.dex_orders.is_empty(), "both orders fully filled");
+        assert_eq!(state.dex_escrow, Amount::ZERO, "escrow fully settled");
+
+        // Every fill in the batch trades at the single clearing price 9.
+        let clearing: Vec<Price> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::OrderFilled { clearing_price, .. } => Some(*clearing_price),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clearing, vec![Price::new(9), Price::new(9)]);
+
+        // Buyer received 100 EXT and paid 100*9 = 900 native (locked 1000, refunded
+        // the 100 price improvement). Fees for this block are only the tx fees.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), alice.address()),
+            Amount::from_units(1_100)
+        );
+        let fee_per_submit = Amount::from_units(10_000); // 10_000 units * 1 base unit
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            alice_native_before
+                .checked_sub(Amount::from_units(900))
+                .and_then(|a| a.checked_sub(fee_per_submit))
+                .unwrap()
+        );
+        // Seller delivered 100 EXT and received 900 native.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), bob.address()),
+            Amount::from_units(900)
+        );
+        assert_eq!(
+            native_balance(&state, bob.address()),
+            bob_native_before
+                .checked_add(Amount::from_units(900))
+                .and_then(|a| a.checked_sub(fee_per_submit))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn non_crossing_orders_stay_pending_and_retry() {
+        // Buy 100 @ 8 and sell 100 @ 10 do not cross; both stay pending across
+        // blocks (chain-native retry) until a crossing order arrives.
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("non-crossing block");
+        assert_eq!(
+            state.dex_orders.len(),
+            2,
+            "non-crossing orders stay pending"
+        );
+
+        // An empty block retries them; still no cross, still pending.
+        dex_block(&mut state, &config, 2, Vec::new()).expect("retry block");
+        assert_eq!(state.dex_orders.len(), 2);
+
+        // Carol adds a crossing sell @ 8; now the buy @ 8 fills against it.
+        dex_block(
+            &mut state,
+            &config,
+            3,
+            vec![submit_order(
+                &carol,
+                0,
+                order_id(3),
+                pair.clone(),
+                OrderSide::Sell,
+                100,
+                8,
+                50,
+                false,
+            )],
+        )
+        .expect("crossing block");
+        // Alice's buy (100 @ 8) and Carol's sell (100 @ 8) cleared and were removed;
+        // Bob's non-crossing sell @ 10 remains pending.
+        assert!(!state.dex_orders.contains_key(&order_id(1)));
+        assert!(!state.dex_orders.contains_key(&order_id(3)));
+        assert!(state.dex_orders.contains_key(&order_id(2)));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn short_side_is_rationed_prorata_with_no_dust_and_the_remainder_retries() {
+        // Three buyers of 100 each (limit 10) against one seller of 100 (limit 8).
+        // Demand 300 > supply 100, so buyers are rationed pro-rata to 100:
+        // cumulative rounding gives [33, 33, 34], summing to exactly 100 (no dust).
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, dave) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &carol,
+                    0,
+                    order_id(3),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &dave,
+                    0,
+                    order_id(4),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("prorata block");
+
+        // The seller fully filled and is gone; the three buyers keep pro-rata
+        // remainders whose fills sum to exactly the 100 that traded.
+        assert!(!state.dex_orders.contains_key(&order_id(4)));
+        let fills: Vec<u128> = [order_id(1), order_id(2), order_id(3)]
+            .iter()
+            .map(|id| {
+                let order = &state.dex_orders[id];
+                Amount::from_units(100).0 - order.remaining.0
+            })
+            .collect();
+        assert_eq!(fills, vec![33, 33, 34]);
+        assert_eq!(fills.iter().sum::<u128>(), 100, "no dust lost");
+        // Remainders retry: each buyer still has an order with the residual amount.
+        for (id, filled) in [order_id(1), order_id(2), order_id(3)].iter().zip(&fills) {
+            assert_eq!(
+                state.dex_orders[id].remaining,
+                Amount::from_units(100 - filled)
+            );
+        }
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn uniform_price_gives_no_participant_a_worse_price_than_a_peer() {
+        // Two buyers with different limits (10 and 12) and one seller (8). Both
+        // buyers trade at the identical clearing price — the aggressive buyer is not
+        // charged more than the marginal one (no intra-block ordering advantage).
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, _d) = dex_fixture(&config, 1_000);
+        state.current_height = 1;
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        for tx in [
+            submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                10,
+                50,
+                false,
+            ),
+            submit_order(
+                &carol,
+                0,
+                order_id(3),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                12,
+                50,
+                false,
+            ),
+            submit_order(
+                &bob,
+                0,
+                order_id(2),
+                pair.clone(),
+                OrderSide::Sell,
+                100,
+                8,
+                50,
+                false,
+            ),
+        ] {
+            state.execute_transaction(&tx, &config).expect("submit");
+        }
+        let events = state.settle_dex_batch(&config).expect("batch settles");
+
+        // Both buy fills carry the same clearing price and the same per-unit quote.
+        let buy_fills: Vec<(Price, u128, u128)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::OrderFilled {
+                    side: OrderSide::Buy,
+                    clearing_price,
+                    filled,
+                    quote,
+                    ..
+                } => Some((*clearing_price, filled.0, quote.0)),
+                _ => None,
+            })
+            .collect::<Vec<(Price, u128, u128)>>();
+        assert_eq!(buy_fills.len(), 2);
+        let price = buy_fills[0].0;
+        for (p, filled, quote) in &buy_fills {
+            assert_eq!(*p, price, "both buyers clear at one uniform price");
+            // Per-unit price is identical: quote == filled * clearing_price.
+            assert_eq!(*quote, filled * price.get());
+        }
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn fill_or_cancel_cancels_an_unfilled_order_same_block() {
+        // A fill-or-cancel buy with no crossing counter-order is cancelled and fully
+        // refunded in the same block it is submitted.
+        let config = dex_config(0);
+        let (mut state, alice, _b, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let before = native_balance(&state, alice.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                8,
+                50,
+                true,
+            )],
+        )
+        .expect("foc block");
+        assert!(
+            state.dex_orders.is_empty(),
+            "unfilled FoC order cancels same block"
+        );
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        // Alice paid only the transaction fee; her 100*8 lock was refunded.
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            before.checked_sub(Amount::from_units(10_000)).unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn fill_or_cancel_partial_fill_cancels_the_remainder_same_block() {
+        // A FoC buy of 100 @ 10 against a sell of 40 @ 8: 40 fills at the clearing
+        // price, the 60 remainder is cancelled and refunded the same block.
+        let config = dex_config(0);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    true,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    40,
+                    8,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("foc partial block");
+        // Both orders gone: the seller fully filled, the FoC buyer filled 40 and
+        // cancelled the remaining 60.
+        assert!(state.dex_orders.is_empty());
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), alice.address()),
+            Amount::from_units(1_040)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn an_order_past_its_deadline_auto_refunds() {
+        // An order with deadline height 1 settles in block 1 (no cross) then expires
+        // at block 2, refunding its lock.
+        let config = dex_config(0);
+        let (mut state, alice, _b, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let before = native_balance(&state, alice.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                8,
+                1,
+                false,
+            )],
+        )
+        .expect("submit block");
+        assert!(
+            state.dex_orders.contains_key(&order_id(1)),
+            "still live on its deadline block"
+        );
+
+        dex_block(&mut state, &config, 2, Vec::new()).expect("expiry block");
+        assert!(
+            !state.dex_orders.contains_key(&order_id(1)),
+            "expired past its deadline"
+        );
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            before.checked_sub(Amount::from_units(10_000)).unwrap(),
+            "lock refunded on expiry; only the tx fee is spent"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn cancel_refunds_the_locked_remainder() {
+        // Submit in block 1, cancel in block 2; the batch pass refunds the lock.
+        let config = dex_config(0);
+        let (mut state, alice, _b, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let before = native_balance(&state, alice.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                8,
+                50,
+                false,
+            )],
+        )
+        .expect("submit block");
+        // Escrow holds the 100*8 = 800 native lock while the order is live.
+        assert_eq!(state.dex_escrow, Amount::from_units(800));
+
+        dex_block(
+            &mut state,
+            &config,
+            2,
+            vec![cancel_order(&alice, 1, order_id(1))],
+        )
+        .expect("cancel block");
+        assert!(state.dex_orders.is_empty(), "cancelled order removed");
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            before.checked_sub(Amount::from_units(20_000)).unwrap(),
+            "lock refunded; two tx fees spent (submit + cancel)"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn two_disjoint_pairs_settle_independently() {
+        // A crossing pair on EXT1 and a crossing pair on EXT2 both settle in one
+        // block without interacting.
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, dave) = dex_fixture(&config, 1_000);
+        let pair1 = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let pair2 = TradingPair::new(ext_asset(2), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair1.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair1.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &carol,
+                    0,
+                    order_id(3),
+                    pair2.clone(),
+                    OrderSide::Buy,
+                    50,
+                    20,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &dave,
+                    0,
+                    order_id(4),
+                    pair2.clone(),
+                    OrderSide::Sell,
+                    50,
+                    18,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("two-pair block");
+        // Both pairs fully cleared and every order was removed.
+        assert!(state.dex_orders.is_empty());
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        // EXT1 traded 100 at pc 9; EXT2 traded 50 at pc 19.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), alice.address()),
+            Amount::from_units(1_100)
+        );
+        assert_eq!(
+            ext_balance(&state, &ext_asset(2), carol.address()),
+            Amount::from_units(1_050)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_fill_fee_on_a_native_quote_is_split_and_supply_balances() {
+        // With a 100 bps (1%) per-fill fee and a native quote, the seller's proceeds
+        // are taxed and the fee is split 50/50 burn/validator. Supply still balances.
+        let config = dex_config(100);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let burned_before = state.burned_fees;
+        let pool_before = state.validator_fee_pool;
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("fee block");
+        // Gross proceeds 100*9 = 900; fee 1% = 9; seller nets 891.
+        // The 9-unit fee (split 4 burned / 5 validator) is on top of the two tx fees.
+        let submit_fees_burned = Amount::from_units(10_000); // 2 tx * 5_000 burned half
+        assert_eq!(
+            state.burned_fees,
+            burned_before
+                .checked_add(submit_fees_burned)
+                .and_then(|b| b.checked_add(Amount::from_units(4)))
+                .unwrap()
+        );
+        assert_eq!(
+            state.validator_fee_pool,
+            pool_before
+                .checked_add(Amount::from_units(10_000))
+                .and_then(|p| p.checked_add(Amount::from_units(5)))
+                .unwrap()
+        );
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn settlement_is_deterministic_and_identical_on_build_and_import() {
+        // The batch pass is a pure function of committed state + height, so a second
+        // producer builds the identical block and an importer reproduces it exactly.
+        let config = dex_config(30);
+        let build_once = || {
+            let (mut state, alice, bob, carol, dave) = dex_fixture(&config, 1_000);
+            let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+            let block = dex_block(
+                &mut state,
+                &config,
+                1,
+                vec![
+                    submit_order(
+                        &alice,
+                        0,
+                        order_id(1),
+                        pair.clone(),
+                        OrderSide::Buy,
+                        100,
+                        10,
+                        50,
+                        false,
+                    ),
+                    submit_order(
+                        &carol,
+                        0,
+                        order_id(3),
+                        pair.clone(),
+                        OrderSide::Buy,
+                        70,
+                        9,
+                        50,
+                        false,
+                    ),
+                    submit_order(
+                        &bob,
+                        0,
+                        order_id(2),
+                        pair.clone(),
+                        OrderSide::Sell,
+                        120,
+                        8,
+                        50,
+                        false,
+                    ),
+                    submit_order(
+                        &dave,
+                        0,
+                        order_id(4),
+                        pair.clone(),
+                        OrderSide::Sell,
+                        30,
+                        9,
+                        50,
+                        false,
+                    ),
+                ],
+            )
+            .expect("block builds");
+            (state, block)
+        };
+        let (producer_a, block_a) = build_once();
+        let (producer_b, block_b) = build_once();
+        assert_eq!(block_a.header, block_b.header, "deterministic across runs");
+        assert_eq!(
+            producer_a.state_root().unwrap(),
+            producer_b.state_root().unwrap()
+        );
+
+        // An importer re-executes the block onto fresh genesis and lands identically.
+        let (mut importer, _a, _b, _c, _d) = dex_fixture(&config, 1_000);
+        apply_block(&mut importer, &config, &block_a).expect("import");
+        assert_eq!(
+            importer.state_root().unwrap(),
+            producer_a.state_root().unwrap(),
+            "build == import"
+        );
+        assert_eq!(importer.dex_orders, producer_a.dex_orders);
+        assert_eq!(importer.dex_escrow, producer_a.dex_escrow);
+        assert!(importer.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn bincode_restart_preserves_orders_escrow_and_state_root() {
+        // A crash-restart round trip through the on-disk bincode config must
+        // preserve every live order, the escrow scalar, and the committed state root.
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        // One partial fill (remainder retries) plus a pending non-crossing order, so
+        // both a live remainder and escrow are non-trivial across the restart.
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    40,
+                    8,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &carol,
+                    0,
+                    order_id(3),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    20,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("mixed block");
+        assert!(!state.dex_orders.is_empty());
+        assert!(!state.dex_escrow.is_zero());
+
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.dex_orders, state.dex_orders);
+        assert_eq!(restored.dex_escrow, state.dex_escrow);
+        assert_eq!(restored.current_height, state.current_height);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            state.state_root().unwrap(),
+            "orders and escrow are committed by the state root across a restart"
+        );
+        assert!(restored.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn a_native_base_sell_locks_and_settles_through_dex_escrow() {
+        // Orientation check: pair (base = native WEBC, quote = EXT). A sell of native
+        // WEBC locks native into `dex_escrow`; the buyer pays EXT. Exercises the
+        // native-base escrow routing (the mirror of the native-quote tests above).
+        let config = dex_config(0);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 100_000);
+        let pair = TradingPair::new(AssetId::NativeWebc, ext_asset(1));
+        let bob_native_before = native_balance(&state, bob.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                // Bob sells 500 native WEBC @ 8 EXT each (locks 500 native).
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    500,
+                    8,
+                    50,
+                    false,
+                ),
+                // Alice buys 500 native WEBC @ 10 EXT each (locks 5000 EXT).
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    500,
+                    10,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("native-base block");
+        assert!(state.dex_orders.is_empty());
+        assert_eq!(
+            state.dex_escrow,
+            Amount::ZERO,
+            "native base escrow fully settled"
+        );
+        // Alice received 500 native WEBC; Bob delivered 500 (minus his tx fee).
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            // started 1000 WEBC, minus tx fee, plus 500 received.
+            Amount::from_webc(1_000)
+                .checked_sub(Amount::from_units(10_000))
+                .and_then(|a| a.checked_add(Amount::from_units(500)))
+                .unwrap()
+        );
+        assert_eq!(
+            native_balance(&state, bob.address()),
+            bob_native_before
+                .checked_sub(Amount::from_units(500))
+                .and_then(|a| a.checked_sub(Amount::from_units(10_000)))
+                .unwrap()
+        );
+        // Alice paid 500*9 = 4500 EXT; Bob received 4500 EXT.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), bob.address()),
+            Amount::from_units(104_500)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
     }
 }

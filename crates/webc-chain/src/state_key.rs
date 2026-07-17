@@ -88,6 +88,8 @@ pub enum StateKeyKind {
         feed_id: crate::FeedId,
         reporter: Address,
     },
+    /// Native DEX order-intent record for one order id.
+    DexOrder { order_id: crate::OrderId },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
 }
@@ -212,6 +214,11 @@ impl StateKey {
     /// Returns the current oracle reporter key for `reporter` on `feed_id`.
     pub const fn oracle_reporter(feed_id: crate::FeedId, reporter: Address) -> Self {
         Self::current(StateKeyKind::OracleReporter { feed_id, reporter })
+    }
+
+    /// Returns the current DEX order-intent key for `order_id`.
+    pub const fn dex_order(order_id: crate::OrderId) -> Self {
+        Self::current(StateKeyKind::DexOrder { order_id })
     }
 
     /// Rejects keys whose schema is not supported by this executable.
