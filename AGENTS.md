@@ -559,15 +559,13 @@ task** — that file and `docs/implementation-status.md` are the single live own
 of "what is done / what is next." This section deliberately does NOT restate the
 phase status, because a second copy rots into a contradiction (see pitfall 8).
 
-The current continuation guide points to the owner-selected end-to-end
-transaction objective in `docs/transaction-system-plan.md`. Follow its three
-verified-worktree tracks and acceptance gates autonomously when it is still the
-live next task. The plan is a bounded objective, not permission to start Weft,
-the DEX, oracle, bridges, or a real STARK backend early. Transparent finalized
-proofs may be implemented, but STARK backend work waits for the Phase 5.5
-independent core-review gate. If `docs/continuation-guide.md` later points
-elsewhere, that live pointer wins; do not preserve this paragraph as competing
-status.
+Resume implementation autonomously from `docs/continuation-guide.md` "Exact
+next work." The session chooses and sequences technical work inside that plan
+without asking permission between routine items. A separately assigned goal may
+have its own explicit branch and task document; that goal does not replace the
+global `main` continuation pointer until its completed branch is deliberately
+integrated. Do not skip phase gates for the contract runtime, Weft, DEX, oracle,
+ZK, or real-fund bridges.
 
 ## User decisions still required later
 

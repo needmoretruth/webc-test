@@ -44,9 +44,6 @@ security content specifically — the definition deliberately does not cover it.
   frugality, bootstrap operations (§15.23/15.26/15.28)
 - `agent-commerce.md` — mandate objects, service registry, HTTP-402 flows
   (§15.5/15.32)
-- `transaction-system-plan.md` — owner-selected end-to-end transaction
-  completion objective, three parallel tracks, proof/light-client boundary,
-  acceptance gates, and implementation decision-log format
 
 ## Topic documents
 
@@ -60,6 +57,15 @@ security content specifically — the definition deliberately does not cover it.
 - `ai-handoff.md` — prevents stale conversation summaries from becoming decisions
 - `session-keys-implementation-plan.md` / `session-keys-next-steps.md` —
   completed session-key gate records (historical; do not redo)
+
+## Goal-scoped task plans
+
+These are active only when an explicit goal names them. They do not replace the
+global next action in `continuation-guide.md`.
+
+- `transaction-system-plan.md` — end-to-end transaction completion on its
+  dedicated branch, with optional parallel work areas, proof/light-client
+  boundaries, acceptance gates, and a branch-local recovery/decision log
 
 ## Review artifacts (`docs/review/`)
 
@@ -96,9 +102,9 @@ record.
 
 This page does not restate phase or completion status because a second copy
 rots. Read `continuation-guide.md` for the exact next task and
-`implementation-status.md` for demonstrated code reality. The current bounded
-task document is `transaction-system-plan.md`; if the live continuation guide
-changes later, it wins.
+`implementation-status.md` for demonstrated code reality. A separately assigned
+goal document is not the global next action unless the continuation guide says
+so.
 
 This project runs in an ephemeral cloud container: the GitHub repo is the
 source of truth, so commit and push every step. `target/`, `node_modules/`,

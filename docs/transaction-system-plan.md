@@ -1,9 +1,36 @@
 # WEBC transaction-system completion plan
 
 Status: owner-selected implementation objective (2026-07-17). This is the task
-specification, not a completion claim. Code reality lives in
-`implementation-status.md`; the resume pointer lives in
-`continuation-guide.md`.
+specification, not a completion claim. Branch-local recovery state lives in the
+goal progress section below. Global code reality and continuation documents are
+reconciled only when the completed branch is integrated.
+
+This plan is activated only by an explicit transaction-system goal. It is not
+the global `main` continuation pointer and must not redirect unrelated agents.
+
+## Goal branch and durability
+
+- The dedicated integration branch is `codex/transaction-system`. Create it
+  from the latest `origin/main`, or resume it if it already exists. Do not do
+  transaction development directly on `main`.
+- Push the branch immediately after creation, then commit and push every
+  coherent tested step to it. Before a long integration/test pass or likely
+  context/session limit, push the latest recoverable checkpoint. Local-only work
+  is not durable.
+- Use subagents only when parallel work is genuinely useful. The root chooses
+  the number, timing, and split from current dependencies; no fixed count is a
+  completion requirement. Every code-changing subagent gets a real worktree and
+  its own branch based on the transaction integration branch, and pushes each
+  coherent tested step. Root integrates subagent work only into
+  `codex/transaction-system` while the goal is in progress.
+- Do not rewrite, force-push, or delete history. Do not change the global
+  `continuation-guide.md` or `implementation-status.md` merely to report
+  branch-local progress; use this plan's decision/progress log and commits. The
+  live global documents are reconciled only during the final main integration.
+- When all allowed completion gates pass, fetch the latest `main`, merge it into
+  `codex/transaction-system`, resolve/test there, push the tested branch, then
+  integrate it into the latest `main` without force. If `main` moves meanwhile,
+  fetch, merge, retest, and retry instead of overwriting concurrent work.
 
 ## Outcome in plain language
 
@@ -136,15 +163,18 @@ specific policy. The implementation session autonomously chooses exact source
 authentication/count/threshold after a threat-model review and records it; a
 later audit can replace it without rewriting the transaction or consensus core.
 
-## Three simultaneous subagent tracks
+## Candidate work areas and optional parallelism
 
-The root agent first makes a small shared-interface/ownership commit, creates
-three real Git worktrees, verifies them with `git worktree list`, and starts all
-three subagents together. Each owns disjoint primary files, commits tested steps
-on its own branch, and pushes. Root owns shared types, integration, status docs,
-full gates, and final merges to `main`.
+The following areas describe ownership and dependencies; they do not force three
+agents or simultaneous execution. Root decides whether to delegate none, one,
+or several areas. If it delegates, it first freezes the smallest shared
+interfaces, gives agents disjoint primary files, verifies every worktree with
+`git worktree list`, and keeps coupled changes sequential when that is safer.
+Root owns shared types, branch integration, the plan's progress/decision log,
+and full gates. Global status documents and `main` are updated only during final
+integration.
 
-### Track A — transaction protocol and execution
+### Area A — transaction protocol and execution
 
 Primary ownership: `crates/webc-chain` and required canonical fixtures.
 
@@ -155,7 +185,7 @@ Primary ownership: `crates/webc-chain` and required canonical fixtures.
 - property/adversarial tests for rollback, supply, replay, access, fees, action
   ordering, and hostile decoding.
 
-### Track B — node lifecycle, storage, and APIs
+### Area B — node lifecycle, storage, and APIs
 
 Primary ownership: `crates/webc-node` and `crates/webc-storage`.
 
@@ -165,7 +195,7 @@ Primary ownership: `crates/webc-node` and `crates/webc-storage`.
 - bounded status/receipt/proof HTTP and WebSocket APIs with typed errors;
 - crash recovery, idempotency, multi-node, rate-limit, and index tests.
 
-### Track C — finalized proofs and light client
+### Area C — finalized proofs and light client
 
 Primary ownership: a focused proof/light-client crate and `sdk/webc-js`.
 
@@ -179,16 +209,22 @@ Primary ownership: a focused proof/light-client crate and `sdk/webc-js`.
 
 ## Integration sequence
 
-1. Freeze shared domains, types, errors, API shapes, compatibility/migration,
-   and file ownership in one root commit.
-2. Run A/B/C concurrently in verified worktrees.
-3. Integrate A, rebase B/C onto the stable protocol surface, then integrate B
-   and the transparent-proof portion of C.
-4. Run Rust, TypeScript, docs, dependency, fuzz-smoke, restart, and multi-node
-   gates; fix integration defects with focused commits on `main`.
-5. Update `implementation-status.md` only with demonstrated facts and point
-   `continuation-guide.md` to the first incomplete acceptance item.
-6. After Phase 5.5, complete the real STARK backend and gates. Until then state
+1. Create/resume and push `codex/transaction-system` from current `origin/main`.
+2. Freeze shared domains, types, errors, API shapes, compatibility/migration,
+   and file ownership in one root commit; push it.
+3. Work through A/B/C in the dependency order root judges safest. Delegate
+   independent portions when useful; keep tightly coupled portions sequential.
+   Every active branch pushes recoverable milestones frequently.
+4. Integrate completed work into the transaction branch in dependency order,
+   resolve interface drift there, test, and push each coherent integration.
+5. Run Rust, TypeScript, docs, dependency, fuzz-smoke, restart, and multi-node
+   gates; fix and push focused integration commits on the transaction branch.
+6. Fetch and merge the latest `origin/main` into the transaction branch, run the
+   full gates again, then reconcile `implementation-status.md` and
+   `continuation-guide.md` with both lines of work.
+7. Push the tested transaction branch, integrate it into the still-latest
+   `main` without force/history rewriting, and verify local/remote equality.
+8. After Phase 5.5, complete the real STARK backend and gates. Until then state
    truthfully: transparent proof complete; ZK backend deferred.
 
 ## Completion gates
@@ -224,6 +260,11 @@ code, then this plan and track-specific files.
   arithmetic, deterministic ordering, and no panic on hostile input.
 - Search first. Reuse existing Merkle, canonical, crypto, storage, network,
   authorization, fee, and error modules instead of cloning logic.
+- Study established Layer-1 implementations such as Sui and Solana when they
+  solve an analogous transaction, fee, storage, proof, or node problem. Use
+  their official source/specification as design evidence, not as an instruction
+  to copy architecture blindly. Record the relevant reference and the WEBC
+  differences in the repository.
 - Prefer maintained reviewed dependencies for commodity machinery. Permit only
   the Apache-2.0-compatible licenses in `AGENTS.md`; verify SPDX/maintenance,
   commit lockfiles, and pass `cargo-deny`/JS audit. Never invent crypto or proof
@@ -252,6 +293,8 @@ Review status: provisional, accepted after review, or superseded by entry/ADR.
 ```
 
 Never erase the earlier reason. Supersede it with a new entry.
+The durable entry belongs in this file or a numbered ADR, with supporting detail
+in the commit when useful. A chat explanation alone does not satisfy this rule.
 
 ### 2026-07-17 — modular checkpoint trust policy
 
@@ -277,37 +320,51 @@ on 2026-07-17; implementation tests/commits remain pending.
 
 Review status: provisional and explicitly replaceable after later review.
 
+## Goal progress checkpoint
+
+Initial state on 2026-07-17: planning complete; implementation not started.
+While the goal runs, update this branch-local section after each integrated
+milestone with the last pushed commit, passed tests, remaining limitation, and
+exact next item. This is the recovery pointer if a usage/session limit ends the
+agent. Do not change the global continuation/status documents until final main
+integration.
+
+## Partial blockers and owner-reserved decisions
+
+A policy conflict or missing owner decision does not stop the whole goal by
+default. Isolate and document the blocked part, choose a reversible interface or
+safe disabled default where allowed, and continue every independent task,
+test, refactor, proof, or integration step that still makes meaningful progress.
+Stop only when all remaining goal work truly depends on the same unresolved
+owner decision or external condition, safe alternatives are exhausted, and no
+additional in-scope development can be completed. Report the exact dependency
+and completed surrounding work at that point.
+
 ## User decisions for this objective
 
 None remain. The checkpoint source direction was the only owner-owned trust
 choice for this transaction/light-client objective, and it is approved as a
 reviewable direction. Agents autonomously choose libraries, modules, formats,
-limits, algorithms, tests, and tuning, then record what and why. Stop only if
-implementation reaches a real conflict with monetary policy, production-bridge
-trust, governance/emergency power, or another item reserved by `AGENTS.md`.
+limits, algorithms, tests, and tuning, then record what and why. If work reaches
+monetary policy, production-bridge trust, governance/emergency power, or another
+owner-reserved boundary, follow the partial-blocker rule above: isolate it and
+continue everything independent before considering a stop.
 
 ## Goal prompt for a fresh session
 
-> Continue the owner-selected WEBC transaction-system completion goal. First
-> follow the full startup protocol in `AGENTS.md`: read it completely and then
-> every required linked authority/status/review document, inspect Git status and
-> history, and read `docs/transaction-system-plan.md`. Treat repository docs and
-> Git as authoritative, not chat memory. Work on `main` and preserve history.
-> Make the small shared-interface/ownership commit, then create and verify three
-> real worktrees and start three subagents simultaneously for Track A
-> (transaction protocol/execution), Track B (node/storage/API lifecycle), and
-> Track C (finalized proofs/light client). Enforce disjoint primary file
-> ownership; root integrates and owns shared interfaces/docs/gates. Proceed
-> autonomously without asking routine technical questions. Reuse existing
-> modules and maintained Apache-2.0-compatible dependencies; do not reinvent
-> crypto, proof, storage, networking, or encoding. Keep code modular, versioned,
-> replaceable, documented, and adversarially tested. Every technical choice is
-> reviewable: record what changed, why, alternatives, compatibility/migration,
-> reused module/dependency/license, evidence, and commit. Commit and push every
-> coherent tested step. Respect the Phase 5.5 gate: transparent finalized proofs
-> may be completed now, but a real STARK backend starts only after the independent
-> core review. Keep `implementation-status.md` truthful and
-> `continuation-guide.md` pointed at the first incomplete acceptance gate. Do not
-> stop until the allowed transaction-system work is integrated, fully tested,
-> documented, committed, and pushed, or a genuinely owner-reserved decision or
-> hard external blocker is reached.
+> 목표: `docs/transaction-system-plan.md`의 WEBC 트랜잭션 시스템을 완료한다.
+>
+> 시작 전에 `AGENTS.md`와 필수 연결 문서, Git 상태, 위 계획서를 모두
+> 읽는다. 개발은 `codex/transaction-system`에서만 하고, 필요할 때만
+> 서브에이전트와 실제 worktree를 사용한다. 기존 WEBC 모듈과 유지보수되는
+> Apache-2.0 호환 오픈소스를 우선하며 Sui·Solana의 공식 구현도 비교
+> 자료로 활용한다. 코드는 모듈형·버전형·교체 가능하게 만들고 필수 주석,
+> 적대적 테스트, 계획서의 완료 조건을 지킨다.
+>
+> 기술 선택의 이유·대안·호환성·근거는 채팅이 아니라 계획서의 결정 기록
+> 또는 ADR에 남긴다. 사용량이나 세션이 끝나도 잃지 않도록 복구 가능한
+> 단계마다 작업 브랜치에 커밋하고 즉시 푸시한다. 일부 정책 문제가
+> 생겨도 독립적인 작업을 계속하고, 모든 남은 작업이 같은 문제에 막혀
+> 더 진행할 수 없을 때만 멈춘다. Phase 5.5 전에는 실제 STARK 백엔드를
+> 시작하지 않는다. 완료 후 최신 `main`을 작업 브랜치에 병합해 전체
+> 검증하고, 강제 푸시나 기록 재작성 없이 최신 `main`에 통합한다.

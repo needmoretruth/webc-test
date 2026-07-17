@@ -1,10 +1,11 @@
 # WEBC continuation guide
 
-Last updated: 2026-07-17 (owner selected the end-to-end transaction system as the
-next bounded development objective; plan and checkpoint-source direction are
-documented, code not started). This file is the live pointer to the **exact next
-task**. Detailed "what the code implements" facts live in
-`implementation-status.md`; do not duplicate them here.
+Last updated: 2026-07-17 (findings backlog complete; the first incomplete global
+`main` item is Phase 5 economics). Separately assigned feature goals use their
+own branches and task documents and do not replace this pointer until merged.
+This file is the live pointer to the **exact next task**. Detailed "what the code
+implements" facts live in `implementation-status.md`; do not duplicate them
+here.
 
 ## Read first
 
@@ -17,7 +18,6 @@ task**. Detailed "what the code implements" facts live in
 6. `docs/review/findings.md` — known code findings (read BEFORE touching
    consensus, networking, mempool, or faucet)
 7. `docs/index.md` and the topic/system document the task needs
-8. For the current task: `docs/transaction-system-plan.md`
 
 Then inspect `git status --short --branch` and `git log -5 --oneline`.
 Preserve all existing changes, determine the first incomplete item below, and
@@ -86,37 +86,14 @@ seven system plans added; development plan rebuilt (phases 0–7 numbering
 preserved, 8–19 new); AGENTS.md facts updated. Committed and pushed through
 `3a327c3`.
 
-## Exact next work — transaction-system completion
+## Exact next work
 
-The owner explicitly selected `docs/transaction-system-plan.md` as the next
-bounded objective. On “continue” after a fresh session or compaction:
-
-1. complete the full `AGENTS.md` startup/read protocol and verify Git state;
-2. audit the existing transaction, receipt, mempool, storage, API, certificate,
-   Merkle, and SDK code against the plan; do not duplicate existing machinery;
-3. root freezes the smallest shared versioned interfaces, error taxonomy,
-   compatibility rules, and primary file ownership in one tested commit;
-4. root creates three real worktrees, verifies them with `git worktree list`,
-   and starts three subagents simultaneously: Track A protocol/execution, Track
-   B node/storage/API lifecycle, Track C finalized proofs/light client;
-5. each track commits and pushes coherent tested steps; root integrates on
-   `main`, runs full gates, updates the two live status documents, and pushes;
-6. continue autonomously to the first incomplete acceptance gate without asking
-   routine technical questions.
-
-The light-node starting checkpoint is a replaceable design: checkpoint
-validation, candidate sources, and acceptance policy are separate modules. The
-current direction compares independent sources, treats the official source as
-optional, stops on disagreement, and allows explicit operator input. It was
-approved as reviewable, not immutable. All technical choices must record what
-was chosen, why, alternatives, reuse/license, compatibility/migration, evidence,
-and commit.
-
-No owner decision remains inside this bounded objective unless implementation
-uncovers a real conflict with an item that `AGENTS.md` explicitly reserves to
-the owner. Respect Phase 5.5: transparent finalized-transaction proofs may be
-built under this objective, but the real STARK backend must wait until the
-independent core-review gate has passed.
+The first incomplete global `main` item is **Phase 5 economics** in
+`development-plan.md`. It begins with the slashing-severity/downtime schedule
+and the §15.2 bootstrap-issuance proposal, which must be presented to the owner
+with threat models at the Phase 5 freeze. Continue the remaining technical work
+inside Phase 5 autonomously; do not substitute a separately scoped feature goal
+for this global pointer.
 
 ## Completed Phase 4 findings checkpoint (historical)
 
@@ -191,7 +168,7 @@ What landed this session (per-finding detail + commit hashes in `findings.md`):
   contract-compile invariant in ADR-0006. E4/E5 direction recorded there; E7
   phase-gated (no VM).
 
-### Default roadmap context after the bounded transaction objective
+### Phase 5 details and later roadmap
 
 The next phase per `development-plan.md` is **Phase 5 economics**, which opens
 with **owner-owned decisions that must be brought to the owner with a threat
