@@ -377,10 +377,18 @@ runs:
 These rules are standing user instructions. They apply in every current and future
 session, including when the user says only “read `AGENTS.md` and continue.”
 
+- **Work directly on `main`; do not develop on a feature branch.** The owner wants
+  every change committed and pushed to `main` so there is nothing to merge by hand
+  (`docs/decision-record.md` "Process rules" says the same). If the session's
+  environment/harness assigns a different working branch (e.g. a
+  `claude/...` branch) it **conflicts with this rule** — surface the conflict to
+  the owner instead of silently developing on the assigned branch, and default to
+  `main` once the owner confirms. Only use a separate branch if the owner asks for
+  one in that session.
 - **This project always runs in an ephemeral cloud environment.** The container is
   reclaimed after the session, so anything left only on local disk is lost. The
   GitHub repository is the single source of truth: push every coherent change to
-  the designated branch, mid-work and again before ending. Never end a turn with
+  `main`, mid-work and again before ending. Never end a turn with
   committed-but-unpushed work or with valuable uncommitted work.
 - **Commit and push frequently**, not only at the end — after each coherent, tested
   step. A container reclaim mid-session must never be able to lose more than the
