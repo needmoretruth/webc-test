@@ -23,7 +23,6 @@ import {
 import type { SignedTransactionJson } from "./types.js";
 import { signWithWallet, type WebcWallet } from "./wallet.js";
 import {
-  MAX_WALLET_REPLAY_IDS,
   WALLET_MESSAGE_CHANNEL,
   WALLET_MESSAGE_VERSION,
   WalletRequestError,
@@ -114,6 +113,11 @@ interface PermissionGrant {
  * is safe concurrently; requests are queued in arrival order, and persistence
  * writes run inside that same serial queue so they cannot race.
  */
+/** Per-origin cap on cached request responses (S4/S7). */
+const MAX_REPLAY_IDS_PER_ORIGIN = 256;
+/** Cap on distinct origins tracked for replay/idempotency (S4). */
+const MAX_REPLAY_ORIGINS = 64;
+
 export class TrustedWalletService {
   readonly #wallet: WebcWallet;
   readonly #chainId: string;
@@ -122,7 +126,13 @@ export class TrustedWalletService {
   readonly #authorizationPolicyRevision: number;
   readonly #persistence: PermissionPersistencePort | undefined;
   readonly #grants = new Map<string, PermissionGrant>();
-  readonly #replayIds = new Map<string, true>();
+  // Per-origin cache of recent `request_id -> response` (S4/S7). Nesting by
+  // origin bounds each origin independently, so one origin's request flood can
+  // never evict another origin's entries (S4). Storing the response — not just
+  // the id — lets a retried request receive the ORIGINAL answer instead of a
+  // REQUEST_REPLAY failure (S7): retries become idempotent and a replay yields
+  // nothing new (the same signed transaction, already nonce-protected on chain).
+  readonly #responseCache = new Map<string, Map<string, WalletResponse>>();
   #queue: Promise<void> = Promise.resolve();
 
   constructor(options: TrustedWalletServiceOptions) {
@@ -221,36 +231,28 @@ export class TrustedWalletService {
       return;
     }
 
-    const replayKey = `${event.origin}\0${request.request_id}`;
-    if (this.#replayIds.has(replayKey)) {
-      this.#post(
-        event.source,
-        event.origin,
-        failureResponse(
-          request.request_id,
-          "REQUEST_REPLAY",
-          "wallet request ID was already used",
-        ),
-      );
+    // S7: a repeated request_id from the same origin re-sends the ORIGINAL
+    // response (idempotent retry) instead of a REQUEST_REPLAY failure. An honest
+    // client that lost the first response recovers it, and a replay yields
+    // nothing new — the same signed transaction, already nonce-protected on chain.
+    const cached = this.#cachedResponse(event.origin, request.request_id);
+    if (cached) {
+      this.#post(event.source, event.origin, cached);
       return;
     }
-    this.#rememberReplay(replayKey);
 
+    let response: WalletResponse;
     try {
       const result = await this.#dispatch(event.origin, request);
-      this.#post(
-        event.source,
-        event.origin,
-        successResponse(request.request_id, result),
-      );
+      response = successResponse(request.request_id, result);
     } catch (error) {
       const mapped = mapServiceError(error);
-      this.#post(
-        event.source,
-        event.origin,
-        failureResponse(request.request_id, mapped.code, mapped.message),
-      );
+      response = failureResponse(request.request_id, mapped.code, mapped.message);
     }
+    // Requests are processed on a serial queue, so a duplicate arriving during
+    // dispatch runs only after this returns and finds the cached response.
+    this.#cacheResponse(event.origin, request.request_id, response);
+    this.#post(event.source, event.origin, response);
   }
 
   async #dispatch(
@@ -409,11 +411,30 @@ export class TrustedWalletService {
     }
   }
 
-  #rememberReplay(key: string): void {
-    this.#replayIds.set(key, true);
-    if (this.#replayIds.size > MAX_WALLET_REPLAY_IDS) {
-      const oldest = this.#replayIds.keys().next().value as string | undefined;
-      if (oldest) this.#replayIds.delete(oldest);
+  #cachedResponse(origin: string, requestId: string): WalletResponse | undefined {
+    return this.#responseCache.get(origin)?.get(requestId);
+  }
+
+  #cacheResponse(origin: string, requestId: string, response: WalletResponse): void {
+    let perOrigin = this.#responseCache.get(origin);
+    if (!perOrigin) {
+      // Bound the number of tracked origins (S4). A Map preserves insertion
+      // order, so the first key is the least-recently-added origin.
+      if (this.#responseCache.size >= MAX_REPLAY_ORIGINS) {
+        const oldestOrigin = this.#responseCache.keys().next().value as
+          | string
+          | undefined;
+        if (oldestOrigin !== undefined) this.#responseCache.delete(oldestOrigin);
+      }
+      perOrigin = new Map<string, WalletResponse>();
+      this.#responseCache.set(origin, perOrigin);
+    }
+    perOrigin.set(requestId, response);
+    // Bound this origin's cache; only this origin's own entries are evicted, so
+    // a flood from one origin cannot displace another origin's ids (S4).
+    if (perOrigin.size > MAX_REPLAY_IDS_PER_ORIGIN) {
+      const oldest = perOrigin.keys().next().value as string | undefined;
+      if (oldest !== undefined) perOrigin.delete(oldest);
     }
   }
 

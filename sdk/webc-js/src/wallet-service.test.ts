@@ -140,10 +140,16 @@ describe("trusted wallet service", () => {
     });
     expect(source.messages.at(-1)?.targetOrigin).toBe(HOST_ORIGIN);
 
+    // S7: replaying the same request_id re-sends the ORIGINAL response
+    // (idempotent), not a REQUEST_REPLAY failure — the identical signed
+    // transaction, so an honest client that lost the first response recovers it
+    // and an attacker gains nothing new.
     await service.handleMessage({ origin: HOST_ORIGIN, source, data: request });
     const replay = source.messages.at(-1)?.response;
-    expect(replay?.ok).toBe(false);
-    if (replay && !replay.ok) expect(replay.error.code).toBe("REQUEST_REPLAY");
+    expect(replay?.ok).toBe(true);
+    if (replay?.ok && "signature" in replay.result && "signature" in signedResponse.result) {
+      expect(replay.result.signature).toBe(signedResponse.result.signature);
+    }
 
     await service.handleMessage({
       origin: HOST_ORIGIN,
@@ -609,5 +615,53 @@ describe("trusted wallet service persistence", () => {
     const response = source.messages.at(-1)?.response;
     expect(response?.ok).toBe(false);
     if (response && !response.ok) expect(response.error.code).toBe("REQUEST_REPLAY");
+  });
+
+  it("bounds the replay cache per origin so a flood cannot evict another origin's ids (S4)", async () => {
+    const source = new CapturingSource();
+    const service = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source,
+      confirm: async () => true,
+    });
+    const victimOrigin = "https://victim.example";
+    const victimId = requestId("b");
+
+    // The victim origin connects once; its response is cached under its origin.
+    await service.handleMessage({
+      origin: victimOrigin,
+      source,
+      data: connectRequest(victimId),
+    });
+    const first = source.messages.at(-1)?.response;
+    const firstSession =
+      first?.ok && "session_id" in first.result ? first.result.session_id : "";
+    expect(firstSession).not.toBe("");
+
+    // An attacker origin floods far more than MAX_REPLAY_IDS_PER_ORIGIN distinct
+    // request ids. Under the old global FIFO cache this would evict the victim's
+    // entry; per-origin caching confines the eviction to the attacker's own ids.
+    for (let i = 0; i < 300; i++) {
+      const id = i.toString(16).padStart(64, "0");
+      await service.handleMessage({
+        origin: HOST_ORIGIN,
+        source,
+        data: connectRequest(id),
+      });
+    }
+
+    // The victim replays its original request_id and still receives the cached
+    // response (same session), proving the attacker's flood did not evict it.
+    await service.handleMessage({
+      origin: victimOrigin,
+      source,
+      data: connectRequest(victimId),
+    });
+    const replay = source.messages.at(-1)?.response;
+    expect(replay?.ok).toBe(true);
+    const replaySession =
+      replay?.ok && "session_id" in replay.result ? replay.result.session_id : "";
+    expect(replaySession).toBe(firstSession);
   });
 });
