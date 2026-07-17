@@ -28,5 +28,7 @@ bytes = "1"
 # OS randomness for fresh handshake challenges (reused workspace pin).
 rand_core = { workspace = true }
 
+# `io-util` (AsyncReadExt) is test-only: the DoS-hardening tests drive raw
+# sockets to exercise handshake timeouts and connection caps.
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

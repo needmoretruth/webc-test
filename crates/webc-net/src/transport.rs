@@ -18,16 +18,16 @@
 //! seen-frame cache drops duplicates so a message does not loop forever. Peer
 //! discovery is a static bootstrap list for A-1; richer discovery is later work.
 
-use std::collections::{HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use rand_core::{OsRng, RngCore};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use webc_chain::ChainId;
 use webc_crypto::Keypair;
@@ -50,6 +50,66 @@ const PEER_SEND_CAPACITY: usize = 256;
 const RECONNECT_BACKOFF_START_MS: u64 = 500;
 const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
 
+/// Default deadline for completing the full authentication handshake.
+///
+/// Why 10s (finding N1): the four-step challenge/response is a few small frames
+/// over one round trip; even a slow, distant, loaded peer completes it well
+/// under a second. Ten seconds is generous enough never to reject an honest
+/// peer, yet short enough that a stalled or malicious peer cannot pin a task,
+/// socket, and file descriptor for long. A peer that has not authenticated
+/// within this window is dropped and its slot freed, which — together with the
+/// inbound connection cap (N2) — bounds the slowloris FD-exhaustion surface.
+const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Default cap on concurrent in-flight inbound connections.
+///
+/// Why 256 (finding N2): every accepted inbound connection costs a task, a
+/// socket, and a file descriptor until it authenticates or its handshake
+/// deadline (N1) elapses. Capping the total number in flight bounds the
+/// resources an inbound flood can pin at once. 256 is far above the handful of
+/// peers a healthy devnet node keeps, so honest inbound is never refused; beyond
+/// the cap, freshly accepted connections are dropped until a slot frees.
+const DEFAULT_MAX_INBOUND_CONNECTIONS: usize = 256;
+
+/// Default cap on concurrent inbound connections from a single source IP.
+///
+/// Why 8 (finding N2): without a per-source-IP ceiling, one host can consume
+/// every global inbound slot and lock every other peer out — a trivial
+/// single-box connection-exhaustion DoS and an eclipse aid. Eight lets a
+/// legitimately multi-homed or NATed peer open a few connections while keeping
+/// any single address to a small share of accept capacity.
+const DEFAULT_MAX_INBOUND_PER_IP: usize = 8;
+
+/// Default cap on the number of authenticated peers in the peer table.
+///
+/// Why 1024 (finding N3): a successful handshake adds one entry to `peers`, and
+/// the identity key it is keyed on is an unauthenticated name anyone can mint.
+/// Without a cap, a Sybil could inflate the table without bound — growing memory
+/// and, worse, multiplying every gossip message through `flood()` (amplification).
+/// A deterministic hard cap bounds both. 1024 is far beyond the peer count a
+/// healthy devnet node maintains, yet keeps the table and fan-out finite. Beyond
+/// the cap, further authenticated connections are rejected (peer scoring and
+/// eviction of the least useful peer are later work).
+const DEFAULT_MAX_PEERS: usize = 1024;
+
+/// Default per-peer inbound token-bucket burst capacity, in frames.
+///
+/// Why 512 (finding N4): a peer may legitimately deliver a short burst — a batch
+/// of relayed transactions plus a round's worth of consensus proposals/votes —
+/// so the bucket must absorb a spike without dropping honest gossip. 512 frames
+/// is comfortably above any normal burst.
+const DEFAULT_PEER_RATE_CAPACITY: u32 = 512;
+
+/// Default per-peer inbound sustained rate, in frames per second.
+///
+/// Why 256/s (finding N4): one fast peer must not monopolize the single gossip
+/// worker (each inbound frame costs a hash, a decode, and a re-flood) and starve
+/// honest peers. 256 frames/s sustained is far above a healthy peer's steady
+/// gossip volume at devnet block cadence, yet bounds any single peer's share of
+/// the worker; frames beyond the rate are dropped before they cost work and are
+/// re-learned from other peers (a fairness bound, not a correctness one).
+const DEFAULT_PEER_RATE_PER_SEC: u32 = 256;
+
 /// A gossip message received from an authenticated peer.
 #[derive(Clone, Debug)]
 pub struct InboundMessage {
@@ -71,10 +131,37 @@ pub struct NetworkConfig {
     pub bootstrap_peers: Vec<SocketAddr>,
     /// Inbound message queue depth delivered to the node.
     pub inbound_capacity: usize,
+    /// Deadline for completing the authentication handshake (finding N1).
+    ///
+    /// A connection that has not finished the mutual challenge/response within
+    /// this window is dropped so a stalled peer cannot hold resources forever.
+    pub handshake_timeout: std::time::Duration,
+    /// Maximum concurrent in-flight inbound connections (finding N2).
+    ///
+    /// Once this many inbound connections are being handled, freshly accepted
+    /// connections are dropped until a slot frees, bounding a connection flood.
+    pub max_inbound_connections: usize,
+    /// Maximum concurrent inbound connections from any single source IP (N2).
+    ///
+    /// Keeps one host from consuming every inbound slot and locking others out.
+    pub max_inbound_per_ip: usize,
+    /// Maximum number of authenticated peers in the peer table (finding N3).
+    ///
+    /// A deterministic hard cap; connections authenticated beyond it are
+    /// rejected so a Sybil cannot inflate the table or gossip fan-out.
+    pub max_peers: usize,
+    /// Per-peer inbound burst capacity, in frames (finding N4).
+    pub peer_rate_capacity: u32,
+    /// Per-peer inbound sustained rate, in frames per second (finding N4).
+    pub peer_rate_per_sec: u32,
 }
 
 impl NetworkConfig {
-    /// Builds a config with a sensible default inbound queue depth.
+    /// Builds a config with sensible defaults for the DoS-hardening limits.
+    ///
+    /// The public constructor keeps a stable four-argument signature so
+    /// downstream callers (`webc-node`) are unaffected; the hardening limits use
+    /// documented defaults and can be overridden on the returned value in tests.
     pub fn new(
         identity: Keypair,
         chain_id: ChainId,
@@ -87,6 +174,76 @@ impl NetworkConfig {
             listen_addr,
             bootstrap_peers,
             inbound_capacity: 1024,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            max_inbound_connections: DEFAULT_MAX_INBOUND_CONNECTIONS,
+            max_inbound_per_ip: DEFAULT_MAX_INBOUND_PER_IP,
+            max_peers: DEFAULT_MAX_PEERS,
+            peer_rate_capacity: DEFAULT_PEER_RATE_CAPACITY,
+            peer_rate_per_sec: DEFAULT_PEER_RATE_PER_SEC,
+        }
+    }
+}
+
+/// Caps concurrent inbound connections per source IP (finding N2).
+///
+/// The global inbound semaphore alone lets a single host consume every slot; a
+/// per-IP ceiling keeps any one address to a small share of accept capacity.
+/// Tokio has no keyed semaphore, so this is a small counted map — the standard
+/// shape for a per-key connection cap. The `std::sync::Mutex` is held only for
+/// the O(1) increment/decrement and never across an `await`, so it cannot block
+/// the runtime. A returned [`IpConnectionGuard`] decrements the count on drop,
+/// freeing the slot exactly when the connection ends. This is network glue, not
+/// consensus state, so a `HashMap` (non-deterministic iteration) is fine.
+#[derive(Clone)]
+struct IpConnectionLimiter {
+    max_per_ip: usize,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl IpConnectionLimiter {
+    /// Builds a limiter allowing at most `max_per_ip` (≥1) connections per IP.
+    fn new(max_per_ip: usize) -> Self {
+        Self {
+            max_per_ip: max_per_ip.max(1),
+            counts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Reserves a slot for `ip`, or returns `None` if it is already at its cap.
+    ///
+    /// Fails closed on a poisoned lock (returns `None`) rather than panicking on
+    /// a path reachable from network activity.
+    fn try_acquire(&self, ip: IpAddr) -> Option<IpConnectionGuard> {
+        let mut counts = self.counts.lock().ok()?;
+        let entry = counts.entry(ip).or_insert(0);
+        if *entry >= self.max_per_ip {
+            return None;
+        }
+        *entry += 1;
+        Some(IpConnectionGuard {
+            ip,
+            counts: self.counts.clone(),
+        })
+    }
+}
+
+/// Frees one per-IP inbound slot when the connection ends.
+struct IpConnectionGuard {
+    ip: IpAddr,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for IpConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.counts.lock() {
+            if let Some(count) = counts.get_mut(&self.ip) {
+                *count -= 1;
+                if *count == 0 {
+                    // Drop empty entries so the map cannot grow unbounded with
+                    // one entry per distinct attacker IP.
+                    counts.remove(&self.ip);
+                }
+            }
         }
     }
 }
@@ -95,6 +252,12 @@ impl NetworkConfig {
 struct SharedConfig {
     identity: Keypair,
     chain_id: ChainId,
+    /// Deadline bounding the authentication handshake (finding N1).
+    handshake_timeout: std::time::Duration,
+    /// Hard cap on admitted peers (finding N3). A connection acquires one permit
+    /// after authenticating and holds it for its lifetime; when none is available
+    /// the peer is rejected, so the peer table can never exceed the cap.
+    peer_slots: Arc<Semaphore>,
 }
 
 /// Cloneable control handle to a running network worker.
@@ -178,6 +341,10 @@ pub async fn spawn_network(
     let shared = Arc::new(SharedConfig {
         identity: config.identity,
         chain_id: config.chain_id,
+        handshake_timeout: config.handshake_timeout,
+        // One permit per admissible peer (finding N3), shared by every inbound
+        // and outbound connection so the total admitted peer count is bounded.
+        peer_slots: Arc::new(Semaphore::new(config.max_peers.max(1))),
     });
 
     let (events_tx, events_rx) = mpsc::channel::<Event>(1024);
@@ -191,7 +358,12 @@ pub async fn spawn_network(
             let bound = listener.local_addr().ok();
             let cfg = shared.clone();
             let ev = events_tx.clone();
-            tokio::spawn(accept_loop(listener, cfg, ev));
+            // Bound total in-flight inbound connections and per-source-IP
+            // concurrency (finding N2) so an inbound flood cannot exhaust
+            // tasks/sockets/FDs or let one host monopolize accept capacity.
+            let inbound_slots = Arc::new(Semaphore::new(config.max_inbound_connections.max(1)));
+            let ip_limiter = IpConnectionLimiter::new(config.max_inbound_per_ip);
+            tokio::spawn(accept_loop(listener, cfg, ev, inbound_slots, ip_limiter));
             bound
         }
         None => None,
@@ -206,6 +378,8 @@ pub async fn spawn_network(
         commands_rx,
         inbound_tx,
         connected.clone(),
+        config.peer_rate_capacity,
+        config.peer_rate_per_sec,
     ));
 
     Ok((
@@ -219,18 +393,38 @@ pub async fn spawn_network(
     ))
 }
 
-/// Accepts inbound TCP peers and hands each to a connection task.
+/// Accepts inbound TCP peers and hands each to a connection task, subject to the
+/// global and per-IP inbound connection caps (finding N2).
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<SharedConfig>,
     events: mpsc::Sender<Event>,
+    inbound_slots: Arc<Semaphore>,
+    ip_limiter: IpConnectionLimiter,
 ) {
     // A failed accept means the listener socket itself broke; stop accepting
     // (existing peers persist through their own connection tasks).
-    while let Ok((stream, _addr)) = listener.accept().await {
+    while let Ok((stream, addr)) = listener.accept().await {
+        // Global cap: if every inbound slot is in use, drop this connection now
+        // instead of spawning an unbounded handler. The permit is held for the
+        // connection's whole lifetime and released when its task ends.
+        let Ok(permit) = inbound_slots.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        // Per-IP cap: keep one source IP from consuming every remaining slot.
+        let Some(ip_guard) = ip_limiter.try_acquire(addr.ip()) else {
+            drop(permit);
+            drop(stream);
+            continue;
+        };
         let cfg = shared.clone();
         let ev = events.clone();
         tokio::spawn(async move {
+            // Hold both guards for the connection's lifetime; dropping them when
+            // the handler returns frees the global and per-IP slots together.
+            let _permit = permit;
+            let _ip_guard = ip_guard;
             let _ = run_connection(stream, cfg, ev).await;
         });
     }
@@ -279,30 +473,39 @@ async fn run_connection(
         .max_frame_length(MAX_FRAME_BYTES)
         .new_framed(stream);
 
-    // 1. Announce ourselves with a fresh challenge.
-    let our_challenge = random_challenge();
-    let hello = build_hello(&shared.identity, &shared.chain_id, our_challenge);
-    framed.send(Bytes::from(codec::encode(&hello)?)).await?;
+    // Bound the entire authentication handshake with a deadline (finding N1).
+    // Without it, a peer that connects and then stalls — never sending its hello
+    // or its proof — blocks forever at `next_frame`, pinning this task plus the
+    // socket and its file descriptor. Many such half-open connections exhaust the
+    // file-descriptor table (a slowloris DoS). `tokio::time::timeout` drops the
+    // connection on elapse and frees the slot. The deadline covers only the
+    // handshake; once authenticated, the steady-state read loop intentionally has
+    // no such deadline, because a healthy peer may sit idle between gossip frames.
+    let peer_id = match tokio::time::timeout(
+        shared.handshake_timeout,
+        perform_handshake(&mut framed, &shared),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => return Err(NetError::HandshakeTimedOut),
+    };
 
-    // 2. Receive and validate the peer's hello.
-    let peer_hello_bytes = next_frame(&mut framed).await?;
-    let peer_hello: HandshakeHello = codec::decode(&peer_hello_bytes)?;
-    let peer_id = accept_hello(&peer_hello, &shared.chain_id)?;
-    if peer_id == PeerId(shared.identity.public_key()) {
-        // Refuse to peer with ourselves (e.g. a bootstrap list naming us).
-        return Err(NetError::MalformedHandshake);
-    }
+    // Bound the peer table (finding N3). The peer is now authenticated, but its
+    // identity key is an unauthenticated name anyone can mint, so a Sybil could
+    // otherwise add unbounded entries to `peers` — inflating memory and, worse,
+    // multiplying every gossip message through `flood()`. Admit it only if a peer
+    // slot is free; at the cap, reject this connection (it is dropped, freeing its
+    // inbound slot) instead of growing the table. The permit is held for the
+    // connection's lifetime and released when it ends, freeing the slot. Because
+    // the permit is acquired before `Event::Connected` is sent, the worker's
+    // `peers` table can never exceed the cap.
+    let _peer_slot = match shared.peer_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => return Err(NetError::PeerTableFull),
+    };
 
-    // 3. Prove possession of our key over the peer's challenge.
-    let proof = build_proof(&shared.identity, &shared.chain_id, &peer_hello.challenge);
-    framed.send(Bytes::from(codec::encode(&proof)?)).await?;
-
-    // 4. Receive and verify the peer's proof over our challenge.
-    let peer_proof_bytes = next_frame(&mut framed).await?;
-    let peer_proof: HandshakeProof = codec::decode(&peer_proof_bytes)?;
-    verify_peer_proof(peer_id, &shared.chain_id, &our_challenge, &peer_proof)?;
-
-    // Authenticated. Register an outbound queue and start pumping frames.
+    // Authenticated and admitted. Register an outbound queue and start pumping.
     let (out_tx, mut out_rx) = mpsc::channel::<Arc<Vec<u8>>>(PEER_SEND_CAPACITY);
     if events
         .send(Event::Connected {
@@ -347,6 +550,42 @@ async fn run_connection(
     Ok(())
 }
 
+/// Runs the four-step mutual challenge/response, returning the authenticated peer.
+///
+/// This is the exact sequence factored out of [`run_connection`] so the whole of
+/// it can be wrapped in a single deadline (finding N1). It performs no
+/// registration or pumping; on success the returned [`PeerId`] is authenticated
+/// (the peer proved possession of its identity key over our fresh challenge).
+async fn perform_handshake(
+    framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
+    shared: &SharedConfig,
+) -> Result<PeerId, NetError> {
+    // 1. Announce ourselves with a fresh challenge.
+    let our_challenge = random_challenge();
+    let hello = build_hello(&shared.identity, &shared.chain_id, our_challenge);
+    framed.send(Bytes::from(codec::encode(&hello)?)).await?;
+
+    // 2. Receive and validate the peer's hello.
+    let peer_hello_bytes = next_frame(framed).await?;
+    let peer_hello: HandshakeHello = codec::decode(&peer_hello_bytes)?;
+    let peer_id = accept_hello(&peer_hello, &shared.chain_id)?;
+    if peer_id == PeerId(shared.identity.public_key()) {
+        // Refuse to peer with ourselves (e.g. a bootstrap list naming us).
+        return Err(NetError::MalformedHandshake);
+    }
+
+    // 3. Prove possession of our key over the peer's challenge.
+    let proof = build_proof(&shared.identity, &shared.chain_id, &peer_hello.challenge);
+    framed.send(Bytes::from(codec::encode(&proof)?)).await?;
+
+    // 4. Receive and verify the peer's proof over our challenge.
+    let peer_proof_bytes = next_frame(framed).await?;
+    let peer_proof: HandshakeProof = codec::decode(&peer_proof_bytes)?;
+    verify_peer_proof(peer_id, &shared.chain_id, &our_challenge, &peer_proof)?;
+
+    Ok(peer_id)
+}
+
 /// Reads the next length-delimited frame, mapping closure/short-read to typed errors.
 async fn next_frame(
     framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
@@ -364,9 +603,15 @@ async fn worker(
     mut commands_rx: mpsc::UnboundedReceiver<Command>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     connected: Arc<AtomicUsize>,
+    peer_rate_capacity: u32,
+    peer_rate_per_sec: u32,
 ) {
     let mut peers: Vec<(PeerId, mpsc::Sender<Arc<Vec<u8>>>)> = Vec::new();
     let mut seen = SeenCache::new(SEEN_CACHE_CAPACITY);
+    // Per-peer inbound token buckets (finding N4). A bucket's lifetime matches
+    // the peer's: created on `Connected`, dropped on `Disconnected`, so the map
+    // is bounded by the peer table (itself capped by N3).
+    let mut rate_limits: HashMap<PeerId, TokenBucket> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -396,13 +641,33 @@ async fn worker(
                         // Replace any stale duplicate connection to the same peer.
                         peers.retain(|(existing, _)| *existing != peer);
                         peers.push((peer, outbound));
+                        // Start (or reset) this peer's inbound rate budget (N4).
+                        rate_limits.insert(
+                            peer,
+                            TokenBucket::new(
+                                peer_rate_capacity,
+                                peer_rate_per_sec,
+                                tokio::time::Instant::now(),
+                            ),
+                        );
                         connected.store(peers.len(), Ordering::Relaxed);
                     }
                     Some(Event::Disconnected { peer }) => {
                         peers.retain(|(existing, _)| *existing != peer);
+                        rate_limits.remove(&peer);
                         connected.store(peers.len(), Ordering::Relaxed);
                     }
                     Some(Event::Frame { from, bytes }) => {
+                        // Per-peer rate limit FIRST (finding N4), before the hash,
+                        // decode, and re-flood a frame would otherwise cost: a peer
+                        // that exceeds its token bucket has this frame dropped so it
+                        // cannot monopolize the shared worker. Dropped gossip is
+                        // re-learned from other peers.
+                        if let Some(bucket) = rate_limits.get_mut(&from) {
+                            if !bucket.try_admit(tokio::time::Instant::now()) {
+                                continue;
+                            }
+                        }
                         // Suppress loops: only act on the first copy of a frame.
                         if !seen.insert(message_id(&bytes)) {
                             continue;
@@ -451,6 +716,74 @@ fn send_to_peer(
 ) {
     if let Some((_, outbound)) = peers.iter().find(|(peer, _)| *peer == target) {
         let _ = outbound.try_send(frame);
+    }
+}
+
+/// A per-peer token bucket bounding how many inbound frames one peer may force
+/// the shared worker to process (finding N4).
+///
+/// Standard token bucket: up to `capacity` tokens accrue at `refill_per_sec`,
+/// one token is spent per admitted frame, and a frame arriving with the bucket
+/// empty is dropped *before* it costs the worker a hash, a decode, or a re-flood.
+/// This keeps one fast peer from monopolizing the single gossip worker and
+/// starving honest peers — a fairness/throughput bound, not a correctness one:
+/// dropped gossip is re-learned from other peers. It lives in the network worker,
+/// never in a consensus state transition, so reading `tokio::time::Instant` here
+/// is deterministic-irrelevant and allowed. All arithmetic is checked/saturating
+/// so hostile timing can never overflow or panic.
+struct TokenBucket {
+    /// Maximum tokens the bucket can hold (burst size).
+    capacity: u64,
+    /// Tokens replenished per second.
+    refill_per_sec: u64,
+    /// Tokens currently available.
+    tokens: u64,
+    /// Instant the `tokens` count was last brought up to date.
+    last_refill: tokio::time::Instant,
+}
+
+impl TokenBucket {
+    /// Builds a bucket that starts full, so a freshly connected peer may burst
+    /// immediately up to `capacity`.
+    fn new(capacity: u32, refill_per_sec: u32, now: tokio::time::Instant) -> Self {
+        let capacity = u64::from(capacity.max(1));
+        Self {
+            capacity,
+            refill_per_sec: u64::from(refill_per_sec.max(1)),
+            tokens: capacity,
+            last_refill: now,
+        }
+    }
+
+    /// Refills for the elapsed time, then spends one token.
+    ///
+    /// Returns `true` if the frame is admitted, `false` if it must be dropped
+    /// because the peer has exceeded its allowance.
+    fn try_admit(&mut self, now: tokio::time::Instant) -> bool {
+        let elapsed_ms = now.saturating_duration_since(self.last_refill).as_millis();
+        // tokens accrued = elapsed_ms * refill_per_sec / 1000 (integer).
+        let accrued = elapsed_ms.saturating_mul(u128::from(self.refill_per_sec)) / 1000;
+        if accrued >= u128::from(self.capacity) {
+            // Enough time elapsed to fully refill; the bucket is full and all of
+            // the elapsed time is now accounted for.
+            self.tokens = self.capacity;
+            self.last_refill = now;
+        } else if accrued > 0 {
+            let accrued = accrued as u64; // < capacity ≤ u32::MAX, so this fits
+            self.tokens = self.tokens.saturating_add(accrued).min(self.capacity);
+            // Advance `last_refill` only by the whole-token time credited, so the
+            // sub-token remainder is not lost to integer rounding (which would
+            // throttle a peer below its configured rate).
+            let credited_ms =
+                (u128::from(accrued).saturating_mul(1000) / u128::from(self.refill_per_sec)) as u64;
+            self.last_refill += std::time::Duration::from_millis(credited_ms);
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -672,6 +1005,238 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_handshake_is_dropped_after_the_timeout() {
+        use tokio::io::AsyncReadExt;
+        // N1 reproduce: a peer that connects and then stalls (never sends its
+        // hello or proof) must be dropped once the handshake deadline elapses,
+        // freeing the task/socket/FD. Pre-fix the handshake had no deadline, so
+        // the server held the half-open connection forever.
+        let chain = ChainId::devnet();
+        let mut cfg = NetworkConfig::new(
+            Keypair::from_seed([21u8; 32]),
+            chain,
+            Some(loopback()),
+            Vec::new(),
+        );
+        cfg.handshake_timeout = Duration::from_millis(300);
+        let (handle, _rx) = spawn_network(cfg).await.unwrap();
+        let addr = handle.local_addr().expect("listener bound");
+
+        // Raw client: connect, then never send a hello or proof (a slowloris).
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // The server must close the connection once the deadline elapses; we see
+        // that as EOF (read returns 0) or a reset. A per-read timeout keeps the
+        // test from hanging if the server (pre-fix) holds the connection open.
+        let mut buf = [0u8; 1024];
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await {
+                Ok(Ok(0)) => break true,  // EOF: server dropped the stalled peer
+                Ok(Ok(_)) => continue,    // server's own hello bytes; keep reading
+                Ok(Err(_)) => break true, // connection reset also means dropped
+                Err(_) => break false,    // no close within 2s → still held open
+            }
+        };
+        assert!(
+            closed,
+            "server must drop a stalled handshake after the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flooding_peer_is_rate_limited_before_reflood() {
+        // N4 reproduce: a receiver applies a per-peer token bucket to inbound
+        // frames, so a peer that floods many distinct frames has the excess
+        // dropped before they are delivered or reflooded. Pre-fix every frame
+        // was processed, letting one peer monopolize the shared worker.
+        let chain = ChainId::devnet();
+        // Receiver R with a tiny per-peer budget so the cap is easy to observe.
+        let mut r_cfg = NetworkConfig::new(
+            Keypair::from_seed([61u8; 32]),
+            chain.clone(),
+            Some(loopback()),
+            Vec::new(),
+        );
+        r_cfg.peer_rate_capacity = 2;
+        r_cfg.peer_rate_per_sec = 1;
+        let (r_handle, mut r_rx) = spawn_network(r_cfg).await.unwrap();
+        let r_addr = r_handle.local_addr().expect("listener bound");
+
+        // Sender S dials R and then floods.
+        let (s_handle, _s_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([62u8; 32]),
+            chain,
+            None,
+            vec![r_addr],
+        ))
+        .await
+        .unwrap();
+        await_connected(&r_handle, &s_handle).await;
+
+        // Flood 20 DISTINCT transactions back-to-back (distinct so the seen-cache
+        // does not collapse them and each is a genuine inbound frame at R).
+        const SENT: u8 = 20;
+        for i in 0..SENT {
+            s_handle
+                .broadcast(NetMessage::Transaction(Box::new(sample_tx(100 + i))))
+                .unwrap();
+        }
+
+        // Count what R actually delivers in a short window. The refill (1/sec)
+        // credits no whole token inside this window, so only the burst capacity
+        // gets through.
+        let mut delivered = 0usize;
+        let window = tokio::time::Instant::now() + Duration::from_millis(700);
+        loop {
+            let remaining = window.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, r_rx.recv()).await {
+                Ok(Some(_)) => delivered += 1,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(delivered >= 1, "the initial burst must get through");
+        assert!(
+            delivered <= 6,
+            "a flooding peer must be rate-limited (delivered {delivered} of {SENT})"
+        );
+    }
+
+    /// Drives the N2 caps: two raw connections occupy two inbound slots, then a
+    /// real dial-only client must be unable to authenticate until a slot frees.
+    /// With `max_conn`/`max_per_ip` chosen so one of the two caps binds at 2, the
+    /// third peer is blocked; pre-fix (no caps) it connected immediately.
+    async fn assert_inbound_cap_blocks_third(max_conn: usize, max_per_ip: usize, seed: u8) {
+        let chain = ChainId::devnet();
+        let mut server_cfg = NetworkConfig::new(
+            Keypair::from_seed([seed; 32]),
+            chain.clone(),
+            Some(loopback()),
+            Vec::new(),
+        );
+        server_cfg.max_inbound_connections = max_conn;
+        server_cfg.max_inbound_per_ip = max_per_ip;
+        // Keep the two stalled slots held for the whole test (no N1 timeout).
+        server_cfg.handshake_timeout = Duration::from_secs(30);
+        let (server, _server_rx) = spawn_network(server_cfg).await.unwrap();
+        let addr = server.local_addr().expect("listener bound");
+
+        // Occupy two inbound slots with raw connections that never authenticate.
+        let s1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let s2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Let the server accept both and take both slots.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // A real dial-only client tries to join; it must NOT authenticate while
+        // the two slots are held.
+        let (client, _client_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([seed.wrapping_add(100); 32]),
+            chain,
+            None,
+            vec![addr],
+        ))
+        .await
+        .unwrap();
+
+        // Give the client several dial attempts; all must be rejected.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(
+            server.connected_peers(),
+            0,
+            "no peer may authenticate while both inbound slots are occupied"
+        );
+
+        // Free one slot; the client must now be able to connect.
+        drop(s1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.connected_peers() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client must connect once an inbound slot frees"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(s2);
+        // Keep the client handle alive until the assertions complete.
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn global_inbound_connection_cap_is_enforced() {
+        // Global cap binds (per-IP set high): two in-flight connections fill the
+        // two-slot global budget, blocking a third.
+        assert_inbound_cap_blocks_third(2, 64, 31).await;
+    }
+
+    #[tokio::test]
+    async fn per_ip_inbound_connection_cap_is_enforced() {
+        // Per-IP cap binds (global set high): two connections from 127.0.0.1 use
+        // up the per-IP budget of 2, blocking a third from the same address.
+        assert_inbound_cap_blocks_third(64, 2, 41).await;
+    }
+
+    #[tokio::test]
+    async fn peer_table_size_is_capped() {
+        // N3 reproduce: with max_peers = 1, only one authenticated peer is
+        // admitted; a second authenticates but is rejected, so the table never
+        // exceeds the cap. Pre-fix the table grew one entry per handshake, so a
+        // second (or a Sybil flood of) peers would all be admitted.
+        let chain = ChainId::devnet();
+        let mut server_cfg = NetworkConfig::new(
+            Keypair::from_seed([51u8; 32]),
+            chain.clone(),
+            Some(loopback()),
+            Vec::new(),
+        );
+        server_cfg.max_peers = 1;
+        let (server, _server_rx) = spawn_network(server_cfg).await.unwrap();
+        let addr = server.local_addr().expect("listener bound");
+
+        // First peer connects and fills the single slot.
+        let (peer1, _p1_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([52u8; 32]),
+            chain.clone(),
+            None,
+            vec![addr],
+        ))
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.connected_peers() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "first peer must be admitted"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        // Second peer dials and authenticates, but the table is full: it must be
+        // rejected, keeping the admitted peer count at the cap.
+        let (peer2, _p2_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([53u8; 32]),
+            chain,
+            None,
+            vec![addr],
+        ))
+        .await
+        .unwrap();
+        // Give the second peer several dial+handshake attempts.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(
+            server.connected_peers(),
+            1,
+            "peer table must never exceed max_peers, even under Sybil dialing"
+        );
+
+        // Keep both client handles alive through the assertion.
+        drop(peer1);
+        drop(peer2);
+    }
+
+    #[tokio::test]
     async fn peer_on_a_different_chain_is_not_accepted() {
         let (a_handle, _a_rx, a_addr) = spawn_listener(5, ChainId::devnet()).await;
         // B dials A but is on a different chain; the handshake must fail.
@@ -708,5 +1273,35 @@ mod tests {
         assert!(!cache.insert(a)); // still present
         assert!(cache.insert(c)); // evicts `a` (oldest)
         assert!(cache.insert(a)); // `a` was evicted, so it is new again
+    }
+
+    #[tokio::test]
+    async fn token_bucket_bounds_burst_then_refills() {
+        // N4 mechanism, deterministic (synthetic instants, no real waiting): the
+        // bucket admits up to `capacity` at once, denies beyond it, and re-admits
+        // exactly as whole tokens refill; a long idle refills only to capacity.
+        let t0 = tokio::time::Instant::now();
+        let mut bucket = TokenBucket::new(2, 10, t0); // capacity 2, 10 tokens/sec
+
+        assert!(bucket.try_admit(t0), "first burst frame admitted");
+        assert!(bucket.try_admit(t0), "second burst frame admitted");
+        assert!(!bucket.try_admit(t0), "third frame beyond capacity denied");
+
+        // 50ms at 10/sec is under one whole token → still denied.
+        assert!(!bucket.try_admit(t0 + Duration::from_millis(50)));
+
+        // 100ms → exactly one token refilled → one admit, then denied again.
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(bucket.try_admit(t1), "one refilled token admits one frame");
+        assert!(
+            !bucket.try_admit(t1),
+            "no tokens left after spending the refill"
+        );
+
+        // A long idle refills to capacity but never beyond it.
+        let t2 = t1 + Duration::from_secs(60);
+        assert!(bucket.try_admit(t2));
+        assert!(bucket.try_admit(t2));
+        assert!(!bucket.try_admit(t2), "refill is clamped to capacity");
     }
 }
