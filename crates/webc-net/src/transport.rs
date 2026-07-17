@@ -92,6 +92,24 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 8;
 /// eviction of the least useful peer are later work).
 const DEFAULT_MAX_PEERS: usize = 1024;
 
+/// Default per-peer inbound token-bucket burst capacity, in frames.
+///
+/// Why 512 (finding N4): a peer may legitimately deliver a short burst — a batch
+/// of relayed transactions plus a round's worth of consensus proposals/votes —
+/// so the bucket must absorb a spike without dropping honest gossip. 512 frames
+/// is comfortably above any normal burst.
+const DEFAULT_PEER_RATE_CAPACITY: u32 = 512;
+
+/// Default per-peer inbound sustained rate, in frames per second.
+///
+/// Why 256/s (finding N4): one fast peer must not monopolize the single gossip
+/// worker (each inbound frame costs a hash, a decode, and a re-flood) and starve
+/// honest peers. 256 frames/s sustained is far above a healthy peer's steady
+/// gossip volume at devnet block cadence, yet bounds any single peer's share of
+/// the worker; frames beyond the rate are dropped before they cost work and are
+/// re-learned from other peers (a fairness bound, not a correctness one).
+const DEFAULT_PEER_RATE_PER_SEC: u32 = 256;
+
 /// A gossip message received from an authenticated peer.
 #[derive(Clone, Debug)]
 pub struct InboundMessage {
@@ -132,6 +150,10 @@ pub struct NetworkConfig {
     /// A deterministic hard cap; connections authenticated beyond it are
     /// rejected so a Sybil cannot inflate the table or gossip fan-out.
     pub max_peers: usize,
+    /// Per-peer inbound burst capacity, in frames (finding N4).
+    pub peer_rate_capacity: u32,
+    /// Per-peer inbound sustained rate, in frames per second (finding N4).
+    pub peer_rate_per_sec: u32,
 }
 
 impl NetworkConfig {
@@ -156,6 +178,8 @@ impl NetworkConfig {
             max_inbound_connections: DEFAULT_MAX_INBOUND_CONNECTIONS,
             max_inbound_per_ip: DEFAULT_MAX_INBOUND_PER_IP,
             max_peers: DEFAULT_MAX_PEERS,
+            peer_rate_capacity: DEFAULT_PEER_RATE_CAPACITY,
+            peer_rate_per_sec: DEFAULT_PEER_RATE_PER_SEC,
         }
     }
 }
@@ -354,6 +378,8 @@ pub async fn spawn_network(
         commands_rx,
         inbound_tx,
         connected.clone(),
+        config.peer_rate_capacity,
+        config.peer_rate_per_sec,
     ));
 
     Ok((
@@ -577,9 +603,15 @@ async fn worker(
     mut commands_rx: mpsc::UnboundedReceiver<Command>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     connected: Arc<AtomicUsize>,
+    peer_rate_capacity: u32,
+    peer_rate_per_sec: u32,
 ) {
     let mut peers: Vec<(PeerId, mpsc::Sender<Arc<Vec<u8>>>)> = Vec::new();
     let mut seen = SeenCache::new(SEEN_CACHE_CAPACITY);
+    // Per-peer inbound token buckets (finding N4). A bucket's lifetime matches
+    // the peer's: created on `Connected`, dropped on `Disconnected`, so the map
+    // is bounded by the peer table (itself capped by N3).
+    let mut rate_limits: HashMap<PeerId, TokenBucket> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -609,13 +641,33 @@ async fn worker(
                         // Replace any stale duplicate connection to the same peer.
                         peers.retain(|(existing, _)| *existing != peer);
                         peers.push((peer, outbound));
+                        // Start (or reset) this peer's inbound rate budget (N4).
+                        rate_limits.insert(
+                            peer,
+                            TokenBucket::new(
+                                peer_rate_capacity,
+                                peer_rate_per_sec,
+                                tokio::time::Instant::now(),
+                            ),
+                        );
                         connected.store(peers.len(), Ordering::Relaxed);
                     }
                     Some(Event::Disconnected { peer }) => {
                         peers.retain(|(existing, _)| *existing != peer);
+                        rate_limits.remove(&peer);
                         connected.store(peers.len(), Ordering::Relaxed);
                     }
                     Some(Event::Frame { from, bytes }) => {
+                        // Per-peer rate limit FIRST (finding N4), before the hash,
+                        // decode, and re-flood a frame would otherwise cost: a peer
+                        // that exceeds its token bucket has this frame dropped so it
+                        // cannot monopolize the shared worker. Dropped gossip is
+                        // re-learned from other peers.
+                        if let Some(bucket) = rate_limits.get_mut(&from) {
+                            if !bucket.try_admit(tokio::time::Instant::now()) {
+                                continue;
+                            }
+                        }
                         // Suppress loops: only act on the first copy of a frame.
                         if !seen.insert(message_id(&bytes)) {
                             continue;
@@ -664,6 +716,74 @@ fn send_to_peer(
 ) {
     if let Some((_, outbound)) = peers.iter().find(|(peer, _)| *peer == target) {
         let _ = outbound.try_send(frame);
+    }
+}
+
+/// A per-peer token bucket bounding how many inbound frames one peer may force
+/// the shared worker to process (finding N4).
+///
+/// Standard token bucket: up to `capacity` tokens accrue at `refill_per_sec`,
+/// one token is spent per admitted frame, and a frame arriving with the bucket
+/// empty is dropped *before* it costs the worker a hash, a decode, or a re-flood.
+/// This keeps one fast peer from monopolizing the single gossip worker and
+/// starving honest peers — a fairness/throughput bound, not a correctness one:
+/// dropped gossip is re-learned from other peers. It lives in the network worker,
+/// never in a consensus state transition, so reading `tokio::time::Instant` here
+/// is deterministic-irrelevant and allowed. All arithmetic is checked/saturating
+/// so hostile timing can never overflow or panic.
+struct TokenBucket {
+    /// Maximum tokens the bucket can hold (burst size).
+    capacity: u64,
+    /// Tokens replenished per second.
+    refill_per_sec: u64,
+    /// Tokens currently available.
+    tokens: u64,
+    /// Instant the `tokens` count was last brought up to date.
+    last_refill: tokio::time::Instant,
+}
+
+impl TokenBucket {
+    /// Builds a bucket that starts full, so a freshly connected peer may burst
+    /// immediately up to `capacity`.
+    fn new(capacity: u32, refill_per_sec: u32, now: tokio::time::Instant) -> Self {
+        let capacity = u64::from(capacity.max(1));
+        Self {
+            capacity,
+            refill_per_sec: u64::from(refill_per_sec.max(1)),
+            tokens: capacity,
+            last_refill: now,
+        }
+    }
+
+    /// Refills for the elapsed time, then spends one token.
+    ///
+    /// Returns `true` if the frame is admitted, `false` if it must be dropped
+    /// because the peer has exceeded its allowance.
+    fn try_admit(&mut self, now: tokio::time::Instant) -> bool {
+        let elapsed_ms = now.saturating_duration_since(self.last_refill).as_millis();
+        // tokens accrued = elapsed_ms * refill_per_sec / 1000 (integer).
+        let accrued = elapsed_ms.saturating_mul(u128::from(self.refill_per_sec)) / 1000;
+        if accrued >= u128::from(self.capacity) {
+            // Enough time elapsed to fully refill; the bucket is full and all of
+            // the elapsed time is now accounted for.
+            self.tokens = self.capacity;
+            self.last_refill = now;
+        } else if accrued > 0 {
+            let accrued = accrued as u64; // < capacity ≤ u32::MAX, so this fits
+            self.tokens = self.tokens.saturating_add(accrued).min(self.capacity);
+            // Advance `last_refill` only by the whole-token time credited, so the
+            // sub-token remainder is not lost to integer rounding (which would
+            // throttle a peer below its configured rate).
+            let credited_ms =
+                (u128::from(accrued).saturating_mul(1000) / u128::from(self.refill_per_sec)) as u64;
+            self.last_refill += std::time::Duration::from_millis(credited_ms);
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -923,6 +1043,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_flooding_peer_is_rate_limited_before_reflood() {
+        // N4 reproduce: a receiver applies a per-peer token bucket to inbound
+        // frames, so a peer that floods many distinct frames has the excess
+        // dropped before they are delivered or reflooded. Pre-fix every frame
+        // was processed, letting one peer monopolize the shared worker.
+        let chain = ChainId::devnet();
+        // Receiver R with a tiny per-peer budget so the cap is easy to observe.
+        let mut r_cfg = NetworkConfig::new(
+            Keypair::from_seed([61u8; 32]),
+            chain.clone(),
+            Some(loopback()),
+            Vec::new(),
+        );
+        r_cfg.peer_rate_capacity = 2;
+        r_cfg.peer_rate_per_sec = 1;
+        let (r_handle, mut r_rx) = spawn_network(r_cfg).await.unwrap();
+        let r_addr = r_handle.local_addr().expect("listener bound");
+
+        // Sender S dials R and then floods.
+        let (s_handle, _s_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([62u8; 32]),
+            chain,
+            None,
+            vec![r_addr],
+        ))
+        .await
+        .unwrap();
+        await_connected(&r_handle, &s_handle).await;
+
+        // Flood 20 DISTINCT transactions back-to-back (distinct so the seen-cache
+        // does not collapse them and each is a genuine inbound frame at R).
+        const SENT: u8 = 20;
+        for i in 0..SENT {
+            s_handle
+                .broadcast(NetMessage::Transaction(Box::new(sample_tx(100 + i))))
+                .unwrap();
+        }
+
+        // Count what R actually delivers in a short window. The refill (1/sec)
+        // credits no whole token inside this window, so only the burst capacity
+        // gets through.
+        let mut delivered = 0usize;
+        let window = tokio::time::Instant::now() + Duration::from_millis(700);
+        loop {
+            let remaining = window.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, r_rx.recv()).await {
+                Ok(Some(_)) => delivered += 1,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(delivered >= 1, "the initial burst must get through");
+        assert!(
+            delivered <= 6,
+            "a flooding peer must be rate-limited (delivered {delivered} of {SENT})"
+        );
+    }
+
     /// Drives the N2 caps: two raw connections occupy two inbound slots, then a
     /// real dial-only client must be unable to authenticate until a slot frees.
     /// With `max_conn`/`max_per_ip` chosen so one of the two caps binds at 2, the
@@ -1091,5 +1273,35 @@ mod tests {
         assert!(!cache.insert(a)); // still present
         assert!(cache.insert(c)); // evicts `a` (oldest)
         assert!(cache.insert(a)); // `a` was evicted, so it is new again
+    }
+
+    #[tokio::test]
+    async fn token_bucket_bounds_burst_then_refills() {
+        // N4 mechanism, deterministic (synthetic instants, no real waiting): the
+        // bucket admits up to `capacity` at once, denies beyond it, and re-admits
+        // exactly as whole tokens refill; a long idle refills only to capacity.
+        let t0 = tokio::time::Instant::now();
+        let mut bucket = TokenBucket::new(2, 10, t0); // capacity 2, 10 tokens/sec
+
+        assert!(bucket.try_admit(t0), "first burst frame admitted");
+        assert!(bucket.try_admit(t0), "second burst frame admitted");
+        assert!(!bucket.try_admit(t0), "third frame beyond capacity denied");
+
+        // 50ms at 10/sec is under one whole token → still denied.
+        assert!(!bucket.try_admit(t0 + Duration::from_millis(50)));
+
+        // 100ms → exactly one token refilled → one admit, then denied again.
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(bucket.try_admit(t1), "one refilled token admits one frame");
+        assert!(
+            !bucket.try_admit(t1),
+            "no tokens left after spending the refill"
+        );
+
+        // A long idle refills to capacity but never beyond it.
+        let t2 = t1 + Duration::from_secs(60);
+        assert!(bucket.try_admit(t2));
+        assert!(bucket.try_admit(t2));
+        assert!(!bucket.try_admit(t2), "refill is clamped to capacity");
     }
 }
