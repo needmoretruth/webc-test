@@ -490,6 +490,9 @@ mod tests {
     fn tampered_overspend_is_detected_by_validate() {
         let mut mandate = open_mandate();
         mandate.spent = Amount::from_units(1_001);
-        assert!(matches!(mandate.validate(), Err(ChainError::InvalidMandate)));
+        assert!(matches!(
+            mandate.validate(),
+            Err(ChainError::InvalidMandate)
+        ));
     }
 }
