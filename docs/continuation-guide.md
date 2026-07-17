@@ -186,11 +186,28 @@ fast-forwarded to include all of them and is the branch to keep developing on).
 
 ### Exact next work
 
-The next phase per `development-plan.md` is **Phase 5 economics**, which opens
-with **owner-owned decisions that must be brought to the owner with a threat
-model at the freeze, not decided unilaterally**: the slashing-severity
-percentages and downtime schedule, and the §15.2 bootstrap-phase issuance
-proposal. After Phase 5 comes the **Phase 5.5 core freeze + independent security
+**Phase 5 economics is UNBLOCKED (owner decisions taken 2026-07-17).** The two
+freeze-gated owner decisions are made and recorded in `docs/decision-record.md`
+(§ "Consensus and slashing" → the two 2026-07-17 subsections):
+
+- **Slashing severity = aggressive posture.** Severe faults (equivocation /
+  double-sign / invalid transition / fraudulent bridge): 25% whole-pool slash +
+  permanent Tombstone; correlated slash ramps `min(100%, max(25%, 3 ×
+  correlated_fraction))`; downtime past tolerance: 0.1% slash + Jail
+  (re-bondable). Slashed units burned. Figures config-tunable to the config
+  freeze; posture fixed.
+- **Bootstrap issuance = stake-keyed with a supply-% cap + published sunset
+  criteria** (base 10%→1% schedule unchanged, resumes on bootstrap exit).
+
+Remaining Phase 5 work is standard economic implementation (much already built —
+delegation, epoch snapshots, commission/reward accounting, inflation curve,
+unbonding/slashable window). The freeze-gated core to build now is **slashing
+execution** (apply the decided severe/correlated/downtime penalties to state
+with objective evidence, Tombstone/Jail lifecycle) and **bootstrap issuance**
+(stake-keyed capped budget + sunset), each reproduce-then-fix with the full
+gate. Then the lighter tasks: public validator perf/reward/slash data, faucet
+devnet staking UX, and the stake-locked-grant / vest-by-operation primitives for
+Phase 16. After Phase 5 comes the **Phase 5.5 core freeze + independent security
 review**, whose per-finding prerequisite this session satisfied.
 
 **Owner-owned items still deferred** (do not decide alone; full list in AGENTS.md

@@ -98,6 +98,60 @@ here (do not re-litigate; plan within them — §16 rules of engagement):
 - No zero-collateral block-producing validator path.
 - Splitting the same stake across identities must not increase voting power.
 
+#### Slashing severity — owner-decided at the 2026-07-17 economics freeze
+
+The owner selected the **aggressive** severity posture (strong deterrence,
+accepting higher operator risk). Concrete parameters below are the chosen
+defaults for this posture; exact figures remain **config-tunable up to the
+configuration freeze**, but the posture (severe = large slash + permanent
+tombstone; downtime = small slash + jail; coordinated = correlated slash) is
+fixed.
+
+- **Severe faults** (conflicting signed votes/blocks — equivocation/double-sign,
+  objectively invalid signed transitions, fraudulent signed bridge messages):
+  slash **25%** of the offender's **whole pool** (operator self-stake plus
+  delegated stake, pro-rata — delegators share the operator's risk, which is
+  what makes delegation a security signal rather than free leverage) and
+  **Tombstone** the pool (permanent exclusion; the consensus key is banned so a
+  re-registration with the same key cannot rejoin).
+- **Correlated slashing** for coordinated provable attacks: the severe fraction
+  ramps with the share of total active stake that committed the same fault in
+  the same evidence window — `slash_fraction = min(100%, max(25%,
+  CORRELATION_MULTIPLIER × correlated_fraction))` with `CORRELATION_MULTIPLIER =
+  3` (Ethereum-style): an isolated fault costs the 25% floor, while a
+  near-majority coordinated equivocation approaches a 100% slash. The multiplier
+  and floor are config values.
+- **Downtime / liveness faults** (missed signatures beyond a tolerance window):
+  a small **0.1%** (10 bps) slash of the whole pool plus **Jail** (temporary
+  exclusion, re-bondable after a jail cooldown of a few epochs). Ordinary
+  operational mistakes stay in the "lost rewards + soft, proportionate penalty"
+  band per the principle above; only sustained downtime past the tolerance
+  triggers the slash.
+- All slashing still requires **objective signed evidence**; nothing here
+  changes the evidence rule. Slashed units are burned (removed from
+  circulating/minted accounting via `slashed_units`), never redistributed to the
+  reporter, to avoid a bounty incentive to manufacture faults.
+
+#### Bootstrap-phase issuance (§15.2) — owner-decided at the 2026-07-17 economics freeze
+
+The owner adopted **stake-keyed issuance with a supply-percentage cap** for the
+labeled bootstrap phase (the base schedule — 10%/yr decaying ×0.8/yr to a 1%
+floor — is unchanged and resumes after bootstrap exit):
+
+- During the bootstrap phase the reward budget is **`rate × total staked`,
+  hard-capped at a configured percentage of total supply per period**, so a tiny
+  early staking base cannot capture outsized *absolute* issuance (the cap binds
+  when stake is low; the stake-keying binds when stake is high).
+- **Published sunset criteria** (validator count, stake dispersion, distribution
+  progress) close the bootstrap phase; on exit the base schedule applies. The
+  exact sunset thresholds and the bootstrap rate/cap are config values published
+  with the distribution specification before the incentivized program starts
+  (Phase 16), but the *mechanism* (stake-keyed, capped, sunset-gated) is fixed
+  here.
+- This composes with the already-decided 5% validator-bootstrap grant ceiling
+  (§15.10) and the 30% contributor pool: grants seed operators; bootstrap
+  issuance funds ongoing validation while the staking base is thin.
+
 ### Bridge safety
 
 - Ethereum-side bridge contracts are written/audited in Solidity; Solana-side
