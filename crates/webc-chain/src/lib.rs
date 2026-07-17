@@ -437,7 +437,9 @@ pub enum ChainError {
     InvalidTokenMetadata,
     #[error("token issued supply overflowed the maximum representable amount")]
     TokenSupplyOverflow,
-    #[error("an nft collection is already registered for this namespace, creator, and create nonce")]
+    #[error(
+        "an nft collection is already registered for this namespace, creator, and create nonce"
+    )]
     NftCollectionAlreadyExists,
     #[error("no nft collection is registered for this collection id")]
     NftCollectionNotFound,

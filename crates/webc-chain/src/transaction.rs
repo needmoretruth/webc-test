@@ -1573,10 +1573,7 @@ impl Operation {
                 // ownership write, and the read-only collection key covers the paused
                 // read.
                 push_unique_key(&mut read_only, StateKey::nft_collection(*collection_id));
-                push_unique_key(
-                    &mut read_write,
-                    StateKey::nft_item(*collection_id, *serial),
-                );
+                push_unique_key(&mut read_write, StateKey::nft_item(*collection_id, *serial));
             }
             Self::BurnNft {
                 collection_id,
@@ -1586,10 +1583,7 @@ impl Operation {
                 // `burned_count` (writes the collection record). The owner and frozen
                 // checks read the item key we already write.
                 push_unique_key(&mut read_write, StateKey::nft_collection(*collection_id));
-                push_unique_key(
-                    &mut read_write,
-                    StateKey::nft_item(*collection_id, *serial),
-                );
+                push_unique_key(&mut read_write, StateKey::nft_item(*collection_id, *serial));
             }
             Self::SetNftCollectionPaused { collection_id, .. }
             | Self::SetNftAuthority { collection_id, .. } => {
@@ -1610,10 +1604,7 @@ impl Operation {
                 // item's `frozen` flag is the only write. Freezing moves no native
                 // units.
                 push_unique_key(&mut read_only, StateKey::nft_collection(*collection_id));
-                push_unique_key(
-                    &mut read_write,
-                    StateKey::nft_item(*collection_id, *serial),
-                );
+                push_unique_key(&mut read_write, StateKey::nft_item(*collection_id, *serial));
             }
             Self::InvokeContract {
                 code_id,
