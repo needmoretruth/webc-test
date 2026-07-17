@@ -23,6 +23,8 @@
 //! that the tip's block and state are actually present and hash-consistent,
 //! reporting any mismatch as [`StorageError::Inconsistent`] or
 //! [`StorageError::Corruption`] so the node fails closed on a damaged store.
+//! Every typed record passes through the shared bounded storage codec before a
+//! write or after a backend read; no caller decodes unbounded stored bincode.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +35,7 @@ use webc_crypto::Hash256;
 
 use crate::error::StorageError;
 use crate::kv::{KvStore, Table, WriteBatch};
+use crate::record_codec::{decode, encode, StoredRecordKind};
 
 /// On-disk schema version for the typed chain layout.
 ///
@@ -117,7 +120,7 @@ impl<K: KvStore> ChainStore<K> {
                 batch.put(
                     Table::Meta,
                     META_CHAIN_ID,
-                    bincode::serialize(expected_chain_id)?,
+                    encode(StoredRecordKind::ChainId, expected_chain_id)?,
                 );
                 store.commit(batch)?;
             }
@@ -137,7 +140,7 @@ impl<K: KvStore> ChainStore<K> {
                 let stored = store
                     .get(Table::Meta, META_CHAIN_ID)?
                     .ok_or_else(|| StorageError::Corruption("stored chain id is missing".into()))?;
-                let stored_chain_id: ChainId = decode(&stored)?;
+                let stored_chain_id: ChainId = decode(StoredRecordKind::ChainId, &stored)?;
                 if &stored_chain_id != expected_chain_id {
                     return Err(StorageError::ChainIdMismatch {
                         expected: expected_chain_id.to_string(),
@@ -212,7 +215,7 @@ impl<K: KvStore> ChainStore<K> {
             }
             return Ok(());
         }
-        let state_bytes = bincode::serialize(genesis)?;
+        let state_bytes = encode(StoredRecordKind::StateSnapshot, genesis)?;
         let tip = ChainTip {
             height: 0,
             block_hash: None,
@@ -220,7 +223,11 @@ impl<K: KvStore> ChainStore<K> {
         };
         let mut batch = WriteBatch::new();
         batch.put(Table::StateSnapshots, be(0).to_vec(), state_bytes);
-        batch.put(Table::Meta, META_TIP, bincode::serialize(&tip)?);
+        batch.put(
+            Table::Meta,
+            META_TIP,
+            encode(StoredRecordKind::ChainTip, &tip)?,
+        );
         self.store.commit(batch)
     }
 
@@ -271,8 +278,8 @@ impl<K: KvStore> ChainStore<K> {
             .block
             .hash()
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
-        let block_bytes = bincode::serialize(commit.block)?;
-        let state_bytes = bincode::serialize(commit.state)?;
+        let block_bytes = encode(StoredRecordKind::Block, commit.block)?;
+        let state_bytes = encode(StoredRecordKind::StateSnapshot, commit.state)?;
         let new_tip = ChainTip {
             height: header.height,
             block_hash: Some(block_hash),
@@ -298,14 +305,14 @@ impl<K: KvStore> ChainStore<K> {
             batch.put(
                 Table::ValidatorSets,
                 be(header.epoch).to_vec(),
-                bincode::serialize(validator_set)?,
+                encode(StoredRecordKind::ValidatorSet, validator_set)?,
             );
         }
         if let Some(certificate) = commit.certificate {
             batch.put(
                 Table::Certificates,
                 be(header.height).to_vec(),
-                bincode::serialize(certificate)?,
+                encode(StoredRecordKind::FinalityCertificate, certificate)?,
             );
         }
         // The consensus journal for this height is obsolete the moment the
@@ -315,7 +322,11 @@ impl<K: KvStore> ChainStore<K> {
         batch.delete(Table::ConsensusWal, be(header.height).to_vec());
         // The tip advances in the same batch, so it is never observable ahead of
         // its block or state.
-        batch.put(Table::Meta, META_TIP, bincode::serialize(&new_tip)?);
+        batch.put(
+            Table::Meta,
+            META_TIP,
+            encode(StoredRecordKind::ChainTip, &new_tip)?,
+        );
         self.store.commit(batch)
     }
 
@@ -323,7 +334,7 @@ impl<K: KvStore> ChainStore<K> {
     pub fn tip(&self) -> Result<Option<ChainTip>, StorageError> {
         match self.store.get(Table::Meta, META_TIP)? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            Some(bytes) => Ok(Some(decode(StoredRecordKind::ChainTip, &bytes)?)),
         }
     }
 
@@ -331,7 +342,7 @@ impl<K: KvStore> ChainStore<K> {
     pub fn block_by_height(&self, height: u64) -> Result<Option<Block>, StorageError> {
         match self.store.get(Table::Blocks, &be(height))? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            Some(bytes) => Ok(Some(decode(StoredRecordKind::Block, &bytes)?)),
         }
     }
 
@@ -358,7 +369,7 @@ impl<K: KvStore> ChainStore<K> {
     pub fn state_at_height(&self, height: u64) -> Result<Option<ChainState>, StorageError> {
         match self.store.get(Table::StateSnapshots, &be(height))? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            Some(bytes) => Ok(Some(decode(StoredRecordKind::StateSnapshot, &bytes)?)),
         }
     }
 
@@ -374,7 +385,7 @@ impl<K: KvStore> ChainStore<K> {
     pub fn validator_set(&self, epoch: u64) -> Result<Option<ValidatorSet>, StorageError> {
         match self.store.get(Table::ValidatorSets, &be(epoch))? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            Some(bytes) => Ok(Some(decode(StoredRecordKind::ValidatorSet, &bytes)?)),
         }
     }
 
@@ -382,7 +393,7 @@ impl<K: KvStore> ChainStore<K> {
     pub fn certificate(&self, height: u64) -> Result<Option<FinalityCertificate>, StorageError> {
         match self.store.get(Table::Certificates, &be(height))? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            Some(bytes) => Ok(Some(decode(StoredRecordKind::FinalityCertificate, &bytes)?)),
         }
     }
 
@@ -399,7 +410,7 @@ impl<K: KvStore> ChainStore<K> {
         batch.put(
             Table::ConsensusWal,
             be(record.height).to_vec(),
-            bincode::serialize(record)?,
+            encode(StoredRecordKind::ConsensusWal, record)?,
         );
         self.store.commit(batch)
     }
@@ -410,7 +421,7 @@ impl<K: KvStore> ChainStore<K> {
     pub fn consensus_wal(&self, height: u64) -> Result<Option<ConsensusWalRecord>, StorageError> {
         match self.store.get(Table::ConsensusWal, &be(height))? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            Some(bytes) => Ok(Some(decode(StoredRecordKind::ConsensusWal, &bytes)?)),
         }
     }
 
@@ -419,12 +430,6 @@ impl<K: KvStore> ChainStore<K> {
     pub fn backend(&self) -> &K {
         &self.store
     }
-}
-
-/// Decodes a bincode value, mapping any failure to a corruption error.
-fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, StorageError> {
-    bincode::deserialize(bytes)
-        .map_err(|error| StorageError::Corruption(format!("stored value is malformed: {error}")))
 }
 
 /// Decodes a 4-byte big-endian `u32`, or `None` if the length is wrong.
@@ -444,6 +449,23 @@ mod tests {
     use webc_crypto::Keypair;
 
     use crate::{MemoryKvStore, RedbKvStore};
+
+    /// Stamps the fixed schema and a valid devnet chain-id record so tests can
+    /// inject one hostile record without `open` rejecting unrelated metadata.
+    fn stamp_schema(store: &mut impl KvStore) {
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Table::Meta,
+            META_SCHEMA_VERSION.to_vec(),
+            CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            Table::Meta,
+            META_CHAIN_ID.to_vec(),
+            encode(StoredRecordKind::ChainId, &ChainId::devnet()).unwrap(),
+        );
+        store.commit(batch).unwrap();
+    }
 
     /// A distinct genesis-shaped state per epoch, so successive blocks commit to
     /// different state roots (letting tests observe the latest snapshot change).
@@ -548,6 +570,79 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = RedbKvStore::open(dir.path().join("chain.redb")).unwrap();
         exercise_lifecycle(backend);
+    }
+
+    #[test]
+    fn block_read_rejects_an_over_limit_backend_record_before_decode() {
+        let mut backend = MemoryKvStore::new();
+        stamp_schema(&mut backend);
+        let oversized_len = usize::try_from(StoredRecordKind::Block.max_bytes()).unwrap() + 1;
+        let mut batch = WriteBatch::new();
+        batch.put(Table::Blocks, be(1).to_vec(), vec![0u8; oversized_len]);
+        backend.commit(batch).unwrap();
+
+        let store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        let error = store.block_by_height(1).unwrap_err();
+        assert!(matches!(error, StorageError::Corruption(_)));
+        assert!(error.to_string().contains("oversized"));
+    }
+
+    #[test]
+    fn block_read_rejects_trailing_persisted_bytes() {
+        let mut backend = MemoryKvStore::new();
+        stamp_schema(&mut backend);
+        let block = block_for(&state_at_epoch(1), 1, Hash256::ZERO);
+        let mut bytes = encode(StoredRecordKind::Block, &block).unwrap();
+        bytes.push(0xaa);
+        let mut batch = WriteBatch::new();
+        batch.put(Table::Blocks, be(1).to_vec(), bytes);
+        backend.commit(batch).unwrap();
+
+        let store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        assert!(matches!(
+            store.block_by_height(1).unwrap_err(),
+            StorageError::Corruption(_)
+        ));
+    }
+
+    #[test]
+    fn wal_read_rejects_a_forged_collection_length_prefix() {
+        let mut backend = MemoryKvStore::new();
+        stamp_schema(&mut backend);
+        // ConsensusWalRecord begins with `height: u64`, then a Vec of signed
+        // proposals. The second u64 claims an impossible element count while
+        // the complete stored record is only sixteen bytes.
+        let mut forged = 1u64.to_le_bytes().to_vec();
+        forged.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut batch = WriteBatch::new();
+        batch.put(Table::ConsensusWal, be(1).to_vec(), forged);
+        backend.commit(batch).unwrap();
+
+        let store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        assert!(matches!(
+            store.consensus_wal(1).unwrap_err(),
+            StorageError::Corruption(_)
+        ));
+    }
+
+    #[test]
+    fn redb_reopen_reports_a_corrupt_persisted_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt-record.redb");
+        {
+            let mut backend = RedbKvStore::open(&path).unwrap();
+            stamp_schema(&mut backend);
+            let mut batch = WriteBatch::new();
+            batch.put(Table::Blocks, be(9).to_vec(), vec![0xff, 0x00, 0x01]);
+            backend.commit(batch).unwrap();
+        }
+
+        let reopened =
+            ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
+        assert!(matches!(
+            reopened.block_by_height(9).unwrap_err(),
+            StorageError::Corruption(_)
+        ));
     }
 
     #[test]
@@ -696,7 +791,7 @@ mod tests {
         batch.put(
             Table::Meta,
             META_CHAIN_ID.to_vec(),
-            bincode::serialize(&ChainId::devnet()).unwrap(),
+            encode(StoredRecordKind::ChainId, &ChainId::devnet()).unwrap(),
         );
         let tip = ChainTip {
             height: 5,
@@ -706,7 +801,7 @@ mod tests {
         batch.put(
             Table::Meta,
             META_TIP.to_vec(),
-            bincode::serialize(&tip).unwrap(),
+            encode(StoredRecordKind::ChainTip, &tip).unwrap(),
         );
         backend.commit(batch).unwrap();
         let err = ChainStore::open(backend, &ChainId::devnet()).unwrap_err();
