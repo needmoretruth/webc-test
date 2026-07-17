@@ -271,6 +271,19 @@ not deeply audited.
   key tiebreak); `seal_block` calls `prune_expired` before selection. Reproduced
   first by `full_pool_evicts_lowest_fee_for_a_strictly_higher_bidder` and
   `seal_prunes_expired_transactions`.
+  - **Hardening follow-up (adversarial re-verification).** The first eviction rule
+    ranked purely by effective fee and was *runnability-blind*: a gapped-nonce bid
+    (nonce far above the sender's expected nonce) is never sealable — `select_block`
+    skips gaps — yet could evict an honest *runnable* tx by merely nominating a
+    higher fee, and never actually pay. Repeated across the future-nonce-gap window
+    this evicts up to `max_future_nonce_gap` honest txs per account for free — the
+    exact "free churn" the guard claimed to prevent. **Fix:** eviction now ranks by
+    the value tuple `(is_runnable, effective_fee)` where `is_runnable =
+    (nonce == expected_nonce)`; the least-valuable entry is evicted only for a
+    strictly more valuable newcomer. A non-runnable bid can no longer displace a
+    runnable entry, and a runnable newcomer actively clears parked non-runnable junk.
+    Reproduced first by `full_pool_gapped_bid_cannot_evict_a_runnable_transaction`
+    (with `full_pool_runnable_bid_evicts_a_parked_gap_entry` locking the dual).
 - **H3 — MEDIUM — RESOLVED (commit `ec327c7`) — unbounded WebSocket
   subscriptions.** `ws.on_upgrade` accepted unlimited concurrent, unauthenticated
   subscribers (FD/memory DoS). **Fix:** an atomic counter caps live subscriptions

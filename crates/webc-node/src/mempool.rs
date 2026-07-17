@@ -229,27 +229,49 @@ impl Mempool {
                 if self.entries.len() >= self.config.max_transactions {
                     // H2: the pool is full. Rejecting outright lets a base-fee
                     // flood permanently block higher-fee honest transactions, so
-                    // instead evict the lowest-effective-fee entry — but only for
-                    // a STRICTLY higher bidder, so eviction cannot be abused to
-                    // churn the pool for free. Effective fee is computed at the
-                    // current base fee; an entry that no longer meets it ranks
-                    // lowest (fee 0) and is evicted first.
+                    // instead evict the LEAST valuable entry for a strictly more
+                    // valuable newcomer. "Value" is `(runnable, effective_fee)`: a
+                    // transaction sitting at exactly its sender/lane's expected
+                    // next nonce is immediately includable and outranks any gapped
+                    // (non-runnable) transaction regardless of the bid. This is
+                    // what keeps eviction free of churn abuse: a gapped bid can
+                    // never be sealed (`select_block` skips gaps) so it would never
+                    // actually pay, and therefore must not be able to evict a
+                    // runnable honest transaction by merely nominating a high fee.
+                    // Within the same runnability class the higher effective fee
+                    // wins; an entry that no longer meets the base fee ranks fee 0.
+                    // Conversely a runnable newcomer *can* evict parked non-runnable
+                    // junk even at a lower nominal fee, actively clearing the pool
+                    // of never-includable transactions.
                     let base_fee = state.current_base_fee_per_unit;
-                    let incoming_fee = tx.fee.effective_fee_per_unit(base_fee).unwrap_or(0);
-                    let lowest = self
+                    let is_runnable = |sender, lane, nonce| {
+                        matches!(
+                            Self::expected_nonce(state, sender, lane),
+                            Some(expected) if nonce == expected
+                        )
+                    };
+                    let incoming_value = (
+                        is_runnable(tx.sender, tx.authorization_lane, tx.nonce),
+                        tx.fee.effective_fee_per_unit(base_fee).unwrap_or(0),
+                    );
+                    let victim = self
                         .entries
                         .iter()
                         .map(|(entry_key, entry)| {
+                            let (sender, lane, nonce) = *entry_key;
                             (
                                 *entry_key,
-                                entry.tx.fee.effective_fee_per_unit(base_fee).unwrap_or(0),
+                                (
+                                    is_runnable(sender, lane, nonce),
+                                    entry.tx.fee.effective_fee_per_unit(base_fee).unwrap_or(0),
+                                ),
                             )
                         })
                         .min_by(|left, right| {
                             left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0))
                         });
-                    match lowest {
-                        Some((evict_key, lowest_fee)) if incoming_fee > lowest_fee => {
+                    match victim {
+                        Some((evict_key, victim_value)) if incoming_value > victim_value => {
                             self.entries.remove(&evict_key);
                         }
                         _ => return Err(MempoolError::Full),
@@ -527,6 +549,83 @@ mod tests {
             Err(MempoolError::Full)
         ));
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn full_pool_gapped_bid_cannot_evict_a_runnable_transaction() {
+        // H2 hardening: a gapped (non-runnable) transaction can never be sealed —
+        // `select_block` skips it forever — so it must not be able to evict a
+        // runnable honest transaction merely by nominating a high fee. Otherwise
+        // an attacker parks high-bid, never-includable transactions to churn
+        // honest traffic out of a full pool for free (the free-churn vector the
+        // eviction path claimed to prevent).
+        let a = keypair(1);
+        let b = keypair(2);
+        let z = keypair(9);
+        let (state, config) = funded_state(&[(&a, 1_000), (&b, 1_000), (&z, 1_000)]);
+        let mut pool = Mempool::new(MempoolConfig {
+            max_transactions: 2,
+            ..MempoolConfig::default()
+        });
+
+        // Fill the pool with two runnable (nonce 0) honest transactions.
+        pool.insert(transfer(&a, &b, 1, 0, 100, 1, 1_000), &state, &config, NOW)
+            .unwrap();
+        pool.insert(transfer(&b, &a, 1, 0, 100, 1, 1_000), &state, &config, NOW)
+            .unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // A gapped high-fee bid (nonce 5 while the sender's expected nonce is 0,
+        // effective fee 10) is rejected, not admitted by evicting a runnable
+        // honest entry.
+        assert!(matches!(
+            pool.insert(transfer(&z, &a, 1, 5, 100, 10, 1_000), &state, &config, NOW),
+            Err(MempoolError::Full)
+        ));
+        assert_eq!(pool.len(), 2);
+        // Both honest runnable transactions survive and still seal.
+        let block = pool.select_block(&state, &config, u64::MAX, NOW);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn full_pool_runnable_bid_evicts_a_parked_gap_entry() {
+        // The dual of the guard above: a runnable newcomer outranks a parked
+        // non-runnable entry even at a lower nominal fee, so honest traffic
+        // actively clears never-includable junk from a full pool.
+        let a = keypair(1);
+        let z = keypair(9);
+        let c = keypair(3);
+        let (state, config) = funded_state(&[(&a, 1_000), (&z, 1_000), (&c, 1_000)]);
+        let mut pool = Mempool::new(MempoolConfig {
+            max_transactions: 2,
+            ..MempoolConfig::default()
+        });
+
+        // Fill the pool with one runnable honest tx and one parked gapped
+        // high-fee tx (admitted while the pool still had room).
+        pool.insert(transfer(&a, &z, 1, 0, 100, 1, 1_000), &state, &config, NOW)
+            .unwrap();
+        pool.insert(transfer(&z, &a, 1, 5, 100, 50, 1_000), &state, &config, NOW)
+            .unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // A runnable newcomer at a *lower* fee than the parked bid still gets in,
+        // evicting the non-runnable junk rather than the runnable honest entry.
+        let outcome = pool
+            .insert(transfer(&c, &a, 1, 0, 100, 1, 1_000), &state, &config, NOW)
+            .unwrap();
+        assert!(matches!(outcome, InsertOutcome::Added));
+        assert_eq!(pool.len(), 2);
+
+        // The two runnable transactions (a, c) remain and seal; the parked gap
+        // entry (z) is gone.
+        let block = pool.select_block(&state, &config, u64::MAX, NOW);
+        assert_eq!(block.len(), 2);
+        let senders: std::collections::BTreeSet<_> = block.iter().map(|tx| tx.sender).collect();
+        assert!(senders.contains(&a.address()));
+        assert!(senders.contains(&c.address()));
+        assert!(!senders.contains(&z.address()));
     }
 
     #[test]
