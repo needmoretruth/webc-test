@@ -364,15 +364,19 @@ and independent external review before production use.
 
 ## Goal progress checkpoint
 
-Checkpoint on 2026-07-17: the isolated branch is pushed through `5e65a8a`.
+Checkpoint on 2026-07-18: the isolated branch is pushed through `d25eb57`.
 Baseline fixes removed a Rust 1.96 clippy type-complexity failure and gave the
 browser permission-store KDF tests their existing 15-second cryptographic test
 budget. A fresh-target Rust full gate passed (`fmt`, strict workspace clippy,
 workspace tests, rustdoc, and node demo), and exact pnpm 11.7.0 `pnpm check`
-passed. Three read-only audits completed in verified worktrees; ADR-0012 records
-their shared interface decision. Implementation has not started. Exact next
-item: commit and push the interface freeze, then implement the V5 typed protocol
-and cross-language fixtures before node/storage/proof consumers.
+passed. Three read-only audits completed in verified worktrees; ADR-0012 and
+`4d54170` freeze their shared interfaces. `d25eb57` adds the versioned
+`FeeSummaryV1` accounting boundary with checked conservation, exact decimal JSON
+values, payer metadata, and focused tests while leaving legacy V4 execution
+unchanged. V5 wire/SDK, bounded storage codec, and indexed transparent Merkle
+proof foundations are active on their verified isolated branches. Exact next
+item: integrate and test the V5 wire/SDK foundation, then the storage and proof
+foundations, before wiring V5 execution and durable lifecycle consumers.
 
 While the goal runs, update this branch-local section after each integrated
 milestone with the last pushed commit, passed tests, remaining limitation, and
