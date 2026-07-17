@@ -2771,7 +2771,8 @@ mod tests {
         // the easiest to add and forget.
         let (_config, base, _a, _b) = funded_state();
         let root = base.state_root().unwrap();
-        let mutators: Vec<(&str, fn(&mut ChainState))> = vec![
+        type NamedStateMutator = (&'static str, fn(&mut ChainState));
+        let mutators: Vec<NamedStateMutator> = vec![
             ("burned_fees", |s| {
                 s.burned_fees = Amount::from_units(s.burned_fees.0 + 1)
             }),
