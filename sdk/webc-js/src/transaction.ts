@@ -2245,6 +2245,9 @@ const NFT_COLLECTION_ID_DOMAIN = new TextEncoder().encode(
 const GOVERNANCE_INSTANCE_ID_DOMAIN = new TextEncoder().encode(
   "WEBC_GOV_INSTANCE_ID_V1",
 );
+const GOVERNANCE_PROPOSAL_ID_DOMAIN = new TextEncoder().encode(
+  "WEBC_GOV_PROPOSAL_ID_V1",
+);
 const GOV_VOTE_ESCROW_DOMAIN = new TextEncoder().encode(
   "WEBC_GOV_VOTE_ESCROW_V1",
 );
@@ -2328,6 +2331,26 @@ export function deriveGovernanceInstanceIdHex(
     creator,
     createNonce,
   );
+}
+
+/**
+ * Derives a governance proposal id from `(instanceId, proposalNonce)`, mirroring
+ * Rust `ProposalId::derive`: `SHA-256("WEBC_GOV_PROPOSAL_ID_V1" || instance_id ||
+ * proposal_nonce_be)`, lowercase hex. The nonce is the instance's monotonic
+ * `next_proposal_nonce` at open time (never reused), so the id is unique for the
+ * instance's life. An `OpenProposal` submitted under the read nonce lands on this
+ * id; if a racing proposal consumes the nonce first, re-read the instance.
+ */
+export function deriveGovernanceProposalIdHex(
+  instanceId: HexString,
+  proposalNonce: number,
+): Promise<string> {
+  requireHash256Hex(instanceId, "governance instance id");
+  return digestManyHex([
+    GOVERNANCE_PROPOSAL_ID_DOMAIN,
+    hexToBytes(instanceId),
+    nonceBe(proposalNonce, "proposal nonce"),
+  ]);
 }
 
 /**
