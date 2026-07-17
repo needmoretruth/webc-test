@@ -19,9 +19,13 @@
  *
  * The module composes the existing operation builders in `transaction.ts`; it
  * does NOT re-implement the operation or its access list. The registry entry used
- * for validation is a CALLER-PROVIDED input (`ServiceEntry`), so the whole flow is
- * unit-testable without a live network — the caller fetches the entry however it
- * likes (light-client read, off-chain mirror), and hands it in directly.
+ * for validation may be a CALLER-PROVIDED input (`ServiceEntry`) handed in
+ * directly, so the whole flow stays unit-testable without a live network. As an
+ * additive convenience, `validateChallenge`/`buildPayment` also accept a
+ * `ServiceEntrySource` (a `WebcNodeClient` or a `(serviceId) => Promise<ServiceEntry>`
+ * fetcher) and obtain the on-chain entry themselves; the same price+pay-to
+ * cross-check then runs on the fetched entry, never on the endpoint challenge
+ * alone.
  */
 
 import type {
@@ -91,10 +95,16 @@ export interface PaymentChallenge {
 }
 
 /**
- * The on-chain registry entry the challenge is validated against. This is
- * CALLER-PROVIDED (fetched however the caller likes) so the validator is pure and
- * network-free. It mirrors the fields of the on-chain `ServiceEntry` this module
- * needs; the caller may carry more, but these are the trust anchors.
+ * The on-chain registry entry the challenge is validated against.
+ *
+ * The registry entry may be CALLER-PROVIDED (fetched however the caller likes) or
+ * fetched from a node by the convenience path (see {@link ServiceEntrySource} and
+ * {@link WebcNodeClient.getService}), so the validator itself stays pure and
+ * network-free. The first five fields are the trust anchors this module reads; the
+ * remaining fields carry the full on-chain record the node read endpoint returns
+ * and are optional so a minimal caller-supplied entry (just the anchors) keeps
+ * validating. The 32-byte-hex `service_id` is NOT part of the serialized on-chain
+ * record (it is the map key); `getService` supplies it from the requested id.
  */
 export interface ServiceEntry {
   /** Registered service id, 32-byte lowercase hex. */
@@ -107,7 +117,49 @@ export interface ServiceEntry {
   pricing: ServicePriceJson[];
   /** Accepted payment flows; `http_402` must be set for this flow. */
   payment_flags: ServicePaymentFlagsJson;
+  /** Application namespace the entry lives under, 32-byte lowercase hex. */
+  namespace?: HexString;
+  /** Taxonomy tags a mandate allowlist may reference, 32-byte lowercase hex each (≤ 8). */
+  categories?: HexString[];
+  /** Short label, LOWERCASE HEX of its UTF-8 bytes (≤ 64 bytes). */
+  title?: HexString;
+  /** HTTPS URL or on-chain entrypoint reference, LOWERCASE HEX of its bytes (≤ 256 bytes). */
+  endpoint?: HexString;
+  /** Manifest reference hash (machine-readable interface), 32-byte lowercase hex. */
+  interface?: HexString;
+  /** Monotonically increasing revision, bumped on every update or status change. */
+  revision?: number;
 }
+
+/**
+ * A function that fetches the on-chain {@link ServiceEntry} for a 32-byte-hex
+ * service id. The convenience path accepts one so a caller can plug in any read
+ * source (a `WebcNodeClient`, a light-client read, an off-chain mirror).
+ */
+export type ServiceEntryFetcher = (
+  serviceId: HexString,
+) => Promise<ServiceEntry>;
+
+/**
+ * Structural shape of a node client that can read a {@link ServiceEntry} by id.
+ * A `WebcNodeClient` satisfies this via its `getService` method, so it can be
+ * passed directly wherever a {@link ServiceEntrySource} is accepted.
+ */
+export interface ServiceEntryClient {
+  getService(serviceId: HexString): Promise<ServiceEntry>;
+}
+
+/**
+ * Where a {@link ServiceEntry} comes from for validation/payment: an already-held
+ * entry (the original caller-supplied path, unchanged), a fetcher function, or a
+ * node client. When a fetcher/client is given, the entry is fetched for the
+ * challenge's `service_id` and the SAME on-chain price+pay-to cross-check runs on
+ * the fetched entry — the endpoint-supplied challenge is never trusted alone.
+ */
+export type ServiceEntrySource =
+  | ServiceEntry
+  | ServiceEntryFetcher
+  | ServiceEntryClient;
 
 /**
  * The payment reference the agent re-sends on the retry request (step 4). Each
@@ -374,7 +426,11 @@ function requireServiceEntry(entry: ServiceEntry): void {
   }
   parseHash256(entry.service_id, "service entry.service_id");
   parseAddress(entry.owner, "service entry.owner");
-  if (entry.status !== "Active" && entry.status !== "Paused") {
+  if (
+    entry.status !== "Active" &&
+    entry.status !== "Paused" &&
+    entry.status !== "Retired"
+  ) {
     fail("malformed", "service entry.status: unrecognized status");
   }
   if (!Array.isArray(entry.pricing)) {
@@ -487,6 +543,56 @@ function resolveNow(now: number | undefined): number {
   return now;
 }
 
+/** Narrows a {@link ServiceEntrySource} to a node client (has `getService`). */
+function isServiceEntryClient(
+  source: ServiceEntrySource,
+): source is ServiceEntryClient {
+  return (
+    typeof source === "object" &&
+    source !== null &&
+    "getService" in source &&
+    typeof (source as ServiceEntryClient).getService === "function"
+  );
+}
+
+/**
+ * Resolves a {@link ServiceEntrySource} into a concrete {@link ServiceEntry} for
+ * the given `serviceId`. A plain entry is returned as-is (the caller-supplied
+ * path); a fetcher is called; a node client is asked via `getService`. The
+ * returned entry is still cross-checked by {@link validateChallenge}.
+ */
+export async function resolveServiceEntry(
+  source: ServiceEntrySource,
+  serviceId: HexString,
+): Promise<ServiceEntry> {
+  if (typeof source === "function") {
+    return source(serviceId);
+  }
+  if (isServiceEntryClient(source)) {
+    return source.getService(serviceId);
+  }
+  return source;
+}
+
+/**
+ * Convenience: obtain the on-chain {@link ServiceEntry} from a
+ * {@link ServiceEntrySource} (a `WebcNodeClient`, a fetcher, or an already-held
+ * entry) and run {@link validateChallenge} against it, returning the resolved
+ * entry on success. Fails closed with a {@link ChallengeError} exactly as
+ * `validateChallenge` does. The entry is fetched for `challenge.service_id`, so a
+ * source that returns a different service still fails the `service_id_mismatch`
+ * cross-check.
+ */
+export async function validateChallengeAgainstSource(
+  challenge: PaymentChallenge,
+  source: ServiceEntrySource,
+  options: ValidateOptions = {},
+): Promise<ServiceEntry> {
+  const entry = await resolveServiceEntry(source, challenge.service_id);
+  validateChallenge(challenge, entry, options);
+  return entry;
+}
+
 // ---------------------------------------------------------------------------
 // Payment + retry (steps 3 and 4)
 // ---------------------------------------------------------------------------
@@ -499,8 +605,14 @@ export interface BuildPaymentArgs {
   mandateId: HexString;
   /** The parsed challenge to pay (re-validated here — see below). */
   challenge: PaymentChallenge;
-  /** The on-chain registry entry the challenge is validated against. */
-  serviceEntry: ServiceEntry;
+  /**
+   * The on-chain registry entry the challenge is validated against. Accepts a
+   * {@link ServiceEntrySource}: an already-held `ServiceEntry` (the original
+   * caller-supplied path, unchanged), a fetcher function, or a `WebcNodeClient`.
+   * When a fetcher/client is given the entry is fetched for the challenge's
+   * `service_id` and the on-chain price+pay-to cross-check runs on it.
+   */
+  serviceEntry: ServiceEntrySource;
   /** Canonical chain id the spend is signed for. */
   chainId: string;
   /** Agent-account nonce for the spend transaction. */
@@ -536,7 +648,14 @@ export interface BuildPaymentArgs {
 export async function buildPayment(
   args: BuildPaymentArgs,
 ): Promise<PaymentResult> {
-  validateChallenge(args.challenge, args.serviceEntry, { now: args.now });
+  // Resolve the entry (from a held entry, a fetcher, or a node client) for the
+  // challenge's service id, then run the on-chain cross-check on the resolved
+  // entry — a caller can never skip validation, whatever the source.
+  const serviceEntry = await resolveServiceEntry(
+    args.serviceEntry,
+    args.challenge.service_id,
+  );
+  validateChallenge(args.challenge, serviceEntry, { now: args.now });
 
   const operation = spendUnderMandateToService(
     args.mandateId,
@@ -549,7 +668,7 @@ export async function buildPayment(
     serviceId: args.challenge.service_id,
     // The pay-to owner: equal to `challenge.pay_to` (validation just proved it),
     // but sourced from the trusted on-chain entry, never from the endpoint.
-    serviceOwner: args.serviceEntry.owner,
+    serviceOwner: serviceEntry.owner,
     authorizationLane: args.authorizationLane,
   });
   const transaction = await signTransaction(
