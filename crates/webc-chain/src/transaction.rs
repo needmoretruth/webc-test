@@ -13,10 +13,10 @@ use crate::namespace::namespace_state_key_hash;
 use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
-    ChainId, ExternalChain, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
-    ProtocolStateKey, ProtocolVersion, SessionKeyConstraints, SessionKeyId, SlashingEvidence,
-    StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
-    SIGNING_DOMAIN,
+    ChainId, Epoch, ExternalChain, MandateCounterpartyPolicy, MandateId, ObjectId, ObjectVersion,
+    PostQuantumRoot, PostQuantumRootReveal, ProtocolStateKey, ProtocolVersion,
+    SessionKeyConstraints, SessionKeyId, SlashingEvidence, StateKey, UnbondingRequestId,
+    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, SignatureBytes};
@@ -506,6 +506,71 @@ pub enum Operation {
         #[serde(with = "crate::hex_bytes")]
         input: Vec<u8>,
     },
+    /// Grants a pre-funded agent mandate and escrows its budget (Phase 9a, §15.32).
+    ///
+    /// Principal-signed (the sender is the principal). Derives the mandate id from
+    /// `(sender, agent_key, grant_nonce)`, moves `budget_total` native base units
+    /// from the sender's liquid balance into the `mandate_escrow` bucket, and
+    /// records a [`crate::Mandate`]. Fails if the derived id already exists, the
+    /// grant parameters are invalid, or the sender cannot cover `budget_total`
+    /// plus the transaction fee. Default lane only.
+    GrantMandate {
+        /// The agent's Ed25519 signing key authorized to spend under this mandate.
+        agent_key: PublicKeyBytes,
+        /// Principal-chosen uniquifier so one principal may hold several mandates
+        /// for the same agent key; part of the derived mandate id.
+        grant_nonce: u64,
+        /// Total native base units authorized over the mandate's whole life.
+        budget_total: Amount,
+        /// Last consensus epoch (inclusive) in which the mandate may be spent.
+        expiry_epoch: Epoch,
+        /// Maximum native principal one mandate-signed spend may move.
+        per_tx_max: Amount,
+        /// Maximum spends per rate-limit window; `0` means unlimited.
+        rate_limit_per_day: u32,
+        /// Which counterparties the mandate's spends may pay.
+        counterparty_policy: MandateCounterpartyPolicy,
+    },
+    /// Adds native base units to an existing mandate's budget (Phase 9a, §15.32).
+    ///
+    /// Principal-signed. Moves `amount` from the sender's liquid balance into the
+    /// `mandate_escrow` bucket and raises the mandate's `budget_total`. Only the
+    /// mandate's principal may top it up; a revoked mandate cannot be topped up.
+    /// Default lane only.
+    TopUpMandate {
+        /// The mandate to top up.
+        mandate_id: MandateId,
+        /// Native base units moved from liquid balance into the mandate budget.
+        amount: Amount,
+    },
+    /// Spends against a mandate, signed by the agent key (Phase 9a, §15.32).
+    ///
+    /// Signed by the mandate's `agent_key` (the sender is the agent's own
+    /// address). The runtime enforces, atomically, that the mandate exists, is not
+    /// revoked, is unexpired, that `amount <= per_tx_max`, that `spent + amount +
+    /// fee <= budget_total`, that the recipient is permitted, and that the per-day
+    /// rate limit is not exceeded. On success it moves `amount` to the recipient
+    /// and routes the fee through the normal burn/reward split — both drawn from
+    /// the mandate escrow, so the agent needs no balance of its own. Default lane
+    /// only.
+    SpendUnderMandate {
+        /// The mandate authorizing (and funding) this spend.
+        mandate_id: MandateId,
+        /// Recipient account credited the spent principal.
+        recipient: Address,
+        /// Native principal moved to the recipient (excludes the fee).
+        amount: Amount,
+    },
+    /// Revokes a mandate and returns its unspent remainder (Phase 9a, §15.32).
+    ///
+    /// Principal-signed. Returns `budget_total - spent` from the `mandate_escrow`
+    /// bucket to the principal's liquid balance and marks the mandate revoked so no
+    /// further spend succeeds; revocation is effective from the block it lands in.
+    /// Also the reclaim path for an expired mandate. Default lane only.
+    RevokeMandate {
+        /// The mandate to revoke and reclaim.
+        mandate_id: MandateId,
+    },
 }
 
 impl Operation {
@@ -539,6 +604,13 @@ impl Operation {
             | Self::FundAppSponsor { .. }
             | Self::WithdrawAppSponsor { .. } => 10_000,
             Self::RegisterNamespace { .. } | Self::TransferNamespace { .. } => 10_000,
+            // A grant creates one record and locks its budget; top-up/revoke move
+            // units on one record; a spend moves units and writes one record —
+            // comparable to the other single-record locked-value operations.
+            Self::GrantMandate { .. }
+            | Self::TopUpMandate { .. }
+            | Self::SpendUnderMandate { .. }
+            | Self::RevokeMandate { .. } => 10_000,
             Self::CreateFeed { .. } => 15_000,
             Self::RegisterReporter { .. }
             | Self::DeregisterReporter { .. }
@@ -905,6 +977,40 @@ impl Operation {
                 // default-lane base; declare the module record it creates.
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::module(manifest.code_id));
+            }
+            Self::GrantMandate {
+                agent_key,
+                grant_nonce,
+                ..
+            } => {
+                // A grant locks the budget from the principal's liquid balance and
+                // writes the new mandate record. The mandate id is derived from the
+                // signer (principal), the agent key, and the grant nonce, so the
+                // access list names the exact record at signing time.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::mandate(MandateId::derive(sender, agent_key, *grant_nonce)),
+                );
+            }
+            Self::TopUpMandate { mandate_id, .. } | Self::RevokeMandate { mandate_id } => {
+                // Top-up moves liquid into escrow; revoke returns the remainder to
+                // liquid. Both touch the principal account and the mandate record.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
+            }
+            Self::SpendUnderMandate {
+                mandate_id,
+                recipient,
+                ..
+            } => {
+                // The sender is the agent; the mandate escrow funds both the
+                // principal moved and the fee, so no principal account key is
+                // needed. The agent account (default-lane base) carries the spend's
+                // nonce/replay state; declare the mandate record and the recipient.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
+                push_unique_key(&mut read_write, StateKey::account(*recipient));
             }
             Self::InvokeContract {
                 code_id,
@@ -1865,6 +1971,65 @@ mod tests {
         // The decode is strict (deny_unknown_fields), matching sibling operations.
         let mut value = serde_json::to_value(&create).unwrap();
         value["CreateFeed"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn mandate_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the four agent-mandate operations (Phase 9a,
+        // §15.32) so a browser SDK mirror must reproduce these exact field names
+        // and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Amounts are decimal
+        // STRINGS (like Amount), never bare JSON numbers.
+        let mandate_id = crate::MandateId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let agent = Keypair::from_seed([9u8; 32]).public_key();
+        let recipient = Keypair::from_seed([2u8; 32]).address();
+
+        // GrantMandate carries an enum policy, so round-trip it rather than pin a
+        // large fixed string; the simpler three are pinned exactly below.
+        let grant = Operation::GrantMandate {
+            agent_key: agent,
+            grant_nonce: 3,
+            budget_total: Amount::from_units(1_000),
+            expiry_epoch: Epoch::new(100),
+            per_tx_max: Amount::from_units(100),
+            rate_limit_per_day: 5,
+            counterparty_policy: MandateCounterpartyPolicy::Open,
+        };
+        let text = serde_json::to_string(&grant).expect("grant serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), grant);
+
+        let top_up = Operation::TopUpMandate {
+            mandate_id,
+            amount: Amount::from_units(5),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&top_up).unwrap(),
+            format!(r#"{{"TopUpMandate":{{"amount":"5","mandate_id":"{id}"}}}}"#),
+        );
+        let spend = Operation::SpendUnderMandate {
+            mandate_id,
+            recipient,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&spend).unwrap(),
+            format!(
+                r#"{{"SpendUnderMandate":{{"amount":"7","mandate_id":"{id}","recipient":"{rec}"}}}}"#,
+                rec = recipient.to_base58(),
+            )
+        );
+        let revoke = Operation::RevokeMandate { mandate_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&revoke).unwrap(),
+            format!(r#"{{"RevokeMandate":{{"mandate_id":"{id}"}}}}"#),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&revoke).unwrap();
+        value["RevokeMandate"]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 
