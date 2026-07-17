@@ -15,6 +15,7 @@ use crate::authorization_policy::{
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy, StoragePricing};
 use crate::genesis::GenesisConfig;
+use crate::namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
 use crate::session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
@@ -161,6 +162,22 @@ pub enum Event {
         application: Hash256,
         /// Native base units returned to the owner's liquid balance.
         amount: Amount,
+    },
+    /// An application namespace was claimed by an owner (§8 application isolation).
+    NamespaceRegistered {
+        /// Application namespace that was claimed.
+        namespace: Hash256,
+        /// Account now recorded as the namespace owner.
+        owner: Address,
+    },
+    /// A registered application namespace changed owner (§8 application isolation).
+    NamespaceTransferred {
+        /// Application namespace whose ownership moved.
+        namespace: Hash256,
+        /// Previous owner that authorized the transfer.
+        from: Address,
+        /// New owner recorded in the registry.
+        to: Address,
     },
     ValidatorRegistered {
         operator: Address,
@@ -412,6 +429,21 @@ pub struct ChainState {
     /// root as a scalar (mirroring `storage_deposits`).
     #[serde(default)]
     pub sponsor_budgets: Amount,
+    /// Application namespace ownership registry (§8 "Application isolation").
+    ///
+    /// Maps an application namespace to its [`NamespaceRecord`] (its owner). An app
+    /// claims its namespace with `RegisterNamespace` and can prove ownership; the
+    /// current owner may reassign it with `TransferNamespace`. Committed by the
+    /// state root through a dedicated Merkle sub-root (`NAMESPACE_LEAF_DOMAIN`), so
+    /// any change to a namespace's owner changes the state root. A `BTreeMap` keeps
+    /// iteration deterministic in the hashed/consensus path.
+    ///
+    /// This registry holds no native units — registration is an ownership record
+    /// only — so it does not enter supply reconciliation. Ownership is **not**
+    /// required to create objects under a namespace today (open namespaces); gating
+    /// object creation on ownership is a later-phase policy decision.
+    #[serde(default)]
+    pub namespaces: BTreeMap<Hash256, NamespaceRecord>,
     pub validator_fee_pool: Amount,
     pub minted_supply: Amount,
     /// Gross issued supply captured at the start of the current inflation year.
@@ -527,6 +559,7 @@ impl Default for ChainState {
             storage_deposits: Amount::ZERO,
             sponsors: BTreeMap::new(),
             sponsor_budgets: Amount::ZERO,
+            namespaces: BTreeMap::new(),
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
             inflation_year_start_supply: Amount::ZERO,
@@ -1166,6 +1199,7 @@ impl ChainState {
             processed_slashing_root: Hash256,
             unbonding_root: Hash256,
             sponsor_root: Hash256,
+            namespace_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
             storage_deposits: Amount,
@@ -1180,15 +1214,18 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            // V9 adds the fee-sponsorship state (§15.35): the `sponsor_root`
+            // V10 adds the application namespace registry (§8 isolation): the
+            // `namespace_root` sub-root commits every namespace ownership record, so
+            // a claim or transfer changes the state root. It adds no new scalar
+            // (the registry locks no native units). The domain bump is a deliberate
+            // consensus-format change; no external fixture pins the prior V9 root.
+            // V9 added the fee-sponsorship state (§15.35): the `sponsor_root`
             // sub-root commits every per-app sponsor record (budget, caps, and
             // per-user/day counters), and the `sponsor_budgets` scalar commits the
             // aggregate locked bucket (mirroring how `storage_deposits` pairs with
-            // the object sub-root). The domain bump is a deliberate consensus-format
-            // change; no external fixture pins the prior V8 root. V8 added the
-            // `storage_deposits` scalar (§15.22); V7 added `last_block_timestamp_ms`
-            // (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V9",
+            // the object sub-root). V8 added the `storage_deposits` scalar (§15.22);
+            // V7 added `last_block_timestamp_ms` (finding E2).
+            domain: "WEBC_STATE_COMMITMENT_V10",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1233,6 +1270,10 @@ impl ChainState {
             // change to any sponsor's budget, caps, or per-user/day counters
             // changes this root and therefore the state root.
             sponsor_root: ordered_value_root(SPONSOR_LEAF_DOMAIN, self.sponsors.iter())?,
+            // Namespace ownership registry committed by its own ordered sub-root
+            // (§8 isolation): a claim or ownership transfer changes this root and
+            // therefore the state root.
+            namespace_root: ordered_value_root(NAMESPACE_LEAF_DOMAIN, self.namespaces.iter())?,
             burned_fees: self.burned_fees,
             slashed_units: self.slashed_units,
             storage_deposits: self.storage_deposits,
@@ -2589,6 +2630,50 @@ impl ChainState {
                 events.push(Event::AppSponsorWithdrawn {
                     application: *namespace,
                     amount: *amount,
+                });
+            }
+            Operation::RegisterNamespace { namespace } => {
+                // Claiming a namespace records an owner; it locks no native units,
+                // so the supply invariant is unaffected (only the ordinary fee
+                // moves). Any authorization lane may pay the fee — there is no
+                // account balance to draw from — so no default-lane restriction.
+                access.write(StateKey::application(
+                    *namespace,
+                    namespace_state_key_hash(),
+                ))?;
+                if self.namespaces.contains_key(namespace) {
+                    return Err(ChainError::NamespaceAlreadyRegistered);
+                }
+                self.namespaces
+                    .insert(*namespace, NamespaceRecord::new(tx.sender));
+                events.push(Event::NamespaceRegistered {
+                    namespace: *namespace,
+                    owner: tx.sender,
+                });
+            }
+            Operation::TransferNamespace {
+                namespace,
+                new_owner,
+            } => {
+                access.write(StateKey::application(
+                    *namespace,
+                    namespace_state_key_hash(),
+                ))?;
+                // Only the current owner may transfer. Validate existence and
+                // ownership before mutating, so a non-owner's attempt fails closed
+                // and leaves the record unchanged (the whole tx rolls back).
+                let record = self
+                    .namespaces
+                    .get_mut(namespace)
+                    .ok_or(ChainError::NamespaceNotFound)?;
+                if record.owner != tx.sender {
+                    return Err(ChainError::NamespaceNotOwner);
+                }
+                record.owner = *new_owner;
+                events.push(Event::NamespaceTransferred {
+                    namespace: *namespace,
+                    from: tx.sender,
+                    to: *new_owner,
                 });
             }
         }
@@ -8854,5 +8939,248 @@ mod tests {
             state.state_root().expect("root"),
             "sponsor state is committed by the state root across a restart"
         );
+    }
+
+    // ----- §8 application namespace ownership registry -----
+
+    /// Builds and signs a `RegisterNamespace` for `owner` at `nonce`.
+    fn register_namespace_tx(owner: &Keypair, namespace: Hash256, nonce: u64) -> Transaction {
+        Transaction::for_operation(
+            owner,
+            nonce,
+            Operation::RegisterNamespace { namespace },
+            unit_fee(10_000),
+        )
+        .expect("register-namespace signs")
+    }
+
+    /// Builds and signs a `TransferNamespace` from `owner` to `new_owner` at `nonce`.
+    fn transfer_namespace_tx(
+        owner: &Keypair,
+        namespace: Hash256,
+        new_owner: Address,
+        nonce: u64,
+    ) -> Transaction {
+        Transaction::for_operation(
+            owner,
+            nonce,
+            Operation::TransferNamespace {
+                namespace,
+                new_owner,
+            },
+            unit_fee(10_000),
+        )
+        .expect("transfer-namespace signs")
+    }
+
+    #[test]
+    fn register_namespace_records_owner_commits_root_and_conserves_supply() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        let issued = state.minted_supply;
+        let root_before = state.state_root().expect("root before");
+
+        let receipt = state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("namespace registered");
+
+        assert_eq!(
+            state.namespaces[&namespace],
+            NamespaceRecord::new(alice.address()),
+            "the sender is recorded as the namespace owner"
+        );
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::NamespaceRegistered { namespace: ns, owner }
+                if *ns == namespace && *owner == alice.address()
+        )));
+        // A registration locks no native units: only the ordinary fee moved.
+        assert_eq!(state.minted_supply, issued, "registration mints no supply");
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "supply invariant is unaffected by the registry"
+        );
+        // The registry is committed state: the state root must have changed.
+        assert_ne!(
+            state.state_root().expect("root after"),
+            root_before,
+            "claiming a namespace changes the committed state root"
+        );
+    }
+
+    #[test]
+    fn double_register_namespace_is_rejected_and_leaves_owner_unchanged() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("first registration");
+
+        let before = state.clone();
+        // A second claim of the same namespace (even by the original owner) fails.
+        assert!(matches!(
+            state.execute_transaction(&register_namespace_tx(&alice, namespace, 1), &config),
+            Err(ChainError::NamespaceAlreadyRegistered)
+        ));
+        assert_eq!(
+            state, before,
+            "a rejected duplicate registration leaves state unchanged"
+        );
+        assert_eq!(state.namespaces.len(), 1);
+    }
+
+    #[test]
+    fn transfer_namespace_by_owner_updates_the_owner() {
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("registration");
+
+        let receipt = state
+            .execute_transaction(
+                &transfer_namespace_tx(&alice, namespace, bob.address(), 1),
+                &config,
+            )
+            .expect("owner transfer");
+
+        assert_eq!(
+            state.namespaces[&namespace],
+            NamespaceRecord::new(bob.address()),
+            "the namespace is now owned by the new owner"
+        );
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::NamespaceTransferred { namespace: ns, from, to }
+                if *ns == namespace && *from == alice.address() && *to == bob.address()
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn transfer_namespace_by_non_owner_is_rejected_and_state_unchanged() {
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("registration");
+        // Fund Bob (a non-owner) so his transaction reaches the ownership check
+        // rather than failing on fees or a missing account.
+        seed_balance(&mut state, &config, &alice, bob.address(), 1_000_000, 1);
+
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&transfer_namespace_tx(&bob, namespace, carol, 0), &config),
+            Err(ChainError::NamespaceNotOwner)
+        ));
+        assert_eq!(
+            state, before,
+            "a non-owner transfer attempt leaves the registry unchanged"
+        );
+        assert_eq!(
+            state.namespaces[&namespace],
+            NamespaceRecord::new(alice.address()),
+            "ownership still belongs to the original owner"
+        );
+    }
+
+    #[test]
+    fn transfer_unregistered_namespace_reports_not_found() {
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x99; 32]);
+        assert!(matches!(
+            state.execute_transaction(
+                &transfer_namespace_tx(&alice, namespace, bob.address(), 0),
+                &config
+            ),
+            Err(ChainError::NamespaceNotFound)
+        ));
+    }
+
+    #[test]
+    fn namespace_registry_survives_bincode_restart_with_stable_state_root() {
+        // A crash-restart (bincode round-trip of the whole state) must preserve the
+        // namespace registry and the committed state root, so a node cannot silently
+        // diverge on the new registry state after reloading from disk.
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("registration");
+        state
+            .execute_transaction(
+                &transfer_namespace_tx(&alice, namespace, bob.address(), 1),
+                &config,
+            )
+            .expect("transfer");
+        assert_eq!(
+            state.namespaces[&namespace].owner,
+            bob.address(),
+            "registry reflects the transfer before restart"
+        );
+
+        let bytes = bincode::serialize(&state).expect("state serializes");
+        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        assert_eq!(
+            restored.namespaces, state.namespaces,
+            "restart preserves the namespace registry"
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "namespace registry is committed by the state root across a restart"
+        );
+    }
+
+    #[test]
+    fn object_creation_is_not_gated_on_namespace_ownership() {
+        // Regression: the registry is an additive ownership record. Object
+        // create/mutate/transfer/delete keep working on OPEN namespaces exactly as
+        // before — creating an object never requires (or is blocked by) a namespace
+        // claim. Gating is a deliberately deferred later-phase policy decision.
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        let create = |creator: &Keypair, id: u8, nonce: u64| {
+            Transaction::for_operation(
+                creator,
+                nonce,
+                Operation::CreateObject {
+                    object_id: ObjectId::new(Hash256([id; 32])),
+                    namespace,
+                    data: vec![0xaa, 0xbb],
+                },
+                unit_fee(20_000),
+            )
+            .expect("create signs")
+        };
+
+        // 1. Create an object under a completely unclaimed namespace: succeeds.
+        state
+            .execute_transaction(&create(&alice, 0x01, 0), &config)
+            .expect("object creation works without any namespace claim");
+
+        // 2. Fund Bob and let him claim the namespace (a different account from the
+        //    object creator).
+        seed_balance(&mut state, &config, &alice, bob.address(), 1_000_000, 1);
+        state
+            .execute_transaction(&register_namespace_tx(&bob, namespace, 0), &config)
+            .expect("bob claims the namespace");
+
+        // 3. Create another object under the now-claimed namespace as Alice, who is
+        //    NOT the namespace owner: still succeeds (open namespaces).
+        state
+            .execute_transaction(&create(&alice, 0x02, 2), &config)
+            .expect("object creation is not blocked by another account's namespace claim");
+
+        assert!(state
+            .objects
+            .contains_key(&ObjectId::new(Hash256([0x01; 32]))));
+        assert!(state
+            .objects
+            .contains_key(&ObjectId::new(Hash256([0x02; 32]))));
+        assert_eq!(state.namespaces[&namespace].owner, bob.address());
+        assert!(state.supply_invariant_report().unwrap().balanced);
     }
 }
