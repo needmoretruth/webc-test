@@ -625,33 +625,45 @@ These were surfaced but not fully audited; several are latent-but-serious.
   a deliberate coordinated root-format change, not a silent one; it cannot forge
   WEBC's fixed-leaf-set consensus roots. Reproduced first by
   `verify_rejects_an_over_length_proof_without_hashing_it`.
-- **E4 — P1 — long-range / weak-subjectivity sync.** State sync hands a late node
-  a block + certificate, validator sets are per-epoch snapshots, and state is
-  latest-only (ST/§4.2) — a fresh node has no trusted anchor and must trust whoever
-  answers; withdrawn validators' old keys enable classic long-range forgery. Needs
-  a weak-subjectivity checkpoint and a defined trust anchor for incoming certs
-  (ties to plan §4.5).
-- **E5 — P1 — eclipse / gossip abuse.** Static bootstrap list, flood gossip, no
-  peer scoring/ban/inbound-diversity/anti-eclipse; an adversary owning a target's
-  few bootstrap peers can censor, withhold the head, or feed a higher-height claim
-  that triggers sync from the attacker (ties to C7). Also check mempool per-peer/
-  per-sender rate + total-bytes bounds.
-- **E6 — P2 — consensus signing-domain scope.** Confirm every signed consensus
-  object (proposal/prevote/precommit/certificate) uses a distinct per-message-type
-  domain so a prevote can't be replayed as a precommit or across height/round/chain,
-  and that Ed25519 non-canonical/malleable signatures can't yield two encodings of
-  "the same" vote (interacts with equivocation detection). `canonical.rs` rejects
-  floats/sorts keys, but the review did not confirm the full scope of what goes
-  through it on the consensus path.
-- **E7 — P2 — reentrancy/metering once a VM exists (gated).** No VM today; flag for
-  the review that must run the moment the contract runtime lands (cross-object
-  reentrancy, deterministic gas metering across nodes, no float/clock/iteration-
-  order nondeterminism inside contracts, and the escrow release path becoming
-  attacker-reachable).
-- **E8 — P2 — dual state encoders.** `state_root` uses canonical JSON
-  (`WEBC_STATE_COMMITMENT_V6`) while restart round-trips tuple-keyed maps via
-  bincode. Confirm no state field is reachable only through the bincode path such
-  that a JSON-invisible mutation could diverge on-disk vs. committed root.
+- **E4 — P1 — DESIGN RECORDED (ADR-0011) — long-range / weak-subjectivity sync.**
+  State sync hands a late node a block + certificate verified against the current
+  set; a fresh node has no trusted anchor and withdrawn validators' old keys enable
+  long-range forgery. **Direction:** [ADR-0011](../adr/0011-historical-state-and-weak-subjectivity.md)
+  fixes the mechanism — certificate-chained set transitions + a weak-subjectivity
+  window shorter than the unbonding/slashable window — and flags the trust-anchor
+  SOURCE as the one owner-owned decision, deferred to the state-proofs phase freeze.
+  Implementation is gated to that phase.
+- **E5 — P1 — PARTIALLY RESOLVED (network bounds landed) — eclipse / gossip
+  abuse.** The network-layer DoS bounds now exist: N1 handshake timeout, N2
+  inbound-connection + per-IP caps, N3 peer-table cap, N4 per-peer rate limit, N5
+  authenticated-only backoff reset (commits per findings above). Remaining —
+  peer scoring / inbound diversity / anti-eclipse peer selection and mempool
+  per-sender byte bounds — is tracked with the weak-subjectivity work in ADR-0011
+  (a node that can be eclipsed can be fed a hostile checkpoint) and gated to the
+  same phase.
+- **E6 — P2 — RESOLVED (commit `7e6412d`) — consensus signing-domain scope.**
+  Verified: proposals (`WEBC_CONSENSUS_PROPOSAL_V1`) and votes
+  (`WEBC_CONSENSUS_VOTE_V1`) use distinct domains; a vote's signed payload includes
+  `vote_type` and full `height/round/chain_id/protocol_version` binding, so a
+  prevote cannot verify as a precommit or replay across height/round/chain; the
+  finality certificate verifies its constituent votes under that domain (no
+  separate certificate signing key). **Fix:** the one gap — `verify_signature` used
+  ed25519-dalek's malleable `verify` — is now `verify_strict`, rejecting
+  non-canonical signatures and small-order keys.
+- **E7 — P2 — DEFERRED (phase-gated; no VM) — reentrancy/metering once a VM
+  exists.** No contract VM exists today, so there is nothing to reproduce or fix.
+  This is the standing review checklist (cross-object reentrancy, deterministic gas
+  metering, no float/clock/iteration-order nondeterminism inside contracts, escrow
+  release reachability) that MUST run the moment the contract runtime lands
+  (Phase 7 gate; ADR-0006). Building it now would violate the phase gate.
+- **E8 — P2 — RESOLVED (commit `7e6412d`) — dual state encoders.** `state_root`
+  uses canonical JSON while restart round-trips maps via bincode. Verified by
+  inspection that every `ChainState` field is committed by the state root (map
+  fields via their dedicated sub-roots, scalars directly), so no field is mutable
+  on the bincode path without changing the committed root. **Guard added:**
+  `every_scalar_state_counter_is_committed_by_the_state_root` fails if a future
+  scalar field is added to state but forgotten in the commitment. (The domain is
+  now `WEBC_STATE_COMMITMENT_V7` after the E2 timestamp field.)
 
 ---
 
