@@ -308,13 +308,43 @@ namespaces, unaffected account transfers, supply reconciliation, bincode
 crash-restart of the fee state with a stable root, and cross-run determinism.
 Full workspace gate green (fmt/clippy -D warnings/test/doc/demo).
 
-**Phase 6 remaining:** varint amount encoding (§15.14, a wire-version bump) —
-IN PROGRESS (subagent): binary/bincode `Amount` encoding switches to LEB128
-varint (rest + wire) while the canonical-JSON decimal-string path stays byte-for-
-byte unchanged (so `state_root`, signing, and the SDK are untouched). After that,
-per-resource (multi-dimensional) congestion measurement beyond the single
-execution-unit dimension is the last open metering refinement. TPS benchmarks
-need real hardware (deferred non-finding).
+**Varint amount encoding (§15.14) — DONE.** The binary bincode paths (wire +
+storage-at-rest) switched to `with_varint_encoding()`, so `Amount` (and every
+binary integer) is compact; `Amount`'s serde is untouched and the canonical-JSON
+decimal-string path is byte-identical, so `state_root`, signing (`SIGNING_DOMAIN`),
+and the SDK are unchanged (SDK gate green unchanged). **`NET_PROTOCOL_VERSION`
+3→4** (a v3 frame is refused before body decode); N6 frame-size protection
+preserved; storage-at-rest layout changed (ephemeral prototype, no migration).
+
+### Phase 6 — major code items COMPLETE (2026-07-17)
+
+All Phase 6 code-completable tasks are done and pushed, full workspace + SDK gate
+green: storage deposit + deletion rebate (§15.22); zstd compression at rest and on
+the wire (§15.24); fee sponsorship / paymaster (§15.35, Rust + SDK); application
+namespace registry; sharded parallel-execution examples; localized per-namespace
+fee pricing + fair block packing; varint amount encoding (§15.14). The scheduler /
+declared-access / parallel-batch foundation (SC1/SC2) was already in place. The
+state-commitment domain moved V7→V11 across these (each bump E8-guarded, supply
+invariant preserved). ADR-0013 records the hot/cold tiering boundary
+(implementation may lag). **Two items remain non-blocking:** (1) multi-dimensional
+per-resource congestion metering (today one execution-unit scalar per namespace —
+a refinement; the acceptance criteria "one app's congestion doesn't raise
+another's price" and "fair capacity bounds saturation" are already met); (2) the
+TPS benchmarks (100/500/1000/2000 gates) need real reference hardware, not a cloud
+container (a known deferred non-finding).
+
+### Next: Phase 7 — contract runtime, native oracle, then Weft
+
+Per `development-plan.md` Phase 7 (sequencing owner-confirmed): **7a** a sandboxed
+contract runtime with declared-access enforcement + interim Rust authoring ships
+first; the **native oracle** (feed registry + bonded reporters + median
+aggregation, §15.17/15.21 economics — see `oracle-economics.md`); then **7b** the
+Weft language + tooling (later, separate project — `weft-language-plan.md`; the
+design is decided, do not re-litigate; the name is owner-renamable). This is a
+large phase — decompose it, keep using worktree subagents with frequent
+commit+push, gate + merge each. Owner-deferred items unchanged (ADR-0012 slashing
+numbers + inactivity-leak wiring; production-bridge trust model; weak-subjectivity
+anchor; governance emergency powers; Weft rename; founder comp §15.4).
 
 **Note on commit signing:** this environment's ssh signing key
 (`/home/claude/.ssh/commit_signing_key.pub`) is a 0-byte placeholder, so no commit
