@@ -58,6 +58,15 @@ pub struct CoolingTranche {
     pub amount: Amount,
     /// Epoch at whose boundary this amount left active voting stake.
     pub admitted_epoch: Epoch,
+    /// Last epoch (inclusive) at which this tranche is still slashable.
+    ///
+    /// ADR-0008 invariant: cooling principal is slashable only through its
+    /// evidence window. When the normal cooldown is longer than the slashable
+    /// window, a tranche can still be cooling (not yet `Withdrawable`) *after*
+    /// this epoch — and it must no longer be slashable then. `slash_locked`
+    /// compares the current epoch against this field so the window, not the
+    /// cooldown, governs slashing.
+    pub slashable_through: Epoch,
     /// First epoch at which the amount may be claimed if no slash applies.
     pub release_epoch: Epoch,
 }
@@ -281,11 +290,19 @@ impl UnbondingQueue {
         Ok(reduced)
     }
 
-    /// Applies the verified penalty rate to cooling and matured principal.
+    /// Applies the verified penalty rate to cooling principal still inside its
+    /// slashable window at `epoch`.
+    ///
+    /// ADR-0008: only principal still inside its evidence window is slashable.
+    /// Matured `withdrawable` principal has passed the window and is never
+    /// slashed here, and a cooling tranche whose `slashable_through` epoch has
+    /// passed (because the normal cooldown is longer) is skipped. `epoch` is the
+    /// current consensus epoch at which the evidence is being applied.
     pub fn slash_locked(
         &mut self,
         validator: Address,
         penalty_bps: u16,
+        epoch: Epoch,
     ) -> Result<UnbondingSlashOutcome, ChainError> {
         let mut outcome = UnbondingSlashOutcome::default();
         for request in self
@@ -295,6 +312,11 @@ impl UnbondingQueue {
         {
             let mut owner_loss = Amount::ZERO;
             for tranche in &mut request.cooling {
+                // Skip tranches whose slashable window has closed; withdrawable
+                // principal is excluded entirely (it has fully matured).
+                if epoch > tranche.slashable_through {
+                    continue;
+                }
                 let loss = tranche
                     .amount
                     .checked_mul_bps(penalty_bps)
@@ -307,17 +329,6 @@ impl UnbondingQueue {
                     .checked_add(loss)
                     .ok_or(ChainError::ArithmeticOverflow)?;
             }
-            let withdrawable_loss = request
-                .withdrawable
-                .checked_mul_bps(penalty_bps)
-                .ok_or(ChainError::ArithmeticOverflow)?;
-            request.withdrawable = request
-                .withdrawable
-                .checked_sub(withdrawable_loss)
-                .ok_or(ChainError::ArithmeticOverflow)?;
-            owner_loss = owner_loss
-                .checked_add(withdrawable_loss)
-                .ok_or(ChainError::ArithmeticOverflow)?;
             if !owner_loss.is_zero() {
                 let prior = outcome
                     .locked_losses
@@ -368,10 +379,14 @@ impl UnbondingQueue {
                 .get()
                 .checked_add(cooldown_epochs)
                 .ok_or(ChainError::ArithmeticOverflow)?;
-            let slashable_end = epoch
+            // Last epoch (inclusive) the tranche stays slashable, then one past
+            // it for the release boundary.
+            let slashable_through = epoch
                 .get()
                 .checked_add(slashable_epochs)
-                .and_then(|value| value.checked_add(1))
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let slashable_end = slashable_through
+                .checked_add(1)
                 .ok_or(ChainError::ArithmeticOverflow)?;
             request.queued = request
                 .queued
@@ -380,6 +395,7 @@ impl UnbondingQueue {
             request.cooling.push(CoolingTranche {
                 amount: admitted,
                 admitted_epoch: epoch,
+                slashable_through: Epoch::new(slashable_through),
                 release_epoch: Epoch::new(cooldown_end.max(slashable_end)),
             });
             remaining = remaining
@@ -396,6 +412,20 @@ impl UnbondingQueue {
                 self.fifo.pop_front();
             }
         }
+
+        // U2: drop fully-settled requests so the queue does not grow without
+        // bound and every per-epoch scan (`mature`, `slash_locked`, `queued_for`)
+        // stays cheap. A request is settled once no live principal remains in any
+        // bucket — it has been fully claimed or fully slashed. Request IDs are
+        // monotonic and never reused, so a pruned request cannot be revived or
+        // replayed: a later claim on its ID fails with `UnbondingRequestNotFound`,
+        // identical to an ID that never existed.
+        self.requests.retain(|_, request| {
+            !(request.queued.is_zero()
+                && request.withdrawable.is_zero()
+                && request.cooling.is_empty())
+        });
+
         Ok(transitions)
     }
 
@@ -593,8 +623,10 @@ mod tests {
         cooling
             .advance_epoch(Epoch::new(2), Amount::from_units(80), 3, 3)
             .expect("admission");
+        // Admitted at epoch 2 with slashable_epochs = 3, so slashable through
+        // epoch 5; slash while still inside the window.
         let outcome = cooling
-            .slash_locked(validator, 8_000)
+            .slash_locked(validator, 8_000, Epoch::new(2))
             .expect("locked slash");
         assert_eq!(outcome.total_locked_slashed, Amount::from_units(64));
         assert_eq!(
@@ -605,5 +637,128 @@ mod tests {
                 .expect("principal"),
             Amount::from_units(16)
         );
+    }
+
+    #[test]
+    fn slash_locked_skips_cooling_past_its_slashable_window() {
+        // U1: with a long cooldown and a short evidence window, a tranche can be
+        // still cooling but past its slashable window. It must NOT be slashed.
+        let owner = Keypair::from_seed([7u8; 32]).address();
+        let validator = Keypair::from_seed([8u8; 32]).address();
+        let mut queue = UnbondingQueue::default();
+        let id = queue
+            .request(
+                owner,
+                validator,
+                UnbondingKind::OperatorStake,
+                Amount::from_units(100),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("request");
+        // Admit at epoch 2 with slashable_epochs = 1 (window through epoch 3) and
+        // cooldown_epochs = 5 (release at epoch 7).
+        queue
+            .advance_epoch(Epoch::new(2), Amount::from_units(100), 5, 1)
+            .expect("admission");
+
+        // Inside the window (epoch 3): slashable.
+        let mut inside = queue.clone();
+        let outcome = inside
+            .slash_locked(validator, 8_000, Epoch::new(3))
+            .expect("in-window slash");
+        assert_eq!(outcome.total_locked_slashed, Amount::from_units(80));
+
+        // Past the window but still cooling (epoch 5): nothing slashed.
+        let outcome = queue
+            .slash_locked(validator, 8_000, Epoch::new(5))
+            .expect("out-of-window slash");
+        assert_eq!(outcome.total_locked_slashed, Amount::ZERO);
+        assert_eq!(
+            queue
+                .get(id)
+                .expect("request")
+                .total_principal()
+                .expect("principal"),
+            Amount::from_units(100)
+        );
+    }
+
+    #[test]
+    fn slash_locked_never_slashes_matured_withdrawable_principal() {
+        // U1: matured principal has passed its slashable window entirely.
+        let owner = Keypair::from_seed([9u8; 32]).address();
+        let validator = Keypair::from_seed([10u8; 32]).address();
+        let mut queue = UnbondingQueue::default();
+        let id = queue
+            .request(
+                owner,
+                validator,
+                UnbondingKind::OperatorStake,
+                Amount::from_units(50),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("request");
+        // Admit at epoch 2 (slashable through 3, release at 4), then advance past
+        // release so the tranche matures into withdrawable.
+        queue
+            .advance_epoch(Epoch::new(2), Amount::from_units(50), 2, 1)
+            .expect("admission");
+        queue
+            .advance_epoch(Epoch::new(5), Amount::ZERO, 2, 1)
+            .expect("maturity");
+        assert_eq!(
+            queue.get(id).expect("request").withdrawable,
+            Amount::from_units(50)
+        );
+        let outcome = queue
+            .slash_locked(validator, 8_000, Epoch::new(5))
+            .expect("slash after maturity");
+        assert_eq!(outcome.total_locked_slashed, Amount::ZERO);
+        assert_eq!(
+            queue.get(id).expect("request").withdrawable,
+            Amount::from_units(50)
+        );
+    }
+
+    #[test]
+    fn advance_epoch_prunes_fully_settled_requests() {
+        // U2: a fully claimed request is dropped on the next epoch advance so the
+        // queue does not grow without bound.
+        let owner = Keypair::from_seed([11u8; 32]).address();
+        let validator = Keypair::from_seed([12u8; 32]).address();
+        let mut queue = UnbondingQueue::default();
+        let id = queue
+            .request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(9),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("request");
+        queue
+            .advance_epoch(Epoch::new(2), Amount::from_units(9), 1, 1)
+            .expect("admission");
+        // Mature (release at epoch 4) then claim everything.
+        queue
+            .advance_epoch(Epoch::new(4), Amount::ZERO, 1, 1)
+            .expect("maturity");
+        assert_eq!(
+            queue.claim(id, owner).expect("claim"),
+            Amount::from_units(9)
+        );
+        assert!(
+            queue.get(id).is_some(),
+            "settled request still present pre-prune"
+        );
+        // The next advance prunes the fully-settled request.
+        queue
+            .advance_epoch(Epoch::new(5), Amount::ZERO, 1, 1)
+            .expect("prune advance");
+        assert!(queue.get(id).is_none(), "settled request pruned");
+        assert_eq!(queue.requests().count(), 0);
     }
 }

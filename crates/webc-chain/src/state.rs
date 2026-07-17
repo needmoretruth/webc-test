@@ -2122,9 +2122,11 @@ impl ChainState {
                 *loss,
             )?;
         }
-        let locked_slash = self
-            .unbonding
-            .slash_locked(validator_address, penalty_bps)?;
+        let locked_slash = self.unbonding.slash_locked(
+            validator_address,
+            penalty_bps,
+            Epoch::new(self.current_epoch),
+        )?;
         for owner in locked_slash.locked_losses.keys() {
             Self::record_slashing_write(&mut access, StateKey::account(*owner))?;
         }
