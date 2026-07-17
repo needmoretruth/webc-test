@@ -17,6 +17,7 @@ export * from "./permission-store.js";
 export * from "./protocol-hash.js";
 export * from "./session-key.js";
 export * from "./transaction.js";
+export * from "./transaction-v5.js";
 export * from "./types.js";
 export * from "./wallet.js";
 export * from "./wallet-derivation.js";

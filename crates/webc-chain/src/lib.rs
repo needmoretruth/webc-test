@@ -27,6 +27,7 @@ pub mod staking;
 pub mod state;
 pub mod state_key;
 pub mod transaction;
+pub mod transaction_v5;
 pub mod unbonding;
 
 pub use account::Account;
@@ -83,6 +84,15 @@ pub use state::{
 };
 pub use state_key::{ProtocolStateKey, StateKey, StateKeyKind, MAX_TRANSACTION_STATE_KEYS};
 pub use transaction::{AccessList, FeeBid, Operation, Transaction};
+pub use transaction_v5::{
+    ActionProgramV1, ActionScopeV1, ActionV1, CancelV1, FeePaymentV1, SponsorGrantId,
+    SponsorGrantV1, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1, TransactionId,
+    TransactionKindV1, TransactionV5, TransactionValidationErrorV1, ValidityWindowV1,
+    ACTION_PROGRAM_V1_DOMAIN, CANCEL_V1_REQUIRED_UNITS, FEE_BID_V1_DOMAIN, MAX_ACTIONS_V1,
+    MAX_TRANSACTION_V5_CANONICAL_BYTES, MAX_TRANSACTION_VALIDITY_BLOCKS, SPONSOR_GRANT_V1_DOMAIN,
+    SPONSOR_USE_V1_DOMAIN, TRANSACTION_ID_V1_DOMAIN, TRANSACTION_V5_PROTOCOL_VERSION,
+    TRANSACTION_V5_SIGNING_DOMAIN,
+};
 pub use unbonding::{
     CoolingTranche, UnbondingKind, UnbondingQueue, UnbondingRequest, UnbondingRequestId,
     UnbondingSlashOutcome, UnbondingStatus, UnbondingTransition,
