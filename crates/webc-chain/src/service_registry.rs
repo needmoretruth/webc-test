@@ -108,7 +108,9 @@ where
     // Two hex characters per byte; bound the string length before decoding so a
     // hostile length prefix cannot size an allocation.
     if encoded.len() > max_bytes.saturating_mul(2) {
-        return Err(D::Error::custom("service field exceeds maximum byte length"));
+        return Err(D::Error::custom(
+            "service field exceeds maximum byte length",
+        ));
     }
     if encoded.len() % 2 != 0 {
         return Err(D::Error::custom("service field hex length must be even"));
@@ -600,8 +602,7 @@ mod tests {
         // so a hostile entry cannot size a title allocation past the bound.
         let entry = sample_entry();
         let mut value = serde_json::to_value(&entry).expect("to value");
-        value["title"] =
-            serde_json::Value::String("61".repeat(MAX_SERVICE_TITLE_BYTES + 1));
+        value["title"] = serde_json::Value::String("61".repeat(MAX_SERVICE_TITLE_BYTES + 1));
         assert!(serde_json::from_value::<ServiceEntry>(value).is_err());
     }
 

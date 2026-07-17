@@ -34,6 +34,9 @@ use crate::oracle::{
     accuracy_weight, median, Feed, FeedId, FeedValue, OracleConfig, OracleReporter,
     ORACLE_FEED_LEAF_DOMAIN, ORACLE_REPORTER_LEAF_DOMAIN,
 };
+use crate::service_registry::{
+    ServiceEntry, ServiceId, ServiceStatus, SERVICE_REGISTRY_LEAF_DOMAIN,
+};
 use crate::session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
     SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyId,
@@ -581,6 +584,47 @@ pub enum Event {
         /// Native base units returned from escrow to the principal.
         refunded: Amount,
     },
+    /// A service was registered in the native registry (Phase 9b, §15.5).
+    ServiceRegistered {
+        /// New service identity.
+        service_id: ServiceId,
+        /// Account that owns (controls and is paid for) the service.
+        owner: Address,
+        /// Application namespace the entry lives under.
+        namespace: Hash256,
+    },
+    /// A registered service's mutable fields were updated (Phase 9b, §15.5).
+    ServiceUpdated {
+        /// Service whose current revision was rewritten.
+        service_id: ServiceId,
+        /// The entry's revision after the update.
+        revision: u64,
+    },
+    /// A registered service's lifecycle status changed (Phase 9b, §15.5).
+    ServiceStatusChanged {
+        /// Service whose status changed.
+        service_id: ServiceId,
+        /// The new lifecycle status.
+        status: ServiceStatus,
+        /// The entry's revision after the change.
+        revision: u64,
+    },
+    /// An agent spent against a mandate to pay a service (Phase 9b, §15.5) — the
+    /// service-scoped audit-trail record carrying both ids.
+    MandateSpentToService {
+        /// Mandate that authorized and funded the spend.
+        mandate_id: MandateId,
+        /// Service whose owner was paid.
+        service_id: ServiceId,
+        /// Agent key that signed the spend.
+        agent_key: webc_crypto::PublicKeyBytes,
+        /// Service owner credited the spent principal (the registry pay-to).
+        recipient: Address,
+        /// Native principal moved to the service owner.
+        amount: Amount,
+        /// Native fee drawn from the mandate escrow for this spend.
+        fee: Amount,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -775,6 +819,23 @@ pub struct ChainState {
     /// as a scalar (mirroring `dex_escrow`/`oracle_bonds`/`sponsor_budgets`).
     #[serde(default)]
     pub mandate_escrow: Amount,
+    /// Native service registry, keyed by [`ServiceId`] (Phase 9b, §15.5).
+    ///
+    /// Each [`ServiceEntry`] holds a service's owner (its controller and pay-to
+    /// account), namespace, taxonomy categories, bounded descriptive fields, price
+    /// list, accepted payment flows, lifecycle status, and current revision. A
+    /// service exists only after an explicit [`Operation::RegisterService`];
+    /// [`Operation::UpdateService`] and [`Operation::SetServiceStatus`] rewrite the
+    /// CURRENT revision in place (prior revisions are an event-log/archival concern,
+    /// never active state, so committed size tracks live services, not edit
+    /// history). Committed by the state root through a dedicated Merkle sub-root
+    /// (`SERVICE_REGISTRY_LEAF_DOMAIN`), so a registration, update, or status change
+    /// changes the state root. Holds no native units — registration is data only,
+    /// its spam-priced fee is the ordinary transaction fee — so it does not enter
+    /// supply reconciliation. A `BTreeMap` keeps iteration deterministic in the
+    /// hashed/consensus path.
+    #[serde(default)]
+    pub services: BTreeMap<ServiceId, ServiceEntry>,
     /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
     ///
     /// Each [`ContractManifest`] describes one registered contract (its identity,
@@ -955,6 +1016,7 @@ impl Default for ChainState {
             dex_escrow: Amount::ZERO,
             mandates: BTreeMap::new(),
             mandate_escrow: Amount::ZERO,
+            services: BTreeMap::new(),
             contracts: BTreeMap::new(),
             contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
@@ -1707,6 +1769,7 @@ impl ChainState {
             oracle_reporter_root: Hash256,
             dex_order_root: Hash256,
             mandate_root: Hash256,
+            service_registry_root: Hash256,
             contract_root: Hash256,
             contract_state_root: Hash256,
             namespace_fee_root: Hash256,
@@ -1729,6 +1792,16 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V16 adds the native service registry (Phase 9b, §15.5): the
+            // `service_registry_root` sub-root commits every live service entry
+            // (owner, namespace, categories, bounded fields, pricing, payment flows,
+            // status, and current revision), so a registration, update, or status
+            // change always changes the state root. It adds a committed MAP but NO
+            // new scalar and locks no native units (registration is data only; its
+            // spam-priced fee flows through the existing `burned_fees`/fee-pool
+            // scalars), so the supply invariant is unchanged. The domain bump is a
+            // deliberate consensus-format change; no external fixture pins a prior
+            // root.
             // V15 adds the native agent-mandate primitive (Phase 9a, §15.32): the
             // `mandate_root` sub-root commits every live mandate record (principal,
             // agent key, escrowed budget/spend, expiry, per-tx cap, counterparty
@@ -1781,7 +1854,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V15",
+            domain: "WEBC_STATE_COMMITMENT_V16",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1850,6 +1923,13 @@ impl ChainState {
             // (§15.32): a grant, top-up, spend, or revocation changes this root and
             // therefore the state root.
             mandate_root: ordered_value_root(MANDATE_LEAF_DOMAIN, self.mandates.iter())?,
+            // Native service registry committed by its own ordered sub-root (§15.5):
+            // a registration, update, or status change (each bumps the entry's
+            // revision) changes this root and therefore the state root.
+            service_registry_root: ordered_value_root(
+                SERVICE_REGISTRY_LEAF_DOMAIN,
+                self.services.iter(),
+            )?,
             // Interim contract runtime committed by its own ordered sub-roots (Phase
             // 7a, ADR-0014): registering a contract changes `contract_root`; any
             // contract state write changes `contract_state_root`; either changes the
@@ -1981,7 +2061,10 @@ impl ChainState {
         // lookup, so default-lane replay protection applies even to an agent that
         // was never separately funded. This runs on the cloned overlay, so it
         // persists only if the whole spend succeeds.
-        if matches!(tx.operation, Operation::SpendUnderMandate { .. }) {
+        if matches!(
+            tx.operation,
+            Operation::SpendUnderMandate { .. } | Operation::SpendUnderMandateToService { .. }
+        ) {
             self.accounts.entry(tx.sender).or_default();
         }
         let mut access =
@@ -3762,6 +3845,217 @@ impl ChainState {
                     mandate_id: *mandate_id,
                     principal: tx.sender,
                     refunded: remainder,
+                });
+            }
+            Operation::RegisterService {
+                namespace,
+                create_nonce,
+                categories,
+                title,
+                endpoint,
+                interface,
+                pricing,
+                payment_flags,
+            } => {
+                // Permissionless-for-a-fee registry write (§15.5): records data only
+                // and locks NO native units, so the supply invariant is unaffected
+                // (only the ordinary, spam-priced transaction fee moves through the
+                // existing burn / fee-pool split). Any authorization lane may pay the
+                // fee — there is no per-op balance to draw from — so no default-lane
+                // restriction (mirrors RegisterNamespace).
+                let service_id = ServiceId::derive(*namespace, tx.sender, *create_nonce);
+                access.write(StateKey::service(service_id))?;
+                if self.services.contains_key(&service_id) {
+                    return Err(ChainError::ServiceAlreadyExists);
+                }
+                // `new` validates every bounded field before the record is committed;
+                // a malformed entry fails closed and rolls the whole tx back.
+                let entry = ServiceEntry::new(
+                    tx.sender,
+                    *namespace,
+                    categories.clone(),
+                    title.clone(),
+                    endpoint.clone(),
+                    *interface,
+                    pricing.clone(),
+                    *payment_flags,
+                )?;
+                self.services.insert(service_id, entry);
+                events.push(Event::ServiceRegistered {
+                    service_id,
+                    owner: tx.sender,
+                    namespace: *namespace,
+                });
+            }
+            Operation::UpdateService {
+                service_id,
+                categories,
+                title,
+                endpoint,
+                interface,
+                pricing,
+                payment_flags,
+            } => {
+                access.write(StateKey::service(*service_id))?;
+                // Only the current owner may update. Validate existence and ownership
+                // before building the replacement, so a non-owner's attempt fails
+                // closed and leaves the record unchanged.
+                let existing = self
+                    .services
+                    .get(service_id)
+                    .ok_or(ChainError::ServiceNotFound)?;
+                if existing.owner != tx.sender {
+                    return Err(ChainError::ServiceNotOwner);
+                }
+                // Rewrite the CURRENT revision in place, keeping owner/namespace/
+                // status and bumping the revision. Only the current revision lives in
+                // committed active state (prior revisions are an event-log concern).
+                let mut updated = existing.clone();
+                updated.categories = categories.clone();
+                updated.title = title.clone();
+                updated.endpoint = endpoint.clone();
+                updated.interface = *interface;
+                updated.pricing = pricing.clone();
+                updated.payment_flags = *payment_flags;
+                updated.revision = updated
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                updated.validate()?;
+                let revision = updated.revision;
+                self.services.insert(*service_id, updated);
+                events.push(Event::ServiceUpdated {
+                    service_id: *service_id,
+                    revision,
+                });
+            }
+            Operation::SetServiceStatus { service_id, status } => {
+                access.write(StateKey::service(*service_id))?;
+                let entry = self
+                    .services
+                    .get_mut(service_id)
+                    .ok_or(ChainError::ServiceNotFound)?;
+                if entry.owner != tx.sender {
+                    return Err(ChainError::ServiceNotOwner);
+                }
+                entry.status = *status;
+                entry.revision = entry
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let revision = entry.revision;
+                events.push(Event::ServiceStatusChanged {
+                    service_id: *service_id,
+                    status: *status,
+                    revision,
+                });
+            }
+            Operation::SpendUnderMandateToService {
+                mandate_id,
+                service_id,
+                amount,
+            } => {
+                // Agent-signed spend paying a registered service's owner. Default
+                // lane only (the mandate escrow — not the agent's balance — funds
+                // both the principal moved and the fee). Every rejection path is a
+                // distinct typed error. The service entry is read-only (only its
+                // owner's account is credited); the pay-to owner account is
+                // state-derived and declared by the signer (fails closed if stale).
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                access.read(StateKey::service(*service_id))?;
+                // Resolve the service and validate the whole spend against immutable
+                // borrows, then drop them before mutating balances and the record.
+                let (service_owner, charge, next_spent, next_window, next_count) = {
+                    let service = self
+                        .services
+                        .get(service_id)
+                        .ok_or(ChainError::ServiceNotFound)?;
+                    // Paying a Paused/Retired service is rejected before any
+                    // counterparty or budget work.
+                    if !service.status.is_active() {
+                        return Err(ChainError::ServiceNotActive);
+                    }
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    // Bind the agent key: only the mandate's own agent key may spend.
+                    if tx.public_key != mandate.agent_key {
+                        return Err(ChainError::MandateAgentKeyMismatch);
+                    }
+                    if mandate.revoked {
+                        return Err(ChainError::MandateRevoked);
+                    }
+                    if self.current_epoch > mandate.expiry_epoch.get() {
+                        return Err(ChainError::MandateExpired);
+                    }
+                    if *amount > mandate.per_tx_max {
+                        return Err(ChainError::MandatePerTxExceeded);
+                    }
+                    // The budget covers BOTH the principal and the fee.
+                    let charge = amount
+                        .checked_add(total_fee)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    let next_spent = mandate
+                        .spent
+                        .checked_add(charge)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    if next_spent > mandate.budget_total {
+                        return Err(ChainError::MandateBudgetExceeded);
+                    }
+                    // Category-allowlist resolution against the registry (§2 loop):
+                    // the service OWNER satisfies a recipient allowlist, and an
+                    // active service's categories resolve a category allowlist.
+                    if !mandate.counterparty_policy.permits_service(service) {
+                        return Err(ChainError::MandateCounterpartyNotAllowed);
+                    }
+                    // Per-day rate limit, in a deterministic epoch window.
+                    let window = config.mandate.window_index(self.current_epoch);
+                    let current_count = if mandate.window_index == window {
+                        mandate.spends_in_window
+                    } else {
+                        0
+                    };
+                    if mandate.rate_limit_per_day != 0
+                        && current_count >= mandate.rate_limit_per_day
+                    {
+                        return Err(ChainError::MandateRateLimited);
+                    }
+                    let next_count = current_count
+                        .checked_add(1)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    (service.owner, charge, next_spent, window, next_count)
+                };
+                // The pay-to owner account is credited, so it must be a declared
+                // writable key; the signer names it (state-derived pay-to), and an
+                // undeclared or stale owner fails closed here.
+                access.write(StateKey::account(service_owner))?;
+                // Commit: escrow -> service owner (principal) + fee split (already
+                // added to burned/pool above). Supply-neutral: mandate_escrow falls
+                // by exactly `amount + fee`.
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_sub(charge)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(service_owner, *amount)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.spent = next_spent;
+                mandate.window_index = next_window;
+                mandate.spends_in_window = next_count;
+                events.push(Event::MandateSpentToService {
+                    mandate_id: *mandate_id,
+                    service_id: *service_id,
+                    agent_key: tx.public_key,
+                    recipient: service_owner,
+                    amount: *amount,
+                    fee: total_fee,
                 });
             }
             Operation::RegisterContract { manifest } => {

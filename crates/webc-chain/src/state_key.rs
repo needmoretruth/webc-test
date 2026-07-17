@@ -92,6 +92,8 @@ pub enum StateKeyKind {
     DexOrder { order_id: crate::OrderId },
     /// Native agent-mandate record for one mandate id (Phase 9a, §15.32).
     Mandate { mandate_id: crate::MandateId },
+    /// Native service-registry entry for one service id (Phase 9b, §15.5).
+    Service { service_id: crate::ServiceId },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
 }
@@ -226,6 +228,11 @@ impl StateKey {
     /// Returns the current agent-mandate key for `mandate_id` (Phase 9a, §15.32).
     pub const fn mandate(mandate_id: crate::MandateId) -> Self {
         Self::current(StateKeyKind::Mandate { mandate_id })
+    }
+
+    /// Returns the current service-registry key for `service_id` (Phase 9b, §15.5).
+    pub const fn service(service_id: crate::ServiceId) -> Self {
+        Self::current(StateKeyKind::Service { service_id })
     }
 
     /// Rejects keys whose schema is not supported by this executable.
@@ -442,6 +449,23 @@ mod tests {
             crate::canonical::canonical_json_string(&key).unwrap(),
             format!(
                 r#"{{"kind":{{"Mandate":{{"mandate_id":"{id}"}}}},"version":1}}"#,
+                id = "88".repeat(32),
+            )
+        );
+    }
+
+    #[test]
+    fn service_state_key_has_a_stable_cross_language_wire_vector() {
+        // The service key is a new StateKeyKind variant (Phase 9b, §15.5). Adding a
+        // variant leaves the frozen every-state-key vector untouched (serde tags
+        // variants by name), so this separate vector pins the service key's
+        // canonical JSON shape for a browser SDK mirror without moving the old hash.
+        let service_id = crate::ServiceId::new(Hash256([0x88; 32]));
+        let key = StateKey::service(service_id);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&key).unwrap(),
+            format!(
+                r#"{{"kind":{{"Service":{{"service_id":"{id}"}}}},"version":1}}"#,
                 id = "88".repeat(32),
             )
         );
