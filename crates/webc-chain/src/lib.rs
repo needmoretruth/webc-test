@@ -45,7 +45,9 @@ pub use block_builder::{
     apply_block, build_block, evidence_root, receipt_root, transaction_root, BlockBuildInput,
     MAX_BLOCK_SLASHING_EVIDENCE,
 };
-pub use bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
+pub use bridge::{
+    AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain, MAX_BRIDGE_RECIPIENT_BYTES,
+};
 pub use consensus::{
     detect_double_votes, DoubleVoteEvidence, FinalityCertificate, Proposal, SignedProposal,
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,

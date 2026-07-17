@@ -9,6 +9,56 @@ use crate::{Amount, ChainError};
 use serde::{Deserialize, Serialize};
 use webc_crypto::{Address, Hash256};
 
+/// Maximum length, in bytes, of a bridge external sender/recipient address
+/// byte string.
+///
+/// External-chain addresses are small — 20 bytes on EVM chains, 32 bytes on
+/// Solana, 32 bytes for a native WEBC address — so 128 leaves generous headroom
+/// for any supported domain while rejecting a hostile message that carries a
+/// multi-kilobyte "address" to inflate the decoded allocation and the canonical
+/// message hash (finding B1). This is deliberately much smaller than
+/// `object::MAX_OBJECT_DATA_BYTES`: an address is not a payload.
+pub const MAX_BRIDGE_RECIPIENT_BYTES: usize = 128;
+
+/// Human-readable hex codec for bridge external-address byte fields that bounds
+/// length *before* decoding (finding B1).
+///
+/// The shared `crate::hex_bytes` codec is intentionally unbounded because it
+/// also carries large post-quantum key material; bridge address fields are tiny
+/// and hostile, so they use this stricter codec instead. Mirrors
+/// `object::bounded_hex`: the serialized form (lowercase hex) is byte-identical,
+/// so canonical hashes and cross-language SDK parity are unchanged — only the
+/// decode path gains a bound and an even-length check.
+pub(crate) mod bounded_recipient_hex {
+    use super::MAX_BRIDGE_RECIPIENT_BYTES;
+    use serde::{de::Error as DeError, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        // Two hex characters per byte; check the string length before decoding
+        // so a hostile length prefix cannot size an allocation.
+        if encoded.len() > MAX_BRIDGE_RECIPIENT_BYTES * 2 {
+            return Err(D::Error::custom(
+                "bridge address exceeds maximum byte length",
+            ));
+        }
+        if encoded.len() % 2 != 0 {
+            return Err(D::Error::custom("bridge address hex length must be even"));
+        }
+        hex::decode(encoded).map_err(D::Error::custom)
+    }
+}
+
 /// External chains WEBC intends to interoperate with.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ExternalChain {
@@ -86,10 +136,10 @@ pub struct BridgeMessage {
     /// Exact origin and contract/mint-bound asset identity.
     pub asset: AssetId,
     /// Source-domain sender bytes encoded as lowercase hex on human-readable wires.
-    #[serde(with = "crate::hex_bytes")]
+    #[serde(with = "crate::bridge::bounded_recipient_hex")]
     pub sender: Vec<u8>,
     /// Destination-domain recipient bytes encoded as lowercase hex.
-    #[serde(with = "crate::hex_bytes")]
+    #[serde(with = "crate::bridge::bounded_recipient_hex")]
     pub recipient: Vec<u8>,
     /// Quantity in the asset's protocol base units; state execution rejects zero.
     pub amount: Amount,
@@ -165,5 +215,43 @@ mod tests {
             message.hash().expect("fixture hashes").to_hex(),
             "4c984acec3e91d74db4d81ccce74b6cd8214ff56626747ced5f24b673b83ce85"
         );
+    }
+
+    #[test]
+    fn bridge_message_rejects_oversized_address_before_decode() {
+        // B1: a hostile over-length recipient hex is rejected at the length
+        // check, before any Vec<u8> is allocated. Pre-fix, the unbounded
+        // `hex_bytes` codec would decode it into a large allocation.
+        let mut value = serde_json::to_value(BridgeMessage {
+            source_chain: ExternalChain::Ethereum,
+            destination_chain: ExternalChain::Webc,
+            nonce: 1,
+            asset: AssetId::NativeWebc,
+            sender: vec![1, 2, 3],
+            recipient: vec![4, 5, 6],
+            amount: Amount::from_units(1),
+            source_tx: Hash256([0u8; 32]),
+        })
+        .expect("serializes");
+        // (MAX + 1) bytes encoded as hex exceeds the bound.
+        value["recipient"] = serde_json::Value::String("ab".repeat(MAX_BRIDGE_RECIPIENT_BYTES + 1));
+        assert!(serde_json::from_value::<BridgeMessage>(value).is_err());
+    }
+
+    #[test]
+    fn bridge_message_rejects_odd_length_address_hex() {
+        let mut value = serde_json::to_value(BridgeMessage {
+            source_chain: ExternalChain::Ethereum,
+            destination_chain: ExternalChain::Webc,
+            nonce: 1,
+            asset: AssetId::NativeWebc,
+            sender: vec![1, 2, 3],
+            recipient: vec![4, 5, 6],
+            amount: Amount::from_units(1),
+            source_tx: Hash256([0u8; 32]),
+        })
+        .expect("serializes");
+        value["sender"] = serde_json::Value::String("abc".to_owned());
+        assert!(serde_json::from_value::<BridgeMessage>(value).is_err());
     }
 }

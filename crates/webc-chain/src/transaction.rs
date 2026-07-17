@@ -93,6 +93,11 @@ impl FeeBid {
 /// actions directly instead of rushing into a full smart-contract VM. This keeps
 /// security-sensitive logic explicit and easier to test.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// T1: strict decode of every struct variant, matching the sibling wire types
+// (`AccessList`, `FeeBid`, `Transaction`). Without this, serde silently ignores
+// unknown fields inside a variant, weakening the project's fail-closed decode
+// discipline on hostile input.
+#[serde(deny_unknown_fields)]
 pub enum Operation {
     /// Migrates an address-derived account to versioned authorization.
     InstallAuthorizationPolicy {
@@ -263,7 +268,7 @@ pub enum Operation {
         /// Destination domain that will receive the representation.
         destination_chain: ExternalChain,
         /// Destination-domain recipient bytes, serialized as lowercase hex.
-        #[serde(with = "crate::hex_bytes")]
+        #[serde(with = "crate::bridge::bounded_recipient_hex")]
         recipient: Vec<u8>,
         /// Locked quantity in the asset's protocol base units.
         amount: Amount,
@@ -275,7 +280,7 @@ pub enum Operation {
         /// Destination/origin domain that will release value.
         destination_chain: ExternalChain,
         /// Destination-domain recipient bytes, serialized as lowercase hex.
-        #[serde(with = "crate::hex_bytes")]
+        #[serde(with = "crate::bridge::bounded_recipient_hex")]
         recipient: Vec<u8>,
         /// Burned quantity in the asset's protocol base units.
         amount: Amount,
@@ -1122,6 +1127,38 @@ mod tests {
             sender.address().to_string(),
             "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3"
         );
+    }
+
+    #[test]
+    fn operation_rejects_unknown_variant_fields() {
+        // T1: struct-variant decode is strict, matching AccessList/FeeBid/
+        // Transaction. Pre-fix, serde silently ignored the extra field.
+        let op = Operation::Transfer {
+            to: Keypair::from_seed([3u8; 32]).address(),
+            amount: Amount::from_units(1),
+        };
+        let mut value = serde_json::to_value(&op).expect("serializes");
+        value["Transfer"]["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<Operation>(value).is_err(),
+            "unknown variant field must be rejected"
+        );
+    }
+
+    #[test]
+    fn bridge_lock_recipient_is_bounded_before_decode() {
+        // B1: the bridge recipient uses the bounded codec, so an over-length
+        // hex string is rejected before allocation.
+        let op = Operation::BridgeLock {
+            asset: AssetId::NativeWebc,
+            destination_chain: ExternalChain::Ethereum,
+            recipient: vec![0xab, 0xcd],
+            amount: Amount::from_units(4),
+        };
+        let mut value = serde_json::to_value(&op).expect("serializes");
+        value["BridgeLock"]["recipient"] =
+            serde_json::Value::String("ab".repeat(crate::bridge::MAX_BRIDGE_RECIPIENT_BYTES + 1));
+        assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 
     #[test]
