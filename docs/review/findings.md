@@ -378,19 +378,24 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
   first by `genesis_pins_the_declared_total_supply`,
   `genesis_accepts_an_allocation_matching_the_declared_total`, and
   `genesis_without_a_declared_total_skips_the_pin`.
-- **U1 — MEDIUM — `slash_locked` over-penalizes and ignores the slashable
-  window.** `unbonding.rs:285-320`: it takes no `epoch` parameter and applies the
-  penalty to `request.withdrawable` (principal that `mature`/`advance_epoch` has
-  already moved past both cooldown and the slashable window), in addition to
-  cooling tranches. This contradicts ADR-0008 ("cooling stays slashable through its
-  window; withdrawable has passed it"). CONFIRMED. Fix: pass the current epoch (or
-  store a per-tranche `slashable_through`) and slash only principal still inside its
-  slashable window; exclude `withdrawable`.
-- **U2 — LOW — settled unbonding requests are never pruned.** `unbonding.rs:402`:
-  claimed requests linger forever in `self.requests`; `mature`/`slash_locked`/
-  `queued_for` re-scan them every epoch (unbounded state + growing per-epoch cost).
-  Fix: prune fully-settled requests past any replay window, or move audit history to
-  a separately-bounded structure.
+- **U1 — MEDIUM — RESOLVED (commit `202126a`) — `slash_locked` over-penalizes and
+  ignores the slashable window.** `unbonding.rs:285-320`: it took no `epoch`
+  parameter and applied the penalty to `request.withdrawable` (principal that
+  `mature`/`advance_epoch` has already moved past both cooldown and the slashable
+  window), in addition to cooling tranches. This contradicts ADR-0008 ("cooling
+  stays slashable through its window; withdrawable has passed it"). CONFIRMED.
+  **Fix:** each `CoolingTranche` now stores `slashable_through`; `slash_locked`
+  takes the current epoch and slashes only tranches whose window is still open,
+  and never touches `withdrawable`. Reproduced first by
+  `slash_locked_skips_cooling_past_its_slashable_window` and
+  `slash_locked_never_slashes_matured_withdrawable_principal`.
+- **U2 — LOW — RESOLVED (commit `202126a`) — settled unbonding requests are never
+  pruned.** `unbonding.rs:402`: claimed requests lingered forever in
+  `self.requests`; `mature`/`slash_locked`/`queued_for` re-scanned them every epoch
+  (unbounded state + growing per-epoch cost). **Fix:** `advance_epoch` prunes
+  fully-settled requests (no live principal in any bucket); IDs are monotonic and
+  never reused, so a pruned request cannot be revived or replayed. Reproduced first
+  by `advance_epoch_prunes_fully_settled_requests`.
 - **B1 — MEDIUM — RESOLVED (commit `09e6165`) — unbounded bridge-recipient hex
   decode.** `hex_bytes.rs:32-38`: `deserialize` runs `hex::decode(text)` with no
   length bound; it backs the `recipient: Vec<u8>` of `BridgeLock`/`BridgeBurn`
