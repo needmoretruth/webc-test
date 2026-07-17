@@ -26,6 +26,7 @@ import type {
   GovernanceInstance,
   GovernanceProposal,
   GovProposalStatusJson,
+  HexString,
   Mandate,
   MandateCounterpartyJson,
   MandateCounterpartyPolicyJson,
@@ -172,6 +173,56 @@ export interface ListServicesOptions {
   readonly cursor?: string;
   /** Maximum ids to return in the page (node-bounded). */
   readonly limit?: number;
+}
+
+/** Cursor + limit shared by the simple paginated list endpoints. */
+export interface PageOptions {
+  /** Opaque pagination cursor from a previous page's `nextCursor`. */
+  readonly cursor?: string;
+  /** Maximum entries to return in the page (node-bounded). */
+  readonly limit?: number;
+}
+
+/**
+ * Filters for {@link WebcNodeClient.listGovernanceProposals}
+ * (`GET /v1/governance/instances/{id}/proposals`).
+ */
+export interface ListProposalsOptions extends PageOptions {
+  /** Restrict to proposals currently in this lifecycle status. */
+  readonly status?: GovProposalStatusJson;
+}
+
+/**
+ * One entry in a collection's items listing
+ * (`GET /v1/nft/collections/{id}/items`): the full {@link NftItem} record with its
+ * `serial` (the node flattens the serial into the record).
+ */
+export interface NftItemEntry extends NftItem {
+  /** The item's serial within its collection. */
+  readonly serial: number;
+}
+
+/**
+ * One entry in an instance's proposals listing
+ * (`GET /v1/governance/instances/{id}/proposals`): the full
+ * {@link GovernanceProposal} record with its `proposalId` (the node flattens the id
+ * into the record).
+ */
+export interface GovernanceProposalEntry extends GovernanceProposal {
+  /** The proposal's 32-byte lowercase-hex id. */
+  readonly proposalId: HexString;
+}
+
+/**
+ * One entry in an address's token-balances listing
+ * (`GET /v1/accounts/{address}/token-balances`): a held token id and the balance,
+ * a canonical decimal string of base units (the holder is fixed by the request).
+ */
+export interface TokenBalanceEntry {
+  /** The held token's 32-byte lowercase-hex id. */
+  readonly tokenId: HexString;
+  /** The address's balance of the token, decimal string of base units. */
+  readonly balance: string;
 }
 
 /**
@@ -405,6 +456,77 @@ export class WebcNodeClient {
       limit: requireOptionalLimitQuery(options.limit),
     });
     return parseHex32Page(await this.#get(`/v1/services${query}`), "service_ids");
+  }
+
+  /**
+   * Lists an NFT collection's items in ascending serial order
+   * (`GET /v1/nft/collections/{id}/items`), cursor-paginated. Each entry carries the
+   * item's `serial` alongside its full {@link NftItem} record. The response is
+   * strictly parsed and fails closed on a malformed page.
+   */
+  async listNftCollectionItems(
+    id: string,
+    options: PageOptions = {},
+  ): Promise<Page<NftItemEntry>> {
+    const query = buildListQuery({
+      cursor: options.cursor,
+      limit: requireOptionalLimitQuery(options.limit),
+    });
+    return parseEntryPage(
+      await this.#get(
+        `/v1/nft/collections/${encodeURIComponent(id)}/items${query}`,
+      ),
+      "nft items page",
+      (entry, index) => parseNftItemEntry(entry, `items[${index}]`),
+    );
+  }
+
+  /**
+   * Lists an instance's governance proposals in ascending proposal-id order
+   * (`GET /v1/governance/instances/{id}/proposals`), optionally filtered by
+   * `status` and cursor-paginated. Each entry carries the proposal's `proposalId`
+   * alongside its full {@link GovernanceProposal} record. The response is strictly
+   * parsed and fails closed on a malformed page.
+   */
+  async listGovernanceProposals(
+    id: string,
+    options: ListProposalsOptions = {},
+  ): Promise<Page<GovernanceProposalEntry>> {
+    const query = buildListQuery({
+      status: options.status,
+      cursor: options.cursor,
+      limit: requireOptionalLimitQuery(options.limit),
+    });
+    return parseEntryPage(
+      await this.#get(
+        `/v1/governance/instances/${encodeURIComponent(id)}/proposals${query}`,
+      ),
+      "governance proposals page",
+      (entry, index) => parseGovernanceProposalEntry(entry, `items[${index}]`),
+    );
+  }
+
+  /**
+   * Lists the token balances held by an address in ascending token-id order
+   * (`GET /v1/accounts/{address}/token-balances`), cursor-paginated. Each entry
+   * carries a held token id and the balance as a decimal string. The response is
+   * strictly parsed and fails closed on a malformed page.
+   */
+  async listAccountTokenBalances(
+    address: string,
+    options: PageOptions = {},
+  ): Promise<Page<TokenBalanceEntry>> {
+    const query = buildListQuery({
+      cursor: options.cursor,
+      limit: requireOptionalLimitQuery(options.limit),
+    });
+    return parseEntryPage(
+      await this.#get(
+        `/v1/accounts/${encodeURIComponent(address)}/token-balances${query}`,
+      ),
+      "token balances page",
+      (entry, index) => parseTokenBalanceEntry(entry, `items[${index}]`),
+    );
   }
 
   /**
@@ -927,6 +1049,26 @@ function parseHex32Page(value: unknown, field: string): Page<string> {
   return Object.freeze({ items, nextCursor: parseNextCursor(record.next_cursor) });
 }
 
+/**
+ * Strictly parses a `{ items: T[], next_cursor }` page (fail-closed), mapping each
+ * entry through `parseItem`. The richer list endpoints (NFT items, proposals,
+ * token balances) all share this `items`/`next_cursor` envelope; only the per-entry
+ * decode differs.
+ */
+function parseEntryPage<T>(
+  value: unknown,
+  ctx: string,
+  parseItem: (entry: unknown, index: number) => T,
+): Page<T> {
+  const record = requireRecord(value, ctx);
+  rejectUnknownKeys(record, ["items", "next_cursor"], ctx);
+  if (!Array.isArray(record.items)) {
+    throw new Error(`node response ${ctx} field items is not an array`);
+  }
+  const items = record.items.map((entry, index) => parseItem(entry, index));
+  return Object.freeze({ items, nextCursor: parseNextCursor(record.next_cursor) });
+}
+
 // ---------------------------------------------------------------------------
 // Native-state read parsers (Phase 9/13). These decode UNTRUSTED node responses
 // into the wire-mirror record types in `types.ts`, failing closed on a missing,
@@ -1393,4 +1535,49 @@ function parseMandate(value: unknown): Mandate {
     window_index: requireCount(obj.window_index, "window_index"),
     spends_in_window: requireCount(obj.spends_in_window, "spends_in_window"),
   };
+}
+
+/**
+ * Parses one NFT-items-listing entry (`serial` flattened onto the `NftItem`
+ * record). The serial is validated as a count and the item body is decoded by the
+ * same strict {@link parseNftItem} used for the single-item read, so the two paths
+ * cannot diverge.
+ */
+function parseNftItemEntry(value: unknown, ctx: string): NftItemEntry {
+  const obj = requireRecord(value, ctx);
+  const serial = requireCount(obj.serial, `${ctx}.serial`);
+  // Decode the flattened item body with the shared record parser (which rejects
+  // unknown fields), so drop `serial` from the copy handed to it.
+  const body: Record<string, unknown> = { ...obj };
+  delete body.serial;
+  const item = parseNftItem(body);
+  return Object.freeze({ serial, ...item });
+}
+
+/**
+ * Parses one proposals-listing entry (`proposal_id` flattened onto the
+ * `GovernanceProposal` record). The id is validated as 32-byte hex and the proposal
+ * body is decoded by the same strict {@link parseGovernanceProposal} used for the
+ * single-proposal read, so the two paths cannot diverge.
+ */
+function parseGovernanceProposalEntry(
+  value: unknown,
+  ctx: string,
+): GovernanceProposalEntry {
+  const obj = requireRecord(value, ctx);
+  const proposalId = requireHex32(obj.proposal_id, `${ctx}.proposal_id`);
+  const body: Record<string, unknown> = { ...obj };
+  delete body.proposal_id;
+  const proposal = parseGovernanceProposal(body);
+  return Object.freeze({ proposalId, ...proposal });
+}
+
+/** Parses one token-balances-listing entry (`{ token_id, balance }`). */
+function parseTokenBalanceEntry(value: unknown, ctx: string): TokenBalanceEntry {
+  const obj = requireRecord(value, ctx);
+  rejectUnknownKeys(obj, ["token_id", "balance"], ctx);
+  return Object.freeze({
+    tokenId: requireHex32(obj.token_id, `${ctx}.token_id`),
+    balance: requireAmountString(obj.balance, `${ctx}.balance`),
+  });
 }
