@@ -13,9 +13,34 @@ use crate::authorization_policy::{
     active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
 };
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
-use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy};
+use crate::contract::{
+    builtin_contract, BuiltinContract, ContractContext, ContractManifest, ContractRuntimeConfig,
+    ContractStateValue, GasMeter, CONTRACT_LEAF_DOMAIN, CONTRACT_STATE_LEAF_DOMAIN,
+    MAX_CONTRACT_INPUT_BYTES,
+};
+use crate::dex::{
+    prorata_fills, uniform_clearing_price, DexConfig, Order, OrderId, OrderSide, Price,
+    TradingPair, DEX_ORDER_LEAF_DOMAIN,
+};
+use crate::fees::{
+    next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
+    StoragePricing, NAMESPACE_FEE_LEAF_DOMAIN,
+};
 use crate::genesis::GenesisConfig;
+use crate::mandate::{Mandate, MandateConfig, MandateId, MANDATE_LEAF_DOMAIN};
+use crate::namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
+use crate::nft::{
+    NftAuthorityKind, NftCollection, NftCollectionId, NftConfig, NftId, NftItem,
+    NFT_COLLECTION_LEAF_DOMAIN, NFT_ITEM_LEAF_DOMAIN,
+};
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
+use crate::oracle::{
+    accuracy_weight, median, Feed, FeedId, FeedValue, OracleConfig, OracleReporter,
+    ORACLE_FEED_LEAF_DOMAIN, ORACLE_REPORTER_LEAF_DOMAIN,
+};
+use crate::service_registry::{
+    ServiceEntry, ServiceId, ServiceStatus, SERVICE_REGISTRY_LEAF_DOMAIN,
+};
 use crate::session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
     SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyId,
@@ -23,14 +48,22 @@ use crate::session_key::{
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
 };
+use crate::sponsorship::{
+    sponsor_state_key_hash, AppSponsor, SponsorshipConfig, SPONSOR_LEAF_DOMAIN,
+};
 use crate::staking::{Delegation, StakingConfig, Validator, ValidatorStatus};
 use crate::state_key::StateAccessRecorder;
+use crate::token::{
+    TokenAuthorityKind, TokenConfig, TokenId, TokenRecord, FROZEN_TOKEN_LEAF_DOMAIN,
+    TOKEN_BALANCE_LEAF_DOMAIN, TOKEN_LEAF_DOMAIN,
+};
 use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
 use crate::{
-    Amount, AuthorizationLaneId, ChainError, ChainId, Epoch, InflationSchedule, ObjectId,
-    ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, StateKey,
-    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    Amount, AuthorizationLaneId, BootstrapIssuance, ChainError, ChainId, Epoch,
+    InactivityLeakConfig, InflationSchedule, ObjectId, ObjectVersion, ProtocolStateKey,
+    ProtocolVersion, SlashingEvidence, StateKey, CURRENT_PROTOCOL_VERSION,
+    LEGACY_AUTHORIZATION_POLICY_REVISION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,9 +85,65 @@ pub struct ChainConfig {
     pub slashing: SlashingPolicy,
     pub inflation: InflationSchedule,
     pub bridge: BridgeConfig,
+    /// Occupancy-priced storage deposit + deletion rebate policy (§15.22).
+    ///
+    /// `#[serde(default)]` keeps a genesis written before storage pricing
+    /// decodable; the default locks a cheap refundable deposit per object byte
+    /// and refunds 90% on delete (burning 10% as the occupancy fee).
+    #[serde(default)]
+    pub storage_pricing: StoragePricing,
+    /// Hard, deterministic caps for application fee sponsorship (§15.35).
+    ///
+    /// `#[serde(default)]` keeps a genesis written before sponsorship decodable;
+    /// the launch values are measurement-tuned placeholders (per-user /
+    /// per-operation / per-app-per-day bounds, simple operations only).
+    #[serde(default)]
+    pub sponsorship: SponsorshipConfig,
+    /// Native oracle parameters (§15.17): feed-creation fee, minimum reporter
+    /// bond, settlement cadence, and liveness window.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before the oracle decodable;
+    /// the launch values are measurement-tuned placeholders (§15.35 method).
+    #[serde(default)]
+    pub oracle: OracleConfig,
+    /// Native DEX parameters (§15.13/§15.18/§15.37): minimum order size, default
+    /// retry-deadline window, and the optional per-fill fee.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before the DEX decodable; the
+    /// launch values are measurement-tuned placeholders (§15.35 method).
+    #[serde(default)]
+    pub dex: DexConfig,
+    /// Interim contract runtime parameters (Phase 7a, ADR-0014): the flat, burned
+    /// contract-registration fee.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before the contract runtime
+    /// decodable; the launch value is a measurement-tuned placeholder.
+    #[serde(default)]
+    pub contracts: ContractRuntimeConfig,
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
+    /// Agent-mandate parameters (Phase 9a, §15.32): the deterministic per-day
+    /// rate-limit window.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before mandates decodable; the
+    /// launch value is a measurement-tuned placeholder (§15.35 method).
+    #[serde(default)]
+    pub mandate: MandateConfig,
+    /// Native fungible-token parameters (Phase 13a, §15): the flat native creation
+    /// deposit locked (non-refundable) as an anti-spam price.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before native tokens decodable;
+    /// the launch value is a measurement-tuned placeholder (§15.35 method).
+    #[serde(default)]
+    pub token: TokenConfig,
+    /// Native NFT parameters (Phase 13b, §15): the flat native creation deposit
+    /// locked (non-refundable) as an anti-spam price per collection.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before native NFTs decodable; the
+    /// launch value is a measurement-tuned placeholder (§15.35 method).
+    #[serde(default)]
+    pub nft: NftConfig,
     /// Total native supply, in base units, that the genesis allocation must sum
     /// to. `Some` on production genesis — mainnet and devnet both pin
     /// [`GENESIS_TOTAL_SUPPLY`] — so `ChainState::from_genesis` rejects any
@@ -65,6 +154,17 @@ pub struct ChainConfig {
     /// [`GENESIS_TOTAL_SUPPLY`]: crate::GENESIS_TOTAL_SUPPLY
     #[serde(default)]
     pub expected_total_supply: Option<Amount>,
+    /// Opt-in bootstrap-phase issuance (§15.2). `None` (default) uses only the
+    /// base [`InflationSchedule`]; `Some` keys issuance to staked amount, capped
+    /// by the base per-period budget, until [`BootstrapIssuance::sunset_epoch`].
+    #[serde(default)]
+    pub bootstrap_issuance: Option<BootstrapIssuance>,
+    /// Opt-in inactivity leak (ADR-0012). `None` (default) keeps vanilla
+    /// Tendermint liveness (halt on >1/3 offline) plus the ADR-0011 restart
+    /// fallback; `Some` will drain offline validator weight to recover finality
+    /// once the recovery-mode consensus design is confirmed and wired.
+    #[serde(default)]
+    pub inactivity_leak: Option<InactivityLeakConfig>,
 }
 
 impl Default for ChainConfig {
@@ -78,10 +178,31 @@ impl Default for ChainConfig {
             slashing: SlashingPolicy::default(),
             inflation: InflationSchedule::default(),
             bridge: BridgeConfig::default(),
+            storage_pricing: StoragePricing::default(),
+            sponsorship: SponsorshipConfig::default(),
+            oracle: OracleConfig::default(),
+            dex: DexConfig::default(),
+            contracts: ContractRuntimeConfig::default(),
             session_keys: SessionKeyConfig::default(),
+            mandate: MandateConfig::default(),
+            token: TokenConfig::default(),
+            nft: NftConfig::default(),
             expected_total_supply: None,
+            bootstrap_issuance: None,
+            inactivity_leak: None,
         }
     }
+}
+
+/// Why a DEX order left the live order set (carried in [`Event::OrderClosed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderCloseReason {
+    /// The owner submitted an explicit `CancelOrder`.
+    Cancelled,
+    /// An immediate-or-cancel order had an unfilled remainder after its batch.
+    FillOrCancel,
+    /// The order's `deadline_height` passed with an unfilled remainder.
+    Expired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +215,203 @@ pub enum Event {
     FeePaid {
         payer: Address,
         breakdown: FeeBreakdown,
+    },
+    /// An application sponsor's budget covered a transaction's fee (§15.35).
+    FeeSponsored {
+        /// Application namespace whose sponsor budget paid the fee.
+        application: Hash256,
+        /// User whose transaction fee was sponsored.
+        beneficiary: Address,
+        /// The burn + validator-reward split drawn from the sponsor budget.
+        breakdown: FeeBreakdown,
+    },
+    /// A new application fee sponsor was registered and initially funded (§15.35).
+    AppSponsorRegistered {
+        /// Application namespace this sponsor underwrites.
+        application: Hash256,
+        /// Account that controls (funds/withdraws) the sponsor.
+        owner: Address,
+        /// App-chosen per-day-window sponsored-fee spend cap.
+        daily_budget_cap: Amount,
+        /// Native base units moved into the budget at registration.
+        funded: Amount,
+    },
+    /// An application fee sponsor's budget was topped up (§15.35).
+    AppSponsorFunded {
+        /// Application namespace whose budget grew.
+        application: Hash256,
+        /// Native base units added to the budget.
+        amount: Amount,
+    },
+    /// Unspent budget was withdrawn from an application fee sponsor (§15.35).
+    AppSponsorWithdrawn {
+        /// Application namespace whose budget shrank.
+        application: Hash256,
+        /// Native base units returned to the owner's liquid balance.
+        amount: Amount,
+    },
+    /// An application namespace was claimed by an owner (§8 application isolation).
+    NamespaceRegistered {
+        /// Application namespace that was claimed.
+        namespace: Hash256,
+        /// Account now recorded as the namespace owner.
+        owner: Address,
+    },
+    /// A registered application namespace changed owner (§8 application isolation).
+    NamespaceTransferred {
+        /// Application namespace whose ownership moved.
+        namespace: Hash256,
+        /// Previous owner that authorized the transfer.
+        from: Address,
+        /// New owner recorded in the registry.
+        to: Address,
+    },
+    /// A native oracle feed was created for the creation fee (§15.6/§15.17).
+    FeedCreated {
+        /// New feed identity.
+        feed_id: FeedId,
+        /// Account that created and paid for the feed.
+        creator: Address,
+        /// Frozen reporter bond-size class for this feed.
+        bond: Amount,
+        /// Creation fee burned from the creator's liquid balance.
+        fee_burned: Amount,
+    },
+    /// A reporter registered and bonded on a feed (§15.17).
+    ReporterRegistered {
+        /// Feed the reporter joined.
+        feed_id: FeedId,
+        /// Reporter that bonded.
+        reporter: Address,
+        /// Native base units locked as the bond.
+        bond: Amount,
+    },
+    /// A reporter deregistered and had its bond returned (§15.17).
+    ReporterDeregistered {
+        /// Feed the reporter left.
+        feed_id: FeedId,
+        /// Reporter that unbonded.
+        reporter: Address,
+        /// Native base units returned to the reporter's liquid balance.
+        bond: Amount,
+    },
+    /// A reporter submitted a value to a feed (§9 median aggregation).
+    ReportSubmitted {
+        /// Feed reported to.
+        feed_id: FeedId,
+        /// Reporter that submitted.
+        reporter: Address,
+        /// The submitted integer value.
+        value: FeedValue,
+        /// Epoch the value was reported for (liveness reference).
+        epoch: u64,
+    },
+    /// A consumer paid a read fee into a feed's revenue pool (§15.17).
+    FeedReadPaid {
+        /// Feed whose value was consumed on-chain.
+        feed_id: FeedId,
+        /// Account that paid the read fee.
+        payer: Address,
+        /// Native base units added to the feed's revenue pool.
+        amount: Amount,
+    },
+    /// A feed's accrued read-fee revenue was settled to its reporters (§15.17).
+    ///
+    /// Distributed weighted by accuracy (closeness to the accepted median) and
+    /// liveness (reported within the window); `carried` is the integer-division
+    /// remainder kept in the pool for the next settlement, so nothing is lost.
+    FeedRevenueSettled {
+        /// Feed that was settled.
+        feed_id: FeedId,
+        /// Epoch the settlement was performed for.
+        epoch: u64,
+        /// Accepted median at settlement (the accuracy reference), if any reporter
+        /// had submitted a value.
+        median: Option<FeedValue>,
+        /// Native base units paid out to reporters this settlement.
+        distributed: Amount,
+        /// Native base units carried forward in the pool (division remainder).
+        carried: Amount,
+    },
+    /// A DEX order intent was submitted and its input locked (§15.37).
+    OrderSubmitted {
+        /// New order identity.
+        order_id: OrderId,
+        /// Account that submitted and locked the order's input.
+        owner: Address,
+        /// Oriented pair the order trades on.
+        pair: TradingPair,
+        /// Buy or sell.
+        side: OrderSide,
+        /// Order size in base-asset base units.
+        amount: Amount,
+        /// Limit price in quote base-units per base base-unit.
+        limit_price: Price,
+        /// Effective deadline height after which the order auto-cancels.
+        deadline_height: u64,
+    },
+    /// A DEX order was (partially or fully) filled in a block's batch (§15.37).
+    ///
+    /// Every order filled in the same pair's batch trades at the identical
+    /// `clearing_price`, so no participant is ordered ahead of another. `filled` is
+    /// this batch's base fill; `remaining` is what is left to retry afterward
+    /// (`0` when fully filled and the order is then closed).
+    OrderFilled {
+        /// Order that filled.
+        order_id: OrderId,
+        /// Pair whose batch settled.
+        pair: TradingPair,
+        /// Buy or sell.
+        side: OrderSide,
+        /// Uniform clearing price for this pair's batch this block.
+        clearing_price: Price,
+        /// Base units filled this batch.
+        filled: Amount,
+        /// Base units still to fill after this batch.
+        remaining: Amount,
+        /// Quote base units the order paid (buy) or received net of fee (sell).
+        quote: Amount,
+    },
+    /// A DEX order was cancelled and its remaining lock refunded (§15.37).
+    ///
+    /// Covers owner-requested cancels, immediate-or-cancel remainders, and
+    /// deadline expiries; `reason` distinguishes them.
+    OrderClosed {
+        /// Order that was closed.
+        order_id: OrderId,
+        /// Account the remaining lock was refunded to.
+        owner: Address,
+        /// Why the order closed.
+        reason: OrderCloseReason,
+        /// Base units of the order left unfilled at closure.
+        unfilled: Amount,
+    },
+    /// An interim Rust-authored contract was registered (Phase 7a, ADR-0014).
+    ContractRegistered {
+        /// Registered contract identity (the manifest / module key).
+        code_id: Hash256,
+        /// Application namespace the contract's state is isolated under.
+        namespace: Hash256,
+        /// Account that registered and owns the contract.
+        owner: Address,
+        /// Audited built-in handler the contract runs.
+        builtin: BuiltinContract,
+        /// Registration fee burned from the owner's liquid balance.
+        fee_burned: Amount,
+    },
+    /// A registered contract's handler was invoked (Phase 7a, ADR-0014).
+    ContractInvoked {
+        /// Registered contract identity that ran.
+        code_id: Hash256,
+        /// Application namespace whose state the call touched.
+        namespace: Hash256,
+        /// Account that invoked the contract.
+        caller: Address,
+        /// Total execution units the call consumed (admission plus metered
+        /// per-host-op consumption), within the sender's authorized `gas_limit`.
+        gas_consumed: u64,
+        /// Length in bytes of the handler's returned output.
+        output_len: u64,
     },
     ValidatorRegistered {
         operator: Address,
@@ -136,6 +454,15 @@ pub enum Event {
         amount: Amount,
     },
     DelegatorRewardsClaimed {
+        delegator: Address,
+        validator: Address,
+        amount: Amount,
+    },
+    ValidatorRewardsCompounded {
+        validator: Address,
+        amount: Amount,
+    },
+    DelegatorRewardsCompounded {
         delegator: Address,
         validator: Address,
         amount: Amount,
@@ -228,6 +555,231 @@ pub enum Event {
         to: Address,
         version: ObjectVersion,
     },
+    ObjectDeleted {
+        object_id: ObjectId,
+        /// Object owner who authorized the deletion and received the refund.
+        owner: Address,
+        /// Native base units returned to the owner's liquid balance.
+        refund: Amount,
+        /// Native base units burned as the storage occupancy fee.
+        burned: Amount,
+    },
+    /// An agent mandate was granted and its budget escrowed (§15.32).
+    MandateGranted {
+        /// New mandate identity.
+        mandate_id: MandateId,
+        /// Account that granted and funds the mandate.
+        principal: Address,
+        /// Agent key authorized to spend under the mandate.
+        agent_key: webc_crypto::PublicKeyBytes,
+        /// Native base units escrowed as the mandate's total budget.
+        budget_total: Amount,
+        /// Last epoch (inclusive) the mandate may be spent.
+        expiry_epoch: Epoch,
+    },
+    /// An agent mandate's budget was topped up (§15.32).
+    MandateToppedUp {
+        /// Mandate whose budget grew.
+        mandate_id: MandateId,
+        /// Native base units added to the escrowed budget.
+        amount: Amount,
+        /// The mandate's total budget after the top-up.
+        budget_total: Amount,
+    },
+    /// An agent spent against a mandate (§15.32) — the audit-trail record.
+    MandateSpent {
+        /// Mandate that authorized and funded the spend.
+        mandate_id: MandateId,
+        /// Agent key that signed the spend.
+        agent_key: webc_crypto::PublicKeyBytes,
+        /// Recipient credited the spent principal.
+        recipient: Address,
+        /// Native principal moved to the recipient.
+        amount: Amount,
+        /// Native fee drawn from the mandate escrow for this spend.
+        fee: Amount,
+    },
+    /// An agent mandate was revoked and its remainder reclaimed (§15.32).
+    MandateRevoked {
+        /// Mandate that was revoked.
+        mandate_id: MandateId,
+        /// Principal that revoked it and received the remainder.
+        principal: Address,
+        /// Native base units returned from escrow to the principal.
+        refunded: Amount,
+    },
+    /// A service was registered in the native registry (Phase 9b, §15.5).
+    ServiceRegistered {
+        /// New service identity.
+        service_id: ServiceId,
+        /// Account that owns (controls and is paid for) the service.
+        owner: Address,
+        /// Application namespace the entry lives under.
+        namespace: Hash256,
+    },
+    /// A registered service's mutable fields were updated (Phase 9b, §15.5).
+    ServiceUpdated {
+        /// Service whose current revision was rewritten.
+        service_id: ServiceId,
+        /// The entry's revision after the update.
+        revision: u64,
+    },
+    /// A registered service's lifecycle status changed (Phase 9b, §15.5).
+    ServiceStatusChanged {
+        /// Service whose status changed.
+        service_id: ServiceId,
+        /// The new lifecycle status.
+        status: ServiceStatus,
+        /// The entry's revision after the change.
+        revision: u64,
+    },
+    /// An agent spent against a mandate to pay a service (Phase 9b, §15.5) — the
+    /// service-scoped audit-trail record carrying both ids.
+    MandateSpentToService {
+        /// Mandate that authorized and funded the spend.
+        mandate_id: MandateId,
+        /// Service whose owner was paid.
+        service_id: ServiceId,
+        /// Agent key that signed the spend.
+        agent_key: webc_crypto::PublicKeyBytes,
+        /// Service owner credited the spent principal (the registry pay-to).
+        recipient: Address,
+        /// Native principal moved to the service owner.
+        amount: Amount,
+        /// Native fee drawn from the mandate escrow for this spend.
+        fee: Amount,
+    },
+    /// A native fungible token was created (Phase 13a, §15).
+    TokenCreated {
+        /// Identity of the created token.
+        token_id: TokenId,
+        /// Account that created the token (its `creator`).
+        creator: Address,
+        /// Application namespace the token lives under.
+        namespace: Hash256,
+        /// Native deposit locked (non-refundable) as the anti-spam price.
+        deposit: Amount,
+        /// Amount minted to the initial recipient at creation (may be zero).
+        initial_supply: Amount,
+    },
+    /// Units of a token were minted to a recipient (Phase 13a, §15).
+    TokenMinted {
+        /// Token minted.
+        token_id: TokenId,
+        /// Account credited the newly minted units.
+        recipient: Address,
+        /// Units minted.
+        amount: Amount,
+        /// Token issued supply after the mint.
+        issued_supply: Amount,
+    },
+    /// Units of a token were burned from a holder (Phase 13a, §15).
+    TokenBurned {
+        /// Token burned.
+        token_id: TokenId,
+        /// Holder whose balance was reduced.
+        holder: Address,
+        /// Units burned.
+        amount: Amount,
+        /// Token issued supply after the burn.
+        issued_supply: Amount,
+    },
+    /// Token units moved from one holder to another (Phase 13a, §15).
+    TokenTransferred {
+        /// Token transferred.
+        token_id: TokenId,
+        /// Sending account.
+        from: Address,
+        /// Receiving account.
+        to: Address,
+        /// Units transferred.
+        amount: Amount,
+    },
+    /// A token's paused flag changed (Phase 13a, §15).
+    TokenPausedChanged {
+        /// Token whose paused flag changed.
+        token_id: TokenId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// A token account was frozen or thawed (Phase 13a, §15).
+    TokenFreezeChanged {
+        /// Token whose account freeze state changed.
+        token_id: TokenId,
+        /// Account whose freeze state changed.
+        account: Address,
+        /// Whether the account is now frozen.
+        frozen: bool,
+    },
+    /// A token authority was transferred or permanently renounced (Phase 13a, §15).
+    TokenAuthorityChanged {
+        /// Token whose authority changed.
+        token_id: TokenId,
+        /// Which authority (mint or freeze) changed.
+        authority_kind: TokenAuthorityKind,
+        /// New holder, or `None` if the authority was permanently renounced.
+        new_authority: Option<Address>,
+    },
+    /// A native NFT collection was created (Phase 13b, §15).
+    NftCollectionCreated {
+        /// Identity of the created collection.
+        collection_id: NftCollectionId,
+        /// Account that created the collection (its `creator`).
+        creator: Address,
+        /// Application namespace the collection lives under.
+        namespace: Hash256,
+        /// Native deposit locked (non-refundable) as the anti-spam price.
+        deposit: Amount,
+    },
+    /// An NFT item was minted to a recipient (Phase 13b, §15).
+    NftMinted {
+        /// Full identity of the minted item (`(collection, serial)`).
+        nft_id: NftId,
+        /// Account that owns the newly minted item.
+        recipient: Address,
+        /// Per-item off-chain metadata commitment.
+        item_metadata_hash: Hash256,
+    },
+    /// An NFT item changed owner (Phase 13b, §15).
+    NftTransferred {
+        /// Identity of the transferred item.
+        nft_id: NftId,
+        /// Previous owner.
+        from: Address,
+        /// New owner.
+        to: Address,
+    },
+    /// An NFT item was burned (Phase 13b, §15).
+    NftBurned {
+        /// Identity of the burned item.
+        nft_id: NftId,
+        /// Owner who burned the item.
+        owner: Address,
+    },
+    /// A collection's paused flag changed (Phase 13b, §15).
+    NftCollectionPausedChanged {
+        /// Collection whose paused flag changed.
+        collection_id: NftCollectionId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// An NFT item was frozen or thawed (Phase 13b, §15).
+    NftItemFreezeChanged {
+        /// Identity of the item whose freeze state changed.
+        nft_id: NftId,
+        /// Whether the item is now frozen.
+        frozen: bool,
+    },
+    /// A collection authority was transferred or permanently renounced
+    /// (Phase 13b, §15).
+    NftAuthorityChanged {
+        /// Collection whose authority changed.
+        collection_id: NftCollectionId,
+        /// Which authority (mint or freeze) changed.
+        authority_kind: NftAuthorityKind,
+        /// New holder, or `None` if the authority was permanently renounced.
+        new_authority: Option<Address>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,12 +851,289 @@ pub struct ChainState {
     pub burned_fees: Amount,
     /// Native units destroyed by verified objective penalties.
     pub slashed_units: Amount,
+    /// Refundable native units locked as object storage deposits (§15.22).
+    ///
+    /// Total of every live object's recorded `deposit`. `CreateObject` moves
+    /// units here from the creator's liquid balance; `MutateObject` resizes the
+    /// lock; `DeleteObject` moves them out as an owner refund plus a burned
+    /// occupancy remainder. Reconciled by [`SupplyInvariantReport`] like the
+    /// other locked buckets, and committed by the state root as a scalar.
+    #[serde(default)]
+    pub storage_deposits: Amount,
+    /// Registered application fee sponsors, keyed by application namespace (§15.35).
+    ///
+    /// Each [`AppSponsor`] holds a pre-funded budget and the hard per-user /
+    /// per-app-per-day counters. Committed by the state root through a dedicated
+    /// Merkle sub-root (`SPONSOR_LEAF_DOMAIN`), so any change to a sponsor's
+    /// budget or counters changes the state root. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub sponsors: BTreeMap<Hash256, AppSponsor>,
+    /// Refundable native units locked across every application sponsor budget (§15.35).
+    ///
+    /// Sum of every live [`AppSponsor::budget`]. Registering/funding a sponsor
+    /// moves units here from the owner's liquid balance; a sponsored fee moves
+    /// them out as the same burn + validator-reward split a normal fee uses;
+    /// withdrawing moves them back to the owner. Reconciled by
+    /// [`SupplyInvariantReport`] as a locked bucket and committed by the state
+    /// root as a scalar (mirroring `storage_deposits`).
+    #[serde(default)]
+    pub sponsor_budgets: Amount,
+    /// Application namespace ownership registry (§8 "Application isolation").
+    ///
+    /// Maps an application namespace to its [`NamespaceRecord`] (its owner). An app
+    /// claims its namespace with `RegisterNamespace` and can prove ownership; the
+    /// current owner may reassign it with `TransferNamespace`. Committed by the
+    /// state root through a dedicated Merkle sub-root (`NAMESPACE_LEAF_DOMAIN`), so
+    /// any change to a namespace's owner changes the state root. A `BTreeMap` keeps
+    /// iteration deterministic in the hashed/consensus path.
+    ///
+    /// This registry holds no native units — registration is an ownership record
+    /// only — so it does not enter supply reconciliation. Ownership is **not**
+    /// required to create objects under a namespace today (open namespaces); gating
+    /// object creation on ownership is a later-phase policy decision.
+    #[serde(default)]
+    pub namespaces: BTreeMap<Hash256, NamespaceRecord>,
+    /// Native oracle feed registry, keyed by [`FeedId`] (§15.17).
+    ///
+    /// Each [`Feed`] holds its creator, its frozen reporter bond class, and its
+    /// accrued read-fee revenue awaiting settlement. Committed by the state root
+    /// through a dedicated Merkle sub-root (`ORACLE_FEED_LEAF_DOMAIN`), so any
+    /// change to a feed (including its revenue) changes the state root. A
+    /// `BTreeMap` keeps iteration deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub oracle_feeds: BTreeMap<FeedId, Feed>,
+    /// Native oracle bonded reporters, keyed by `(FeedId, reporter)` (§15.17).
+    ///
+    /// Each [`OracleReporter`] holds the reporter's latest value and the epoch it
+    /// was reported for (liveness). The record's existence means the reporter's
+    /// bond (its feed's `bond`) is locked in `oracle_bonds`. Committed by the
+    /// state root through a dedicated Merkle sub-root (`ORACLE_REPORTER_LEAF_DOMAIN`).
+    #[serde(default)]
+    pub oracle_reporters: BTreeMap<(FeedId, Address), OracleReporter>,
+    /// Refundable native units locked across every oracle reporter bond (§15.17).
+    ///
+    /// Sum of every live reporter's feed `bond`. `RegisterReporter` moves units
+    /// here from the reporter's liquid balance; `DeregisterReporter` moves them
+    /// back. Reconciled by [`SupplyInvariantReport`] as a locked bucket and
+    /// committed by the state root as a scalar (mirroring `sponsor_budgets`).
+    #[serde(default)]
+    pub oracle_bonds: Amount,
+    /// Native units locked across every feed's accrued read-fee revenue (§15.17).
+    ///
+    /// Sum of every [`Feed::revenue`]. `PayFeedRead` moves units here from a
+    /// consumer's liquid balance; epoch settlement moves them out to reporters'
+    /// liquid balances (carrying the integer-division remainder to the next
+    /// settlement). Reconciled by [`SupplyInvariantReport`] as a locked bucket and
+    /// committed by the state root as a scalar.
+    #[serde(default)]
+    pub oracle_revenue: Amount,
+    /// Native DEX live order intents, keyed by [`OrderId`] (§15.13/§15.18/§15.37).
+    ///
+    /// Each [`Order`] holds its owner, oriented pair, side, original and remaining
+    /// size, limit price, deadline, and flags. An order exists only between a
+    /// [`Operation::SubmitOrder`] and the batch/cancel/expiry that closes it. The
+    /// per-block batch pass (`settle_dex_batch`) settles all orders on a pair at one
+    /// uniform clearing price. Committed by the state root through a
+    /// dedicated Merkle sub-root (`DEX_ORDER_LEAF_DOMAIN`), so any submit/fill/
+    /// cancel/expire changes the state root. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub dex_orders: BTreeMap<OrderId, Order>,
+    /// Refundable native units locked across every live DEX order (§15.37).
+    ///
+    /// Sum of every order's native locked leg (a buy locks `remaining × limit_price`
+    /// quote, a sell locks `remaining` base; only the native leg counts here — a
+    /// non-native leg is held out of the owner's `asset_balances`). `SubmitOrder`
+    /// moves units here from the owner's liquid balance; settlement moves them out
+    /// to counterparties plus an optional fee split; cancel/expiry returns them.
+    /// Reconciled by [`SupplyInvariantReport`] as a locked bucket and committed by
+    /// the state root as a scalar (mirroring `oracle_bonds`/`sponsor_budgets`).
+    #[serde(default)]
+    pub dex_escrow: Amount,
+    /// Native agent mandates, keyed by [`MandateId`] (Phase 9a, §15.32).
+    ///
+    /// Each [`Mandate`] holds its principal, agent key, escrowed budget and spend,
+    /// expiry, per-transaction cap, counterparty policy, revocation flag, and
+    /// per-day rate-limit counters. A mandate exists only between a
+    /// [`Operation::GrantMandate`] and the [`Operation::RevokeMandate`] that marks
+    /// it revoked (which also reclaims its remainder). Committed by the state root
+    /// through a dedicated Merkle sub-root (`MANDATE_LEAF_DOMAIN`), so a grant,
+    /// top-up, spend, or revocation changes the state root. A `BTreeMap` keeps
+    /// iteration deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub mandates: BTreeMap<MandateId, Mandate>,
+    /// Refundable native units locked across every live agent mandate (Phase 9a,
+    /// §15.32).
+    ///
+    /// Sum of every mandate's unspent remainder (`budget_total - spent`).
+    /// `GrantMandate`/`TopUpMandate` move units here from the principal's liquid
+    /// balance; `SpendUnderMandate` moves them out to the recipient plus the fee
+    /// split; `RevokeMandate` returns the remainder to the principal. Reconciled by
+    /// [`SupplyInvariantReport`] as a locked bucket and committed by the state root
+    /// as a scalar (mirroring `dex_escrow`/`oracle_bonds`/`sponsor_budgets`).
+    #[serde(default)]
+    pub mandate_escrow: Amount,
+    /// Native service registry, keyed by [`ServiceId`] (Phase 9b, §15.5).
+    ///
+    /// Each [`ServiceEntry`] holds a service's owner (its controller and pay-to
+    /// account), namespace, taxonomy categories, bounded descriptive fields, price
+    /// list, accepted payment flows, lifecycle status, and current revision. A
+    /// service exists only after an explicit [`Operation::RegisterService`];
+    /// [`Operation::UpdateService`] and [`Operation::SetServiceStatus`] rewrite the
+    /// CURRENT revision in place (prior revisions are an event-log/archival concern,
+    /// never active state, so committed size tracks live services, not edit
+    /// history). Committed by the state root through a dedicated Merkle sub-root
+    /// (`SERVICE_REGISTRY_LEAF_DOMAIN`), so a registration, update, or status change
+    /// changes the state root. Holds no native units — registration is data only,
+    /// its spam-priced fee is the ordinary transaction fee — so it does not enter
+    /// supply reconciliation. A `BTreeMap` keeps iteration deterministic in the
+    /// hashed/consensus path.
+    #[serde(default)]
+    pub services: BTreeMap<ServiceId, ServiceEntry>,
+    /// Native fungible tokens, keyed by [`TokenId`] (Phase 13a, §15).
+    ///
+    /// Each [`TokenRecord`] holds a token's creator, bounded metadata, its two
+    /// configurable authorities (`Option`, where `None` is a permanent renounce),
+    /// its paused flag, and its running `issued_supply` (minted minus burned). A
+    /// token exists only after an explicit [`Operation::CreateToken`]. This is a
+    /// SEPARATE identity space from the bridge `asset_balances` map, so native-token
+    /// supply accounting stays isolated from the bridge trust model. Committed by
+    /// the state root through a dedicated Merkle sub-root (`TOKEN_LEAF_DOMAIN`), so
+    /// a create, mint, burn, pause, or authority change changes the state root.
+    /// Token supply is a separate asset and does NOT enter the native WEBC supply
+    /// reconciliation. A `BTreeMap` keeps iteration deterministic in the
+    /// hashed/consensus path.
+    #[serde(default)]
+    pub tokens: BTreeMap<TokenId, TokenRecord>,
+    /// Native token balances, keyed by `(TokenId, holder)` (Phase 13a, §15).
+    ///
+    /// The per-`(token, holder)` key is what makes ordinary [`Operation::TransferToken`]
+    /// parallel-schedulable: a transfer writes only the two account balance entries,
+    /// never one global per-token object. A zero balance is PRUNED (the entry is
+    /// removed when it hits zero) so the map stays bounded, mirroring how other maps
+    /// avoid storing zeros. Committed by the state root through a dedicated Merkle
+    /// sub-root (`TOKEN_BALANCE_LEAF_DOMAIN`). For every token,
+    /// `sum(balances) == issued_supply` (the per-token supply invariant, checked by
+    /// [`ChainState::token_supply_report`]).
+    #[serde(default)]
+    pub token_balances: BTreeMap<(TokenId, Address), Amount>,
+    /// Frozen token accounts, as `(TokenId, account)` pairs (Phase 13a, §15).
+    ///
+    /// A frozen `(token, account)` pair cannot SEND or RECEIVE that token. Only
+    /// currently-frozen pairs are present, so the committed set stays bounded — a
+    /// thaw removes the pair. Written only by [`Operation::FreezeTokenAccount`] /
+    /// [`Operation::ThawTokenAccount`] and read on the mint/burn/transfer value
+    /// paths. Committed by the state root through a dedicated Merkle sub-root
+    /// (`FROZEN_TOKEN_LEAF_DOMAIN`).
+    #[serde(default)]
+    pub frozen_token_accounts: BTreeSet<(TokenId, Address)>,
+    /// Native units LOCKED across every live token's non-refundable creation
+    /// deposit (Phase 13a, §15).
+    ///
+    /// Sum of every [`Operation::CreateToken`]'s `ChainConfig::token.creation_deposit`.
+    /// Creation moves units here from the creator's liquid balance; they stay locked
+    /// for the token's life (a non-refundable anti-spam price — a burn-to-zero +
+    /// close refund path is a later pass). Reconciled by [`SupplyInvariantReport`]
+    /// as a locked bucket and committed by the state root as a scalar (mirroring
+    /// `storage_deposits`/`sponsor_budgets`). Token BALANCES are a separate asset and
+    /// are NOT part of this native reconciliation.
+    #[serde(default)]
+    pub token_deposits: Amount,
+    /// Native NFT collections, keyed by [`NftCollectionId`] (Phase 13b, §15).
+    ///
+    /// Each [`NftCollection`] holds a collection's creator, bounded metadata, its two
+    /// configurable authorities (`Option`, where `None` is a permanent renounce), its
+    /// paused flag, the monotonic `next_serial` mint counter, the running
+    /// minted/burned counts, the optional supply cap, and the royalty commitment. A
+    /// collection exists only after an explicit [`Operation::CreateNftCollection`].
+    /// This is a SEPARATE identity space from fungible `tokens` / `token_balances`.
+    /// Committed by the state root through a dedicated Merkle sub-root
+    /// (`NFT_COLLECTION_LEAF_DOMAIN`), so a create, mint, burn, pause, or authority
+    /// change changes the state root. NFT items are NOT fungible balances and do not
+    /// enter the native WEBC supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub nft_collections: BTreeMap<NftCollectionId, NftCollection>,
+    /// Native NFT items, keyed by [`NftId`] = `(collection, serial)` (Phase 13b, §15).
+    ///
+    /// The per-[`NftId`] key is what makes ordinary [`Operation::TransferNft`]
+    /// parallel-schedulable: a transfer writes only the one item entry, never one
+    /// global per-collection object. A burned item is REMOVED (there is no tombstone;
+    /// the serial is never reminted because `next_serial` only grows), so the map
+    /// holds exactly the live items. The item's `frozen` flag lives ON the item
+    /// record (there is no separate freeze set). Committed by the state root through a
+    /// dedicated Merkle sub-root (`NFT_ITEM_LEAF_DOMAIN`). For every collection,
+    /// `minted_count - burned_count == count(live items)` (the per-collection item
+    /// invariant, checked by [`ChainState::nft_collection_supply_report`]).
+    #[serde(default)]
+    pub nft_items: BTreeMap<NftId, NftItem>,
+    /// Native units LOCKED across every live NFT collection's non-refundable creation
+    /// deposit (Phase 13b, §15).
+    ///
+    /// Sum of every [`Operation::CreateNftCollection`]'s
+    /// `ChainConfig::nft.creation_deposit`. Creation moves units here from the
+    /// creator's liquid balance; they stay locked for the collection's life (a
+    /// non-refundable anti-spam price). Reconciled by [`SupplyInvariantReport`] as a
+    /// locked bucket and committed by the state root as a scalar (mirroring
+    /// `token_deposits`). NFT items are a separate, non-fungible asset and are NOT
+    /// part of this native reconciliation.
+    #[serde(default)]
+    pub nft_deposits: Amount,
+    /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
+    ///
+    /// Each [`ContractManifest`] describes one registered contract (its identity,
+    /// application namespace, declared footprint, ABI/gas-schedule versions, and
+    /// audited built-in handler). Addressed for declared access by
+    /// `StateKey::module(code_id)`. Committed by the state root through a dedicated
+    /// Merkle sub-root (`CONTRACT_LEAF_DOMAIN`), so registering a contract changes
+    /// the state root. Holds no native units — the registration fee is burned — so
+    /// it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub contracts: BTreeMap<Hash256, ContractManifest>,
+    /// Interim contract application state, keyed by `(namespace, key_hash)` (Phase
+    /// 7a, ADR-0014).
+    ///
+    /// A contract's state lives under `StateKey::application(namespace, key_hash)`
+    /// for each `key_hash` in its manifest footprint; this map is the physical
+    /// backing store. Committed by the state root through a dedicated Merkle
+    /// sub-root (`CONTRACT_STATE_LEAF_DOMAIN`), so any contract write changes the
+    /// state root. Holds only opaque contract-owned bytes, never native units, so
+    /// it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub contract_state: BTreeMap<(Hash256, Hash256), ContractStateValue>,
+    /// Localized (per-application-namespace) base-fee state (Phase 6, §8 isolation).
+    ///
+    /// Maps a currently-congested application namespace to its [`NamespaceFeeState`]
+    /// (its own EIP-1559 base fee). Object operations under a namespace are priced
+    /// by this localized fee; account-scoped operations keep
+    /// `current_base_fee_per_unit`. A namespace's fee adjusts each block from only
+    /// that namespace's own usage vs `FeePolicy::per_namespace_target_units`, so one
+    /// application's congestion never raises another's price. A namespace resting at
+    /// `min_base_fee_per_unit` carries no entry (pricing at the floor is identical to
+    /// having none), so the map holds only congested namespaces and stays bounded.
+    /// Committed by the state root through a dedicated Merkle sub-root
+    /// (`NAMESPACE_FEE_LEAF_DOMAIN`), so any localized-fee change changes the state
+    /// root. Holds no native units — it changes the fee *rate*, never the accounting
+    /// — so it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub namespace_fees: BTreeMap<Hash256, NamespaceFeeState>,
     pub validator_fee_pool: Amount,
     pub minted_supply: Amount,
     /// Gross issued supply captured at the start of the current inflation year.
     pub inflation_year_start_supply: Amount,
     pub current_base_fee_per_unit: u64,
     pub current_epoch: u64,
+    /// Height of the block currently being built/imported, set at the start of
+    /// `build_block` before transactions execute so height-dependent logic (DEX
+    /// order deadlines, §15.37) reads a stable committed value on both build and
+    /// import. Genesis leaves it `0` (the genesis "height"); the first block sets
+    /// it to `1`. Committed by the state root so all nodes agree.
+    #[serde(default)]
+    pub current_height: u64,
     pub bridge_nonce: u64,
     /// Consensus timestamp (Unix ms) of the most recently applied block.
     ///
@@ -338,6 +1167,22 @@ pub struct SupplyInvariantReport {
     pub pending_rewards: Amount,
     /// Collected fee rewards awaiting distribution.
     pub fee_reward_pool: Amount,
+    /// Refundable native units locked as object storage deposits (§15.22).
+    pub storage_deposits: Amount,
+    /// Native units locked across every application fee-sponsor budget (§15.35).
+    pub sponsor_budgets: Amount,
+    /// Native units locked across every oracle reporter bond (§15.17).
+    pub oracle_bonds: Amount,
+    /// Native units locked across every feed's accrued read-fee revenue (§15.17).
+    pub oracle_revenue: Amount,
+    /// Native units locked across every live DEX order (§15.37).
+    pub dex_escrow: Amount,
+    /// Native units locked across every live agent mandate (§15.32).
+    pub mandate_escrow: Amount,
+    /// Native units locked across every live token's creation deposit (§15).
+    pub token_deposits: Amount,
+    /// Native units locked across every live NFT collection's creation deposit (§15).
+    pub nft_deposits: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -345,6 +1190,43 @@ pub struct SupplyInvariantReport {
     /// Checked sum of all non-duplicated buckets.
     pub accounted: Amount,
     /// Whether gross issuance exactly equals all buckets.
+    pub balanced: bool,
+}
+
+/// Deterministic per-token supply reconciliation (Phase 13a, §15).
+///
+/// For any one token, the running [`TokenRecord::issued_supply`] must equal the
+/// sum of every held balance. This report is a SEPARATE asset from native WEBC and
+/// never enters [`SupplyInvariantReport`]; it exists so tests and RPC callers can
+/// assert `sum(balances) == issued` after any token state transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenSupplyReport {
+    /// The token's recorded issued supply (total minted minus total burned).
+    pub issued: Amount,
+    /// Checked sum of every held balance for this token.
+    pub held: Amount,
+    /// Whether `issued` exactly equals `held`.
+    pub balanced: bool,
+}
+
+/// Deterministic per-collection item reconciliation (Phase 13b, §15).
+///
+/// For any one collection, the running counters must satisfy
+/// `minted_count - burned_count == count(live NftItems in that collection)`. NFT
+/// items are NOT fungible balances and this report never enters
+/// [`SupplyInvariantReport`]; it exists so tests and RPC callers can assert the
+/// per-collection item invariant after any NFT state transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NftCollectionSupplyReport {
+    /// Total items ever minted in this collection.
+    pub minted: u64,
+    /// Total items ever burned in this collection.
+    pub burned: u64,
+    /// `minted - burned`: the number of items that should be live.
+    pub expected_live: u64,
+    /// Actual count of live [`NftItem`] entries for this collection.
+    pub live_items: u64,
+    /// Whether `expected_live` exactly equals `live_items`.
     pub balanced: bool,
 }
 
@@ -407,11 +1289,35 @@ impl Default for ChainState {
             processed_slashing_evidence: BTreeSet::new(),
             burned_fees: Amount::ZERO,
             slashed_units: Amount::ZERO,
+            storage_deposits: Amount::ZERO,
+            sponsors: BTreeMap::new(),
+            sponsor_budgets: Amount::ZERO,
+            namespaces: BTreeMap::new(),
+            oracle_feeds: BTreeMap::new(),
+            oracle_reporters: BTreeMap::new(),
+            oracle_bonds: Amount::ZERO,
+            oracle_revenue: Amount::ZERO,
+            dex_orders: BTreeMap::new(),
+            dex_escrow: Amount::ZERO,
+            mandates: BTreeMap::new(),
+            mandate_escrow: Amount::ZERO,
+            services: BTreeMap::new(),
+            tokens: BTreeMap::new(),
+            token_balances: BTreeMap::new(),
+            frozen_token_accounts: BTreeSet::new(),
+            token_deposits: Amount::ZERO,
+            nft_collections: BTreeMap::new(),
+            nft_items: BTreeMap::new(),
+            nft_deposits: Amount::ZERO,
+            contracts: BTreeMap::new(),
+            contract_state: BTreeMap::new(),
+            namespace_fees: BTreeMap::new(),
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
             inflation_year_start_supply: Amount::ZERO,
             current_base_fee_per_unit: 0,
             current_epoch: 0,
+            current_height: 0,
             bridge_nonce: 0,
             last_block_timestamp_ms: 0,
         }
@@ -445,6 +1351,18 @@ impl ChainState {
     /// supply reconciliation and prevents stake from being counted twice.
     pub fn from_genesis(genesis: &GenesisConfig) -> Result<Self, ChainError> {
         let mut state = Self::new(&genesis.chain)?;
+        // Reject a malformed sponsorship window (zero epochs) before any state
+        // exists, so a chain never runs with an undefined "per day" boundary.
+        genesis.chain.sponsorship.validate()?;
+        // Reject a malformed oracle config (zero settlement cadence or liveness
+        // window) so settlement never divides by zero and liveness is well-defined.
+        genesis.chain.oracle.validate()?;
+        // Reject a malformed DEX config (per-fill fee above 100%) so settlement can
+        // never carve more than the proceeds and underflow.
+        genesis.chain.dex.validate()?;
+        // Reject a malformed mandate config (zero rate-limit window) so the per-day
+        // rate limit has a well-defined, non-divide-by-zero window boundary.
+        genesis.chain.mandate.validate()?;
 
         for account in &genesis.accounts {
             if state.accounts.contains_key(&account.address) {
@@ -583,6 +1501,14 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(lane_fees))
             .and_then(|amount| amount.checked_add(pending_rewards))
             .and_then(|amount| amount.checked_add(self.validator_fee_pool))
+            .and_then(|amount| amount.checked_add(self.storage_deposits))
+            .and_then(|amount| amount.checked_add(self.sponsor_budgets))
+            .and_then(|amount| amount.checked_add(self.oracle_bonds))
+            .and_then(|amount| amount.checked_add(self.oracle_revenue))
+            .and_then(|amount| amount.checked_add(self.dex_escrow))
+            .and_then(|amount| amount.checked_add(self.mandate_escrow))
+            .and_then(|amount| amount.checked_add(self.token_deposits))
+            .and_then(|amount| amount.checked_add(self.nft_deposits))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -596,6 +1522,14 @@ impl ChainState {
             lane_fees,
             pending_rewards,
             fee_reward_pool: self.validator_fee_pool,
+            storage_deposits: self.storage_deposits,
+            sponsor_budgets: self.sponsor_budgets,
+            oracle_bonds: self.oracle_bonds,
+            oracle_revenue: self.oracle_revenue,
+            dex_escrow: self.dex_escrow,
+            mandate_escrow: self.mandate_escrow,
+            token_deposits: self.token_deposits,
+            nft_deposits: self.nft_deposits,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -702,14 +1636,46 @@ impl ChainState {
         Ok(TransactionAuthorization::SessionKey(id))
     }
 
-    /// Commits the next deterministic base fee after a completed block.
+    /// The base fee in base units per execution unit that prices `operation`.
     ///
-    /// `units_used` is measured in execution units and must not exceed the
-    /// configured block maximum. Invalid policy or overflow leaves state
-    /// unchanged and returns an error to the whole-block overlay.
+    /// Object operations are priced by their namespace's localized base fee (Phase 6
+    /// §8); every other operation keeps the global `current_base_fee_per_unit`. Both
+    /// are read as block-constant values (localized fees are only adjusted by
+    /// [`ChainState::finish_block`] after every transaction has executed), so all
+    /// transactions in a block observe a single stable price.
+    pub fn base_fee_per_unit_for(&self, operation: &Operation, config: &ChainConfig) -> u64 {
+        match operation.fee_namespace() {
+            Some(namespace) => self.localized_base_fee_per_unit(&namespace, config),
+            None => self.current_base_fee_per_unit,
+        }
+    }
+
+    /// A namespace's current localized base fee, floored at the network minimum.
+    ///
+    /// A namespace with no record is priced at `min_base_fee_per_unit` — pricing at
+    /// the floor is what "no record" means — so an uncongested namespace is charged
+    /// exactly the network minimum and is never affected by any other namespace.
+    fn localized_base_fee_per_unit(&self, namespace: &Hash256, config: &ChainConfig) -> u64 {
+        self.namespace_fees
+            .get(namespace)
+            .map(|state| state.base_fee_per_unit)
+            .unwrap_or(config.fee_policy.min_base_fee_per_unit)
+            .max(config.fee_policy.min_base_fee_per_unit)
+    }
+
+    /// Commits the next deterministic base fees after a completed block.
+    ///
+    /// `units_used` is the block's total execution units (must not exceed the
+    /// configured block maximum); `namespace_units` is each namespace's own
+    /// execution-unit usage this block. The global base fee reacts to total
+    /// fullness; each namespace's localized base fee reacts to only its own usage,
+    /// so one application's congestion never moves another's price. Invalid policy
+    /// or overflow leaves state unchanged and returns an error to the whole-block
+    /// overlay.
     pub fn finish_block(
         &mut self,
         units_used: u64,
+        namespace_units: &BTreeMap<Hash256, u64>,
         config: &ChainConfig,
     ) -> Result<(), ChainError> {
         self.current_base_fee_per_unit = next_base_fee(
@@ -717,6 +1683,48 @@ impl ChainState {
             units_used,
             &config.fee_policy,
         )?;
+        self.adjust_namespace_fees(namespace_units, config)?;
+        Ok(())
+    }
+
+    /// Re-prices every congested namespace from its own per-block usage.
+    ///
+    /// Adjusts the union of currently-tracked namespaces (so idle ones decay) and
+    /// namespaces used this block (so newly hot ones rise), each by the same
+    /// EIP-1559 rule as the global fee but against `per_namespace_target_units`
+    /// using only that namespace's own units. A namespace whose new fee returns to
+    /// the network floor loses its record, keeping the committed map bounded to
+    /// currently-congested namespaces. Deterministic ordered iteration.
+    fn adjust_namespace_fees(
+        &mut self,
+        namespace_units: &BTreeMap<Hash256, u64>,
+        config: &ChainConfig,
+    ) -> Result<(), ChainError> {
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let mut namespaces: BTreeSet<Hash256> = self.namespace_fees.keys().copied().collect();
+        namespaces.extend(namespace_units.keys().copied());
+        for namespace in namespaces {
+            let current = self
+                .namespace_fees
+                .get(&namespace)
+                .map(|state| state.base_fee_per_unit)
+                .unwrap_or(min)
+                .max(min);
+            let used = namespace_units.get(&namespace).copied().unwrap_or(0);
+            let next = next_localized_base_fee(current, used, &config.fee_policy)?;
+            if next <= min {
+                // Back at the network floor: identical to having no record, so drop
+                // it to keep the committed map bounded to congested namespaces.
+                self.namespace_fees.remove(&namespace);
+            } else {
+                self.namespace_fees.insert(
+                    namespace,
+                    NamespaceFeeState {
+                        base_fee_per_unit: next,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -735,17 +1743,9 @@ impl ChainState {
         if self.current_epoch.is_multiple_of(periods_per_year) {
             self.inflation_year_start_supply = self.minted_supply;
         }
-        let inflation = config
-            .inflation
-            .reward_for_period(self.inflation_year_start_supply, self.current_epoch)?;
-        let total_reward = inflation
-            .checked_add(self.validator_fee_pool)
-            .ok_or(ChainError::ArithmeticOverflow)?;
 
-        if total_reward.is_zero() {
-            return self.finish_epoch(config, Amount::ZERO);
-        }
-
+        // Total active stake is needed both for reward weighting and to size the
+        // stake-keyed bootstrap budget, so it is computed before the issuance.
         let total_active_stake = self
             .validators
             .values()
@@ -754,6 +1754,29 @@ impl ChainState {
                 sum.checked_add(validator.total_stake()?)
                     .ok_or(ChainError::ArithmeticOverflow)
             })?;
+
+        // Base schedule budget for this period. During a configured, not-yet-sunset
+        // bootstrap phase (§15.2), issuance is instead keyed to staked amount and
+        // capped by this base budget, so a thin early staking base cannot capture
+        // the full base issuance. Supply conservation is unaffected: whatever the
+        // issued `inflation` is, `minted_supply` grows by exactly it and the F1
+        // distribution accounts for exactly it (see below).
+        let base_budget = config
+            .inflation
+            .reward_for_period(self.inflation_year_start_supply, self.current_epoch)?;
+        let inflation = match &config.bootstrap_issuance {
+            Some(bootstrap) if bootstrap.is_active(self.current_epoch) => {
+                bootstrap.budget_for_period(total_active_stake, periods_per_year, base_budget)?
+            }
+            _ => base_budget,
+        };
+        let total_reward = inflation
+            .checked_add(self.validator_fee_pool)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+
+        if total_reward.is_zero() {
+            return self.finish_epoch(config, Amount::ZERO);
+        }
 
         if total_active_stake.is_zero() {
             // If no one is eligible, avoid minting rewards into nowhere. Fees stay
@@ -880,6 +1903,18 @@ impl ChainState {
         distributed_reward: Amount,
     ) -> Result<Vec<Event>, ChainError> {
         let event_epoch = self.current_epoch;
+        // Native oracle read-fee settlement (§15.17) runs at the epoch boundary on
+        // the just-completed epoch, before it is incremented, so a report's
+        // liveness is measured against the settlement epoch. Gated by the
+        // configured cadence. Supply-neutral (revenue pool -> reporter liquid, with
+        // the division remainder carried), so it does not disturb the reward math
+        // above. Runs on the same whole-epoch overlay, so any failure rolls the
+        // epoch advance back atomically.
+        let oracle_events = if config.oracle.is_settlement_epoch(self.current_epoch) {
+            self.settle_oracle_feeds(config, self.current_epoch)?
+        } else {
+            Vec::new()
+        };
         let next_epoch = self
             .current_epoch
             .checked_add(1)
@@ -894,6 +1929,7 @@ impl ChainState {
             epoch: event_epoch,
             total: distributed_reward,
         }];
+        events.extend(oracle_events);
         for transition in transitions {
             match transition {
                 UnbondingTransition::Admitted {
@@ -1023,22 +2059,134 @@ impl ChainState {
             processed_bridge_root: Hash256,
             processed_slashing_root: Hash256,
             unbonding_root: Hash256,
+            sponsor_root: Hash256,
+            namespace_root: Hash256,
+            oracle_feed_root: Hash256,
+            oracle_reporter_root: Hash256,
+            dex_order_root: Hash256,
+            mandate_root: Hash256,
+            service_registry_root: Hash256,
+            token_root: Hash256,
+            token_balance_root: Hash256,
+            frozen_token_root: Hash256,
+            nft_collection_root: Hash256,
+            nft_item_root: Hash256,
+            contract_root: Hash256,
+            contract_state_root: Hash256,
+            namespace_fee_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
+            storage_deposits: Amount,
+            sponsor_budgets: Amount,
+            oracle_bonds: Amount,
+            oracle_revenue: Amount,
+            dex_escrow: Amount,
+            mandate_escrow: Amount,
+            token_deposits: Amount,
+            nft_deposits: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
             current_base_fee_per_unit: u64,
             current_epoch: u64,
+            current_height: u64,
             bridge_nonce: u64,
             last_block_timestamp_ms: u64,
         }
 
         let commitment = StateCommitment {
-            // V7 adds `last_block_timestamp_ms` (finding E2). The domain bump is a
-            // deliberate consensus-format change; no external fixture pins the
-            // prior V6 root.
-            domain: "WEBC_STATE_COMMITMENT_V7",
+            // V18 adds the native NFT system (Phase 13b, §15): the
+            // `nft_collection_root` sub-root commits every collection record
+            // (creator, bounded metadata, both `Option` authorities, paused flag,
+            // monotonic `next_serial`, minted/burned counts, optional supply cap,
+            // royalty commitment), the `nft_item_root` sub-root commits every live
+            // `(NftId, NftItem)` (single owner, per-item metadata commitment, frozen
+            // flag), and the `nft_deposits` scalar commits the aggregate locked native
+            // creation-deposit bucket (a SEPARATE bucket from `token_deposits`,
+            // matching the fungible-token precedent). So a create / mint / transfer /
+            // burn / pause / freeze / thaw / authority change always changes the state
+            // root. NFT items are a SEPARATE, non-fungible asset from native WEBC and
+            // never enter the native supply reconciliation; the only native units that
+            // move are the ordinary fee and the creation deposit. The domain bump is a
+            // deliberate consensus-format change; no external fixture pins a prior
+            // root.
+            // V17 adds the native fungible-token system (Phase 13a, §15): the
+            // `token_root` sub-root commits every token record (creator, bounded
+            // metadata, both `Option` authorities, paused flag, issued supply), the
+            // `token_balance_root` sub-root commits every per-`(token, holder)`
+            // balance, and the `frozen_token_root` sub-root commits every frozen
+            // `(token, account)` pair, while the `token_deposits` scalar commits the
+            // aggregate locked native creation-deposit bucket (mirroring how
+            // `storage_deposits`/`sponsor_budgets` pair with their sub-roots). So a
+            // create / mint / burn / transfer / pause / freeze / thaw / authority
+            // change always changes the state root. Token supply is a SEPARATE asset
+            // from native WEBC and never enters the native supply reconciliation; the
+            // only native units that move are the ordinary fee and the creation
+            // deposit. The domain bump is a deliberate consensus-format change; no
+            // external fixture pins a prior root.
+            // V16 adds the native service registry (Phase 9b, §15.5): the
+            // `service_registry_root` sub-root commits every live service entry
+            // (owner, namespace, categories, bounded fields, pricing, payment flows,
+            // status, and current revision), so a registration, update, or status
+            // change always changes the state root. It adds a committed MAP but NO
+            // new scalar and locks no native units (registration is data only; its
+            // spam-priced fee flows through the existing `burned_fees`/fee-pool
+            // scalars), so the supply invariant is unchanged. The domain bump is a
+            // deliberate consensus-format change; no external fixture pins a prior
+            // root.
+            // V15 adds the native agent-mandate primitive (Phase 9a, §15.32): the
+            // `mandate_root` sub-root commits every live mandate record (principal,
+            // agent key, escrowed budget/spend, expiry, per-tx cap, counterparty
+            // policy, revocation flag, per-day rate-limit counters), and the
+            // `mandate_escrow` scalar commits the aggregate locked native bucket
+            // (mirroring how `dex_escrow`/`oracle_bonds`/`sponsor_budgets` pair with
+            // their sub-roots). So a grant / top-up / spend / revoke always changes
+            // the state root. The domain bump is a deliberate consensus-format
+            // change; no external fixture pins a prior root.
+            // V14 adds the native DEX (Phase 8, §15.13/§15.18/§15.37): the
+            // `dex_order_root` sub-root commits every live order intent (owner, pair,
+            // side, amount/remaining, limit price, deadline, flags), and the
+            // `dex_escrow` scalar commits the aggregate locked native bucket
+            // (mirroring how `oracle_bonds`/`sponsor_budgets` pair with their
+            // sub-roots). So a submit / partial-or-full fill / cancel / expire always
+            // changes the state root, and the deterministic per-block batch pass is
+            // therefore consensus-bound identically on build and import. The domain
+            // bump is a deliberate consensus-format change; no external fixture pins a
+            // prior root.
+            // V13 adds the interim contract runtime (Phase 7a, ADR-0014): the
+            // `contract_root` sub-root commits every registered contract manifest
+            // (identity, namespace, footprint, ABI/gas-schedule versions, handler)
+            // and the `contract_state_root` sub-root commits every contract state
+            // value, so a register or any contract write always changes the state
+            // root. It adds no new scalar and locks no native units (the
+            // registration fee is burned into the existing `burned_fees` scalar).
+            // The domain bump is a deliberate consensus-format change; no external
+            // fixture pins a prior root.
+            // V12 adds the native oracle (Phase 7, §15.17): the `oracle_feed_root`
+            // and `oracle_reporter_root` sub-roots commit every feed record
+            // (creator, bond class, accrued revenue) and every bonded-reporter
+            // record (latest value, report epoch), and the `oracle_bonds` and
+            // `oracle_revenue` scalars commit the two aggregate locked buckets
+            // (mirroring how `sponsor_budgets`/`storage_deposits` pair with their
+            // sub-roots). So a create/register/report/pay/settle/deregister always
+            // changes the state root. The domain bump is a deliberate
+            // consensus-format change; no external fixture pins a prior root.
+            // V11 adds localized (per-application-namespace) fee state (Phase 6, §8
+            // isolation): the `namespace_fee_root` sub-root commits every congested
+            // namespace's localized base fee, so a localized-fee change changes the
+            // state root. It adds no new scalar and locks no native units (localized
+            // pricing changes the fee rate, never the accounting). The domain bump is
+            // a deliberate consensus-format change; no external fixture pins a prior
+            // root. V10 added the application namespace registry (§8 isolation): the
+            // `namespace_root` sub-root commits every namespace ownership record, so
+            // a claim or transfer changes the state root. V9 added the
+            // fee-sponsorship state (§15.35): the `sponsor_root` sub-root commits
+            // every per-app sponsor record (budget, caps, and per-user/day counters),
+            // and the `sponsor_budgets` scalar commits the aggregate locked bucket
+            // (mirroring how `storage_deposits` pairs with the object sub-root). V8
+            // added the `storage_deposits` scalar (§15.22); V7 added
+            // `last_block_timestamp_ms` (finding E2).
+            domain: "WEBC_STATE_COMMITMENT_V18",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1054,7 +2202,9 @@ impl ChainState {
                 b"WEBC_SESSION_KEY_LEAF_V1",
                 self.session_keys.iter(),
             )?,
-            object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V1", self.objects.iter())?,
+            // V2: the object leaf now includes the recorded storage deposit
+            // (§15.22), so a resize/refund changes the object sub-root.
+            object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V2", self.objects.iter())?,
             validator_root: ordered_value_root(b"WEBC_VALIDATOR_LEAF_V1", self.validators.iter())?,
             delegation_root: ordered_value_root(
                 b"WEBC_DELEGATION_LEAF_V1",
@@ -1077,13 +2227,99 @@ impl ChainState {
                 self.processed_slashing_evidence.iter(),
             )?,
             unbonding_root: leaf_hash(b"WEBC_UNBONDING_QUEUE_V1", &self.unbonding)?,
+            // Per-map bucket committed by its own ordered sub-root (§15.35): a
+            // change to any sponsor's budget, caps, or per-user/day counters
+            // changes this root and therefore the state root.
+            sponsor_root: ordered_value_root(SPONSOR_LEAF_DOMAIN, self.sponsors.iter())?,
+            // Namespace ownership registry committed by its own ordered sub-root
+            // (§8 isolation): a claim or ownership transfer changes this root and
+            // therefore the state root.
+            namespace_root: ordered_value_root(NAMESPACE_LEAF_DOMAIN, self.namespaces.iter())?,
+            // Native oracle registry committed by its own ordered sub-roots (§15.17):
+            // a feed change (including accrued revenue) or a reporter change
+            // (register/report/deregister) changes these roots and the state root.
+            oracle_feed_root: ordered_value_root(
+                ORACLE_FEED_LEAF_DOMAIN,
+                self.oracle_feeds.iter(),
+            )?,
+            oracle_reporter_root: ordered_value_root(
+                ORACLE_REPORTER_LEAF_DOMAIN,
+                self.oracle_reporters.iter(),
+            )?,
+            // Native DEX order registry committed by its own ordered sub-root
+            // (§15.37): a submit, a partial/full fill, a cancel, or an expiry changes
+            // this root and therefore the state root, binding the per-block batch pass
+            // to consensus.
+            dex_order_root: ordered_value_root(DEX_ORDER_LEAF_DOMAIN, self.dex_orders.iter())?,
+            // Native agent-mandate registry committed by its own ordered sub-root
+            // (§15.32): a grant, top-up, spend, or revocation changes this root and
+            // therefore the state root.
+            mandate_root: ordered_value_root(MANDATE_LEAF_DOMAIN, self.mandates.iter())?,
+            // Native service registry committed by its own ordered sub-root (§15.5):
+            // a registration, update, or status change (each bumps the entry's
+            // revision) changes this root and therefore the state root.
+            service_registry_root: ordered_value_root(
+                SERVICE_REGISTRY_LEAF_DOMAIN,
+                self.services.iter(),
+            )?,
+            // Native fungible-token system committed by its own ordered sub-roots
+            // (Phase 13a, §15): a create/mint/burn/pause/authority change moves
+            // `token_root`; a mint/burn/transfer moves `token_balance_root`; a
+            // freeze/thaw moves `frozen_token_root`; any of them changes the state
+            // root. The `token_deposits` scalar (below) commits the aggregate locked
+            // native creation-deposit bucket.
+            token_root: ordered_value_root(TOKEN_LEAF_DOMAIN, self.tokens.iter())?,
+            token_balance_root: ordered_value_root(
+                TOKEN_BALANCE_LEAF_DOMAIN,
+                self.token_balances.iter(),
+            )?,
+            frozen_token_root: ordered_set_root(
+                FROZEN_TOKEN_LEAF_DOMAIN,
+                self.frozen_token_accounts.iter(),
+            )?,
+            // Native NFT system committed by its own ordered sub-roots (Phase 13b,
+            // §15): a create/mint/burn/pause/authority change moves
+            // `nft_collection_root`; a mint/transfer/burn/freeze/thaw moves
+            // `nft_item_root`; any of them changes the state root. The `nft_deposits`
+            // scalar (below) commits the aggregate locked native creation-deposit
+            // bucket.
+            nft_collection_root: ordered_value_root(
+                NFT_COLLECTION_LEAF_DOMAIN,
+                self.nft_collections.iter(),
+            )?,
+            nft_item_root: ordered_value_root(NFT_ITEM_LEAF_DOMAIN, self.nft_items.iter())?,
+            // Interim contract runtime committed by its own ordered sub-roots (Phase
+            // 7a, ADR-0014): registering a contract changes `contract_root`; any
+            // contract state write changes `contract_state_root`; either changes the
+            // state root.
+            contract_root: ordered_value_root(CONTRACT_LEAF_DOMAIN, self.contracts.iter())?,
+            contract_state_root: ordered_value_root(
+                CONTRACT_STATE_LEAF_DOMAIN,
+                self.contract_state.iter(),
+            )?,
+            // Localized per-namespace fee state committed by its own ordered sub-root
+            // (Phase 6, §8 isolation): a change to any namespace's localized base fee
+            // changes this root and therefore the state root.
+            namespace_fee_root: ordered_value_root(
+                NAMESPACE_FEE_LEAF_DOMAIN,
+                self.namespace_fees.iter(),
+            )?,
             burned_fees: self.burned_fees,
             slashed_units: self.slashed_units,
+            storage_deposits: self.storage_deposits,
+            sponsor_budgets: self.sponsor_budgets,
+            oracle_bonds: self.oracle_bonds,
+            oracle_revenue: self.oracle_revenue,
+            dex_escrow: self.dex_escrow,
+            mandate_escrow: self.mandate_escrow,
+            token_deposits: self.token_deposits,
+            nft_deposits: self.nft_deposits,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
             current_base_fee_per_unit: self.current_base_fee_per_unit,
             current_epoch: self.current_epoch,
+            current_height: self.current_height,
             bridge_nonce: self.bridge_nonce,
             last_block_timestamp_ms: self.last_block_timestamp_ms,
         };
@@ -1172,6 +2408,25 @@ impl ChainState {
         tx_hash: Hash256,
         authorization: TransactionAuthorization,
     ) -> Result<Receipt, ChainError> {
+        // Fee sponsorship is a default-lane-only feature (a prepaid lane already
+        // funds its own fees). Reject a sponsor named on a non-default lane up
+        // front — before any lane/nonce lookup — so the combination fails fast
+        // with a precise error regardless of whether the named lane exists.
+        if tx.sponsor.is_some() && !tx.authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
+        // A mandate spend is authorized by the agent key's signature; the agent
+        // holds no balance of its own (the mandate escrow funds both the principal
+        // moved and the fee). Ensure the agent account exists before the nonce
+        // lookup, so default-lane replay protection applies even to an agent that
+        // was never separately funded. This runs on the cloned overlay, so it
+        // persists only if the whole spend succeeds.
+        if matches!(
+            tx.operation,
+            Operation::SpendUnderMandate { .. } | Operation::SpendUnderMandateToService { .. }
+        ) {
+            self.accounts.entry(tx.sender).or_default();
+        }
         let mut access =
             StateAccessRecorder::new(&tx.access_list.read_only, &tx.access_list.read_write)?;
         // Authorization policy is consensus state even though it is consulted
@@ -1218,10 +2473,14 @@ impl ChainState {
         if tx.fee.gas_limit < units {
             return Err(ChainError::GasLimitTooLow);
         }
+        // The base fee this transaction pays is the global one for account-scoped
+        // operations and the operation's namespace-localized one for object
+        // operations (Phase 6 §8). Both are block-constant reads committed by the
+        // `BaseFee` protocol key already declared in every access list, so localized
+        // pricing needs no new access-list key or scheduler change.
         access.read(StateKey::protocol(ProtocolStateKey::BaseFee))?;
-        let fee_per_unit = tx
-            .fee
-            .effective_fee_per_unit(self.current_base_fee_per_unit)?;
+        let base_fee_per_unit = self.base_fee_per_unit_for(&tx.operation, config);
+        let fee_per_unit = tx.fee.effective_fee_per_unit(base_fee_per_unit)?;
         let total_fee = Amount(
             u128::from(units)
                 .checked_mul(u128::from(fee_per_unit))
@@ -1229,8 +2488,44 @@ impl ChainState {
         );
         let fee = split_fee(total_fee);
 
+        // Choose the fee source. On the default lane a transaction may opt into
+        // application fee sponsorship (§15.35): when it names a sponsor, the
+        // operation is sponsorable, and the app's hard per-user / per-operation /
+        // per-app-per-day caps and funded budget permit it, the fee is drawn from
+        // the app's sponsor budget instead of the sender's liquid balance.
+        // Best-effort (fail-open): an unavailable, non-sponsorable, or exhausted
+        // sponsor never fails the transaction — the sender pays exactly as a
+        // non-sponsored transaction would, never more than `fee` already
+        // authorized. The burn + validator-reward split below is identical
+        // whichever source pays, so supply is conserved either way.
+        let mut sponsored_by: Option<Hash256> = None;
+        // A mandate spend pays its fee out of the mandate escrow, not the agent's
+        // balance (the prepaid-card model). The escrow debit happens atomically in
+        // the `SpendUnderMandate` / `SpendUnderMandateToService` arm after the
+        // mandate's budget check; the burn + validator-reward split below is applied
+        // here identically to any other fee, so supply is conserved whichever source
+        // pays.
+        let fee_from_mandate = matches!(
+            &tx.operation,
+            Operation::SpendUnderMandate { .. } | Operation::SpendUnderMandateToService { .. }
+        );
         if tx.authorization_lane.is_default() {
-            self.debit_native(tx.sender, total_fee)?;
+            let mut paid_by_sponsor = false;
+            if let Some(namespace) = tx.sponsor {
+                // The sponsor record is consensus state this transaction touches
+                // whether or not it ultimately pays, so record the declared write
+                // up front (the recorder requires every declared key be used).
+                access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+                if tx.operation.is_sponsorable()
+                    && self.try_charge_sponsor(namespace, tx.sender, total_fee, config)?
+                {
+                    paid_by_sponsor = true;
+                    sponsored_by = Some(namespace);
+                }
+            }
+            if !paid_by_sponsor && !fee_from_mandate {
+                self.debit_native(tx.sender, total_fee)?;
+            }
         } else {
             let lane = self
                 .authorization_lanes
@@ -1284,6 +2579,16 @@ impl ChainState {
             payer: tx.sender,
             breakdown: fee,
         }];
+        // When an application sponsor covered the fee, additionally record which
+        // application paid and for whom, so wallets/indexers can attribute the
+        // subsidy. `FeePaid` above still records the burn + reward split.
+        if let Some(application) = sponsored_by {
+            events.push(Event::FeeSponsored {
+                application,
+                beneficiary: tx.sender,
+                breakdown: fee,
+            });
+        }
 
         // A session key authorizes only within its fixed constraints. This runs
         // before the operation mutates balances; any failure rolls back the
@@ -1599,11 +2904,29 @@ impl ChainState {
             } => {
                 access.write(StateKey::object(*object_id))?;
                 access.write(StateKey::application(*namespace, object_id.hash()))?;
+                // The storage deposit is locked from the creator's liquid
+                // balance, so this operation also writes the sender account
+                // (already recorded on the default lane; declared explicitly so
+                // it is covered on a non-default fee lane too).
+                access.write(StateKey::account(tx.sender))?;
                 if self.objects.contains_key(object_id) {
                     return Err(ChainError::ObjectAlreadyExists);
                 }
-                let object =
+                let mut object =
                     StateObject::new_owned(*object_id, *namespace, tx.sender, data.clone())?;
+                // §15.22: lock a refundable storage deposit proportional to the
+                // deterministic stored byte count. `debit_native` fails closed
+                // (rolling the whole transaction back) if the creator cannot
+                // afford it, so an object can never exist without its deposit.
+                let deposit = config
+                    .storage_pricing
+                    .deposit_for_bytes(object.data.len())?;
+                self.debit_native(tx.sender, deposit)?;
+                object.deposit = deposit;
+                self.storage_deposits = self
+                    .storage_deposits
+                    .checked_add(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
                 let version = object.version;
                 self.objects.insert(*object_id, object);
                 events.push(Event::ObjectCreated {
@@ -1621,14 +2944,54 @@ impl ChainState {
             } => {
                 access.write(StateKey::object(*object_id))?;
                 access.write(StateKey::application(*namespace, object_id.hash()))?;
+                // A resize locks or refunds the difference against the sender's
+                // liquid balance, so the sender account is written here too.
+                access.write(StateKey::account(tx.sender))?;
                 validate_object_data(data)?;
+                let new_deposit = config.storage_pricing.deposit_for_bytes(data.len())?;
+                // Validate ownership/version and read the current deposit, then
+                // release the object borrow before touching balances (which
+                // borrow `self` mutably through the native credit/debit helpers).
+                let old_deposit = {
+                    let object = self
+                        .objects
+                        .get_mut(object_id)
+                        .ok_or(ChainError::ObjectNotFound)?;
+                    validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
+                    object.deposit
+                };
+                // Keep the locked deposit exactly matching the new byte size:
+                // lock the extra when growing (fail closed if unaffordable),
+                // refund the difference when shrinking. Both conserve supply
+                // (liquid <-> storage_deposits).
+                if new_deposit > old_deposit {
+                    let extra = new_deposit
+                        .checked_sub(old_deposit)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    self.debit_native(tx.sender, extra)?;
+                    self.storage_deposits = self
+                        .storage_deposits
+                        .checked_add(extra)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                } else if old_deposit > new_deposit {
+                    let refund = old_deposit
+                        .checked_sub(new_deposit)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    self.storage_deposits = self
+                        .storage_deposits
+                        .checked_sub(refund)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    self.credit_native(tx.sender, refund)?;
+                }
+                // Commit the new revision, bytes, and matching deposit only after
+                // the balance move succeeded.
                 let object = self
                     .objects
                     .get_mut(object_id)
                     .ok_or(ChainError::ObjectNotFound)?;
-                validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
                 object.version = object.version.checked_next()?;
                 object.data = data.clone();
+                object.deposit = new_deposit;
                 events.push(Event::ObjectMutated {
                     object_id: *object_id,
                     version: object.version,
@@ -1654,6 +3017,46 @@ impl ChainState {
                     from: tx.sender,
                     to: *new_owner,
                     version: object.version,
+                });
+            }
+            Operation::DeleteObject {
+                object_id,
+                namespace,
+                expected_version,
+            } => {
+                access.write(StateKey::object(*object_id))?;
+                access.write(StateKey::application(*namespace, object_id.hash()))?;
+                // The deletion refund credits the owner's liquid balance.
+                access.write(StateKey::account(tx.sender))?;
+                // Validate ownership/version and read the recorded deposit, then
+                // release the borrow before settling balances.
+                let deposit = {
+                    let object = self
+                        .objects
+                        .get(object_id)
+                        .ok_or(ChainError::ObjectNotFound)?;
+                    validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
+                    object.deposit
+                };
+                // §15.22: refund the majority to the owner, burn the occupancy
+                // remainder. `refund + burned == deposit`, so the deposit leaves
+                // `storage_deposits` with no mint or loss.
+                let split = config.storage_pricing.refund_split(deposit)?;
+                self.storage_deposits = self
+                    .storage_deposits
+                    .checked_sub(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(tx.sender, split.refund)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(split.burned)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.objects.remove(object_id);
+                events.push(Event::ObjectDeleted {
+                    object_id: *object_id,
+                    owner: tx.sender,
+                    refund: split.refund,
+                    burned: split.burned,
                 });
             }
             Operation::Transfer { to, amount } => {
@@ -1962,6 +3365,110 @@ impl ChainState {
                     amount: reward,
                 });
             }
+            Operation::CompoundValidatorRewards => {
+                access.write(StateKey::validator(tx.sender))?;
+                access.write(StateKey::account(tx.sender))?;
+                // Move accumulated operator rewards straight into self-stake. This
+                // shifts units from the pending-rewards bucket to the staked
+                // bucket (supply-neutral) without a claim-then-restake round trip.
+                let reward = {
+                    let validator = self
+                        .validators
+                        .get_mut(&tx.sender)
+                        .ok_or(ChainError::ValidatorNotFound(tx.sender))?;
+                    let reward = validator.accumulated_rewards;
+                    validator.accumulated_rewards = Amount::ZERO;
+                    validator.self_stake = validator
+                        .self_stake
+                        .checked_add(reward)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    validator.refresh_stake_status(&config.staking)?;
+                    reward
+                };
+                let account = self.account_mut(tx.sender)?;
+                account.staked = account
+                    .staked
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::ValidatorRewardsCompounded {
+                    validator: tx.sender,
+                    amount: reward,
+                });
+            }
+            Operation::CompoundDelegatorRewards { validator } => {
+                access.write(StateKey::validator(*validator))?;
+                access.write(StateKey::delegation(tx.sender, *validator))?;
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::unbonding_queue(*validator))?;
+                let target = self
+                    .validators
+                    .get(validator)
+                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
+                if matches!(
+                    target.status,
+                    ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
+                ) {
+                    return Err(ChainError::ValidatorNotActive(*validator));
+                }
+                let reward = self
+                    .delegations
+                    .get(&(tx.sender, *validator))
+                    .ok_or(ChainError::DelegationNotFound)?
+                    .accumulated_rewards;
+                // Adding the reward to the position must respect the operator/
+                // delegator ratio, exactly as a fresh delegation would (a queued
+                // operator exit still cannot back new delegated stake).
+                let queued_operator_stake = self.unbonding.queued_for(
+                    *validator,
+                    *validator,
+                    UnbondingKind::OperatorStake,
+                )?;
+                let available_operator_stake = target
+                    .self_stake
+                    .checked_sub(queued_operator_stake)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let maximum_delegated = available_operator_stake
+                    .checked_mul_u64(4)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let proposed_delegated = target
+                    .delegated_stake
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                if proposed_delegated > maximum_delegated {
+                    return Err(ChainError::DelegationRatioExceeded);
+                }
+
+                {
+                    let delegation = self
+                        .delegations
+                        .get_mut(&(tx.sender, *validator))
+                        .ok_or(ChainError::DelegationNotFound)?;
+                    delegation.accumulated_rewards = Amount::ZERO;
+                    delegation.amount = delegation
+                        .amount
+                        .checked_add(reward)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                }
+                let validator_state = self
+                    .validators
+                    .get_mut(validator)
+                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
+                validator_state.delegated_stake = validator_state
+                    .delegated_stake
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                validator_state.refresh_stake_status(&config.staking)?;
+                let account = self.account_mut(tx.sender)?;
+                account.delegated = account
+                    .delegated
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::DelegatorRewardsCompounded {
+                    delegator: tx.sender,
+                    validator: *validator,
+                    amount: reward,
+                });
+            }
             Operation::SubmitSlashingEvidence { evidence } => {
                 let outcome = self.apply_slashing_evidence(evidence, config, Some(&mut access))?;
                 events.push(Event::Slashed { outcome });
@@ -2069,6 +3576,1541 @@ impl ChainState {
                         message: message.clone(),
                         message_hash,
                     },
+                });
+            }
+            Operation::RegisterAppSponsor {
+                namespace,
+                daily_budget_cap,
+                initial_funding,
+            } => {
+                // Owner financial action: default lane only (the account balance
+                // is the funding source). The sender account key is already
+                // recorded by the default-lane path; declare the sponsor state key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SponsorshipRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                // The app-chosen per-day cap must stay within the protocol ceiling
+                // (§15.35 "within hard protocol caps").
+                if *daily_budget_cap > config.sponsorship.max_app_daily_budget {
+                    return Err(ChainError::AppSponsorDailyCapTooHigh);
+                }
+                if self.sponsors.contains_key(namespace) {
+                    return Err(ChainError::AppSponsorAlreadyExists);
+                }
+                // Lock the initial funding: liquid -> sponsor_budgets. `debit_native`
+                // fails closed if the owner cannot afford it, rolling back the tx.
+                self.debit_native(tx.sender, *initial_funding)?;
+                self.sponsor_budgets = self
+                    .sponsor_budgets
+                    .checked_add(*initial_funding)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let mut sponsor = AppSponsor::new(tx.sender, *daily_budget_cap);
+                sponsor.budget = *initial_funding;
+                self.sponsors.insert(*namespace, sponsor);
+                events.push(Event::AppSponsorRegistered {
+                    application: *namespace,
+                    owner: tx.sender,
+                    daily_budget_cap: *daily_budget_cap,
+                    funded: *initial_funding,
+                });
+            }
+            Operation::FundAppSponsor { namespace, amount } => {
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SponsorshipRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                // Validate existence and ownership before touching balances; only
+                // the owner may fund. Read-only borrow is dropped before `debit`.
+                {
+                    let sponsor = self
+                        .sponsors
+                        .get(namespace)
+                        .ok_or(ChainError::AppSponsorNotFound)?;
+                    if sponsor.owner != tx.sender {
+                        return Err(ChainError::AppSponsorNotOwner);
+                    }
+                }
+                self.debit_native(tx.sender, *amount)?;
+                self.sponsor_budgets = self
+                    .sponsor_budgets
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let sponsor = self
+                    .sponsors
+                    .get_mut(namespace)
+                    .ok_or(ChainError::AppSponsorNotFound)?;
+                sponsor.budget = sponsor
+                    .budget
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::AppSponsorFunded {
+                    application: *namespace,
+                    amount: *amount,
+                });
+            }
+            Operation::WithdrawAppSponsor { namespace, amount } => {
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SponsorshipRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                // Validate ownership and sufficient budget before moving units.
+                {
+                    let sponsor = self
+                        .sponsors
+                        .get(namespace)
+                        .ok_or(ChainError::AppSponsorNotFound)?;
+                    if sponsor.owner != tx.sender {
+                        return Err(ChainError::AppSponsorNotOwner);
+                    }
+                    if sponsor.budget < *amount {
+                        return Err(ChainError::AppSponsorBudgetInsufficient {
+                            needed: *amount,
+                            available: sponsor.budget,
+                        });
+                    }
+                }
+                // Move sponsor_budgets -> owner liquid, keeping the per-app budget
+                // and the aggregate bucket in lockstep (no mint, no loss).
+                {
+                    let sponsor = self
+                        .sponsors
+                        .get_mut(namespace)
+                        .ok_or(ChainError::AppSponsorNotFound)?;
+                    sponsor.budget = sponsor
+                        .budget
+                        .checked_sub(*amount)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                }
+                self.sponsor_budgets = self
+                    .sponsor_budgets
+                    .checked_sub(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(tx.sender, *amount)?;
+                events.push(Event::AppSponsorWithdrawn {
+                    application: *namespace,
+                    amount: *amount,
+                });
+            }
+            Operation::RegisterNamespace { namespace } => {
+                // Claiming a namespace records an owner; it locks no native units,
+                // so the supply invariant is unaffected (only the ordinary fee
+                // moves). Any authorization lane may pay the fee — there is no
+                // account balance to draw from — so no default-lane restriction.
+                access.write(StateKey::application(
+                    *namespace,
+                    namespace_state_key_hash(),
+                ))?;
+                if self.namespaces.contains_key(namespace) {
+                    return Err(ChainError::NamespaceAlreadyRegistered);
+                }
+                self.namespaces
+                    .insert(*namespace, NamespaceRecord::new(tx.sender));
+                events.push(Event::NamespaceRegistered {
+                    namespace: *namespace,
+                    owner: tx.sender,
+                });
+            }
+            Operation::TransferNamespace {
+                namespace,
+                new_owner,
+            } => {
+                access.write(StateKey::application(
+                    *namespace,
+                    namespace_state_key_hash(),
+                ))?;
+                // Only the current owner may transfer. Validate existence and
+                // ownership before mutating, so a non-owner's attempt fails closed
+                // and leaves the record unchanged (the whole tx rolls back).
+                let record = self
+                    .namespaces
+                    .get_mut(namespace)
+                    .ok_or(ChainError::NamespaceNotFound)?;
+                if record.owner != tx.sender {
+                    return Err(ChainError::NamespaceNotOwner);
+                }
+                record.owner = *new_owner;
+                events.push(Event::NamespaceTransferred {
+                    namespace: *namespace,
+                    from: tx.sender,
+                    to: *new_owner,
+                });
+            }
+            Operation::CreateFeed { feed_id } => {
+                // Permissionless-for-a-fee (§15.6): default lane only (the creation
+                // fee draws from the sender's liquid balance) and the fee is BURNED,
+                // so a creation is never free. Supply-neutral: liquid -> burned.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_feed(*feed_id))?;
+                if self.oracle_feeds.contains_key(feed_id) {
+                    return Err(ChainError::OracleFeedAlreadyExists);
+                }
+                let creation_fee = config.oracle.feed_creation_fee;
+                self.debit_native(tx.sender, creation_fee)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(creation_fee)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let bond = config.oracle.min_reporter_bond;
+                self.oracle_feeds
+                    .insert(*feed_id, Feed::new(tx.sender, bond));
+                events.push(Event::FeedCreated {
+                    feed_id: *feed_id,
+                    creator: tx.sender,
+                    bond,
+                    fee_burned: creation_fee,
+                });
+            }
+            Operation::RegisterReporter { feed_id } => {
+                // Default lane only: the bond draws from the sender's liquid
+                // balance. Supply-neutral: liquid -> oracle_bonds.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.read(StateKey::oracle_feed(*feed_id))?;
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
+                // The bond is the feed's frozen bond class (reading it also
+                // confirms the feed exists).
+                let bond = self
+                    .oracle_feeds
+                    .get(feed_id)
+                    .ok_or(ChainError::OracleFeedNotFound)?
+                    .bond;
+                if self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
+                    return Err(ChainError::OracleReporterAlreadyRegistered);
+                }
+                self.debit_native(tx.sender, bond)?;
+                self.oracle_bonds = self
+                    .oracle_bonds
+                    .checked_add(bond)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.oracle_reporters
+                    .insert((*feed_id, tx.sender), OracleReporter::new());
+                events.push(Event::ReporterRegistered {
+                    feed_id: *feed_id,
+                    reporter: tx.sender,
+                    bond,
+                });
+            }
+            Operation::DeregisterReporter { feed_id } => {
+                // Default lane only: the bond returns to the sender's liquid
+                // balance. Supply-neutral: oracle_bonds -> liquid.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.read(StateKey::oracle_feed(*feed_id))?;
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
+                // The reporter's locked bond equals its feed's frozen bond.
+                let bond = self
+                    .oracle_feeds
+                    .get(feed_id)
+                    .ok_or(ChainError::OracleFeedNotFound)?
+                    .bond;
+                if !self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
+                    return Err(ChainError::OracleReporterNotFound);
+                }
+                self.oracle_bonds = self
+                    .oracle_bonds
+                    .checked_sub(bond)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.oracle_reporters.remove(&(*feed_id, tx.sender));
+                self.credit_native(tx.sender, bond)?;
+                events.push(Event::ReporterDeregistered {
+                    feed_id: *feed_id,
+                    reporter: tx.sender,
+                    bond,
+                });
+            }
+            Operation::SubmitReport { feed_id, value } => {
+                // Reporting moves no native units (only the ordinary tx fee), so it
+                // may run on any authorization lane. It records the value and the
+                // epoch it was reported for (liveness).
+                access.read(StateKey::oracle_feed(*feed_id))?;
+                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
+                if !self.oracle_feeds.contains_key(feed_id) {
+                    return Err(ChainError::OracleFeedNotFound);
+                }
+                let epoch = self.current_epoch;
+                let reporter = self
+                    .oracle_reporters
+                    .get_mut(&(*feed_id, tx.sender))
+                    .ok_or(ChainError::OracleReporterNotFound)?;
+                reporter.value = Some(*value);
+                reporter.reported_epoch = epoch;
+                events.push(Event::ReportSubmitted {
+                    feed_id: *feed_id,
+                    reporter: tx.sender,
+                    value: *value,
+                    epoch,
+                });
+            }
+            Operation::PayFeedRead { feed_id, amount } => {
+                // A consumer pays a read fee into the feed's revenue pool
+                // (§15.17). Default lane only: the payment draws from the payer's
+                // liquid balance. Supply-neutral: liquid -> oracle_revenue.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_feed(*feed_id))?;
+                if amount.is_zero() {
+                    return Err(ChainError::OracleReadAmountZero);
+                }
+                if !self.oracle_feeds.contains_key(feed_id) {
+                    return Err(ChainError::OracleFeedNotFound);
+                }
+                self.debit_native(tx.sender, *amount)?;
+                self.oracle_revenue = self
+                    .oracle_revenue
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let feed = self
+                    .oracle_feeds
+                    .get_mut(feed_id)
+                    .ok_or(ChainError::OracleFeedNotFound)?;
+                feed.revenue = feed
+                    .revenue
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::FeedReadPaid {
+                    feed_id: *feed_id,
+                    payer: tx.sender,
+                    amount: *amount,
+                });
+            }
+            Operation::SubmitOrder {
+                order_id,
+                pair,
+                side,
+                amount,
+                limit_price,
+                deadline_height,
+                fill_or_cancel,
+            } => {
+                // Default lane only: the order's input is locked from the sender's
+                // liquid balance (native leg -> dex_escrow) or asset balance
+                // (non-native leg). The block-level batch pass later settles/refunds
+                // it; that pass is not access-list-bound (like epoch settlement).
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::DexRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::dex_order(*order_id))?;
+                // Validate the hostile order intent before touching any supply.
+                pair.validate()?;
+                if amount.is_zero() || *amount < config.dex.min_order_amount {
+                    return Err(ChainError::DexOrderAmountTooSmall);
+                }
+                if limit_price.is_zero() {
+                    return Err(ChainError::DexOrderPriceZero);
+                }
+                if self.dex_orders.contains_key(order_id) {
+                    return Err(ChainError::DexOrderAlreadyExists);
+                }
+                // Resolve the effective deadline: 0 is the "use the default window"
+                // sentinel; an explicit deadline must not already be in the past.
+                let effective_deadline = if *deadline_height == 0 {
+                    self.current_height
+                        .checked_add(config.dex.default_deadline_blocks)
+                        .ok_or(ChainError::ArithmeticOverflow)?
+                } else {
+                    if *deadline_height < self.current_height {
+                        return Err(ChainError::DexOrderDeadlineInPast);
+                    }
+                    *deadline_height
+                };
+                // The locked leg and its asset: a buy locks quote = amount*price, a
+                // sell locks base = amount. Compute the quote lock overflow-safely.
+                let (locked_asset, locked_amount) = match side {
+                    OrderSide::Buy => (
+                        pair.quote.clone(),
+                        limit_price
+                            .quote_for(*amount)
+                            .ok_or(ChainError::ArithmeticOverflow)?,
+                    ),
+                    OrderSide::Sell => (pair.base.clone(), *amount),
+                };
+                if locked_asset != AssetId::NativeWebc {
+                    access.write(StateKey::asset_balance(locked_asset.clone(), tx.sender))?;
+                }
+                self.dex_lock(tx.sender, &locked_asset, locked_amount)?;
+                let order = Order {
+                    owner: tx.sender,
+                    pair: pair.clone(),
+                    side: *side,
+                    amount: *amount,
+                    remaining: *amount,
+                    limit_price: *limit_price,
+                    deadline_height: effective_deadline,
+                    fill_or_cancel: *fill_or_cancel,
+                    cancel_requested: false,
+                };
+                self.dex_orders.insert(*order_id, order);
+                events.push(Event::OrderSubmitted {
+                    order_id: *order_id,
+                    owner: tx.sender,
+                    pair: pair.clone(),
+                    side: *side,
+                    amount: *amount,
+                    limit_price: *limit_price,
+                    deadline_height: effective_deadline,
+                });
+            }
+            Operation::CancelOrder { order_id } => {
+                // Default lane only. Only marks the order for the block-level batch
+                // pass, which performs the refund (possibly a non-native asset the
+                // access list cannot name) and removal. Marking is a write to the
+                // order's own state key; the fee already touches the account.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::DexRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::dex_order(*order_id))?;
+                let order = self
+                    .dex_orders
+                    .get_mut(order_id)
+                    .ok_or(ChainError::DexOrderNotFound)?;
+                if order.owner != tx.sender {
+                    return Err(ChainError::DexOrderNotOwner);
+                }
+                order.cancel_requested = true;
+            }
+            Operation::GrantMandate {
+                agent_key,
+                grant_nonce,
+                budget_total,
+                expiry_epoch,
+                per_tx_max,
+                rate_limit_per_day,
+                counterparty_policy,
+            } => {
+                // Principal-signed financial action: default lane only (the budget
+                // is escrowed from the sender's liquid balance). Supply-neutral:
+                // liquid -> mandate_escrow.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                let mandate_id = MandateId::derive(tx.sender, agent_key, *grant_nonce);
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(mandate_id))?;
+                // Validate the grant parameters before touching any supply.
+                let mandate = Mandate::new(
+                    tx.sender,
+                    *agent_key,
+                    *budget_total,
+                    *expiry_epoch,
+                    *per_tx_max,
+                    *rate_limit_per_day,
+                    counterparty_policy.clone(),
+                )?;
+                if self.mandates.contains_key(&mandate_id) {
+                    return Err(ChainError::MandateAlreadyExists);
+                }
+                // Escrow the budget. `debit_native` fails closed if the principal
+                // cannot afford it (after the fee was already charged above), so the
+                // whole transaction rolls back and no mandate is created.
+                self.debit_native(tx.sender, *budget_total)?;
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_add(*budget_total)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.mandates.insert(mandate_id, mandate);
+                events.push(Event::MandateGranted {
+                    mandate_id,
+                    principal: tx.sender,
+                    agent_key: *agent_key,
+                    budget_total: *budget_total,
+                    expiry_epoch: *expiry_epoch,
+                });
+            }
+            Operation::TopUpMandate { mandate_id, amount } => {
+                // Principal-signed: default lane only (liquid -> mandate_escrow).
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                if amount.is_zero() {
+                    return Err(ChainError::InvalidMandate);
+                }
+                // Validate existence, ownership, and liveness before moving units.
+                {
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    if mandate.principal != tx.sender {
+                        return Err(ChainError::MandateNotOwner);
+                    }
+                    if mandate.revoked {
+                        return Err(ChainError::MandateRevoked);
+                    }
+                }
+                self.debit_native(tx.sender, *amount)?;
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.budget_total = mandate
+                    .budget_total
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::MandateToppedUp {
+                    mandate_id: *mandate_id,
+                    amount: *amount,
+                    budget_total: mandate.budget_total,
+                });
+            }
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient,
+                amount,
+            } => {
+                // Agent-signed spend: default lane only. The agent account (its
+                // nonce/replay state and the default-lane base key) was ensured to
+                // exist above; the mandate escrow — not the agent's balance — funds
+                // both the principal moved and the fee. Every rejection path is a
+                // distinct typed error, checked in the spec's fixed order.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                access.write(StateKey::account(*recipient))?;
+                // Validate the whole spend against an immutable borrow, then drop it
+                // before mutating balances and the record.
+                let (charge, next_spent, next_window, next_count) = {
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    // Bind the agent key: only the mandate's own agent key may
+                    // spend. The envelope already proved the signer controls
+                    // `tx.public_key`; this ties that key to this mandate.
+                    if tx.public_key != mandate.agent_key {
+                        return Err(ChainError::MandateAgentKeyMismatch);
+                    }
+                    if mandate.revoked {
+                        return Err(ChainError::MandateRevoked);
+                    }
+                    if self.current_epoch > mandate.expiry_epoch.get() {
+                        return Err(ChainError::MandateExpired);
+                    }
+                    if amount.is_zero() {
+                        return Err(ChainError::MandateZeroAmount);
+                    }
+                    // The budget covers BOTH the principal and the fee, so the
+                    // per-transaction cap must bound their SUM, not the principal
+                    // alone. The fee is agent-chosen (via the priority bid) and is
+                    // drawn from the same escrow; bounding only `amount` would let a
+                    // single high-fee spend drain the whole budget past the per-tx
+                    // and per-day limits the principal set. Checking `amount + fee`
+                    // is what makes `per_tx_max` a real per-spend blast-radius cap.
+                    let charge = amount
+                        .checked_add(total_fee)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    if charge > mandate.per_tx_max {
+                        return Err(ChainError::MandatePerTxExceeded);
+                    }
+                    let next_spent = mandate
+                        .spent
+                        .checked_add(charge)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    if next_spent > mandate.budget_total {
+                        return Err(ChainError::MandateBudgetExceeded);
+                    }
+                    if !mandate.counterparty_policy.permits(recipient) {
+                        return Err(ChainError::MandateCounterpartyNotAllowed);
+                    }
+                    // Per-day rate limit, in a deterministic epoch window. A window
+                    // roll resets the counter; `0` means unlimited.
+                    let window = config.mandate.window_index(self.current_epoch);
+                    let current_count = if mandate.window_index == window {
+                        mandate.spends_in_window
+                    } else {
+                        0
+                    };
+                    if mandate.rate_limit_per_day != 0
+                        && current_count >= mandate.rate_limit_per_day
+                    {
+                        return Err(ChainError::MandateRateLimited);
+                    }
+                    let next_count = current_count
+                        .checked_add(1)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    (charge, next_spent, window, next_count)
+                };
+                // Commit: escrow -> recipient (principal) + fee split (already added
+                // to burned/pool above). Supply-neutral: mandate_escrow decreases by
+                // exactly `amount + fee`, matching the recipient credit plus the
+                // burn + validator-reward split.
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_sub(charge)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(*recipient, *amount)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.spent = next_spent;
+                mandate.window_index = next_window;
+                mandate.spends_in_window = next_count;
+                events.push(Event::MandateSpent {
+                    mandate_id: *mandate_id,
+                    agent_key: tx.public_key,
+                    recipient: *recipient,
+                    amount: *amount,
+                    fee: total_fee,
+                });
+            }
+            Operation::RevokeMandate { mandate_id } => {
+                // Principal-signed: default lane only. Returns the unspent remainder
+                // (mandate_escrow -> principal liquid) and marks the mandate revoked
+                // so no further spend succeeds. Also the reclaim path for an expired
+                // mandate. Supply-neutral.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                let remainder = {
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    if mandate.principal != tx.sender {
+                        return Err(ChainError::MandateNotOwner);
+                    }
+                    if mandate.revoked {
+                        // Already revoked: nothing left to reclaim.
+                        return Err(ChainError::MandateRevoked);
+                    }
+                    mandate.remaining()?
+                };
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_sub(remainder)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(tx.sender, remainder)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.revoked = true;
+                // The remainder is now returned, so this mandate contributes zero to
+                // `mandate_escrow`: set `spent` to the full budget to keep the
+                // per-record `budget_total - spent` invariant in lockstep.
+                mandate.spent = mandate.budget_total;
+                events.push(Event::MandateRevoked {
+                    mandate_id: *mandate_id,
+                    principal: tx.sender,
+                    refunded: remainder,
+                });
+            }
+            Operation::RegisterService {
+                namespace,
+                create_nonce,
+                categories,
+                title,
+                endpoint,
+                interface,
+                pricing,
+                payment_flags,
+            } => {
+                // Permissionless-for-a-fee registry write (§15.5): records data only
+                // and locks NO native units, so the supply invariant is unaffected
+                // (only the ordinary, spam-priced transaction fee moves through the
+                // existing burn / fee-pool split). Any authorization lane may pay the
+                // fee — there is no per-op balance to draw from — so no default-lane
+                // restriction (mirrors RegisterNamespace).
+                let service_id = ServiceId::derive(*namespace, tx.sender, *create_nonce);
+                access.write(StateKey::service(service_id))?;
+                if self.services.contains_key(&service_id) {
+                    return Err(ChainError::ServiceAlreadyExists);
+                }
+                // `new` validates every bounded field before the record is committed;
+                // a malformed entry fails closed and rolls the whole tx back.
+                let entry = ServiceEntry::new(
+                    tx.sender,
+                    *namespace,
+                    categories.clone(),
+                    title.clone(),
+                    endpoint.clone(),
+                    *interface,
+                    pricing.clone(),
+                    *payment_flags,
+                )?;
+                self.services.insert(service_id, entry);
+                events.push(Event::ServiceRegistered {
+                    service_id,
+                    owner: tx.sender,
+                    namespace: *namespace,
+                });
+            }
+            Operation::UpdateService {
+                service_id,
+                categories,
+                title,
+                endpoint,
+                interface,
+                pricing,
+                payment_flags,
+            } => {
+                access.write(StateKey::service(*service_id))?;
+                // Only the current owner may update. Validate existence and ownership
+                // before building the replacement, so a non-owner's attempt fails
+                // closed and leaves the record unchanged.
+                let existing = self
+                    .services
+                    .get(service_id)
+                    .ok_or(ChainError::ServiceNotFound)?;
+                if existing.owner != tx.sender {
+                    return Err(ChainError::ServiceNotOwner);
+                }
+                // Rewrite the CURRENT revision in place, keeping owner/namespace/
+                // status and bumping the revision. Only the current revision lives in
+                // committed active state (prior revisions are an event-log concern).
+                let mut updated = existing.clone();
+                updated.categories = categories.clone();
+                updated.title = title.clone();
+                updated.endpoint = endpoint.clone();
+                updated.interface = *interface;
+                updated.pricing = pricing.clone();
+                updated.payment_flags = *payment_flags;
+                updated.revision = updated
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                updated.validate()?;
+                let revision = updated.revision;
+                self.services.insert(*service_id, updated);
+                events.push(Event::ServiceUpdated {
+                    service_id: *service_id,
+                    revision,
+                });
+            }
+            Operation::SetServiceStatus { service_id, status } => {
+                access.write(StateKey::service(*service_id))?;
+                let entry = self
+                    .services
+                    .get_mut(service_id)
+                    .ok_or(ChainError::ServiceNotFound)?;
+                if entry.owner != tx.sender {
+                    return Err(ChainError::ServiceNotOwner);
+                }
+                entry.status = *status;
+                entry.revision = entry
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let revision = entry.revision;
+                events.push(Event::ServiceStatusChanged {
+                    service_id: *service_id,
+                    status: *status,
+                    revision,
+                });
+            }
+            Operation::SpendUnderMandateToService {
+                mandate_id,
+                service_id,
+                amount,
+            } => {
+                // Agent-signed spend paying a registered service's owner. Default
+                // lane only (the mandate escrow — not the agent's balance — funds
+                // both the principal moved and the fee). Every rejection path is a
+                // distinct typed error. The service entry is read-only (only its
+                // owner's account is credited); the pay-to owner account is
+                // state-derived and declared by the signer (fails closed if stale).
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                access.read(StateKey::service(*service_id))?;
+                // Resolve the service and validate the whole spend against immutable
+                // borrows, then drop them before mutating balances and the record.
+                let (service_owner, charge, next_spent, next_window, next_count) = {
+                    let service = self
+                        .services
+                        .get(service_id)
+                        .ok_or(ChainError::ServiceNotFound)?;
+                    // Paying a Paused/Retired service is rejected before any
+                    // counterparty or budget work.
+                    if !service.status.is_active() {
+                        return Err(ChainError::ServiceNotActive);
+                    }
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    // Bind the agent key: only the mandate's own agent key may spend.
+                    if tx.public_key != mandate.agent_key {
+                        return Err(ChainError::MandateAgentKeyMismatch);
+                    }
+                    if mandate.revoked {
+                        return Err(ChainError::MandateRevoked);
+                    }
+                    if self.current_epoch > mandate.expiry_epoch.get() {
+                        return Err(ChainError::MandateExpired);
+                    }
+                    if amount.is_zero() {
+                        return Err(ChainError::MandateZeroAmount);
+                    }
+                    // `per_tx_max` bounds the TOTAL leaving escrow per spend
+                    // (principal + agent-chosen fee), not the principal alone — see
+                    // the `SpendUnderMandate` arm for why bounding `amount` alone
+                    // would let one high-fee spend drain the whole budget.
+                    let charge = amount
+                        .checked_add(total_fee)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    if charge > mandate.per_tx_max {
+                        return Err(ChainError::MandatePerTxExceeded);
+                    }
+                    let next_spent = mandate
+                        .spent
+                        .checked_add(charge)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    if next_spent > mandate.budget_total {
+                        return Err(ChainError::MandateBudgetExceeded);
+                    }
+                    // Category-allowlist resolution against the registry (§2 loop):
+                    // the service OWNER satisfies a recipient allowlist, and an
+                    // active service's categories resolve a category allowlist.
+                    if !mandate.counterparty_policy.permits_service(service) {
+                        return Err(ChainError::MandateCounterpartyNotAllowed);
+                    }
+                    // Per-day rate limit, in a deterministic epoch window.
+                    let window = config.mandate.window_index(self.current_epoch);
+                    let current_count = if mandate.window_index == window {
+                        mandate.spends_in_window
+                    } else {
+                        0
+                    };
+                    if mandate.rate_limit_per_day != 0
+                        && current_count >= mandate.rate_limit_per_day
+                    {
+                        return Err(ChainError::MandateRateLimited);
+                    }
+                    let next_count = current_count
+                        .checked_add(1)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    (service.owner, charge, next_spent, window, next_count)
+                };
+                // The pay-to owner account is credited, so it must be a declared
+                // writable key; the signer names it (state-derived pay-to), and an
+                // undeclared or stale owner fails closed here.
+                access.write(StateKey::account(service_owner))?;
+                // Commit: escrow -> service owner (principal) + fee split (already
+                // added to burned/pool above). Supply-neutral: mandate_escrow falls
+                // by exactly `amount + fee`.
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_sub(charge)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(service_owner, *amount)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.spent = next_spent;
+                mandate.window_index = next_window;
+                mandate.spends_in_window = next_count;
+                events.push(Event::MandateSpentToService {
+                    mandate_id: *mandate_id,
+                    service_id: *service_id,
+                    agent_key: tx.public_key,
+                    recipient: service_owner,
+                    amount: *amount,
+                    fee: total_fee,
+                });
+            }
+            Operation::CreateToken {
+                namespace,
+                create_nonce,
+                metadata,
+                mint_authority,
+                freeze_authority,
+                initial_supply,
+                initial_recipient,
+            } => {
+                // Self-contained native token creation (§15): records a token in its
+                // OWN identity space (never the bridge `asset_balances`) and locks a
+                // NON-REFUNDABLE native creation deposit (liquid -> token_deposits) as
+                // the anti-spam price. Token creation NEVER mints or burns native
+                // WEBC. The account key is declared explicitly so a non-default fee
+                // lane is covered (mirrors CreateObject).
+                let token_id = TokenId::derive(*namespace, tx.sender, *create_nonce);
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::token(token_id))?;
+                if !initial_supply.is_zero() {
+                    access.write(StateKey::token_balance(token_id, *initial_recipient))?;
+                }
+                if self.tokens.contains_key(&token_id) {
+                    return Err(ChainError::TokenAlreadyExists);
+                }
+                // Validate metadata before locking any deposit; a malformed record
+                // fails closed and rolls the whole transaction back. `issued_supply`
+                // starts at the optional initial mint, keeping the per-token invariant
+                // (`sum(balances) == issued_supply`) true from creation.
+                let record = TokenRecord::new(
+                    tx.sender,
+                    metadata.clone(),
+                    *mint_authority,
+                    *freeze_authority,
+                    *initial_supply,
+                )?;
+                // Lock the deposit; `debit_native` fails closed if the creator cannot
+                // afford it, so a token can never exist without its deposit.
+                let deposit = config.token.creation_deposit;
+                self.debit_native(tx.sender, deposit)?;
+                self.token_deposits = self
+                    .token_deposits
+                    .checked_add(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.tokens.insert(token_id, record);
+                // A brand-new token has no frozen accounts, so the initial mint needs
+                // no freeze check.
+                self.credit_token(token_id, *initial_recipient, *initial_supply)?;
+                events.push(Event::TokenCreated {
+                    token_id,
+                    creator: tx.sender,
+                    namespace: *namespace,
+                    deposit,
+                    initial_supply: *initial_supply,
+                });
+            }
+            Operation::MintToken {
+                token_id,
+                recipient,
+                amount,
+            } => {
+                access.write(StateKey::token(*token_id))?;
+                access.write(StateKey::token_balance(*token_id, *recipient))?;
+                // Authorize against the CURRENT mint authority: a renounced (None)
+                // authority rejects, and any signer that is not the authority rejects.
+                // The checked-add of `issued_supply` is computed under the immutable
+                // borrow, then applied after crediting so the borrow is released.
+                let next_issued = {
+                    let token = self.tokens.get(token_id).ok_or(ChainError::TokenNotFound)?;
+                    match token.mint_authority {
+                        Some(authority) if authority == tx.sender => {}
+                        _ => return Err(ChainError::TokenMintNotAuthorized),
+                    }
+                    token
+                        .issued_supply
+                        .checked_add(*amount)
+                        .ok_or(ChainError::TokenSupplyOverflow)?
+                };
+                // A frozen recipient cannot receive. Freeze state is read directly on
+                // the value path (not via the access recorder), matching the minimal
+                // transfer access list.
+                if self
+                    .frozen_token_accounts
+                    .contains(&(*token_id, *recipient))
+                {
+                    return Err(ChainError::TokenAccountFrozen);
+                }
+                // Credit the recipient and raise issued supply by the same amount.
+                // Token mint NEVER touches native WEBC supply.
+                self.credit_token(*token_id, *recipient, *amount)?;
+                self.tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .issued_supply = next_issued;
+                events.push(Event::TokenMinted {
+                    token_id: *token_id,
+                    recipient: *recipient,
+                    amount: *amount,
+                    issued_supply: next_issued,
+                });
+            }
+            Operation::BurnToken { token_id, amount } => {
+                access.write(StateKey::token(*token_id))?;
+                access.write(StateKey::token_balance(*token_id, tx.sender))?;
+                if !self.tokens.contains_key(token_id) {
+                    return Err(ChainError::TokenNotFound);
+                }
+                // A frozen holder cannot burn.
+                if self.frozen_token_accounts.contains(&(*token_id, tx.sender)) {
+                    return Err(ChainError::TokenAccountFrozen);
+                }
+                // Debit the holder's OWN balance first (fails closed on insufficient
+                // balance, pruning a zero remainder), then lower issued supply by the
+                // same amount. Since a successful debit proves `balance >= amount` and
+                // the per-token invariant keeps `issued_supply >= balance`, the
+                // issued-supply subtraction cannot underflow. Burn NEVER touches
+                // native WEBC supply.
+                self.debit_token(*token_id, tx.sender, *amount)?;
+                let token = self
+                    .tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?;
+                token.issued_supply = token
+                    .issued_supply
+                    .checked_sub(*amount)
+                    .ok_or(ChainError::TokenSupplyOverflow)?;
+                let issued_supply = token.issued_supply;
+                events.push(Event::TokenBurned {
+                    token_id: *token_id,
+                    holder: tx.sender,
+                    amount: *amount,
+                    issued_supply,
+                });
+            }
+            Operation::TransferToken {
+                token_id,
+                recipient,
+                amount,
+            } => {
+                // The token record is READ-ONLY (only its paused flag is consulted);
+                // the two per-account balance keys are the ONLY writes — an ordinary
+                // transfer never writes a global per-token object (Phase 13 acceptance
+                // criterion). A transfer conserves the token's supply, so
+                // `issued_supply` (and thus the record) is never written.
+                access.read(StateKey::token(*token_id))?;
+                access.write(StateKey::token_balance(*token_id, tx.sender))?;
+                access.write(StateKey::token_balance(*token_id, *recipient))?;
+                // Both freeze markers are declared reads (see the matching access
+                // list in `transaction.rs`), recorded UNCONDITIONALLY here — before
+                // the short-circuiting frozen check — so the observed access always
+                // equals the declaration and the parallel scheduler serializes this
+                // transfer against a freeze/thaw of either party.
+                access.read(StateKey::token_freeze(*token_id, tx.sender))?;
+                access.read(StateKey::token_freeze(*token_id, *recipient))?;
+                let paused = self
+                    .tokens
+                    .get(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .paused;
+                if paused {
+                    return Err(ChainError::TokenPaused);
+                }
+                // Neither sender nor recipient may be frozen.
+                if self.frozen_token_accounts.contains(&(*token_id, tx.sender))
+                    || self
+                        .frozen_token_accounts
+                        .contains(&(*token_id, *recipient))
+                {
+                    return Err(ChainError::TokenAccountFrozen);
+                }
+                // Debit the sender (pruning a zero remainder), then credit the
+                // recipient by the same amount.
+                self.debit_token(*token_id, tx.sender, *amount)?;
+                self.credit_token(*token_id, *recipient, *amount)?;
+                events.push(Event::TokenTransferred {
+                    token_id: *token_id,
+                    from: tx.sender,
+                    to: *recipient,
+                    amount: *amount,
+                });
+            }
+            Operation::SetTokenPaused { token_id, paused } => {
+                access.write(StateKey::token(*token_id))?;
+                let token = self
+                    .tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?;
+                // Only the current mint authority may pause/unpause (Phase 13a keeps a
+                // single privileged authority); a renounced (None) mint authority
+                // rejects.
+                match token.mint_authority {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::TokenMintNotAuthorized),
+                }
+                token.paused = *paused;
+                events.push(Event::TokenPausedChanged {
+                    token_id: *token_id,
+                    paused: *paused,
+                });
+            }
+            Operation::FreezeTokenAccount { token_id, account } => {
+                access.read(StateKey::token(*token_id))?;
+                access.write(StateKey::token_freeze(*token_id, *account))?;
+                // Authorize against the CURRENT freeze authority; a renounced (None)
+                // authority rejects.
+                let authority = self
+                    .tokens
+                    .get(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::TokenFreezeNotAuthorized),
+                }
+                self.frozen_token_accounts.insert((*token_id, *account));
+                events.push(Event::TokenFreezeChanged {
+                    token_id: *token_id,
+                    account: *account,
+                    frozen: true,
+                });
+            }
+            Operation::ThawTokenAccount { token_id, account } => {
+                access.read(StateKey::token(*token_id))?;
+                access.write(StateKey::token_freeze(*token_id, *account))?;
+                let authority = self
+                    .tokens
+                    .get(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::TokenFreezeNotAuthorized),
+                }
+                self.frozen_token_accounts.remove(&(*token_id, *account));
+                events.push(Event::TokenFreezeChanged {
+                    token_id: *token_id,
+                    account: *account,
+                    frozen: false,
+                });
+            }
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind,
+                new_authority,
+            } => {
+                access.write(StateKey::token(*token_id))?;
+                let token = self
+                    .tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?;
+                let current = match authority_kind {
+                    TokenAuthorityKind::Mint => token.mint_authority,
+                    TokenAuthorityKind::Freeze => token.freeze_authority,
+                };
+                // Only the CURRENT holder may transfer/renounce. A renounced (None)
+                // authority has nothing to transfer, so it can never be restored —
+                // renouncement is PERMANENT (a Phase 13 acceptance criterion).
+                match current {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::TokenAuthorityNotAuthorized),
+                }
+                match authority_kind {
+                    TokenAuthorityKind::Mint => token.mint_authority = *new_authority,
+                    TokenAuthorityKind::Freeze => token.freeze_authority = *new_authority,
+                }
+                events.push(Event::TokenAuthorityChanged {
+                    token_id: *token_id,
+                    authority_kind: *authority_kind,
+                    new_authority: *new_authority,
+                });
+            }
+            Operation::CreateNftCollection {
+                namespace,
+                create_nonce,
+                metadata,
+                mint_authority,
+                freeze_authority,
+                max_supply,
+                royalty_bps,
+            } => {
+                // Self-contained native NFT collection creation (§15): records a
+                // collection in its OWN identity space and locks a NON-REFUNDABLE
+                // native creation deposit (liquid -> nft_deposits) as the anti-spam
+                // price. Creation NEVER mints or burns native WEBC and mints no items.
+                // The account key is declared explicitly so a non-default fee lane is
+                // covered (mirrors CreateToken).
+                let collection_id = NftCollectionId::derive(*namespace, tx.sender, *create_nonce);
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::nft_collection(collection_id))?;
+                if self.nft_collections.contains_key(&collection_id) {
+                    return Err(ChainError::NftCollectionAlreadyExists);
+                }
+                // Validate metadata + royalty before locking any deposit; a malformed
+                // record fails closed and rolls the whole transaction back.
+                let record = NftCollection::new(
+                    tx.sender,
+                    metadata.clone(),
+                    *mint_authority,
+                    *freeze_authority,
+                    *max_supply,
+                    *royalty_bps,
+                )?;
+                // Lock the deposit; `debit_native` fails closed if the creator cannot
+                // afford it, so a collection can never exist without its deposit.
+                let deposit = config.nft.creation_deposit;
+                self.debit_native(tx.sender, deposit)?;
+                self.nft_deposits = self
+                    .nft_deposits
+                    .checked_add(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.nft_collections.insert(collection_id, record);
+                events.push(Event::NftCollectionCreated {
+                    collection_id,
+                    creator: tx.sender,
+                    namespace: *namespace,
+                    deposit,
+                });
+            }
+            Operation::MintNft {
+                collection_id,
+                recipient,
+                item_metadata_hash,
+            } => {
+                // Mint bumps `next_serial`/`minted_count` (writes the collection
+                // record) and creates ONE brand-new item at the chain-assigned
+                // `serial = next_serial`. Reads of the collection's authority, paused
+                // flag, cap, and counters are all covered by the read_write collection
+                // declaration.
+                access.write(StateKey::nft_collection(*collection_id))?;
+                let (serial, next_serial, next_minted) = {
+                    let collection = self
+                        .nft_collections
+                        .get(collection_id)
+                        .ok_or(ChainError::NftCollectionNotFound)?;
+                    // Authorize against the CURRENT mint authority: a renounced (None)
+                    // authority rejects, and any non-authority signer rejects.
+                    match collection.mint_authority {
+                        Some(authority) if authority == tx.sender => {}
+                        _ => return Err(ChainError::NftMintNotAuthorized),
+                    }
+                    // A paused collection cannot mint.
+                    if collection.paused {
+                        return Err(ChainError::NftCollectionPaused);
+                    }
+                    // Enforce the optional cap on total items ever minted. Because a
+                    // burned serial is never reminted, burning does not free capacity.
+                    if let Some(cap) = collection.max_supply {
+                        if collection.minted_count >= cap {
+                            return Err(ChainError::NftMaxSupplyReached);
+                        }
+                    }
+                    let serial = collection.next_serial;
+                    let next_serial = serial.checked_add(1).ok_or(ChainError::NftSerialOverflow)?;
+                    let next_minted = collection
+                        .minted_count
+                        .checked_add(1)
+                        .ok_or(ChainError::NftSerialOverflow)?;
+                    (serial, next_serial, next_minted)
+                };
+                let nft_id = NftId::new(*collection_id, serial);
+                // The new item's key is state-dependent (serial == next_serial) and
+                // cannot be pre-declared in the signed access list, so the item is
+                // created under the collection record's WRITE scope rather than via
+                // the access recorder: the collection record is declared read_write,
+                // so every mint of this collection serializes on it and no concurrent
+                // transaction can reference this fresh serial. This is the ONE
+                // deliberate exception (a chain-assigned id); every other item access
+                // (transfer/burn/freeze/thaw) names a caller-supplied serial and DOES
+                // declare its item key. See the matching note in `transaction.rs`.
+                self.nft_items
+                    .insert(nft_id, NftItem::new_owned(*recipient, *item_metadata_hash));
+                // Commit the bumped counters after the item write releases the borrow.
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                collection.next_serial = next_serial;
+                collection.minted_count = next_minted;
+                events.push(Event::NftMinted {
+                    nft_id,
+                    recipient: *recipient,
+                    item_metadata_hash: *item_metadata_hash,
+                });
+            }
+            Operation::TransferNft {
+                collection_id,
+                serial,
+                recipient,
+            } => {
+                // The collection record is READ-ONLY (only its paused flag is
+                // consulted); the single item key is the ONLY write — an ordinary
+                // transfer never writes a global per-collection object (Phase 13
+                // acceptance criterion). The item's `frozen` flag lives ON the item
+                // key we already write, so it needs no separate declaration.
+                access.read(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                let paused = self
+                    .nft_collections
+                    .get(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?
+                    .paused;
+                if paused {
+                    return Err(ChainError::NftCollectionPaused);
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let item = self
+                    .nft_items
+                    .get_mut(&nft_id)
+                    .ok_or(ChainError::NftItemNotFound)?;
+                // Only the current owner may transfer.
+                if item.owner != tx.sender {
+                    return Err(ChainError::NftNotOwner);
+                }
+                // A frozen item cannot be transferred.
+                if item.frozen {
+                    return Err(ChainError::NftItemFrozen);
+                }
+                let from = item.owner;
+                item.owner = *recipient;
+                events.push(Event::NftTransferred {
+                    nft_id,
+                    from,
+                    to: *recipient,
+                });
+            }
+            Operation::BurnNft {
+                collection_id,
+                serial,
+            } => {
+                // A burn removes the item (writes the item key) and bumps
+                // `burned_count` (writes the collection record). `next_serial` is NOT
+                // decremented, so a burned serial is never reminted.
+                access.write(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                if !self.nft_collections.contains_key(collection_id) {
+                    return Err(ChainError::NftCollectionNotFound);
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let (owner, frozen) = {
+                    let item = self
+                        .nft_items
+                        .get(&nft_id)
+                        .ok_or(ChainError::NftItemNotFound)?;
+                    (item.owner, item.frozen)
+                };
+                // Only the current owner may burn, and a frozen item cannot be burned.
+                if owner != tx.sender {
+                    return Err(ChainError::NftNotOwner);
+                }
+                if frozen {
+                    return Err(ChainError::NftItemFrozen);
+                }
+                self.nft_items.remove(&nft_id);
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                collection.burned_count = collection
+                    .burned_count
+                    .checked_add(1)
+                    .ok_or(ChainError::NftSerialOverflow)?;
+                events.push(Event::NftBurned { nft_id, owner });
+            }
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused,
+            } => {
+                access.write(StateKey::nft_collection(*collection_id))?;
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                // Only the current mint authority may pause/unpause (Phase 13b keeps a
+                // single privileged authority); a renounced (None) mint authority
+                // rejects.
+                match collection.mint_authority {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::NftMintNotAuthorized),
+                }
+                collection.paused = *paused;
+                events.push(Event::NftCollectionPausedChanged {
+                    collection_id: *collection_id,
+                    paused: *paused,
+                });
+            }
+            Operation::FreezeNftItem {
+                collection_id,
+                serial,
+            } => {
+                access.read(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                // Authorize against the CURRENT freeze authority; a renounced (None)
+                // authority rejects.
+                let authority = self
+                    .nft_collections
+                    .get(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::NftFreezeNotAuthorized),
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let item = self
+                    .nft_items
+                    .get_mut(&nft_id)
+                    .ok_or(ChainError::NftItemNotFound)?;
+                item.frozen = true;
+                events.push(Event::NftItemFreezeChanged {
+                    nft_id,
+                    frozen: true,
+                });
+            }
+            Operation::ThawNftItem {
+                collection_id,
+                serial,
+            } => {
+                access.read(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                let authority = self
+                    .nft_collections
+                    .get(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::NftFreezeNotAuthorized),
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let item = self
+                    .nft_items
+                    .get_mut(&nft_id)
+                    .ok_or(ChainError::NftItemNotFound)?;
+                item.frozen = false;
+                events.push(Event::NftItemFreezeChanged {
+                    nft_id,
+                    frozen: false,
+                });
+            }
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind,
+                new_authority,
+            } => {
+                access.write(StateKey::nft_collection(*collection_id))?;
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                let current = match authority_kind {
+                    NftAuthorityKind::Mint => collection.mint_authority,
+                    NftAuthorityKind::Freeze => collection.freeze_authority,
+                };
+                // Only the CURRENT holder may transfer/renounce. A renounced (None)
+                // authority has nothing to transfer, so it can never be restored —
+                // renouncement is PERMANENT (a Phase 13 acceptance criterion).
+                match current {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::NftAuthorityNotAuthorized),
+                }
+                match authority_kind {
+                    NftAuthorityKind::Mint => collection.mint_authority = *new_authority,
+                    NftAuthorityKind::Freeze => collection.freeze_authority = *new_authority,
+                }
+                events.push(Event::NftAuthorityChanged {
+                    collection_id: *collection_id,
+                    authority_kind: *authority_kind,
+                    new_authority: *new_authority,
+                });
+            }
+            Operation::RegisterContract { manifest } => {
+                // Default lane only: the registration fee draws from and burns
+                // liquid (supply-neutral, like feed creation). The manifest record
+                // is committed under the reserved module key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::ContractRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::module(manifest.code_id))?;
+                // Validate the hostile manifest before touching supply or state.
+                manifest.validate(tx.sender)?;
+                if self.contracts.contains_key(&manifest.code_id) {
+                    return Err(ChainError::ContractAlreadyExists);
+                }
+                let fee = config.contracts.registration_fee;
+                self.debit_native(tx.sender, fee)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(fee)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.contracts.insert(manifest.code_id, manifest.clone());
+                events.push(Event::ContractRegistered {
+                    code_id: manifest.code_id,
+                    namespace: manifest.namespace,
+                    owner: tx.sender,
+                    builtin: manifest.builtin,
+                    fee_burned: fee,
+                });
+            }
+            Operation::InvokeContract {
+                code_id,
+                namespace,
+                declared_keys,
+                input,
+            } => {
+                // Bound the hostile input before any work.
+                if input.len() > MAX_CONTRACT_INPUT_BYTES {
+                    return Err(ChainError::ContractInputTooLarge {
+                        actual: input.len(),
+                        maximum: MAX_CONTRACT_INPUT_BYTES,
+                    });
+                }
+                // Resolve the manifest through the declared (read-only) module key.
+                access.read(StateKey::module(*code_id))?;
+                let manifest = self
+                    .contracts
+                    .get(code_id)
+                    .ok_or(ChainError::ContractNotFound)?
+                    .clone();
+                // Bind the signed operation to the committed manifest so the access
+                // list and the scheduler agree with the manifest and a call cannot
+                // under- or mis-declare what it touches.
+                if *namespace != manifest.namespace {
+                    return Err(ChainError::ContractNamespaceMismatch);
+                }
+                if declared_keys.as_slice() != manifest.footprint.as_slice() {
+                    return Err(ChainError::ContractFootprintMismatch);
+                }
+                // Seed the meter with the admission cost already priced into the fee
+                // (`units`), and cap it at the sender's authorized `gas_limit`; the
+                // handler's per-host-op consumption is metered on top and hard-stops
+                // on over-gas (fail-closed atomic rollback of the whole transaction).
+                let mut meter = GasMeter::new(tx.fee.gas_limit, units)?;
+                // Load the contract's whole declared footprint from committed state
+                // into a working set. Every footprint key is recorded/enforced
+                // through the shared recorder by `ContractContext`, so an omitted or
+                // padded access list fails closed exactly like a native op.
+                let mut working = BTreeMap::new();
+                for key_hash in &manifest.footprint {
+                    let current = self
+                        .contract_state
+                        .get(&(manifest.namespace, *key_hash))
+                        .map(|value| value.0.clone());
+                    working.insert(*key_hash, current);
+                }
+                let mut ctx = ContractContext::new(
+                    manifest.namespace,
+                    &manifest.footprint,
+                    working,
+                    &mut access,
+                    &mut meter,
+                    self.current_epoch,
+                );
+                let handler = builtin_contract(manifest.builtin);
+                let output = handler.call(&mut ctx, input)?;
+                let writes = ctx.into_writes()?;
+                let gas_consumed = meter.consumed();
+                // Commit the contract's declared writes back to committed state.
+                for (key_hash, value) in writes {
+                    let key = (manifest.namespace, key_hash);
+                    match value {
+                        Some(bytes) => {
+                            self.contract_state.insert(key, ContractStateValue(bytes));
+                        }
+                        None => {
+                            self.contract_state.remove(&key);
+                        }
+                    }
+                }
+                events.push(Event::ContractInvoked {
+                    code_id: *code_id,
+                    namespace: *namespace,
+                    caller: tx.sender,
+                    gas_consumed,
+                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
                 });
             }
         }
@@ -2465,6 +5507,322 @@ impl ChainState {
         Ok(())
     }
 
+    /// Credits `amount` of `token_id` to `holder`'s token balance (Phase 13a, §15).
+    ///
+    /// A zero credit is a no-op (so no zero entry is ever created). Checked
+    /// addition; overflow returns [`ChainError::TokenSupplyOverflow`]. This moves
+    /// only the token's own balance — never native WEBC.
+    fn credit_token(
+        &mut self,
+        token_id: TokenId,
+        holder: Address,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let entry = self
+            .token_balances
+            .entry((token_id, holder))
+            .or_insert(Amount::ZERO);
+        *entry = entry
+            .checked_add(amount)
+            .ok_or(ChainError::TokenSupplyOverflow)?;
+        Ok(())
+    }
+
+    /// Debits `amount` of `token_id` from `holder`'s token balance, PRUNING a
+    /// balance that reaches zero (Phase 13a, §15).
+    ///
+    /// A zero debit is a no-op. Rejects an insufficient balance with
+    /// [`ChainError::TokenInsufficientBalance`] (a missing entry is a zero balance).
+    /// When the remaining balance is zero the entry is removed, so the balance map
+    /// never stores zeros and stays bounded. Moves only the token's own balance —
+    /// never native WEBC.
+    fn debit_token(
+        &mut self,
+        token_id: TokenId,
+        holder: Address,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let current = self
+            .token_balances
+            .get(&(token_id, holder))
+            .copied()
+            .unwrap_or(Amount::ZERO);
+        let remaining = current
+            .checked_sub(amount)
+            .ok_or(ChainError::TokenInsufficientBalance)?;
+        if remaining.is_zero() {
+            self.token_balances.remove(&(token_id, holder));
+        } else {
+            self.token_balances.insert((token_id, holder), remaining);
+        }
+        Ok(())
+    }
+
+    /// Reconciles one token's issued supply against the sum of its held balances
+    /// (Phase 13a, §15).
+    ///
+    /// For any token, `issued_supply` must equal the sum of every held balance.
+    /// This is a SEPARATE asset from native WEBC and never enters
+    /// [`Self::supply_invariant_report`]. Returns [`ChainError::TokenNotFound`] if
+    /// the token does not exist. Checked addition over the held balances.
+    pub fn token_supply_report(&self, token_id: TokenId) -> Result<TokenSupplyReport, ChainError> {
+        let issued = self
+            .tokens
+            .get(&token_id)
+            .ok_or(ChainError::TokenNotFound)?
+            .issued_supply;
+        let mut held = Amount::ZERO;
+        for ((token, _holder), balance) in self.token_balances.iter() {
+            if *token == token_id {
+                held = held
+                    .checked_add(*balance)
+                    .ok_or(ChainError::TokenSupplyOverflow)?;
+            }
+        }
+        Ok(TokenSupplyReport {
+            issued,
+            held,
+            balanced: issued == held,
+        })
+    }
+
+    /// Reconciles one collection's mint/burn counters against its live item count
+    /// (Phase 13b, §15).
+    ///
+    /// For any collection, `minted_count - burned_count` must equal the number of
+    /// live [`NftItem`] entries for that collection. NFT items are a SEPARATE,
+    /// non-fungible asset from native WEBC and never enter
+    /// [`Self::supply_invariant_report`]. Returns [`ChainError::NftCollectionNotFound`]
+    /// if the collection does not exist, or [`ChainError::ArithmeticOverflow`] if the
+    /// counters are inconsistent (which the state transitions never allow).
+    pub fn nft_collection_supply_report(
+        &self,
+        collection_id: NftCollectionId,
+    ) -> Result<NftCollectionSupplyReport, ChainError> {
+        let collection = self
+            .nft_collections
+            .get(&collection_id)
+            .ok_or(ChainError::NftCollectionNotFound)?;
+        let minted = collection.minted_count;
+        let burned = collection.burned_count;
+        let expected_live = collection.live_count()?;
+        // Count live items for exactly this collection. Items are keyed by
+        // `NftId { collection, serial }`, so this scans the whole item map; a
+        // per-collection secondary index is a later optimization if needed.
+        let mut live_items: u64 = 0;
+        for nft_id in self.nft_items.keys() {
+            if nft_id.collection == collection_id {
+                live_items = live_items
+                    .checked_add(1)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+            }
+        }
+        Ok(NftCollectionSupplyReport {
+            minted,
+            burned,
+            expected_live,
+            live_items,
+            balanced: expected_live == live_items,
+        })
+    }
+
+    /// Attempts to draw `total_fee` from application `namespace`'s sponsor budget.
+    ///
+    /// Returns `true` and relocates the fee out of the aggregate `sponsor_budgets`
+    /// bucket (the caller then applies the identical burn + validator-reward split
+    /// a normal fee uses) iff the app is a registered sponsor and its hard
+    /// per-user / per-operation / per-app-per-day caps and funded budget all
+    /// permit charging `user` in the current day-window. Returns `false` with no
+    /// mutation of the aggregate bucket otherwise, so the caller self-pays.
+    /// Deterministic (the day-window comes from `current_epoch`, never a clock);
+    /// checked arithmetic; never panics.
+    fn try_charge_sponsor(
+        &mut self,
+        namespace: Hash256,
+        user: Address,
+        total_fee: Amount,
+        config: &ChainConfig,
+    ) -> Result<bool, ChainError> {
+        let window = config.sponsorship.window_index(self.current_epoch);
+        let Some(sponsor) = self.sponsors.get_mut(&namespace) else {
+            return Ok(false);
+        };
+        if !sponsor.try_charge(user, total_fee, window, &config.sponsorship)? {
+            return Ok(false);
+        }
+        // The per-app budget already decremented inside `try_charge`; keep the
+        // aggregate locked bucket in lockstep so the supply invariant reconciles
+        // (issued == liquid + … + sponsor_budgets + burned + slashed).
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_sub(total_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        Ok(true)
+    }
+
+    /// Returns the current median aggregate of a feed, or `None` (§9, §15.21).
+    ///
+    /// The aggregate is the deterministic integer [`median`] of every registered
+    /// reporter's latest submitted value (see the lower-mid tie-break rule on
+    /// [`median`]). Returns `None` if the feed does not exist or no reporter has
+    /// yet submitted a value.
+    ///
+    /// This is a pure read (a query), not an operation: display-only reads are
+    /// free (§15.21) and pay no fee, and a browser reads the committed reporter
+    /// state via a light-client proof. Freshness-gating the aggregate to only
+    /// live reporters is a deferred refinement — liveness is applied at revenue
+    /// settlement, not to the displayed value — so this method needs no epoch or
+    /// config input and is a pure function of committed state.
+    pub fn feed_value(&self, feed_id: FeedId) -> Option<FeedValue> {
+        if !self.oracle_feeds.contains_key(&feed_id) {
+            return None;
+        }
+        let values: Vec<FeedValue> = self
+            .oracle_reporters
+            .iter()
+            .filter(|((fid, _), _)| *fid == feed_id)
+            .filter_map(|(_, reporter)| reporter.value)
+            .collect();
+        median(&values)
+    }
+
+    /// Settles every feed's accrued read-fee revenue for settlement `epoch`.
+    ///
+    /// Deterministic: feeds are settled in sorted `FeedId` order. Supply-neutral:
+    /// see [`ChainState::settle_one_feed`]. Reporter slashing (persistent-outlier
+    /// penalties) is deliberately NOT applied here — §15.6/§15.17 defer slashing
+    /// mechanics to the security documents and the severity schedule is an
+    /// owner-deferred decision (ADR-0012); an outlier instead earns zero revenue
+    /// because its accuracy weight decays to zero.
+    fn settle_oracle_feeds(
+        &mut self,
+        config: &ChainConfig,
+        epoch: u64,
+    ) -> Result<Vec<Event>, ChainError> {
+        // Snapshot the feed ids first so the per-feed mutation does not alias an
+        // outstanding immutable borrow of the map. Sorted iteration is deterministic.
+        let feed_ids: Vec<FeedId> = self.oracle_feeds.keys().copied().collect();
+        let mut events = Vec::new();
+        for feed_id in feed_ids {
+            if let Some(event) = self.settle_one_feed(feed_id, config, epoch)? {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    /// Distributes one feed's accrued revenue to its reporters for `epoch`.
+    ///
+    /// The accepted median is the integer [`median`] of the feed's reporters'
+    /// latest values. Each reporter's score is its integer [`accuracy_weight`]
+    /// (closeness to that median) if it is live (reported within
+    /// `liveness_window_epochs` of `epoch`), else zero. Revenue is split
+    /// proportionally to score with floored shares; the integer-division
+    /// remainder stays in the feed's pool for the next settlement, exactly like
+    /// the F1 epoch-reward dust carry, so nothing is minted or lost.
+    ///
+    /// Supply move: `oracle_revenue` (and the feed's `revenue`) decrease by the
+    /// distributed total, and reporters' liquid balances increase by the same
+    /// total; the carried remainder stays locked in the feed's `revenue`. Returns
+    /// `None` (revenue fully carried, no state move) when the feed has no accrued
+    /// revenue, no reporter has submitted a value, or no reporter is live.
+    fn settle_one_feed(
+        &mut self,
+        feed_id: FeedId,
+        config: &ChainConfig,
+        epoch: u64,
+    ) -> Result<Option<Event>, ChainError> {
+        let revenue = match self.oracle_feeds.get(&feed_id) {
+            Some(feed) => feed.revenue,
+            None => return Ok(None),
+        };
+        if revenue.is_zero() {
+            return Ok(None);
+        }
+        // Collect this feed's reporters that have submitted a value, in sorted
+        // address order (BTreeMap iteration), so scoring is deterministic.
+        let reporters: Vec<(Address, FeedValue, u64)> = self
+            .oracle_reporters
+            .iter()
+            .filter(|((fid, _), _)| *fid == feed_id)
+            .filter_map(|((_, address), reporter)| {
+                reporter
+                    .value
+                    .map(|value| (*address, value, reporter.reported_epoch))
+            })
+            .collect();
+        let values: Vec<FeedValue> = reporters.iter().map(|(_, value, _)| *value).collect();
+        let Some(median_value) = median(&values) else {
+            // No reporter has a value: carry the accrued revenue untouched.
+            return Ok(None);
+        };
+        // Score = accuracy weight, gated by liveness (a stale reporter earns 0).
+        let scores: Vec<(Address, u128)> = reporters
+            .iter()
+            .map(|(address, value, reported_epoch)| {
+                let score = if config.oracle.report_is_live(*reported_epoch, epoch) {
+                    accuracy_weight(*value, median_value)
+                } else {
+                    0
+                };
+                (*address, score)
+            })
+            .collect();
+        let total_score = scores.iter().try_fold(0u128, |total, (_, score)| {
+            total
+                .checked_add(*score)
+                .ok_or(ChainError::ArithmeticOverflow)
+        })?;
+        if total_score == 0 {
+            // No live reporter earned a positive weight: carry the revenue.
+            return Ok(None);
+        }
+        // Proportional floored distribution; the remainder is carried (F1 pattern).
+        let mut distributed = Amount::ZERO;
+        for (address, score) in &scores {
+            if *score == 0 {
+                continue;
+            }
+            let share = revenue
+                .checked_mul_ratio(*score, total_score)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            if share.is_zero() {
+                continue;
+            }
+            self.credit_native(*address, share)?;
+            distributed = distributed
+                .checked_add(share)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        let carried = revenue
+            .checked_sub(distributed)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        // Move the distributed total out of the locked revenue bucket; the carried
+        // remainder stays locked in the feed's pool for the next settlement.
+        self.oracle_revenue = self
+            .oracle_revenue
+            .checked_sub(distributed)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let feed = self
+            .oracle_feeds
+            .get_mut(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?;
+        feed.revenue = carried;
+        Ok(Some(Event::FeedRevenueSettled {
+            feed_id,
+            epoch,
+            median: Some(median_value),
+            distributed,
+            carried,
+        }))
+    }
+
     fn debit_asset_or_native(
         &mut self,
         owner: Address,
@@ -2525,6 +5883,358 @@ impl ChainState {
                 .checked_add(amount)
                 .ok_or(ChainError::ArithmeticOverflow)?,
         );
+        Ok(())
+    }
+
+    // ----- native DEX escrow + batch settlement (§15.13/§15.18/§15.37) -----
+
+    /// Locks `amount` of `asset` from `owner` into DEX escrow (a `SubmitOrder`).
+    ///
+    /// Native leg: debit the owner's liquid balance and grow `dex_escrow`
+    /// (supply-neutral: liquid -> dex_escrow). Non-native leg: debit the owner's
+    /// asset balance (held out of circulation; a non-native asset has no native
+    /// supply bucket). Fails closed on an insufficient balance or overflow.
+    fn dex_lock(
+        &mut self,
+        owner: Address,
+        asset: &AssetId,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        self.debit_asset_or_native(owner, asset, amount)?;
+        if *asset == AssetId::NativeWebc {
+            self.dex_escrow = self
+                .dex_escrow
+                .checked_add(amount)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        Ok(())
+    }
+
+    /// Releases `amount` of `asset` from DEX escrow to `recipient`.
+    ///
+    /// Used both for refunds (recipient is the original owner) and for settlement
+    /// legs (recipient is a counterparty), since escrow-out is the same operation
+    /// either way. Native leg: shrink `dex_escrow` and credit the recipient's
+    /// liquid balance. Non-native leg: credit the recipient's asset balance. The
+    /// native decrement is checked, so an accounting bug fails closed rather than
+    /// silently under-flowing the supply invariant.
+    fn dex_release(
+        &mut self,
+        recipient: Address,
+        asset: &AssetId,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        if *asset == AssetId::NativeWebc {
+            self.dex_escrow = self
+                .dex_escrow
+                .checked_sub(amount)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        self.credit_asset_or_native(recipient, asset, amount)
+    }
+
+    /// Removes `amount` of native quote from DEX escrow as the protocol per-fill
+    /// fee, split 50/50 burn/validator by [`split_fee`] (only ever called when the
+    /// pair's quote leg is native WEBC). Supply-neutral: dex_escrow -> burned +
+    /// validator pool. A zero fee is a no-op.
+    fn dex_take_native_fee(&mut self, amount: Amount) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        self.dex_escrow = self
+            .dex_escrow
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let split = split_fee(amount);
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(split.burned)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.validator_fee_pool = self
+            .validator_fee_pool
+            .checked_add(split.validator_reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// Refunds an order's remaining locked input to its owner and removes it.
+    ///
+    /// Used by owner cancellation, immediate-or-cancel remainders, and deadline
+    /// expiry. Supply-neutral: the currently-locked leg (a buy's
+    /// `remaining * limit_price` quote, a sell's `remaining` base) returns to the
+    /// owner via [`ChainState::dex_release`]. A fully-filled order carries no lock
+    /// and is removed elsewhere without a refund.
+    fn close_dex_order(
+        &mut self,
+        order_id: OrderId,
+        reason: OrderCloseReason,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
+        let order = self
+            .dex_orders
+            .get(&order_id)
+            .ok_or(ChainError::DexOrderNotFound)?
+            .clone();
+        let (asset, amount) = order.locked_input().ok_or(ChainError::ArithmeticOverflow)?;
+        self.dex_release(order.owner, &asset, amount)?;
+        self.dex_orders.remove(&order_id);
+        events.push(Event::OrderClosed {
+            order_id,
+            owner: order.owner,
+            reason,
+            unfilled: order.remaining,
+        });
+        Ok(())
+    }
+
+    /// Runs the mandatory per-block uniform-price batch settlement (§15.37).
+    ///
+    /// Deterministic and a pure function of the committed order map and
+    /// `self.current_height`, so it runs identically on `build_block` and
+    /// `apply_block` (the `dex_order_root`/`dex_escrow` commitment binds it). Whole
+    /// step is atomic with the block: any failure rolls the block back.
+    ///
+    /// Ordering (all deterministic, sorted iteration):
+    /// 1. Honor owner cancellations — a cancel included in this block takes effect
+    ///    before this block's batch (doc §3.1).
+    /// 2. Expire orders whose `deadline_height` has passed (refund + remove).
+    /// 3. Settle each pair (sorted) at one uniform clearing price.
+    /// 4. Close immediate-or-cancel orders still carrying an unfilled remainder.
+    ///
+    /// Supply-neutral in native units across every step.
+    pub(crate) fn settle_dex_batch(
+        &mut self,
+        config: &ChainConfig,
+    ) -> Result<Vec<Event>, ChainError> {
+        let mut events = Vec::new();
+        let height = self.current_height;
+
+        // 1. Owner-requested cancellations.
+        let cancelled: Vec<OrderId> = self
+            .dex_orders
+            .iter()
+            .filter(|(_, order)| order.cancel_requested)
+            .map(|(id, _)| *id)
+            .collect();
+        for order_id in cancelled {
+            self.close_dex_order(order_id, OrderCloseReason::Cancelled, &mut events)?;
+        }
+
+        // 2. Deadline expiries: the retry window is inclusive of `deadline_height`,
+        // so an order is expired only once the block height strictly passes it.
+        let expired: Vec<OrderId> = self
+            .dex_orders
+            .iter()
+            .filter(|(_, order)| height > order.deadline_height)
+            .map(|(id, _)| *id)
+            .collect();
+        for order_id in expired {
+            self.close_dex_order(order_id, OrderCloseReason::Expired, &mut events)?;
+        }
+
+        // 3. Settle each pair independently at its own uniform clearing price. Two
+        // disjoint pairs never interact. `BTreeSet` keeps the pair order deterministic.
+        let pairs: BTreeSet<TradingPair> = self
+            .dex_orders
+            .values()
+            .map(|order| order.pair.clone())
+            .collect();
+        for pair in pairs {
+            self.settle_dex_pair(&pair, config, &mut events)?;
+        }
+
+        // 4. Immediate-or-cancel: any FoC order with a surviving remainder cancels
+        // this block instead of retrying (§15.37). A fully-filled FoC order was
+        // already removed during matching.
+        let fill_or_cancel: Vec<OrderId> = self
+            .dex_orders
+            .iter()
+            .filter(|(_, order)| order.fill_or_cancel && !order.remaining.is_zero())
+            .map(|(id, _)| *id)
+            .collect();
+        for order_id in fill_or_cancel {
+            self.close_dex_order(order_id, OrderCloseReason::FillOrCancel, &mut events)?;
+        }
+
+        Ok(events)
+    }
+
+    /// Settles all live orders on one pair at a single uniform clearing price.
+    ///
+    /// The clearing price and matched volume come from the pure
+    /// [`uniform_clearing_price`]; the surplus side is rationed by the dust-free
+    /// [`prorata_fills`]; every filled order trades at the identical price, so no
+    /// order is ordered ahead of another (no intra-block MEV). Base and quote are
+    /// each conserved exactly (integer prices make the value leg exact; the pro-rata
+    /// quantity leg is dust-free), and an optional per-fill fee on a native quote
+    /// leg is split by [`split_fee`]. Fully-filled orders are removed; partial
+    /// remainders retry in the next block's batch.
+    fn settle_dex_pair(
+        &mut self,
+        pair: &TradingPair,
+        config: &ChainConfig,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
+        // Gather this pair's live buys and sells in sorted OrderId order (BTreeMap
+        // iteration), so scoring, eligibility, and pro-rata are all deterministic.
+        let mut buy_ids: Vec<OrderId> = Vec::new();
+        let mut buys: Vec<(Price, Amount)> = Vec::new();
+        let mut sell_ids: Vec<OrderId> = Vec::new();
+        let mut sells: Vec<(Price, Amount)> = Vec::new();
+        for (id, order) in &self.dex_orders {
+            if &order.pair != pair || order.remaining.is_zero() {
+                continue;
+            }
+            match order.side {
+                OrderSide::Buy => {
+                    buy_ids.push(*id);
+                    buys.push((order.limit_price, order.remaining));
+                }
+                OrderSide::Sell => {
+                    sell_ids.push(*id);
+                    sells.push((order.limit_price, order.remaining));
+                }
+            }
+        }
+        let Some((clearing, _volume)) = uniform_clearing_price(&buys, &sells) else {
+            // The books did not cross: every order stays pending for the next batch.
+            return Ok(());
+        };
+
+        // Eligible orders at the clearing price, keeping the sorted OrderId order.
+        let mut eligible_buys: Vec<(OrderId, Amount)> = Vec::new();
+        for id in &buy_ids {
+            let order = &self.dex_orders[id];
+            if order.limit_price.get() >= clearing.get() {
+                eligible_buys.push((*id, order.remaining));
+            }
+        }
+        let mut eligible_sells: Vec<(OrderId, Amount)> = Vec::new();
+        for id in &sell_ids {
+            let order = &self.dex_orders[id];
+            if order.limit_price.get() <= clearing.get() {
+                eligible_sells.push((*id, order.remaining));
+            }
+        }
+        let demand = eligible_buys
+            .iter()
+            .try_fold(Amount::ZERO, |sum, (_, remaining)| {
+                sum.checked_add(*remaining)
+            })
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let supply = eligible_sells
+            .iter()
+            .try_fold(Amount::ZERO, |sum, (_, remaining)| {
+                sum.checked_add(*remaining)
+            })
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if demand.is_zero() || supply.is_zero() {
+            return Ok(());
+        }
+
+        // The short side fills fully; the long (surplus) side is rationed pro-rata
+        // to the short side's total, so total filled base is min(demand, supply).
+        let (buy_fills, sell_fills) = if demand.0 <= supply.0 {
+            let buy_fills: Vec<Amount> = eligible_buys.iter().map(|(_, r)| *r).collect();
+            let sell_remainings: Vec<Amount> = eligible_sells.iter().map(|(_, r)| *r).collect();
+            let sell_fills = prorata_fills(&sell_remainings, demand)?;
+            (buy_fills, sell_fills)
+        } else {
+            let buy_remainings: Vec<Amount> = eligible_buys.iter().map(|(_, r)| *r).collect();
+            let buy_fills = prorata_fills(&buy_remainings, supply)?;
+            let sell_fills: Vec<Amount> = eligible_sells.iter().map(|(_, r)| *r).collect();
+            (buy_fills, sell_fills)
+        };
+
+        // Whether a native-quote per-fill fee applies (external-asset quote fee
+        // routing is deferred, so a non-native quote leg carries no protocol fee).
+        let native_quote = pair.quote == AssetId::NativeWebc;
+        let fee_bps = if native_quote { config.dex.fee_bps } else { 0 };
+
+        // Buy legs: each filled buyer receives base and is refunded the price
+        // improvement (they locked at their own limit but pay only the clearing
+        // price). The clearing-price quote they pay stays in escrow for the sellers.
+        for ((order_id, _), fill) in eligible_buys.iter().zip(buy_fills.iter()) {
+            if fill.is_zero() {
+                continue;
+            }
+            let owner = self.dex_orders[order_id].owner;
+            let limit = self.dex_orders[order_id].limit_price;
+            // Buyer receives `fill` base out of escrow (put there by the sellers).
+            self.dex_release(owner, &pair.base, *fill)?;
+            // Price-improvement refund: fill * (limit - clearing) of quote.
+            let improvement = Price::new(limit.get() - clearing.get())
+                .quote_for(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            self.dex_release(owner, &pair.quote, improvement)?;
+            let paid = clearing
+                .quote_for(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let order = self
+                .dex_orders
+                .get_mut(order_id)
+                .ok_or(ChainError::DexOrderNotFound)?;
+            order.remaining = order
+                .remaining
+                .checked_sub(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let remaining = order.remaining;
+            events.push(Event::OrderFilled {
+                order_id: *order_id,
+                pair: pair.clone(),
+                side: OrderSide::Buy,
+                clearing_price: clearing,
+                filled: *fill,
+                remaining,
+                quote: paid,
+            });
+            if remaining.is_zero() {
+                self.dex_orders.remove(order_id);
+            }
+        }
+
+        // Sell legs: each filled seller delivers base (already released to buyers
+        // above, so it only reduces the seller's remaining) and receives the
+        // clearing-price quote net of any protocol fee.
+        for ((order_id, _), fill) in eligible_sells.iter().zip(sell_fills.iter()) {
+            if fill.is_zero() {
+                continue;
+            }
+            let gross = clearing
+                .quote_for(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let fee = gross
+                .checked_mul_bps(fee_bps)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let net = gross
+                .checked_sub(fee)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let owner = self.dex_orders[order_id].owner;
+            self.dex_release(owner, &pair.quote, net)?;
+            self.dex_take_native_fee(fee)?;
+            let order = self
+                .dex_orders
+                .get_mut(order_id)
+                .ok_or(ChainError::DexOrderNotFound)?;
+            order.remaining = order
+                .remaining
+                .checked_sub(*fill)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let remaining = order.remaining;
+            events.push(Event::OrderFilled {
+                order_id: *order_id,
+                pair: pair.clone(),
+                side: OrderSide::Sell,
+                clearing_price: clearing,
+                filled: *fill,
+                remaining,
+                quote: net,
+            });
+            if remaining.is_zero() {
+                self.dex_orders.remove(order_id);
+            }
+        }
+
         Ok(())
     }
 }
@@ -2607,6 +6317,7 @@ fn leaf_hash<T: Serialize + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::kv_command;
     use crate::{
         AuthorizationPolicyRevision, DoubleVoteEvidence, FeeBid, GenesisAccount, GenesisValidator,
         Nonce, Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
@@ -2619,6 +6330,21 @@ mod tests {
         ml_dsa65_keygen, Keypair, MlDsa65PublicKey, MlDsa65SecretKey, PublicKeyBytes,
         ML_DSA_65_SIGNATURE_LEN,
     };
+
+    /// Round-trips `state` through the storage-at-rest bincode config — WEBC
+    /// §15.14 variable-length integers, exactly what `webc-storage` writes to
+    /// disk — so these crash-restart tests exercise the real on-disk format
+    /// rather than a throwaway one. The whole chain state uses tuple-keyed maps,
+    /// so it must go through bincode (a non-string-key binary format) rather than
+    /// the canonical-JSON path that drives `state_root` and signing.
+    fn bincode_restart(state: &ChainState) -> ChainState {
+        use bincode::Options;
+        let options = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .reject_trailing_bytes();
+        let bytes = options.serialize(state).expect("state serializes");
+        options.deserialize(&bytes).expect("state deserializes")
+    }
 
     fn funded_state() -> (ChainConfig, ChainState, Keypair, Keypair) {
         let config = ChainConfig::default();
@@ -2762,6 +6488,282 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_issuance_keys_to_stake_caps_at_base_and_conserves_supply() {
+        // Task 12 (§15.2): during the bootstrap phase issuance is keyed to the
+        // staked amount and capped by the base per-period budget, and supply must
+        // still reconcile exactly. Here the staking base is thin relative to the
+        // circulating supply, so the (small) stake-keyed budget binds, not the
+        // (large) base budget — the whole point of §15.2.
+        let config = ChainConfig {
+            bootstrap_issuance: Some(BootstrapIssuance {
+                annual_rate_bps: 1_000,
+                sunset_epoch: 1_000_000,
+            }),
+            ..ChainConfig::default()
+        };
+        let mut state = ChainState::new(&config).expect("empty state");
+        let stake = Amount::from_webc(100);
+        for seed in [31u8, 32u8] {
+            let address = Keypair::from_seed([seed; 32]).address();
+            let mut account = Account::with_balance(Amount::ZERO);
+            account.staked = stake;
+            state.accounts.insert(address, account);
+            state.validators.insert(
+                address,
+                Validator {
+                    operator: address,
+                    consensus_key: PublicKeyBytes([seed; 32]),
+                    self_stake: stake,
+                    delegated_stake: Amount::ZERO,
+                    commission_bps: 0,
+                    status: ValidatorStatus::Active,
+                    bootstrap: false,
+                    accumulated_rewards: Amount::ZERO,
+                },
+            );
+        }
+        // A large liquid holder makes the base schedule budget far exceed the
+        // stake-keyed budget, so the stake-keying (not the cap) binds.
+        let holder = Keypair::from_seed([33u8; 32]).address();
+        let extra = Amount::from_webc(1_000_000);
+        state.accounts.insert(holder, Account::with_balance(extra));
+        state.minted_supply = Amount::from_units(2 * stake.0 + extra.0);
+        state.inflation_year_start_supply = state.minted_supply;
+        state.current_epoch = 1;
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let minted_before = state.minted_supply;
+        state
+            .distribute_epoch_rewards(&config)
+            .expect("bootstrap epoch reward distribution");
+
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "supply must reconcile after bootstrap issuance"
+        );
+        // Minted grew by exactly the stake-keyed budget (below the base cap):
+        // 200 WEBC * 1000 bps / (10_000 * 365) base units.
+        let minted_growth = state.minted_supply.0 - minted_before.0;
+        let expected_stake_keyed = (2 * stake.0) * 1_000 / (10_000 * 365);
+        assert_eq!(minted_growth, expected_stake_keyed);
+        assert!(minted_growth > 0);
+    }
+
+    #[test]
+    fn compound_validator_rewards_restakes_and_conserves_supply() {
+        // Task 6b: compounding moves accumulated operator rewards straight into
+        // self-stake (pending-rewards bucket -> staked bucket), supply-neutral.
+        let config = ChainConfig::default();
+        let mut state = ChainState::new(&config).expect("empty state");
+        let alice = Keypair::from_seed([41u8; 32]);
+        let self_stake = Amount::from_webc(100);
+        let reward = Amount::from_webc(10);
+        let mut account = Account::with_balance(Amount::from_webc(1));
+        account.staked = self_stake;
+        state.accounts.insert(alice.address(), account);
+        state.validators.insert(
+            alice.address(),
+            Validator {
+                operator: alice.address(),
+                consensus_key: alice.public_key(),
+                self_stake,
+                delegated_stake: Amount::ZERO,
+                commission_bps: 0,
+                status: ValidatorStatus::Active,
+                bootstrap: false,
+                accumulated_rewards: reward,
+            },
+        );
+        state.minted_supply = Amount::from_units(self_stake.0 + reward.0 + Amount::from_webc(1).0);
+        state.inflation_year_start_supply = state.minted_supply;
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let tx = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::CompoundValidatorRewards,
+            FeeBid {
+                gas_limit: 10_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("compound signs");
+        state
+            .execute_transaction(&tx, &config)
+            .expect("compound executes");
+
+        let compounded = self_stake.checked_add(reward).unwrap();
+        let v = state.validators.get(&alice.address()).unwrap();
+        assert_eq!(v.self_stake, compounded);
+        assert_eq!(v.accumulated_rewards, Amount::ZERO);
+        assert_eq!(
+            state.accounts.get(&alice.address()).unwrap().staked,
+            compounded
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn compound_delegator_rewards_restakes_within_ratio_and_conserves_supply() {
+        // Task 6b: compounding a delegation restakes its rewards into the position
+        // (pending -> delegated), supply-neutral, respecting the 4x ratio.
+        let config = ChainConfig::default();
+        let mut state = ChainState::new(&config).expect("empty state");
+        let alice = Keypair::from_seed([42u8; 32]); // operator
+        let bob = Keypair::from_seed([43u8; 32]); // delegator
+        let self_stake = Amount::from_webc(100);
+        let delegated = Amount::from_webc(40);
+        let reward = Amount::from_webc(5);
+
+        let mut op_account = Account::with_balance(Amount::ZERO);
+        op_account.staked = self_stake;
+        state.accounts.insert(alice.address(), op_account);
+        let mut del_account = Account::with_balance(Amount::from_webc(1));
+        del_account.delegated = delegated;
+        state.accounts.insert(bob.address(), del_account);
+        state.validators.insert(
+            alice.address(),
+            Validator {
+                operator: alice.address(),
+                consensus_key: alice.public_key(),
+                self_stake,
+                delegated_stake: delegated,
+                commission_bps: 0,
+                status: ValidatorStatus::Active,
+                bootstrap: false,
+                accumulated_rewards: Amount::ZERO,
+            },
+        );
+        state.delegations.insert(
+            (bob.address(), alice.address()),
+            Delegation {
+                delegator: bob.address(),
+                validator: alice.address(),
+                amount: delegated,
+                accumulated_rewards: reward,
+            },
+        );
+        state.minted_supply =
+            Amount::from_units(self_stake.0 + delegated.0 + reward.0 + Amount::from_webc(1).0);
+        state.inflation_year_start_supply = state.minted_supply;
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let tx = Transaction::for_operation(
+            &bob,
+            0,
+            Operation::CompoundDelegatorRewards {
+                validator: alice.address(),
+            },
+            FeeBid {
+                gas_limit: 10_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("compound signs");
+        state
+            .execute_transaction(&tx, &config)
+            .expect("compound executes");
+
+        let compounded = delegated.checked_add(reward).unwrap();
+        assert_eq!(
+            state
+                .delegations
+                .get(&(bob.address(), alice.address()))
+                .unwrap()
+                .amount,
+            compounded
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get(&(bob.address(), alice.address()))
+                .unwrap()
+                .accumulated_rewards,
+            Amount::ZERO
+        );
+        assert_eq!(
+            state
+                .validators
+                .get(&alice.address())
+                .unwrap()
+                .delegated_stake,
+            compounded
+        );
+        assert_eq!(
+            state.accounts.get(&bob.address()).unwrap().delegated,
+            compounded
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn compound_delegator_rewards_rejects_ratio_violation() {
+        // Compounding cannot push delegated stake past 4x the operator self-stake,
+        // exactly as a fresh delegation cannot.
+        let config = ChainConfig::default();
+        let mut state = ChainState::new(&config).expect("empty state");
+        let alice = Keypair::from_seed([44u8; 32]);
+        let bob = Keypair::from_seed([45u8; 32]);
+        let self_stake = Amount::from_webc(20);
+        let delegated = Amount::from_webc(80); // exactly at the 4x cap
+        let reward = Amount::from_webc(5); // would exceed the cap
+
+        let mut op_account = Account::with_balance(Amount::ZERO);
+        op_account.staked = self_stake;
+        state.accounts.insert(alice.address(), op_account);
+        let mut del_account = Account::with_balance(Amount::from_webc(1));
+        del_account.delegated = delegated;
+        state.accounts.insert(bob.address(), del_account);
+        state.validators.insert(
+            alice.address(),
+            Validator {
+                operator: alice.address(),
+                consensus_key: alice.public_key(),
+                self_stake,
+                delegated_stake: delegated,
+                commission_bps: 0,
+                status: ValidatorStatus::Active,
+                bootstrap: false,
+                accumulated_rewards: Amount::ZERO,
+            },
+        );
+        state.delegations.insert(
+            (bob.address(), alice.address()),
+            Delegation {
+                delegator: bob.address(),
+                validator: alice.address(),
+                amount: delegated,
+                accumulated_rewards: reward,
+            },
+        );
+        state.minted_supply =
+            Amount::from_units(self_stake.0 + delegated.0 + reward.0 + Amount::from_webc(1).0);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let tx = Transaction::for_operation(
+            &bob,
+            0,
+            Operation::CompoundDelegatorRewards {
+                validator: alice.address(),
+            },
+            FeeBid {
+                gas_limit: 10_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("compound signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::DelegationRatioExceeded)
+        ));
+        assert_eq!(state, before, "rejected compound leaves state unchanged");
+    }
+
+    #[test]
     fn every_scalar_state_counter_is_committed_by_the_state_root() {
         // E8: the state root (canonical JSON) must commit every consensus field,
         // so no field can be mutated on disk (the bincode restart path) without
@@ -2771,12 +6773,37 @@ mod tests {
         // the easiest to add and forget.
         let (_config, base, _a, _b) = funded_state();
         let root = base.state_root().unwrap();
-        let mutators: Vec<(&str, fn(&mut ChainState))> = vec![
+        type StateMutator = fn(&mut ChainState);
+        let mutators: Vec<(&str, StateMutator)> = vec![
             ("burned_fees", |s| {
                 s.burned_fees = Amount::from_units(s.burned_fees.0 + 1)
             }),
             ("slashed_units", |s| {
                 s.slashed_units = Amount::from_units(s.slashed_units.0 + 1)
+            }),
+            ("storage_deposits", |s| {
+                s.storage_deposits = Amount::from_units(s.storage_deposits.0 + 1)
+            }),
+            ("sponsor_budgets", |s| {
+                s.sponsor_budgets = Amount::from_units(s.sponsor_budgets.0 + 1)
+            }),
+            ("oracle_bonds", |s| {
+                s.oracle_bonds = Amount::from_units(s.oracle_bonds.0 + 1)
+            }),
+            ("oracle_revenue", |s| {
+                s.oracle_revenue = Amount::from_units(s.oracle_revenue.0 + 1)
+            }),
+            ("dex_escrow", |s| {
+                s.dex_escrow = Amount::from_units(s.dex_escrow.0 + 1)
+            }),
+            ("mandate_escrow", |s| {
+                s.mandate_escrow = Amount::from_units(s.mandate_escrow.0 + 1)
+            }),
+            ("token_deposits", |s| {
+                s.token_deposits = Amount::from_units(s.token_deposits.0 + 1)
+            }),
+            ("nft_deposits", |s| {
+                s.nft_deposits = Amount::from_units(s.nft_deposits.0 + 1)
             }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
@@ -2792,6 +6819,7 @@ mod tests {
                 s.current_base_fee_per_unit += 1
             }),
             ("current_epoch", |s| s.current_epoch += 1),
+            ("current_height", |s| s.current_height += 1),
             ("bridge_nonce", |s| s.bridge_nonce += 1),
             ("last_block_timestamp_ms", |s| {
                 s.last_block_timestamp_ms += 1
@@ -2806,6 +6834,2278 @@ mod tests {
                 "mutating {name} must change the state root (E8)"
             );
         }
+    }
+
+    // ----- native agent mandate (Phase 9a, §15.32) -----
+
+    use crate::mandate::{MandateCounterparty, MandateCounterpartyPolicy};
+
+    /// Mandate-tuned config with an explicit per-day rate-limit window.
+    fn mandate_config(day_window_epochs: u64) -> ChainConfig {
+        ChainConfig {
+            mandate: MandateConfig { day_window_epochs },
+            ..ChainConfig::default()
+        }
+    }
+
+    /// Genesis funding only the principal (no validators, so epoch advance mints
+    /// nothing). The agent is deliberately UNFUNDED: it must be able to spend with
+    /// no balance of its own, and recipients are created lazily on credit.
+    fn mandate_fixture(config: &ChainConfig) -> (ChainState, Keypair, Keypair, Keypair, Keypair) {
+        let principal = Keypair::from_seed([11u8; 32]);
+        let agent = Keypair::from_seed([12u8; 32]);
+        let recipient = Keypair::from_seed([13u8; 32]);
+        let stranger = Keypair::from_seed([14u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: principal.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("mandate genesis");
+        (state, principal, agent, recipient, stranger)
+    }
+
+    /// Executes one mandate operation at the floor base fee (1 base unit/unit) and
+    /// a gas limit above any mandate op's cost, so the fee is exactly 10_000 units.
+    fn mandate_exec(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        signer: &Keypair,
+        nonce: u64,
+        operation: Operation,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_operation(
+            signer,
+            nonce,
+            operation,
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("mandate tx signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    /// Grants a mandate from `principal` to `agent` and returns its derived id.
+    #[allow(clippy::too_many_arguments)]
+    fn grant_mandate(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        principal: &Keypair,
+        agent: &Keypair,
+        nonce: u64,
+        grant_nonce: u64,
+        budget_total: Amount,
+        expiry_epoch: Epoch,
+        per_tx_max: Amount,
+        rate_limit_per_day: u32,
+        counterparty_policy: MandateCounterpartyPolicy,
+    ) -> Result<MandateId, ChainError> {
+        mandate_exec(
+            state,
+            config,
+            principal,
+            nonce,
+            Operation::GrantMandate {
+                agent_key: agent.public_key(),
+                grant_nonce,
+                budget_total,
+                expiry_epoch,
+                per_tx_max,
+                rate_limit_per_day,
+                counterparty_policy,
+            },
+        )?;
+        Ok(MandateId::derive(
+            principal.address(),
+            &agent.public_key(),
+            grant_nonce,
+        ))
+    }
+
+    #[test]
+    fn grant_escrows_budget_and_supply_stays_balanced() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, _stranger) = mandate_fixture(&config);
+        let before = balance(&state, principal.address());
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            5,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("grant succeeds");
+        // Budget is escrowed; the fee (10_000) is additionally debited.
+        assert_eq!(state.mandate_escrow, budget);
+        assert_eq!(
+            balance(&state, principal.address()),
+            before - 500_000 - 10_000
+        );
+        let mandate = state.mandates.get(&mandate_id).expect("mandate exists");
+        assert_eq!(mandate.principal, principal.address());
+        assert_eq!(mandate.agent_key, agent.public_key());
+        assert_eq!(mandate.spent, Amount::ZERO);
+        assert!(!mandate.revoked);
+        // Most important: escrow keeps the supply invariant balanced.
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn spend_moves_principal_and_fee_from_escrow_agent_needs_no_balance() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            5,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let burned_before = state.burned_fees.0;
+        let pool_before = state.validator_fee_pool.0;
+        let mandate_count = state.mandates.len();
+
+        let amount = Amount::from_units(100_000);
+        let receipt = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount,
+            },
+        )
+        .expect("spend succeeds");
+
+        // Recipient credited exactly the principal; the fee left escrow too.
+        assert_eq!(balance(&state, recipient.address()), 100_000);
+        // The agent holds no balance of its own — it never was funded.
+        assert_eq!(balance(&state, agent.address()), 0);
+        // Escrow fell by amount + fee; the mandate's spent grew by the same.
+        assert_eq!(state.mandate_escrow, Amount::from_units(500_000 - 110_000));
+        let mandate = state.mandates.get(&mandate_id).unwrap();
+        assert_eq!(mandate.spent, Amount::from_units(110_000));
+        // The fee was split into burn + validator reward exactly as any tx.
+        assert_eq!(
+            state.burned_fees.0 + state.validator_fee_pool.0,
+            burned_before + pool_before + 10_000
+        );
+        // No re-delegation: a spend never mints or removes a mandate.
+        assert_eq!(state.mandates.len(), mandate_count);
+        // The receipt carries the mandate id — the complete audit trail.
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::MandateSpent { mandate_id: id, .. } if *id == mandate_id
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn spend_over_budget_is_rejected() {
+        // Because grant enforces `per_tx_max <= budget_total`, a single spend can
+        // never exceed the budget without first exceeding the per-tx cap, so the
+        // budget bound is a CUMULATIVE limit: two within-cap spends whose running
+        // total overflows the budget must be rejected on the second.
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(100_000), // budget covers one 60_000 spend, not two
+            Epoch::new(100),
+            Amount::from_units(60_000), // per-tx cap (<= budget_total)
+            0,                          // unlimited rate, so only the budget binds
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // First spend: 50_000 + 10_000 fee = 60_000, within both cap and budget.
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(50_000),
+            },
+        )
+        .expect("first within-budget spend succeeds");
+        let before = state.clone();
+        // Second identical spend brings cumulative spent to 120_000 > 100_000.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(50_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateBudgetExceeded));
+        assert_eq!(state, before, "rejected spend leaves state unchanged");
+    }
+
+    #[test]
+    fn spend_exceeding_per_tx_max_is_rejected() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(10_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(10_001),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandatePerTxExceeded));
+    }
+
+    #[test]
+    fn fee_bid_cannot_inflate_a_spend_past_per_tx_max() {
+        // Regression: a mandate spend draws BOTH the principal and the fee from
+        // escrow, and the fee is agent-chosen via the priority bid. If the per-tx
+        // cap bounded only the principal, one spend with a huge fee could drain the
+        // whole budget past the per-tx and per-day limits the principal set (with
+        // ~half recoverable through the validator fee pool). The cap must bound
+        // principal + fee.
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(2_000_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(1_000), // the tiny per-tx cap the principal intends
+            1,                         // and one spend per day
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let before = state.clone();
+        // A within-cap principal (1_000) but a fee inflated via the priority bid:
+        // base fee is 1/unit, so a max/priority of 100/99 pays 100/unit over 10_000
+        // units = 1_000_000 fee — 1000x the per-tx cap, still inside the 2_000_000
+        // budget. Pre-fix this spend succeeded and drained ~1_000_000 in one tx.
+        let tx = Transaction::for_operation(
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 100,
+                priority_fee_per_unit: 99,
+            },
+        )
+        .expect("spend tx signs");
+        let err = state.execute_transaction(&tx, &config).unwrap_err();
+        assert!(
+            matches!(err, ChainError::MandatePerTxExceeded),
+            "a fee-inflated spend must be capped, got {err:?}"
+        );
+        // The drain was fully rejected: escrow and all state are untouched.
+        assert_eq!(state, before, "rejected spend leaves state unchanged");
+    }
+
+    #[test]
+    fn zero_amount_spend_is_rejected() {
+        // A zero-principal spend delivers nothing but would still burn budget via
+        // the fee; reject it so a mandate cannot be bled by fee-only spends.
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::ZERO,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateZeroAmount));
+        assert_eq!(state, before, "rejected spend leaves state unchanged");
+    }
+
+    #[test]
+    fn spend_on_expired_mandate_is_rejected_but_reclaimable() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(10),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // Advance past expiry (inclusive at epoch 10).
+        state.current_epoch = 11;
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateExpired));
+        // The principal reclaims the full remainder from an expired mandate.
+        let before = balance(&state, principal.address());
+        mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::RevokeMandate { mandate_id },
+        )
+        .expect("reclaim on expired mandate");
+        // Remainder = full budget (nothing spent); the fee is separately debited.
+        assert_eq!(
+            balance(&state, principal.address()),
+            before + 500_000 - 10_000
+        );
+        assert_eq!(state.mandate_escrow, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn revoked_mid_flight_refunds_remainder_and_rejects_further_spend() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // One spend goes through.
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(100_000),
+            },
+        )
+        .expect("first spend");
+        let spent = state.mandates.get(&mandate_id).unwrap().spent;
+        assert_eq!(spent, Amount::from_units(110_000));
+
+        // Principal revokes; the unspent remainder returns.
+        let principal_before = balance(&state, principal.address());
+        let receipt = mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::RevokeMandate { mandate_id },
+        )
+        .expect("revoke");
+        let remainder: u128 = 500_000 - 110_000;
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::MandateRevoked { refunded, .. } if refunded.0 == remainder
+        )));
+        assert_eq!(
+            balance(&state, principal.address()),
+            principal_before + remainder - 10_000
+        );
+        assert_eq!(state.mandate_escrow, Amount::ZERO);
+        assert!(state.mandates.get(&mandate_id).unwrap().revoked);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A further spend against the revoked mandate fails.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateRevoked));
+    }
+
+    #[test]
+    fn rate_limit_binds_within_a_day_then_resets_next_window() {
+        // A tight day window so a single epoch advance crosses it.
+        let config = mandate_config(10);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(1_000_000),
+            Epoch::new(1_000),
+            Amount::from_units(1_000_000),
+            2, // at most two spends per window
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let spend = |state: &mut ChainState, nonce: u64| {
+            mandate_exec(
+                state,
+                &config,
+                &agent,
+                nonce,
+                Operation::SpendUnderMandate {
+                    mandate_id,
+                    recipient: recipient.address(),
+                    amount: Amount::from_units(1_000),
+                },
+            )
+        };
+        // Two spends in window 0 (epoch 0) succeed; the third is rate-limited.
+        spend(&mut state, 0).expect("first spend");
+        spend(&mut state, 1).expect("second spend");
+        assert!(matches!(
+            spend(&mut state, 2).unwrap_err(),
+            ChainError::MandateRateLimited
+        ));
+        // Cross into the next window (epoch 10 -> window 1); the counter resets.
+        state.current_epoch = 10;
+        spend(&mut state, 2).expect("spend in the next window");
+        let mandate = state.mandates.get(&mandate_id).unwrap();
+        assert_eq!(mandate.window_index, 1);
+        assert_eq!(mandate.spends_in_window, 1);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn counterparty_allowlist_admits_only_listed_recipients() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, stranger) = mandate_fixture(&config);
+        let mut entries = BTreeSet::new();
+        entries.insert(MandateCounterparty::Recipient(recipient.address()));
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Allowlist(entries),
+        )
+        .unwrap();
+        // A spend to a non-listed recipient is rejected.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: stranger.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateCounterpartyNotAllowed));
+        // A spend to the listed recipient succeeds.
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .expect("allowlisted spend");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn spend_signed_by_wrong_key_is_rejected() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // `stranger` signs a spend against the agent's mandate. The envelope is
+        // valid for the stranger's own address, but the mandate binds `agent_key`.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &stranger,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateAgentKeyMismatch));
+        assert_eq!(state, before, "a wrong-key spend must not mutate state");
+    }
+
+    #[test]
+    fn agent_cannot_re_delegate_the_principals_escrow() {
+        // No-re-delegation: an agent-signed grant funds a sub-mandate from the
+        // AGENT's own liquid balance, never from the principal's escrow. With no
+        // balance, the agent cannot mint a sub-mandate, and the original escrow is
+        // untouched. There is likewise no operation by which a spend mints a mandate.
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, sub_agent) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // Fund the agent just enough to pay a grant fee (10_000) but far less than
+        // a sub-budget, so a grant draws from the agent's OWN balance and cannot
+        // reach the principal's escrow.
+        mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::Transfer {
+                to: agent.address(),
+                amount: Amount::from_units(20_000),
+            },
+        )
+        .expect("fund agent minimally");
+        let escrow_before = state.mandate_escrow;
+        let mandate_count = state.mandates.len();
+        // The agent tries to grant a 100_000 sub-mandate to `sub_agent`: the fee is
+        // affordable, but the sub-budget exceeds the agent's own balance.
+        let err = grant_mandate(
+            &mut state,
+            &config,
+            &agent,
+            &sub_agent,
+            0,
+            0,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap_err();
+        // The grant draws from the agent's own balance, not any mandate escrow.
+        assert!(matches!(err, ChainError::InsufficientBalance { .. }));
+        assert_eq!(state.mandate_escrow, escrow_before, "escrow untouched");
+        assert_eq!(state.mandates.len(), mandate_count, "no sub-mandate minted");
+        assert!(state.mandates.contains_key(&mandate_id));
+    }
+
+    #[test]
+    fn double_grant_same_nonce_collides_and_distinct_nonce_coexists() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, _stranger) = mandate_fixture(&config);
+        grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            7,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("first grant");
+        // Same (principal, agent_key, grant_nonce) derives the same id -> rejected.
+        let err = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            1,
+            7,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateAlreadyExists));
+        // A different grant nonce derives a distinct id -> both coexist.
+        grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            1,
+            8,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("distinct-nonce grant");
+        assert_eq!(state.mandates.len(), 2);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn top_up_raises_budget_and_keeps_supply_balanced() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        // Original budget is exactly one 40_000 spend (+10_000 fee = 50_000).
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(50_000),
+            Epoch::new(100),
+            Amount::from_units(50_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::TopUpMandate {
+                mandate_id,
+                amount: Amount::from_units(200_000),
+            },
+        )
+        .expect("top up");
+        assert_eq!(
+            state.mandates.get(&mandate_id).unwrap().budget_total,
+            Amount::from_units(250_000)
+        );
+        assert_eq!(state.mandate_escrow, Amount::from_units(250_000));
+        // Two 40_000 spends (charge 50_000 each) need 100_000 total — impossible
+        // under the original 50_000 budget, now comfortably within the raised one.
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(40_000),
+            },
+        )
+        .expect("first spend under raised budget");
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(40_000),
+            },
+        )
+        .expect("second spend under raised budget");
+        assert_eq!(
+            state.mandates.get(&mandate_id).unwrap().spent,
+            Amount::from_units(100_000)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn mandate_ops_reject_non_default_lane() {
+        // All four mandate ops require the default lane, like the oracle/DEX
+        // financial operations. Open a funded non-default lane first so its
+        // nonce/fee lookup succeeds and the default-lane guard is the check that
+        // actually fires (rather than an incidental lane-not-found).
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, _stranger) = mandate_fixture(&config);
+        let lane = AuthorizationLaneId::new(Hash256([0x5a; 32]));
+        let fee = FeeBid {
+            gas_limit: 100_000,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        };
+        let open = Transaction::for_operation(
+            &principal,
+            0,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            fee,
+        )
+        .expect("open lane signs");
+        state
+            .execute_transaction(&open, &config)
+            .expect("lane opens");
+
+        let grant = Transaction::for_operation_in_lane(
+            &principal,
+            lane,
+            0,
+            Operation::GrantMandate {
+                agent_key: agent.public_key(),
+                grant_nonce: 0,
+                budget_total: Amount::from_units(100_000),
+                expiry_epoch: Epoch::new(100),
+                per_tx_max: Amount::from_units(100_000),
+                rate_limit_per_day: 0,
+                counterparty_policy: MandateCounterpartyPolicy::Open,
+            },
+            fee,
+        )
+        .expect("grant signs");
+        assert!(matches!(
+            state.execute_transaction(&grant, &config),
+            Err(ChainError::MandateRequiresDefaultLane)
+        ));
+        assert!(state.mandates.is_empty());
+    }
+
+    // ----- native service registry (Phase 9b, §15.5) -----
+
+    use crate::service_registry::{
+        ServicePaymentFlags, ServicePrice, MAX_SERVICE_CATEGORIES, MAX_SERVICE_PRICING_ENTRIES,
+    };
+
+    /// The application namespace all service-registry tests register under.
+    fn service_namespace() -> Hash256 {
+        Hash256([0x55; 32])
+    }
+
+    /// Genesis funding a mandate principal AND two prospective service owners
+    /// (owners pay the spam-priced registration fee and are the pay-to accounts).
+    /// The agent is deliberately UNFUNDED: it must spend with no balance of its own.
+    fn service_fixture(config: &ChainConfig) -> (ChainState, Keypair, Keypair, Keypair, Keypair) {
+        let principal = Keypair::from_seed([31u8; 32]);
+        let agent = Keypair::from_seed([32u8; 32]);
+        let owner = Keypair::from_seed([33u8; 32]);
+        let other_owner = Keypair::from_seed([34u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: principal.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: owner.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: other_owner.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("service genesis");
+        (state, principal, agent, owner, other_owner)
+    }
+
+    fn one_category(tag: u8) -> BTreeSet<Hash256> {
+        let mut set = BTreeSet::new();
+        set.insert(Hash256([tag; 32]));
+        set
+    }
+
+    fn active_flags() -> ServicePaymentFlags {
+        ServicePaymentFlags {
+            on_chain_direct: true,
+            http_402: false,
+            subscription: false,
+        }
+    }
+
+    /// Registers a service owned by `owner` with `categories`, returning its id.
+    fn register_service(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        owner: &Keypair,
+        nonce: u64,
+        create_nonce: u64,
+        categories: BTreeSet<Hash256>,
+    ) -> Result<ServiceId, ChainError> {
+        mandate_exec(
+            state,
+            config,
+            owner,
+            nonce,
+            Operation::RegisterService {
+                namespace: service_namespace(),
+                create_nonce,
+                categories,
+                title: b"inference".to_vec(),
+                endpoint: b"https://api.example/infer".to_vec(),
+                interface: Hash256([0x1f; 32]),
+                pricing: vec![ServicePrice {
+                    operation: Hash256([0x0b; 32]),
+                    price: Amount::from_units(1_000),
+                    unit: b"call".to_vec(),
+                }],
+                payment_flags: active_flags(),
+            },
+        )?;
+        Ok(ServiceId::derive(
+            service_namespace(),
+            owner.address(),
+            create_nonce,
+        ))
+    }
+
+    /// Builds and executes a service-scoped spend (declaring the pay-to owner).
+    #[allow(clippy::too_many_arguments)]
+    fn spend_to_service(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        agent: &Keypair,
+        nonce: u64,
+        mandate_id: MandateId,
+        service_id: ServiceId,
+        amount: Amount,
+        service_owner: Address,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_service_spend(
+            agent,
+            nonce,
+            mandate_id,
+            service_id,
+            amount,
+            service_owner,
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("service spend signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    #[test]
+    fn register_records_entry_and_reads_back() {
+        let config = mandate_config(1_440);
+        let (mut state, _principal, _agent, owner, _other) = service_fixture(&config);
+        let service_id = register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+            .expect("register succeeds");
+        let entry = state.services.get(&service_id).expect("entry exists");
+        assert_eq!(entry.owner, owner.address());
+        assert_eq!(entry.namespace, service_namespace());
+        assert_eq!(entry.title, b"inference");
+        assert_eq!(entry.revision, crate::INITIAL_SERVICE_REVISION);
+        assert_eq!(entry.status, ServiceStatus::Active);
+        assert!(entry.categories.contains(&Hash256([0xc1; 32])));
+        // Registration locks no native units, so supply stays balanced.
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn duplicate_service_id_is_rejected() {
+        let config = mandate_config(1_440);
+        let (mut state, _principal, _agent, owner, _other) = service_fixture(&config);
+        register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+            .expect("first register");
+        // Same (namespace, owner, create_nonce) derives the same id: rejected.
+        let before = state.clone();
+        let err =
+            register_service(&mut state, &config, &owner, 1, 0, one_category(0xc2)).unwrap_err();
+        assert!(matches!(err, ChainError::ServiceAlreadyExists));
+        assert_eq!(state, before, "rejected duplicate leaves state unchanged");
+    }
+
+    #[test]
+    fn update_by_non_owner_is_rejected_and_by_owner_bumps_revision() {
+        let config = mandate_config(1_440);
+        let (mut state, _principal, _agent, owner, other) = service_fixture(&config);
+        let service_id = register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+            .expect("register");
+        let update = |new_title: &[u8]| Operation::UpdateService {
+            service_id,
+            categories: one_category(0xc3),
+            title: new_title.to_vec(),
+            endpoint: b"https://api.example/v2".to_vec(),
+            interface: Hash256([0x2f; 32]),
+            pricing: vec![],
+            payment_flags: active_flags(),
+        };
+        // A non-owner cannot update.
+        let before = state.clone();
+        let err = mandate_exec(&mut state, &config, &other, 0, update(b"hijack")).unwrap_err();
+        assert!(matches!(err, ChainError::ServiceNotOwner));
+        assert_eq!(state, before, "rejected update leaves state unchanged");
+        // The owner can, and the revision bumps.
+        mandate_exec(&mut state, &config, &owner, 1, update(b"inference-v2"))
+            .expect("owner update");
+        let entry = state.services.get(&service_id).unwrap();
+        assert_eq!(entry.revision, crate::INITIAL_SERVICE_REVISION + 1);
+        assert_eq!(entry.title, b"inference-v2");
+        assert_eq!(entry.interface, Hash256([0x2f; 32]));
+        assert!(entry.categories.contains(&Hash256([0xc3; 32])));
+    }
+
+    #[test]
+    fn update_or_status_on_missing_service_is_rejected() {
+        let config = mandate_config(1_440);
+        let (mut state, _principal, _agent, owner, _other) = service_fixture(&config);
+        let missing = ServiceId::new(Hash256([0xab; 32]));
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &owner,
+            0,
+            Operation::SetServiceStatus {
+                service_id: missing,
+                status: ServiceStatus::Paused,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::ServiceNotFound));
+    }
+
+    #[test]
+    fn over_count_categories_and_pricing_are_rejected_on_apply() {
+        let config = mandate_config(1_440);
+        let (mut state, _principal, _agent, owner, _other) = service_fixture(&config);
+        // Too many categories.
+        let too_many_categories: BTreeSet<Hash256> = (0..=MAX_SERVICE_CATEGORIES as u8)
+            .map(|i| Hash256([i; 32]))
+            .collect();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &owner,
+            0,
+            Operation::RegisterService {
+                namespace: service_namespace(),
+                create_nonce: 0,
+                categories: too_many_categories,
+                title: b"svc".to_vec(),
+                endpoint: b"https://x".to_vec(),
+                interface: Hash256([0x1f; 32]),
+                pricing: vec![],
+                payment_flags: active_flags(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::InvalidServiceEntry));
+        assert!(state.services.is_empty());
+        // Too many pricing entries.
+        let too_many_pricing: Vec<ServicePrice> = (0..=MAX_SERVICE_PRICING_ENTRIES as u8)
+            .map(|i| ServicePrice {
+                operation: Hash256([i; 32]),
+                price: Amount::from_units(1),
+                unit: b"call".to_vec(),
+            })
+            .collect();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &owner,
+            0,
+            Operation::RegisterService {
+                namespace: service_namespace(),
+                create_nonce: 1,
+                categories: BTreeSet::new(),
+                title: b"svc".to_vec(),
+                endpoint: b"https://x".to_vec(),
+                interface: Hash256([0x1f; 32]),
+                pricing: too_many_pricing,
+                payment_flags: active_flags(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::InvalidServiceEntry));
+        assert!(state.services.is_empty());
+    }
+
+    #[test]
+    fn service_scoped_spend_pays_owner_and_supply_stays_balanced() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+        let service_id = register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+            .expect("register");
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            5,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("grant");
+        let owner_before = balance(&state, owner.address());
+        let burned_before = state.burned_fees.0;
+        let pool_before = state.validator_fee_pool.0;
+
+        let amount = Amount::from_units(100_000);
+        let receipt = spend_to_service(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            mandate_id,
+            service_id,
+            amount,
+            owner.address(),
+        )
+        .expect("service spend succeeds");
+
+        // The service owner is credited exactly the principal; the agent stays broke.
+        assert_eq!(balance(&state, owner.address()), owner_before + 100_000);
+        assert_eq!(balance(&state, agent.address()), 0);
+        // Escrow fell by amount + fee (10_000); the mandate's spent grew by the same.
+        assert_eq!(state.mandate_escrow, Amount::from_units(500_000 - 110_000));
+        assert_eq!(
+            state.mandates.get(&mandate_id).unwrap().spent,
+            Amount::from_units(110_000)
+        );
+        // The fee split (burn + validator reward) is exactly one ordinary tx fee.
+        assert_eq!(
+            state.burned_fees.0 + state.validator_fee_pool.0,
+            burned_before + pool_before + 10_000
+        );
+        // The receipt carries BOTH ids — the service-scoped audit trail.
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::MandateSpentToService { mandate_id: m, service_id: s, .. }
+                if *m == mandate_id && *s == service_id
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn paused_or_retired_service_rejects_the_spend() {
+        let config = mandate_config(1_440);
+        for status in [ServiceStatus::Paused, ServiceStatus::Retired] {
+            let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+            let service_id =
+                register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+                    .expect("register");
+            mandate_exec(
+                &mut state,
+                &config,
+                &owner,
+                1,
+                Operation::SetServiceStatus { service_id, status },
+            )
+            .expect("status change");
+            let mandate_id = grant_mandate(
+                &mut state,
+                &config,
+                &principal,
+                &agent,
+                0,
+                0,
+                Amount::from_units(500_000),
+                Epoch::new(100),
+                Amount::from_units(200_000),
+                0,
+                MandateCounterpartyPolicy::Open,
+            )
+            .expect("grant");
+            let before = state.clone();
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                0,
+                mandate_id,
+                service_id,
+                Amount::from_units(100_000),
+                owner.address(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ChainError::ServiceNotActive));
+            assert_eq!(state, before, "rejected spend leaves state unchanged");
+        }
+    }
+
+    #[test]
+    fn category_allowlist_pays_matching_service_and_rejects_non_intersecting() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, owner, other) = service_fixture(&config);
+        // A service tagged with the allowed category, and one that is not.
+        let allowed_category = Hash256([0xaa; 32]);
+        let matching = register_service(&mut state, &config, &owner, 0, 0, {
+            let mut set = BTreeSet::new();
+            set.insert(allowed_category);
+            set
+        })
+        .expect("register matching");
+        let non_matching = register_service(&mut state, &config, &other, 0, 1, one_category(0xbb))
+            .expect("register non-matching");
+        // Mandate whose allowlist references ONLY the category tag.
+        let mut allowlist = BTreeSet::new();
+        allowlist.insert(MandateCounterparty::Category(allowed_category));
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Allowlist(allowlist),
+        )
+        .expect("grant");
+        // The category-tagged service is paid.
+        spend_to_service(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            mandate_id,
+            matching,
+            Amount::from_units(50_000),
+            owner.address(),
+        )
+        .expect("matching category is paid");
+        // The non-intersecting service is rejected.
+        let err = spend_to_service(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            mandate_id,
+            non_matching,
+            Amount::from_units(50_000),
+            other.address(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateCounterpartyNotAllowed));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn recipient_allowlist_matches_service_owner() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, owner, other) = service_fixture(&config);
+        let owned = register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+            .expect("register owned");
+        let other_service = register_service(&mut state, &config, &other, 0, 1, one_category(0xc1))
+            .expect("register other");
+        // Allowlist references the OWNER address (not a category).
+        let mut allowlist = BTreeSet::new();
+        allowlist.insert(MandateCounterparty::Recipient(owner.address()));
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Allowlist(allowlist),
+        )
+        .expect("grant");
+        // The service owned by the allowlisted owner is paid.
+        spend_to_service(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            mandate_id,
+            owned,
+            Amount::from_units(50_000),
+            owner.address(),
+        )
+        .expect("owner recipient match is paid");
+        // A service owned by a different account is rejected.
+        let err = spend_to_service(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            mandate_id,
+            other_service,
+            Amount::from_units(50_000),
+            other.address(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateCounterpartyNotAllowed));
+    }
+
+    #[test]
+    fn every_phase_9a_mandate_check_binds_on_the_service_path() {
+        let config = mandate_config(2);
+        let base_grant = |state: &mut ChainState,
+                          principal: &Keypair,
+                          agent: &Keypair,
+                          per_tx: Amount,
+                          budget: Amount,
+                          expiry: u64,
+                          rate: u32| {
+            grant_mandate(
+                state,
+                &config,
+                principal,
+                agent,
+                0,
+                0,
+                budget,
+                Epoch::new(expiry),
+                per_tx,
+                rate,
+                MandateCounterpartyPolicy::Open,
+            )
+            .expect("grant")
+        };
+
+        // Wrong key: a spend signed by a non-agent key is rejected.
+        {
+            let (mut state, principal, agent, owner, stranger) = service_fixture(&config);
+            let service_id =
+                register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1)).unwrap();
+            let mandate_id = base_grant(
+                &mut state,
+                &principal,
+                &agent,
+                Amount::from_units(200_000),
+                Amount::from_units(500_000),
+                100,
+                0,
+            );
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &stranger,
+                0,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ChainError::MandateAgentKeyMismatch));
+        }
+
+        // Per-tx cap, over-budget, expired, revoked, and rate-limit all bind.
+        {
+            let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+            let service_id =
+                register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1)).unwrap();
+            let mandate_id = base_grant(
+                &mut state,
+                &principal,
+                &agent,
+                Amount::from_units(40_000),
+                Amount::from_units(500_000),
+                100,
+                1,
+            );
+            // Per-tx cap: 50_000 > 40_000.
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                0,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ChainError::MandatePerTxExceeded));
+        }
+
+        // Over-budget is a CUMULATIVE limit (per_tx_max <= budget_total): two
+        // within-cap spends whose running total overflows the budget are rejected
+        // on the second.
+        {
+            let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+            let service_id =
+                register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1)).unwrap();
+            let mandate_id = base_grant(
+                &mut state,
+                &principal,
+                &agent,
+                Amount::from_units(60_000),  // per_tx
+                Amount::from_units(100_000), // budget covers one 60_000 spend, not two
+                100,
+                0,
+            );
+            spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                0,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .expect("first within-budget spend succeeds");
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                1,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ChainError::MandateBudgetExceeded));
+        }
+
+        // Expired: current epoch past the mandate's expiry.
+        {
+            let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+            let service_id =
+                register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1)).unwrap();
+            let mandate_id = base_grant(
+                &mut state,
+                &principal,
+                &agent,
+                Amount::from_units(200_000),
+                Amount::from_units(500_000),
+                0,
+                0,
+            );
+            state.current_epoch = 1;
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                0,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ChainError::MandateExpired));
+        }
+
+        // Revoked: a revoked mandate rejects the spend.
+        {
+            let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+            let service_id =
+                register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1)).unwrap();
+            let mandate_id = base_grant(
+                &mut state,
+                &principal,
+                &agent,
+                Amount::from_units(200_000),
+                Amount::from_units(500_000),
+                100,
+                0,
+            );
+            mandate_exec(
+                &mut state,
+                &config,
+                &principal,
+                1,
+                Operation::RevokeMandate { mandate_id },
+            )
+            .expect("revoke");
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                0,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ChainError::MandateRevoked));
+        }
+
+        // Rate limit: a single-spend-per-window mandate rejects the second spend.
+        {
+            let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+            let service_id =
+                register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1)).unwrap();
+            let mandate_id = base_grant(
+                &mut state,
+                &principal,
+                &agent,
+                Amount::from_units(200_000),
+                Amount::from_units(500_000),
+                100,
+                1,
+            );
+            spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                0,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .expect("first spend");
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                1,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ChainError::MandateRateLimited));
+        }
+    }
+
+    #[test]
+    fn supply_is_balanced_after_register_spend_and_revoke_reclaim() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, owner, _other) = service_fixture(&config);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        let service_id = register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+            .expect("register");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("grant");
+        spend_to_service(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            mandate_id,
+            service_id,
+            Amount::from_units(100_000),
+            owner.address(),
+        )
+        .expect("spend");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        // Revoke returns the unspent remainder; supply stays balanced.
+        mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::RevokeMandate { mandate_id },
+        )
+        .expect("revoke");
+        assert_eq!(state.mandate_escrow, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn service_registry_is_committed_by_the_state_root() {
+        // E8 extension: the service registry map is a committed consensus field (via
+        // the service_registry_root sub-root), so a registration or any in-place
+        // revision bump must change the state root. Otherwise two nodes could
+        // diverge on registry state yet share a root.
+        let config = mandate_config(1_440);
+        let (mut state, _principal, _agent, owner, _other) = service_fixture(&config);
+        let root = state.state_root().unwrap();
+        let service_id = register_service(&mut state, &config, &owner, 0, 0, one_category(0xc1))
+            .expect("register");
+        assert_ne!(
+            state.state_root().unwrap(),
+            root,
+            "registering a service must change the state root (E8)"
+        );
+        let after_register = state.state_root().unwrap();
+        // A status change bumps the entry's revision in place, moving the root.
+        mandate_exec(
+            &mut state,
+            &config,
+            &owner,
+            1,
+            Operation::SetServiceStatus {
+                service_id,
+                status: ServiceStatus::Paused,
+            },
+        )
+        .expect("status change");
+        assert_ne!(
+            state.state_root().unwrap(),
+            after_register,
+            "a status/revision change must change the state root (E8)"
+        );
+    }
+
+    // ----- native oracle (Phase 7, §15.17) -----
+
+    /// Oracle-tuned config with small, exact fee/bond placeholders and a fixed
+    /// settlement cadence and liveness window.
+    fn oracle_config(settlement_epochs: u64, liveness_window_epochs: u64) -> ChainConfig {
+        ChainConfig {
+            oracle: OracleConfig {
+                feed_creation_fee: Amount::from_units(1_000),
+                min_reporter_bond: Amount::from_units(10_000),
+                settlement_epochs,
+                liveness_window_epochs,
+            },
+            ..ChainConfig::default()
+        }
+    }
+
+    /// Genesis funding four accounts (no validators) under an oracle config, so
+    /// epoch advance mints nothing and every balance change is an oracle move.
+    fn oracle_fixture(config: &ChainConfig) -> (ChainState, Keypair, Keypair, Keypair, Keypair) {
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let carol = Keypair::from_seed([3u8; 32]);
+        let dave = Keypair::from_seed([4u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: alice.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: bob.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: carol.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: dave.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("oracle genesis");
+        (state, alice, bob, carol, dave)
+    }
+
+    /// Executes one oracle operation with a gas limit above any oracle op's cost
+    /// and the floor base fee (1 base unit/unit), so tx fees are exact.
+    fn oracle_exec(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        keypair: &Keypair,
+        nonce: u64,
+        operation: Operation,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_operation(
+            keypair,
+            nonce,
+            operation,
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("oracle tx signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    fn balance(state: &ChainState, address: Address) -> u128 {
+        state.accounts.get(&address).map_or(0, |a| a.balance.0)
+    }
+
+    fn find_settlement(
+        events: &[Event],
+        feed_id: FeedId,
+    ) -> Option<(Amount, Amount, Option<FeedValue>)> {
+        events.iter().find_map(|event| match event {
+            Event::FeedRevenueSettled {
+                feed_id: id,
+                distributed,
+                carried,
+                median,
+                ..
+            } if *id == feed_id => Some((*distributed, *carried, *median)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn create_feed_charges_fee_and_rejects_duplicate() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, ..) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        let before = balance(&state, alice.address());
+        let burned_before = state.burned_fees.0;
+
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+        assert!(state.oracle_feeds.contains_key(&feed));
+        assert_eq!(state.oracle_feeds[&feed].creator, alice.address());
+        assert_eq!(
+            state.oracle_feeds[&feed].bond,
+            config.oracle.min_reporter_bond
+        );
+        // The creation fee was burned (on top of the ordinary tx fee).
+        assert_eq!(
+            state.burned_fees.0,
+            burned_before + config.oracle.feed_creation_fee.0 + 15_000 / 2 // creation burn + half the tx fee
+        );
+        // Liquid dropped by at least the creation fee.
+        assert!(before - balance(&state, alice.address()) >= config.oracle.feed_creation_fee.0);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A duplicate feed id is rejected.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                Operation::CreateFeed { feed_id: feed }
+            ),
+            Err(ChainError::OracleFeedAlreadyExists)
+        ));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn register_and_deregister_reporter_locks_and_returns_bond() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, bob, ..) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        let bond = config.oracle.min_reporter_bond;
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+
+        // Registering on a missing feed fails.
+        let missing = FeedId::new(Hash256([0xee; 32]));
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                0,
+                Operation::RegisterReporter { feed_id: missing }
+            ),
+            Err(ChainError::OracleFeedNotFound)
+        ));
+
+        let bob_before = balance(&state, bob.address());
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register reporter");
+        assert_eq!(state.oracle_bonds, bond);
+        // Bond + the register tx fee (10_000 units at the floor fee) left liquid.
+        assert_eq!(bob_before - balance(&state, bob.address()), bond.0 + 10_000);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A duplicate registration is rejected.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                1,
+                Operation::RegisterReporter { feed_id: feed }
+            ),
+            Err(ChainError::OracleReporterAlreadyRegistered)
+        ));
+
+        let before = balance(&state, bob.address());
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            1,
+            Operation::DeregisterReporter { feed_id: feed },
+        )
+        .expect("deregister reporter");
+        assert_eq!(state.oracle_bonds, Amount::ZERO);
+        // The bond returned, minus the deregister tx fee (10_000 units at floor).
+        assert_eq!(balance(&state, bob.address()), before + bond.0 - 10_000);
+        assert!(!state.oracle_reporters.contains_key(&(feed, bob.address())));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Deregistering again fails.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                2,
+                Operation::DeregisterReporter { feed_id: feed }
+            ),
+            Err(ChainError::OracleReporterNotFound)
+        ));
+    }
+
+    #[test]
+    fn median_aggregation_over_single_even_and_odd_reporters() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+
+        // No feed / no reports -> None.
+        assert_eq!(state.feed_value(FeedId::new(Hash256([1u8; 32]))), None);
+        assert_eq!(state.feed_value(feed), None);
+
+        // A reporter cannot report before registering.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                0,
+                Operation::SubmitReport {
+                    feed_id: feed,
+                    value: FeedValue::new(42)
+                }
+            ),
+            Err(ChainError::OracleReporterNotFound)
+        ));
+
+        // Single reporter: the median is that value.
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register bob");
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(42),
+            },
+        )
+        .expect("bob reports");
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(42)));
+
+        // Even count (2): lower-mid of sorted [10, 42] is 10.
+        oracle_exec(
+            &mut state,
+            &config,
+            &carol,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register carol");
+        oracle_exec(
+            &mut state,
+            &config,
+            &carol,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(10),
+            },
+        )
+        .expect("carol reports");
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(10)));
+
+        // Odd count (3): middle of sorted [10, 42, 100] is 42.
+        oracle_exec(
+            &mut state,
+            &config,
+            &dave,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register dave");
+        oracle_exec(
+            &mut state,
+            &config,
+            &dave,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(100),
+            },
+        )
+        .expect("dave reports");
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(42)));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn read_fee_revenue_is_accuracy_weighted_with_exact_conservation() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+
+        // Three reporters at distances 0, 1, 10 from the median 100.
+        for (kp, value) in [(&bob, 100i128), (&carol, 101), (&dave, 90)] {
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                0,
+                Operation::RegisterReporter { feed_id: feed },
+            )
+            .expect("register");
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                1,
+                Operation::SubmitReport {
+                    feed_id: feed,
+                    value: FeedValue::new(value),
+                },
+            )
+            .expect("report");
+        }
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(100)));
+
+        // A zero read-fee is rejected; a real one accrues to the pool.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                Operation::PayFeedRead {
+                    feed_id: feed,
+                    amount: Amount::ZERO
+                }
+            ),
+            Err(ChainError::OracleReadAmountZero)
+        ));
+        let revenue = Amount::from_units(1_000_000);
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            1,
+            Operation::PayFeedRead {
+                feed_id: feed,
+                amount: revenue,
+            },
+        )
+        .expect("pay read fee");
+        assert_eq!(state.oracle_revenue, revenue);
+        assert_eq!(state.oracle_feeds[&feed].revenue, revenue);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let (bob_b, carol_b, dave_b) = (
+            balance(&state, bob.address()),
+            balance(&state, carol.address()),
+            balance(&state, dave.address()),
+        );
+        let events = state.distribute_epoch_rewards(&config).expect("settle");
+        let (distributed, carried, median_value) =
+            find_settlement(&events, feed).expect("settlement event");
+        assert_eq!(median_value, Some(FeedValue::new(100)));
+
+        let bob_share = balance(&state, bob.address()) - bob_b;
+        let carol_share = balance(&state, carol.address()) - carol_b;
+        let dave_share = balance(&state, dave.address()) - dave_b;
+        // Accuracy ordering: nearer the median earns strictly more.
+        assert!(bob_share > carol_share);
+        assert!(carol_share > dave_share);
+        assert!(dave_share > 0);
+        // Exact conservation: shares sum to the distributed total, and the
+        // integer-division remainder is carried in the feed pool (nothing lost).
+        assert_eq!(bob_share + carol_share + dave_share, distributed.0);
+        assert_eq!(distributed.0 + carried.0, revenue.0);
+        assert_eq!(state.oracle_feeds[&feed].revenue, carried);
+        assert_eq!(state.oracle_revenue, carried);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn stale_reporter_earns_no_liveness_reward() {
+        // Liveness window 1: a report is live only for the reporting epoch and the
+        // next one.
+        let config = oracle_config(1, 1);
+        let (mut state, alice, bob, carol, _dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+        for kp in [&bob, &carol] {
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                0,
+                Operation::RegisterReporter { feed_id: feed },
+            )
+            .expect("register");
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                1,
+                Operation::SubmitReport {
+                    feed_id: feed,
+                    value: FeedValue::new(100),
+                },
+            )
+            .expect("report at epoch 0");
+        }
+
+        // Advance to epoch 2 (both intermediate settlements have no revenue).
+        state
+            .distribute_epoch_rewards(&config)
+            .expect("advance to epoch 1");
+        state
+            .distribute_epoch_rewards(&config)
+            .expect("advance to epoch 2");
+        assert_eq!(state.current_epoch, 2);
+
+        // Bob refreshes at epoch 2 (live); carol stays stale (last report epoch 0).
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            2,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(100),
+            },
+        )
+        .expect("bob refreshes");
+        let revenue = Amount::from_units(500_000);
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            1,
+            Operation::PayFeedRead {
+                feed_id: feed,
+                amount: revenue,
+            },
+        )
+        .expect("pay read fee");
+
+        let (bob_b, carol_b) = (
+            balance(&state, bob.address()),
+            balance(&state, carol.address()),
+        );
+        let events = state
+            .distribute_epoch_rewards(&config)
+            .expect("settle epoch 2");
+        let (distributed, carried, _median) = find_settlement(&events, feed).expect("settled");
+
+        let bob_share = balance(&state, bob.address()) - bob_b;
+        let carol_share = balance(&state, carol.address()) - carol_b;
+        assert_eq!(carol_share, 0, "a stale reporter earns nothing");
+        assert!(bob_share > 0, "the live reporter earns the revenue");
+        assert_eq!(bob_share, distributed.0);
+        // Bob is the only live reporter and sits on the median, so he takes all of
+        // the revenue with no remainder.
+        assert_eq!(distributed, revenue);
+        assert_eq!(carried, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn oracle_state_survives_bincode_restart() {
+        let config = oracle_config(4, 5);
+        let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+        // A reporter with a value, a reporter without a value, and accrued
+        // (unsettled) revenue exercise every oracle field on disk.
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register bob");
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(-987_654_321),
+            },
+        )
+        .expect("bob reports");
+        oracle_exec(
+            &mut state,
+            &config,
+            &carol,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register carol (no report)");
+        oracle_exec(
+            &mut state,
+            &config,
+            &dave,
+            0,
+            Operation::PayFeedRead {
+                feed_id: feed,
+                amount: Amount::from_units(777),
+            },
+        )
+        .expect("dave pays a read fee");
+
+        let root = state.state_root().unwrap();
+        let restored = bincode_restart(&state);
+        assert_eq!(restored, state, "oracle state round-trips through bincode");
+        assert_eq!(
+            restored.state_root().unwrap(),
+            root,
+            "state root is preserved across a crash-restart"
+        );
+        assert_eq!(restored.feed_value(feed), state.feed_value(feed));
+        assert_eq!(restored.oracle_bonds, state.oracle_bonds);
+        assert_eq!(restored.oracle_revenue, state.oracle_revenue);
+        assert!(restored.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn oracle_settlement_is_deterministic_across_runs() {
+        fn run() -> Hash256 {
+            let config = oracle_config(1, 5);
+            let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+            let feed = FeedId::new(Hash256([9u8; 32]));
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                0,
+                Operation::CreateFeed { feed_id: feed },
+            )
+            .unwrap();
+            for (kp, value) in [(&bob, 100i128), (&carol, 103), (&dave, 88)] {
+                oracle_exec(
+                    &mut state,
+                    &config,
+                    kp,
+                    0,
+                    Operation::RegisterReporter { feed_id: feed },
+                )
+                .unwrap();
+                oracle_exec(
+                    &mut state,
+                    &config,
+                    kp,
+                    1,
+                    Operation::SubmitReport {
+                        feed_id: feed,
+                        value: FeedValue::new(value),
+                    },
+                )
+                .unwrap();
+            }
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                Operation::PayFeedRead {
+                    feed_id: feed,
+                    amount: Amount::from_units(999_983),
+                },
+            )
+            .unwrap();
+            state.distribute_epoch_rewards(&config).unwrap();
+            state.state_root().unwrap()
+        }
+        assert_eq!(run(), run(), "oracle settlement is deterministic");
     }
 
     // ----- session-key test helpers -----
@@ -3744,8 +10044,7 @@ mod tests {
 
         // The whole chain state uses tuple-keyed maps, so it round-trips through
         // bincode (a non-string-key format) rather than JSON.
-        let bytes = bincode::serialize(&state).unwrap();
-        let restored: ChainState = bincode::deserialize(&bytes).unwrap();
+        let restored = bincode_restart(&state);
         assert_eq!(restored, state);
         assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
     }
@@ -5679,6 +11978,271 @@ mod tests {
     }
 
     #[test]
+    fn storage_deposit_locks_on_create_resizes_on_mutate_and_refunds_on_delete() {
+        // §15.22: writing object state locks a refundable native deposit
+        // proportional to stored bytes; deleting refunds the majority and burns
+        // the occupancy remainder. Supply must reconcile at every step.
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256::digest(b"deposit-ns");
+        let object_id = ObjectId::new(Hash256::digest(b"deposit-obj"));
+        let per_byte = config.storage_pricing.deposit_per_byte;
+        assert!(per_byte > 0, "default pricing must lock a real deposit");
+        let deposit_for = |len: usize| Amount::from_units(u128::from(per_byte) * len as u128);
+        let issued = state.minted_supply;
+        let assert_balanced = |s: &ChainState| {
+            assert!(
+                s.supply_invariant_report().expect("report").balanced,
+                "supply must reconcile"
+            );
+        };
+
+        let fee = FeeBid {
+            gas_limit: 30_000,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        };
+
+        // --- Create: liquid -> storage_deposits ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let create = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![0u8; 10],
+            },
+            fee,
+        )
+        .expect("create signs");
+        let create_fee = Amount::from_units(u128::from(create.required_units())); // base fee 1/unit
+        state
+            .execute_transaction(&create, &config)
+            .expect("object created");
+        assert_eq!(state.storage_deposits, deposit_for(10));
+        assert_eq!(state.objects[&object_id].deposit, deposit_for(10));
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(create_fee)
+                .and_then(|b| b.checked_sub(deposit_for(10)))
+                .unwrap(),
+            "create must debit both the fee and the storage deposit"
+        );
+        assert_eq!(state.minted_supply, issued, "create mints no supply");
+        assert_balanced(&state);
+
+        // --- Mutate grow: 10 -> 30 bytes locks the extra ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let grow = Transaction::for_operation(
+            &alice,
+            1,
+            Operation::MutateObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::INITIAL,
+                data: vec![0u8; 30],
+            },
+            fee,
+        )
+        .expect("grow signs");
+        let grow_fee = Amount::from_units(u128::from(grow.required_units()));
+        state.execute_transaction(&grow, &config).expect("grew");
+        assert_eq!(state.storage_deposits, deposit_for(30));
+        assert_eq!(state.objects[&object_id].deposit, deposit_for(30));
+        let extra = deposit_for(30).checked_sub(deposit_for(10)).unwrap();
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(grow_fee)
+                .and_then(|b| b.checked_sub(extra))
+                .unwrap(),
+        );
+        assert_balanced(&state);
+
+        // --- Mutate shrink: 30 -> 5 bytes refunds the difference ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let shrink = Transaction::for_operation(
+            &alice,
+            2,
+            Operation::MutateObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::new(2),
+                data: vec![0u8; 5],
+            },
+            fee,
+        )
+        .expect("shrink signs");
+        let shrink_fee = Amount::from_units(u128::from(shrink.required_units()));
+        state.execute_transaction(&shrink, &config).expect("shrank");
+        assert_eq!(state.storage_deposits, deposit_for(5));
+        assert_eq!(state.objects[&object_id].deposit, deposit_for(5));
+        let refunded = deposit_for(30).checked_sub(deposit_for(5)).unwrap();
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(shrink_fee)
+                .and_then(|b| b.checked_add(refunded))
+                .unwrap(),
+        );
+        assert_balanced(&state);
+
+        // --- Delete: storage_deposits -> refund + burned ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let burned_before = state.burned_fees;
+        let split = config
+            .storage_pricing
+            .refund_split(deposit_for(5))
+            .expect("split");
+        assert_eq!(
+            split.refund.checked_add(split.burned).unwrap(),
+            deposit_for(5)
+        );
+        assert!(
+            !split.burned.is_zero(),
+            "occupancy fee must burn a remainder"
+        );
+        let delete = Transaction::for_operation(
+            &alice,
+            3,
+            Operation::DeleteObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::new(3),
+            },
+            fee,
+        )
+        .expect("delete signs");
+        let delete_fee = Amount::from_units(u128::from(delete.required_units()));
+        let receipt = state
+            .execute_transaction(&delete, &config)
+            .expect("deleted");
+        assert!(!state.objects.contains_key(&object_id), "object removed");
+        assert_eq!(state.storage_deposits, Amount::ZERO);
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::ObjectDeleted { refund, burned, .. }
+                if *refund == split.refund && *burned == split.burned
+        )));
+        // The delete fee burns half its fee too, so account for both burn sources.
+        let delete_fee_burn = split_fee(delete_fee).burned;
+        assert_eq!(
+            state.burned_fees,
+            burned_before
+                .checked_add(split.burned)
+                .and_then(|b| b.checked_add(delete_fee_burn))
+                .unwrap(),
+            "deletion burns the occupancy remainder plus the fee burn"
+        );
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(delete_fee)
+                .and_then(|b| b.checked_add(split.refund))
+                .unwrap(),
+            "owner is refunded the majority of the deposit"
+        );
+        assert_eq!(state.minted_supply, issued, "delete mints no supply");
+        assert_balanced(&state);
+    }
+
+    #[test]
+    fn insufficient_balance_storage_deposit_create_fails_closed() {
+        // A creator who cannot afford the storage deposit fails closed and leaves
+        // no partial object or deposit behind (the whole transaction rolls back).
+        let (config, mut state, alice, bob) = funded_state();
+        // Fund bob with just enough for one fee but far less than a big deposit.
+        let seed = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::Transfer {
+                to: bob.address(),
+                amount: Amount::from_units(30_000),
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("seed signs");
+        state
+            .execute_transaction(&seed, &config)
+            .expect("bob funded");
+
+        let namespace = Hash256::digest(b"poor-ns");
+        let object_id = ObjectId::new(Hash256::digest(b"poor-obj"));
+        // Deposit for 100 bytes = 100_000 base units, above bob's post-fee balance.
+        let create = Transaction::for_operation(
+            &bob,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![0u8; 100],
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("create signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&create, &config),
+            Err(ChainError::InsufficientBalance { .. })
+        ));
+        assert_eq!(state, before, "failed create leaves no partial state");
+        assert!(!state.objects.contains_key(&object_id));
+        assert_eq!(state.storage_deposits, Amount::ZERO);
+        assert!(state.supply_invariant_report().expect("report").balanced);
+    }
+
+    #[test]
+    fn storage_deposits_survive_bincode_restart_with_stable_state_root() {
+        // A crash-restart (bincode round-trip of the whole state) must preserve
+        // the locked storage deposits and the committed state root, so a node
+        // cannot silently diverge on the new bucket after reloading from disk.
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256::digest(b"restart-ns");
+        let object_id = ObjectId::new(Hash256::digest(b"restart-obj"));
+        let create = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![7u8; 42],
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("create signs");
+        state
+            .execute_transaction(&create, &config)
+            .expect("created");
+        assert!(!state.storage_deposits.is_zero());
+
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.storage_deposits, state.storage_deposits);
+        assert_eq!(
+            restored.objects[&object_id].deposit,
+            state.objects[&object_id].deposit
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "storage_deposits is committed by the state root across a restart"
+        );
+    }
+
+    #[test]
     fn delegated_rewards_can_be_claimed_by_delegator() {
         let (config, mut state, alice, bob) = funded_state();
 
@@ -7103,8 +13667,7 @@ mod tests {
         // a serialized-then-restored copy. Pruning is a pure function of committed
         // state, so both must produce identical state, root, and events.
         // bincode (not JSON) because state maps use non-string tuple keys.
-        let snapshot = bincode::serialize(&state).unwrap();
-        let mut restored: ChainState = bincode::deserialize(&snapshot).unwrap();
+        let mut restored = bincode_restart(&state);
         let live_events = state.distribute_epoch_rewards(&config).unwrap();
         let restored_events = restored.distribute_epoch_rewards(&config).unwrap();
         assert_eq!(state, restored);
@@ -7137,5 +13700,4383 @@ mod tests {
             small_fee(),
         );
         state.execute_transaction(&transfer, &config).unwrap();
+    }
+
+    // ----- §15.35 fee sponsorship (paymaster) -----
+
+    /// Devnet-style state whose sponsorship caps are small enough to exhaust in
+    /// a test. Alice (seed 1) is funded with 1,000 WEBC; Bob (seed 2) has nothing.
+    fn sponsored_setup() -> (ChainConfig, ChainState, Keypair, Keypair, Hash256) {
+        let config = ChainConfig {
+            sponsorship: SponsorshipConfig {
+                enabled: true,
+                max_ops_per_user_per_app_per_day: 2,
+                max_sponsored_fee_per_op: Amount::from_units(1_000),
+                max_app_daily_budget: Amount::from_units(1_000_000),
+                day_window_epochs: 10,
+            },
+            ..ChainConfig::default()
+        };
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("genesis builds");
+        (
+            config,
+            state,
+            alice,
+            bob,
+            Hash256::digest(b"demo-app-namespace"),
+        )
+    }
+
+    /// Fee bid whose effective per-unit price is exactly 1, so a `Transfer`'s fee
+    /// is exactly 500 base units (its 500 execution units × 1).
+    fn unit_fee(gas_limit: u64) -> FeeBid {
+        FeeBid {
+            gas_limit,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        }
+    }
+
+    /// Registers `owner` as the sponsor of `namespace`, funding `funding` and
+    /// setting a `daily_cap`, at `nonce`; asserts the transaction succeeds.
+    fn register_sponsor(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        owner: &Keypair,
+        namespace: Hash256,
+        daily_cap: u128,
+        funding: u128,
+        nonce: u64,
+    ) {
+        let tx = Transaction::for_operation(
+            owner,
+            nonce,
+            Operation::RegisterAppSponsor {
+                namespace,
+                daily_budget_cap: Amount::from_units(daily_cap),
+                initial_funding: Amount::from_units(funding),
+            },
+            unit_fee(20_000),
+        )
+        .expect("register signs");
+        state
+            .execute_transaction(&tx, config)
+            .expect("sponsor registered");
+    }
+
+    /// Transfers `amount` base units from `from` to `to` at `nonce` (self-paid).
+    fn seed_balance(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        from: &Keypair,
+        to: Address,
+        amount: u128,
+        nonce: u64,
+    ) {
+        let tx = Transaction::for_operation(
+            from,
+            nonce,
+            Operation::Transfer {
+                to,
+                amount: Amount::from_units(amount),
+            },
+            unit_fee(1_000),
+        )
+        .expect("seed signs");
+        state.execute_transaction(&tx, config).expect("seeded");
+    }
+
+    /// Builds a sponsored `Transfer` of `amount` from `from` to `to` at `nonce`,
+    /// opting into fee sponsorship by `namespace`. The transfer fee is 500.
+    fn sponsored_transfer(
+        from: &Keypair,
+        to: Address,
+        amount: u128,
+        nonce: u64,
+        namespace: Hash256,
+    ) -> Transaction {
+        Transaction::for_sponsored_operation(
+            from,
+            nonce,
+            Operation::Transfer {
+                to,
+                amount: Amount::from_units(amount),
+            },
+            unit_fee(1_000),
+            namespace,
+        )
+        .expect("sponsored transfer signs")
+    }
+
+    #[test]
+    fn register_and_fund_app_sponsor_locks_budget_and_conserves_supply() {
+        let (config, mut state, alice, _bob, namespace) = sponsored_setup();
+        let issued = state.minted_supply;
+
+        register_sponsor(&mut state, &config, &alice, namespace, 50_000, 100_000, 0);
+        let sponsor = &state.sponsors[&namespace];
+        assert_eq!(sponsor.owner, alice.address());
+        assert_eq!(sponsor.budget, Amount::from_units(100_000));
+        assert_eq!(sponsor.daily_budget_cap, Amount::from_units(50_000));
+        assert_eq!(state.sponsor_budgets, Amount::from_units(100_000));
+        assert_eq!(
+            state.minted_supply, issued,
+            "registering a sponsor mints no supply"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Top up the same sponsor; the aggregate bucket tracks the per-app budget.
+        let fund = Transaction::for_operation(
+            &alice,
+            1,
+            Operation::FundAppSponsor {
+                namespace,
+                amount: Amount::from_units(50_000),
+            },
+            unit_fee(20_000),
+        )
+        .expect("fund signs");
+        let receipt = state.execute_transaction(&fund, &config).expect("funded");
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(150_000)
+        );
+        assert_eq!(state.sponsor_budgets, Amount::from_units(150_000));
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::AppSponsorFunded { application, amount }
+                if *application == namespace && *amount == Amount::from_units(50_000)
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Only the owner may fund; a stranger's fund is rejected and rolls back.
+        let stranger = Keypair::from_seed([9u8; 32]);
+        seed_balance(&mut state, &config, &alice, stranger.address(), 100_000, 2);
+        let bad = Transaction::for_operation(
+            &stranger,
+            0,
+            Operation::FundAppSponsor {
+                namespace,
+                amount: Amount::from_units(10),
+            },
+            unit_fee(20_000),
+        )
+        .expect("stranger fund signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&bad, &config),
+            Err(ChainError::AppSponsorNotOwner)
+        ));
+        assert_eq!(state, before, "rejected fund leaves state unchanged");
+    }
+
+    #[test]
+    fn sponsored_transfer_draws_fee_from_sponsor_leaving_sender_fee_untouched() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 200_000, 0,
+        );
+
+        // Fund Bob with EXACTLY one transfer principal and no fee headroom: a
+        // self-paid transfer would fail, so success proves the sponsor paid.
+        let principal = 100u128;
+        seed_balance(&mut state, &config, &alice, bob.address(), principal, 1);
+        assert_eq!(
+            state.accounts[&bob.address()].balance,
+            Amount::from_units(principal)
+        );
+
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let issued = state.minted_supply;
+        let burned_before = state.burned_fees;
+        let pool_before = state.validator_fee_pool;
+
+        let tx = sponsored_transfer(&bob, carol, principal, 0, namespace);
+        let receipt = state
+            .execute_transaction(&tx, &config)
+            .expect("sponsored transfer succeeds despite zero fee headroom");
+
+        // Bob's balance fell by the principal only — the 500 fee never touched it.
+        assert_eq!(state.accounts[&bob.address()].balance, Amount::ZERO);
+        assert_eq!(
+            state.accounts[&carol].balance,
+            Amount::from_units(principal)
+        );
+        // The fee came out of the sponsor budget and split into burn + reward.
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(199_500)
+        );
+        assert_eq!(state.sponsor_budgets, Amount::from_units(199_500));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            1
+        );
+        assert_eq!(
+            state.burned_fees,
+            burned_before.checked_add(Amount::from_units(250)).unwrap()
+        );
+        assert_eq!(
+            state.validator_fee_pool,
+            pool_before.checked_add(Amount::from_units(250)).unwrap()
+        );
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::FeeSponsored { application, beneficiary, .. }
+                if *application == namespace && *beneficiary == bob.address()
+        )));
+        assert_eq!(
+            state.minted_supply, issued,
+            "a sponsored fee mints no supply"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_user_daily_cap_exhausts_then_falls_back_to_self_pay() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        // per-user cap is 2. Fund Bob for 3 principals + exactly one self-paid fee.
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        seed_balance(&mut state, &config, &alice, bob.address(), 3 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        // First two sponsored operations are covered by the sponsor.
+        for nonce in 0..2 {
+            let tx = sponsored_transfer(&bob, carol, 10, nonce, namespace);
+            let receipt = state.execute_transaction(&tx, &config).expect("sponsored");
+            assert!(receipt
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        }
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_000)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
+
+        // The third exceeds the per-user daily cap and falls back to self-pay.
+        let bob_before = state.accounts[&bob.address()].balance;
+        let tx = sponsored_transfer(&bob, carol, 10, 2, namespace);
+        let receipt = state
+            .execute_transaction(&tx, &config)
+            .expect("third op still succeeds via self-pay");
+        assert!(
+            !receipt
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::FeeSponsored { .. })),
+            "over-cap op is not sponsored"
+        );
+        // Bob paid the 500 fee himself plus the 10 principal; sponsor unchanged.
+        assert_eq!(
+            state.accounts[&bob.address()].balance,
+            bob_before.checked_sub(Amount::from_units(510)).unwrap()
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_000),
+            "the sponsor budget did not move for the self-paid op"
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_app_budget_exhaustion_falls_back_to_self_pay() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        // Fund the sponsor with only enough for a single 500-unit fee.
+        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 600, 0);
+        seed_balance(&mut state, &config, &alice, bob.address(), 2 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        let first = sponsored_transfer(&bob, carol, 10, 0, namespace);
+        let receipt = state.execute_transaction(&first, &config).expect("first");
+        assert!(receipt
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(100));
+
+        // Budget (100) can no longer cover the 500 fee -> self-pay.
+        let bob_before = state.accounts[&bob.address()].balance;
+        let second = sponsored_transfer(&bob, carol, 10, 1, namespace);
+        let receipt = state.execute_transaction(&second, &config).expect("second");
+        assert!(!receipt
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.accounts[&bob.address()].balance,
+            bob_before.checked_sub(Amount::from_units(510)).unwrap()
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(100),
+            "an underfunded sponsor is never overdrawn"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_app_daily_spend_cap_binds_then_self_pays() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        // Well-funded, but the app's per-day spend cap only covers one 500 fee.
+        register_sponsor(&mut state, &config, &alice, namespace, 700, 100_000, 0);
+        seed_balance(&mut state, &config, &alice, bob.address(), 2 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        let first = sponsored_transfer(&bob, carol, 10, 0, namespace);
+        assert!(state
+            .execute_transaction(&first, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+
+        // 500 + 500 > 700 day cap -> self-pay; the daily spend counter stays put.
+        let second = sponsored_transfer(&bob, carol, 10, 1, namespace);
+        assert!(!state
+            .execute_transaction(&second, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_500)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn a_non_simple_operation_is_never_sponsored() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        // CreateObject costs a 20,000 fee + a 1,000 storage deposit (1 byte).
+        seed_balance(&mut state, &config, &alice, bob.address(), 21_000, 1);
+        let sponsor_before = state.sponsors[&namespace].clone();
+
+        let object_id = ObjectId::new(Hash256::digest(b"sponsor-nonsimple-obj"));
+        let tx = Transaction::for_sponsored_operation(
+            &bob,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![0u8; 1],
+            },
+            unit_fee(20_000),
+            namespace,
+        )
+        .expect("sponsored non-simple op signs");
+        let receipt = state
+            .execute_transaction(&tx, &config)
+            .expect("CreateObject self-pays and succeeds");
+
+        assert!(
+            !receipt
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::FeeSponsored { .. })),
+            "a non-sponsorable operation must never draw from a sponsor"
+        );
+        assert_eq!(
+            state.sponsors[&namespace], sponsor_before,
+            "the sponsor budget and counters are untouched by a non-simple op"
+        );
+        assert!(state.objects.contains_key(&object_id));
+        // Bob self-paid the 20,000 fee and the 1,000 deposit out of 21,000.
+        assert_eq!(state.accounts[&bob.address()].balance, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn day_window_counter_resets_deterministically_across_windows() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        // window 0: two sponsored + one self-paid (per-user cap 2); window 1: one more.
+        seed_balance(&mut state, &config, &alice, bob.address(), 4 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        for nonce in 0..2 {
+            let tx = sponsored_transfer(&bob, carol, 10, nonce, namespace);
+            state
+                .execute_transaction(&tx, &config)
+                .expect("window-0 sponsored");
+        }
+        // Third in window 0 hits the per-user cap and self-pays.
+        let capped = sponsored_transfer(&bob, carol, 10, 2, namespace);
+        assert!(!state
+            .execute_transaction(&capped, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
+        let budget_after_window0 = state.sponsors[&namespace].budget;
+        assert_eq!(budget_after_window0, Amount::from_units(99_000));
+
+        // Advance the consensus epoch into the next day-window (10 epochs/window).
+        state.current_epoch = 10;
+
+        // The per-user and per-app daily counters reset, so Bob can be sponsored again.
+        let next_window = sponsored_transfer(&bob, carol, 10, 3, namespace);
+        assert!(state
+            .execute_transaction(&next_window, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(state.sponsors[&namespace].window_index, 1);
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 1),
+            1
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            0,
+            "the previous window reads as zero after rollover"
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            budget_after_window0
+                .checked_sub(Amount::from_units(500))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn withdraw_returns_unspent_budget_and_conserves_supply() {
+        let (config, mut state, alice, _bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        let liquid_before = state.accounts[&alice.address()].balance;
+
+        let withdraw = Transaction::for_operation(
+            &alice,
+            1,
+            Operation::WithdrawAppSponsor {
+                namespace,
+                amount: Amount::from_units(40_000),
+            },
+            unit_fee(20_000),
+        )
+        .expect("withdraw signs");
+        let withdraw_fee = Amount::from_units(u128::from(withdraw.required_units()));
+        state
+            .execute_transaction(&withdraw, &config)
+            .expect("withdrew");
+
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(60_000)
+        );
+        assert_eq!(state.sponsor_budgets, Amount::from_units(60_000));
+        // Alice regained the withdrawal minus the withdrawal transaction's own fee.
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_add(Amount::from_units(40_000))
+                .and_then(|b| b.checked_sub(withdraw_fee))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Over-withdrawing the remaining budget is rejected and rolls back.
+        let over = Transaction::for_operation(
+            &alice,
+            2,
+            Operation::WithdrawAppSponsor {
+                namespace,
+                amount: Amount::from_units(60_001),
+            },
+            unit_fee(20_000),
+        )
+        .expect("over-withdraw signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over, &config),
+            Err(ChainError::AppSponsorBudgetInsufficient { .. })
+        ));
+        assert_eq!(state, before, "rejected withdraw leaves state unchanged");
+    }
+
+    #[test]
+    fn sponsorship_on_a_non_default_lane_is_rejected() {
+        let (config, mut state, alice, _bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        // Hand-craft a transfer that names a sponsor but selects a non-default lane.
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let lane = AuthorizationLaneId::new(Hash256([0x42; 32]));
+        let mut tx = Transaction::new_unsigned_in_lane(
+            alice.address(),
+            alice.public_key(),
+            lane,
+            0,
+            Operation::Transfer {
+                to: carol,
+                amount: Amount::from_units(1),
+            },
+            Operation::Transfer {
+                to: carol,
+                amount: Amount::from_units(1),
+            }
+            .default_access_list_for_lane(alice.address(), lane)
+            .unwrap(),
+            unit_fee(1_000),
+        );
+        tx.sponsor = Some(namespace);
+        tx.sign(&alice).expect("signs");
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::SponsorshipRequiresDefaultLane)
+        ));
+    }
+
+    #[test]
+    fn sponsor_registry_and_counters_survive_bincode_restart_with_stable_state_root() {
+        // A crash-restart (bincode round-trip of the whole state) must preserve
+        // the sponsor registry, per-user/day counters, the sponsor_budgets bucket,
+        // and the committed state root, so a node cannot silently diverge on the
+        // new sponsorship state after reloading from disk.
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        seed_balance(&mut state, &config, &alice, bob.address(), 100, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let tx = sponsored_transfer(&bob, carol, 100, 0, namespace);
+        state
+            .execute_transaction(&tx, &config)
+            .expect("sponsored transfer");
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            1
+        );
+        assert!(!state.sponsor_budgets.is_zero());
+
+        let restored = bincode_restart(&state);
+        assert_eq!(
+            restored.sponsors, state.sponsors,
+            "restart preserves the sponsor registry and its per-user/day counters"
+        );
+        assert_eq!(restored.sponsor_budgets, state.sponsor_budgets);
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "sponsor state is committed by the state root across a restart"
+        );
+    }
+
+    // ----- §8 application namespace ownership registry -----
+
+    /// Builds and signs a `RegisterNamespace` for `owner` at `nonce`.
+    fn register_namespace_tx(owner: &Keypair, namespace: Hash256, nonce: u64) -> Transaction {
+        Transaction::for_operation(
+            owner,
+            nonce,
+            Operation::RegisterNamespace { namespace },
+            unit_fee(10_000),
+        )
+        .expect("register-namespace signs")
+    }
+
+    /// Builds and signs a `TransferNamespace` from `owner` to `new_owner` at `nonce`.
+    fn transfer_namespace_tx(
+        owner: &Keypair,
+        namespace: Hash256,
+        new_owner: Address,
+        nonce: u64,
+    ) -> Transaction {
+        Transaction::for_operation(
+            owner,
+            nonce,
+            Operation::TransferNamespace {
+                namespace,
+                new_owner,
+            },
+            unit_fee(10_000),
+        )
+        .expect("transfer-namespace signs")
+    }
+
+    #[test]
+    fn register_namespace_records_owner_commits_root_and_conserves_supply() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        let issued = state.minted_supply;
+        let root_before = state.state_root().expect("root before");
+
+        let receipt = state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("namespace registered");
+
+        assert_eq!(
+            state.namespaces[&namespace],
+            NamespaceRecord::new(alice.address()),
+            "the sender is recorded as the namespace owner"
+        );
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::NamespaceRegistered { namespace: ns, owner }
+                if *ns == namespace && *owner == alice.address()
+        )));
+        // A registration locks no native units: only the ordinary fee moved.
+        assert_eq!(state.minted_supply, issued, "registration mints no supply");
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "supply invariant is unaffected by the registry"
+        );
+        // The registry is committed state: the state root must have changed.
+        assert_ne!(
+            state.state_root().expect("root after"),
+            root_before,
+            "claiming a namespace changes the committed state root"
+        );
+    }
+
+    #[test]
+    fn double_register_namespace_is_rejected_and_leaves_owner_unchanged() {
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("first registration");
+
+        let before = state.clone();
+        // A second claim of the same namespace (even by the original owner) fails.
+        assert!(matches!(
+            state.execute_transaction(&register_namespace_tx(&alice, namespace, 1), &config),
+            Err(ChainError::NamespaceAlreadyRegistered)
+        ));
+        assert_eq!(
+            state, before,
+            "a rejected duplicate registration leaves state unchanged"
+        );
+        assert_eq!(state.namespaces.len(), 1);
+    }
+
+    #[test]
+    fn transfer_namespace_by_owner_updates_the_owner() {
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("registration");
+
+        let receipt = state
+            .execute_transaction(
+                &transfer_namespace_tx(&alice, namespace, bob.address(), 1),
+                &config,
+            )
+            .expect("owner transfer");
+
+        assert_eq!(
+            state.namespaces[&namespace],
+            NamespaceRecord::new(bob.address()),
+            "the namespace is now owned by the new owner"
+        );
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::NamespaceTransferred { namespace: ns, from, to }
+                if *ns == namespace && *from == alice.address() && *to == bob.address()
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn transfer_namespace_by_non_owner_is_rejected_and_state_unchanged() {
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("registration");
+        // Fund Bob (a non-owner) so his transaction reaches the ownership check
+        // rather than failing on fees or a missing account.
+        seed_balance(&mut state, &config, &alice, bob.address(), 1_000_000, 1);
+
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&transfer_namespace_tx(&bob, namespace, carol, 0), &config),
+            Err(ChainError::NamespaceNotOwner)
+        ));
+        assert_eq!(
+            state, before,
+            "a non-owner transfer attempt leaves the registry unchanged"
+        );
+        assert_eq!(
+            state.namespaces[&namespace],
+            NamespaceRecord::new(alice.address()),
+            "ownership still belongs to the original owner"
+        );
+    }
+
+    #[test]
+    fn transfer_unregistered_namespace_reports_not_found() {
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x99; 32]);
+        assert!(matches!(
+            state.execute_transaction(
+                &transfer_namespace_tx(&alice, namespace, bob.address(), 0),
+                &config
+            ),
+            Err(ChainError::NamespaceNotFound)
+        ));
+    }
+
+    #[test]
+    fn namespace_registry_survives_bincode_restart_with_stable_state_root() {
+        // A crash-restart (bincode round-trip of the whole state) must preserve the
+        // namespace registry and the committed state root, so a node cannot silently
+        // diverge on the new registry state after reloading from disk.
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        state
+            .execute_transaction(&register_namespace_tx(&alice, namespace, 0), &config)
+            .expect("registration");
+        state
+            .execute_transaction(
+                &transfer_namespace_tx(&alice, namespace, bob.address(), 1),
+                &config,
+            )
+            .expect("transfer");
+        assert_eq!(
+            state.namespaces[&namespace].owner,
+            bob.address(),
+            "registry reflects the transfer before restart"
+        );
+
+        let restored = bincode_restart(&state);
+        assert_eq!(
+            restored.namespaces, state.namespaces,
+            "restart preserves the namespace registry"
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "namespace registry is committed by the state root across a restart"
+        );
+    }
+
+    #[test]
+    fn object_creation_is_not_gated_on_namespace_ownership() {
+        // Regression: the registry is an additive ownership record. Object
+        // create/mutate/transfer/delete keep working on OPEN namespaces exactly as
+        // before — creating an object never requires (or is blocked by) a namespace
+        // claim. Gating is a deliberately deferred later-phase policy decision.
+        let (config, mut state, alice, bob) = funded_state();
+        let namespace = Hash256([0x77; 32]);
+        let create = |creator: &Keypair, id: u8, nonce: u64| {
+            Transaction::for_operation(
+                creator,
+                nonce,
+                Operation::CreateObject {
+                    object_id: ObjectId::new(Hash256([id; 32])),
+                    namespace,
+                    data: vec![0xaa, 0xbb],
+                },
+                unit_fee(20_000),
+            )
+            .expect("create signs")
+        };
+
+        // 1. Create an object under a completely unclaimed namespace: succeeds.
+        state
+            .execute_transaction(&create(&alice, 0x01, 0), &config)
+            .expect("object creation works without any namespace claim");
+
+        // 2. Fund Bob and let him claim the namespace (a different account from the
+        //    object creator).
+        seed_balance(&mut state, &config, &alice, bob.address(), 1_000_000, 1);
+        state
+            .execute_transaction(&register_namespace_tx(&bob, namespace, 0), &config)
+            .expect("bob claims the namespace");
+
+        // 3. Create another object under the now-claimed namespace as Alice, who is
+        //    NOT the namespace owner: still succeeds (open namespaces).
+        state
+            .execute_transaction(&create(&alice, 0x02, 2), &config)
+            .expect("object creation is not blocked by another account's namespace claim");
+
+        assert!(state
+            .objects
+            .contains_key(&ObjectId::new(Hash256([0x01; 32]))));
+        assert!(state
+            .objects
+            .contains_key(&ObjectId::new(Hash256([0x02; 32]))));
+        assert_eq!(state.namespaces[&namespace].owner, bob.address());
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    // ----- Phase 6: localized (per-namespace) fee pricing -----
+
+    /// Runs one block's fee finalization with `namespace` charged `units` this
+    /// block and a zero total (so the global base fee decays), asserting success.
+    fn finish_block_with_namespace_usage(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        namespace: Hash256,
+        units: u64,
+    ) {
+        let mut usage = BTreeMap::new();
+        usage.insert(namespace, units);
+        state
+            .finish_block(0, &usage, config)
+            .expect("block finalization succeeds");
+    }
+
+    fn create_in(namespace: Hash256, seed: &[u8]) -> Operation {
+        Operation::CreateObject {
+            object_id: ObjectId::new(Hash256::digest(seed)),
+            namespace,
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn namespace_congestion_raises_only_its_own_localized_price() {
+        // Phase 6 headline acceptance: heavy load in namespace A raises A's own
+        // localized base fee, while an unrelated namespace B stays at the network
+        // floor — one application's congestion never raises another's price.
+        let (config, mut state, _alice, bob) = funded_state();
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let ns_a = Hash256::digest(b"app-a");
+        let ns_b = Hash256::digest(b"app-b");
+        let hot = config.fee_policy.per_namespace_target_units * 3;
+
+        // Drive many blocks that saturate ONLY namespace A.
+        for _ in 0..24 {
+            finish_block_with_namespace_usage(&mut state, &config, ns_a, hot);
+        }
+
+        let a_fee = state.namespace_fees[&ns_a].base_fee_per_unit;
+        assert!(
+            a_fee > min,
+            "namespace A congestion must raise A's localized fee"
+        );
+
+        // Namespace B never appeared in any usage map: it carries no record and is
+        // priced at exactly the network minimum, unaffected by A's congestion.
+        assert!(!state.namespace_fees.contains_key(&ns_b));
+        assert_eq!(
+            state.base_fee_per_unit_for(&create_in(ns_b, b"b-obj"), &config),
+            min,
+            "an idle namespace prices at the floor regardless of another's congestion"
+        );
+        // A's object operations are priced by A's raised localized fee.
+        assert_eq!(
+            state.base_fee_per_unit_for(&create_in(ns_a, b"a-obj"), &config),
+            a_fee
+        );
+        // Account-scoped operations keep the global base fee, independent of A.
+        assert_eq!(
+            state.base_fee_per_unit_for(
+                &Operation::Transfer {
+                    to: bob.address(),
+                    amount: Amount::from_units(1),
+                },
+                &config,
+            ),
+            state.current_base_fee_per_unit
+        );
+    }
+
+    #[test]
+    fn localized_base_fee_never_drops_below_the_network_minimum() {
+        let (config, mut state, _alice, _bob) = funded_state();
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let ns = Hash256::digest(b"floor-ns");
+        for _ in 0..20 {
+            finish_block_with_namespace_usage(
+                &mut state,
+                &config,
+                ns,
+                config.fee_policy.per_namespace_target_units * 3,
+            );
+        }
+        let raised = state.namespace_fees[&ns].base_fee_per_unit;
+        assert!(raised > min);
+
+        // Idle it: the localized fee decays monotonically, never below the floor,
+        // and once it returns to the floor the record is dropped entirely (so the
+        // committed map stays bounded to currently-congested namespaces).
+        let idle = BTreeMap::new();
+        let mut previous = raised;
+        for _ in 0..2_000 {
+            state.finish_block(0, &idle, &config).expect("finish");
+            let now = state
+                .namespace_fees
+                .get(&ns)
+                .map(|s| s.base_fee_per_unit)
+                .unwrap_or(min);
+            assert!(
+                now <= previous,
+                "localized fee decays monotonically while idle"
+            );
+            assert!(
+                now >= min,
+                "localized fee never drops below the network minimum"
+            );
+            previous = now;
+        }
+        assert!(
+            !state.namespace_fees.contains_key(&ns),
+            "a namespace back at the floor carries no committed record"
+        );
+    }
+
+    #[test]
+    fn object_op_pays_localized_fee_and_account_ops_are_unaffected() {
+        // End-to-end charging: after congesting namespace `ns`, an object op there
+        // is charged its raised localized fee, while a native Transfer keeps paying
+        // the global base fee. Supply still reconciles.
+        let (config, mut state, alice, bob) = funded_state();
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let ns = Hash256::digest(b"hot-app");
+        for _ in 0..24 {
+            finish_block_with_namespace_usage(
+                &mut state,
+                &config,
+                ns,
+                config.fee_policy.per_namespace_target_units * 3,
+            );
+        }
+        let localized = state.namespace_fees[&ns].base_fee_per_unit;
+        assert!(localized > min);
+        // The global fee decayed to the floor across those idle-total blocks.
+        assert_eq!(state.current_base_fee_per_unit, min);
+
+        // A native Transfer (account-scoped) pays the GLOBAL base fee, so a max-fee
+        // at the floor still clears despite the namespace congestion.
+        let before = state.accounts[&alice.address()].balance.0;
+        let transfer = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::Transfer {
+                to: bob.address(),
+                amount: Amount::from_units(1),
+            },
+            unit_fee(1_000),
+        )
+        .expect("transfer signs");
+        state
+            .execute_transaction(&transfer, &config)
+            .expect("transfer clears at the global base fee");
+        let spent = before - state.accounts[&alice.address()].balance.0;
+        assert_eq!(
+            spent,
+            1 + 500 * u128::from(min),
+            "transfer pays amount + units*global_base_fee, not the localized fee"
+        );
+
+        // An object op in the congested namespace priced with a floor max-fee is now
+        // rejected (its localized base fee is above the floor)...
+        let cheap = Transaction::for_operation(&alice, 1, create_in(ns, b"o1"), unit_fee(30_000))
+            .expect("create signs");
+        assert!(matches!(
+            state.execute_transaction(&cheap, &config),
+            Err(ChainError::FeeTooLow)
+        ));
+
+        // ...and clears when the bid covers the localized fee, charged units*localized.
+        let burned_before = state.burned_fees.0;
+        let pool_before = state.validator_fee_pool.0;
+        let create = Transaction::for_operation(
+            &alice,
+            1,
+            create_in(ns, b"o1"),
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: localized,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("create signs");
+        state
+            .execute_transaction(&create, &config)
+            .expect("object op clears at the localized fee");
+        let fee_charged =
+            (state.burned_fees.0 - burned_before) + (state.validator_fee_pool.0 - pool_before);
+        assert_eq!(
+            fee_charged,
+            20_000 * u128::from(localized),
+            "object op is charged units*localized_base_fee"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn localized_base_fees_are_deterministic_across_runs() {
+        // Determinism: identical usage sequences produce identical localized fees
+        // and state roots, independent of run.
+        let (config, _seed_state, _a, _b) = funded_state();
+        let ns1 = Hash256::digest(b"n1");
+        let ns2 = Hash256::digest(b"n2");
+        let run = || {
+            let (_c, mut state, _a, _b) = funded_state();
+            for round in 0..15u64 {
+                let mut usage = BTreeMap::new();
+                usage.insert(
+                    ns1,
+                    config.fee_policy.per_namespace_target_units * 2 + round,
+                );
+                usage.insert(ns2, config.fee_policy.per_namespace_target_units / 2);
+                state
+                    .finish_block(round + 1, &usage, &config)
+                    .expect("finish");
+            }
+            (
+                state.namespace_fees.clone(),
+                state.state_root().expect("root"),
+            )
+        };
+        assert_eq!(
+            run(),
+            run(),
+            "localized fees are a deterministic function of usage"
+        );
+    }
+
+    #[test]
+    fn namespace_fee_state_survives_bincode_restart_with_stable_state_root() {
+        // Crash-restart (bincode round-trip): the committed localized fee state and
+        // the state root must survive, so a node cannot silently diverge on
+        // localized pricing after reloading from disk.
+        let (config, mut state, _alice, _bob) = funded_state();
+        let ns = Hash256::digest(b"restart-fee-ns");
+        for _ in 0..12 {
+            finish_block_with_namespace_usage(
+                &mut state,
+                &config,
+                ns,
+                config.fee_policy.per_namespace_target_units * 3,
+            );
+        }
+        assert!(
+            state.namespace_fees[&ns].base_fee_per_unit > config.fee_policy.min_base_fee_per_unit
+        );
+
+        let restored = bincode_restart(&state);
+        assert_eq!(
+            restored.namespace_fees, state.namespace_fees,
+            "restart preserves the per-namespace fee state"
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "localized fee state is committed by the state root across a restart"
+        );
+    }
+
+    #[test]
+    fn namespace_fee_state_is_committed_by_the_state_root() {
+        // E8 extension: the localized per-namespace fee map is a committed consensus
+        // field (via the namespace_fee_root sub-root), so inserting or changing a
+        // namespace's localized fee must change the state root. Otherwise two nodes
+        // could diverge on localized pricing yet share a state root.
+        let (_config, base, _a, _b) = funded_state();
+        let root = base.state_root().unwrap();
+        let ns = Hash256::digest(b"fee-commit-ns");
+
+        let mut inserted = base.clone();
+        inserted.namespace_fees.insert(
+            ns,
+            NamespaceFeeState {
+                base_fee_per_unit: 7,
+            },
+        );
+        assert_ne!(
+            inserted.state_root().unwrap(),
+            root,
+            "adding a localized fee must change the state root (E8)"
+        );
+
+        let mut changed = inserted.clone();
+        changed
+            .namespace_fees
+            .get_mut(&ns)
+            .unwrap()
+            .base_fee_per_unit = 8;
+        assert_ne!(
+            changed.state_root().unwrap(),
+            inserted.state_root().unwrap(),
+            "changing a localized fee must change the state root (E8)"
+        );
+    }
+
+    // ----- interim contract runtime (Phase 7a, ADR-0014) -----
+
+    /// Genesis funding three accounts (no validators) so epoch advance mints
+    /// nothing and every balance change is a contract move (fee/burn only).
+    fn contract_fixture() -> (ChainConfig, ChainState, Keypair, Keypair, Keypair) {
+        let config = ChainConfig::default();
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let carol = Keypair::from_seed([3u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: alice.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: bob.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: carol.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("contract genesis");
+        (config, state, alice, bob, carol)
+    }
+
+    fn kv_manifest(code_id: Hash256, namespace: Hash256, owner: Address) -> ContractManifest {
+        ContractManifest::new(
+            code_id,
+            namespace,
+            BuiltinContract::KeyValue,
+            [Hash256([0xa1; 32])],
+            owner,
+        )
+    }
+
+    /// Registers a key/value contract; returns the receipt.
+    fn register_kv(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        keypair: &Keypair,
+        nonce: u64,
+        manifest: ContractManifest,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::RegisterContract { manifest },
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("register tx signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    /// Builds a signed contract-invocation transaction with an explicit gas limit.
+    fn invoke_tx(
+        keypair: &Keypair,
+        nonce: u64,
+        manifest: &ContractManifest,
+        input: Vec<u8>,
+        gas_limit: u64,
+    ) -> Transaction {
+        Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::InvokeContract {
+                code_id: manifest.code_id,
+                namespace: manifest.namespace,
+                declared_keys: manifest.footprint.clone(),
+                input,
+            },
+            FeeBid {
+                gas_limit,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("invoke tx signs")
+    }
+
+    #[test]
+    fn register_contract_charges_fee_and_rejects_duplicate() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let before = balance(&state, alice.address());
+        let burned_before = state.burned_fees.0;
+
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        assert_eq!(state.contracts.get(&code_id), Some(&manifest));
+        // The registration fee was burned (plus half the ordinary tx fee).
+        assert_eq!(
+            state.burned_fees.0,
+            burned_before + config.contracts.registration_fee.0 + 30_000 / 2
+        );
+        assert!(before - balance(&state, alice.address()) >= config.contracts.registration_fee.0);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A duplicate code id is rejected and leaves state unchanged.
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_kv(&mut state, &config, &alice, 1, manifest),
+            Err(ChainError::ContractAlreadyExists)
+        ));
+        assert_eq!(state, snapshot, "rejected duplicate leaves state unchanged");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn register_contract_rejects_malformed_manifest() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        // A manifest whose owner is not the registrant fails closed.
+        let bob = Keypair::from_seed([2u8; 32]);
+        let mut manifest = kv_manifest(code_id, namespace, bob.address());
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_kv(&mut state, &config, &alice, 0, manifest.clone()),
+            Err(ChainError::InvalidContractManifest)
+        ));
+        assert_eq!(state, snapshot);
+        // An empty footprint fails closed.
+        manifest.owner = alice.address();
+        manifest.footprint = Vec::new();
+        assert!(matches!(
+            register_kv(&mut state, &config, &alice, 0, manifest),
+            Err(ChainError::InvalidContractManifest)
+        ));
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn invoke_contract_mutates_declared_state_and_conserves_supply() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Increment the counter from zero to 5.
+        let tx = invoke_tx(&alice, 1, &manifest, kv_command::increment(key, 5), 100_000);
+        let receipt = state.execute_transaction(&tx, &config).expect("invoke");
+        assert_eq!(
+            state.contract_state.get(&(namespace, key)),
+            Some(&ContractStateValue(5u128.to_be_bytes().to_vec()))
+        );
+        // The invocation moved no native value beyond the ordinary tx fee.
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::ContractInvoked { code_id: c, .. } if *c == code_id
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A second increment accumulates: 5 + 37 = 42.
+        let tx = invoke_tx(
+            &alice,
+            2,
+            &manifest,
+            kv_command::increment(key, 37),
+            100_000,
+        );
+        state.execute_transaction(&tx, &config).expect("invoke2");
+        assert_eq!(
+            state.contract_state.get(&(namespace, key)),
+            Some(&ContractStateValue(42u128.to_be_bytes().to_vec()))
+        );
+
+        // Set then delete round-trips the value out of state.
+        let tx = invoke_tx(&alice, 3, &manifest, kv_command::set(key, b"data"), 100_000);
+        state.execute_transaction(&tx, &config).expect("set");
+        assert_eq!(
+            state.contract_state.get(&(namespace, key)),
+            Some(&ContractStateValue(b"data".to_vec()))
+        );
+        let tx = invoke_tx(&alice, 4, &manifest, kv_command::delete(key), 100_000);
+        state.execute_transaction(&tx, &config).expect("delete");
+        assert!(!state.contract_state.contains_key(&(namespace, key)));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn invoke_contract_fails_closed_on_undeclared_key() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+
+        // The handler references a key OUTSIDE the declared footprint: the
+        // ContractContext rejects it (via the shared recorder discipline) and the
+        // whole transaction rolls back atomically.
+        let stranger = Hash256([0x99; 32]);
+        let tx = invoke_tx(
+            &alice,
+            1,
+            &manifest,
+            kv_command::increment(stranger, 1),
+            100_000,
+        );
+        let snapshot = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractUndeclaredKey)
+        ));
+        assert_eq!(state, snapshot, "undeclared access leaves state unchanged");
+    }
+
+    #[test]
+    fn invoke_contract_fails_closed_when_access_list_omits_a_footprint_key() {
+        // Directly exercises the StateAccessRecorder reuse: a signed access list
+        // that omits a declared footprint key fails closed when the runtime records
+        // the whole footprint through the recorder.
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        // A two-key footprint so one key can be dropped from the access list.
+        let manifest = ContractManifest::new(
+            code_id,
+            namespace,
+            BuiltinContract::KeyValue,
+            [Hash256([0x21; 32]), Hash256([0x22; 32])],
+            alice.address(),
+        );
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+
+        let dropped = StateKey::application(namespace, manifest.footprint[1]);
+        let mut tx = invoke_tx(
+            &alice,
+            1,
+            &manifest,
+            kv_command::set(manifest.footprint[0], b"x"),
+            100_000,
+        );
+        tx.access_list.read_write.retain(|key| key != &dropped);
+        tx.sign(&alice).expect("re-sign truncated access list");
+        let snapshot = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractUndeclaredKey)
+        ));
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn invoke_contract_over_gas_rolls_back_atomically() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+
+        // Seed a value so the state is non-trivially present before the over-gas call.
+        let tx = invoke_tx(&alice, 1, &manifest, kv_command::set(key, b"seed"), 100_000);
+        state.execute_transaction(&tx, &config).expect("seed set");
+        let snapshot = state.clone();
+
+        // A gas limit just above the admission cost cannot cover the metered
+        // per-host-op consumption, so the call aborts with ContractOutOfGas and the
+        // whole transaction (including its fee) rolls back — state is unchanged.
+        let op = Operation::InvokeContract {
+            code_id,
+            namespace,
+            declared_keys: manifest.footprint.clone(),
+            input: kv_command::increment(key, 1),
+        };
+        let admission = op.required_units();
+        let tx = invoke_tx(
+            &alice,
+            2,
+            &manifest,
+            kv_command::increment(key, 1),
+            admission + 100,
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractOutOfGas)
+        ));
+        assert_eq!(state, snapshot, "over-gas call leaves state unchanged");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn contracts_in_different_namespaces_parallelize_while_same_serializes() {
+        let (config, mut state, alice, bob, carol) = contract_fixture();
+        let ns_a = Hash256([0x11; 32]);
+        let ns_b = Hash256([0x22; 32]);
+        let manifest_a = kv_manifest(Hash256([0xaa; 32]), ns_a, alice.address());
+        let manifest_b = kv_manifest(Hash256([0xbb; 32]), ns_b, alice.address());
+        register_kv(&mut state, &config, &alice, 0, manifest_a.clone()).expect("register A");
+        register_kv(&mut state, &config, &alice, 1, manifest_b.clone()).expect("register B");
+        let key_a = manifest_a.footprint[0];
+        let key_b = manifest_b.footprint[0];
+
+        // Two invocations of DIFFERENT contracts in different namespaces, from
+        // different senders, share no read_write key -> one parallel batch.
+        let inv_a = invoke_tx(
+            &bob,
+            0,
+            &manifest_a,
+            kv_command::increment(key_a, 1),
+            100_000,
+        );
+        let inv_b = invoke_tx(
+            &carol,
+            0,
+            &manifest_b,
+            kv_command::increment(key_b, 1),
+            100_000,
+        );
+        let batches = crate::parallel_batches(&[inv_a.clone(), inv_b]);
+        assert_eq!(batches.len(), 1, "disjoint-namespace contracts parallelize");
+
+        // Two invocations of the SAME contract, from different senders, both write
+        // its application state key -> they must serialize into two batches.
+        let inv_a2 = invoke_tx(
+            &carol,
+            0,
+            &manifest_a,
+            kv_command::increment(key_a, 1),
+            100_000,
+        );
+        let batches = crate::parallel_batches(&[inv_a, inv_a2]);
+        assert_eq!(
+            batches.len(),
+            2,
+            "same-contract invocations serialize on the shared footprint key"
+        );
+    }
+
+    #[test]
+    fn supply_reconciles_across_register_and_invoke() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        for (nonce, input) in [
+            (1, kv_command::increment(key, 3)),
+            (2, kv_command::set(key, b"hello world")),
+            (3, kv_command::delete(key)),
+        ] {
+            let tx = invoke_tx(&alice, nonce, &manifest, input, 100_000);
+            state.execute_transaction(&tx, &config).expect("invoke");
+            assert!(state.supply_invariant_report().unwrap().balanced);
+        }
+    }
+
+    #[test]
+    fn bincode_restart_preserves_contract_registry_and_state_root() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        let tx = invoke_tx(&alice, 1, &manifest, kv_command::increment(key, 9), 100_000);
+        state.execute_transaction(&tx, &config).expect("invoke");
+
+        let restored = bincode_restart(&state);
+        assert_eq!(
+            restored.contracts, state.contracts,
+            "restart preserves the contract registry"
+        );
+        assert_eq!(
+            restored.contract_state, state.contract_state,
+            "restart preserves contract state"
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "the contract registry and state are committed by the state root across a restart"
+        );
+    }
+
+    #[test]
+    fn contract_registry_and_state_are_committed_by_the_state_root() {
+        // E8 extension: the contract registry and contract state maps are committed
+        // consensus fields (via the contract_root / contract_state_root sub-roots),
+        // so registering a contract or writing contract state must change the state
+        // root. Otherwise two nodes could diverge on contract state yet share a root.
+        let (_config, base, alice, ..) = contract_fixture();
+        let root = base.state_root().unwrap();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let key = Hash256([0xa1; 32]);
+
+        let mut with_contract = base.clone();
+        with_contract
+            .contracts
+            .insert(code_id, kv_manifest(code_id, namespace, alice.address()));
+        assert_ne!(
+            with_contract.state_root().unwrap(),
+            root,
+            "registering a contract must change the state root (E8)"
+        );
+
+        let mut with_state = with_contract.clone();
+        with_state
+            .contract_state
+            .insert((namespace, key), ContractStateValue(vec![1, 2, 3]));
+        assert_ne!(
+            with_state.state_root().unwrap(),
+            with_contract.state_root().unwrap(),
+            "writing contract state must change the state root (E8)"
+        );
+    }
+
+    #[test]
+    fn contract_execution_is_deterministic_across_runs() {
+        let build = || {
+            let (config, mut state, alice, ..) = contract_fixture();
+            let code_id = Hash256([0xc0; 32]);
+            let namespace = Hash256([0x11; 32]);
+            let manifest = kv_manifest(code_id, namespace, alice.address());
+            let key = manifest.footprint[0];
+            register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+            for (nonce, delta) in [(1u64, 7u128), (2, 35)] {
+                let tx = invoke_tx(
+                    &alice,
+                    nonce,
+                    &manifest,
+                    kv_command::increment(key, delta),
+                    100_000,
+                );
+                state.execute_transaction(&tx, &config).expect("invoke");
+            }
+            state.state_root().expect("root")
+        };
+        assert_eq!(
+            build(),
+            build(),
+            "identical inputs produce an identical root"
+        );
+    }
+
+    // ----- native DEX batch settlement (Phase 8, §15.13/§15.18/§15.37) -----
+
+    use crate::block_builder::{apply_block, build_block, BlockBuildInput};
+    use crate::dex::{OrderId, OrderSide, Price, TradingPair};
+    use crate::Block;
+
+    /// One external (bridged) asset used as a DEX pair leg in tests.
+    fn ext_asset(tag: u8) -> AssetId {
+        AssetId::External {
+            origin_chain: ExternalChain::Ethereum,
+            symbol: format!("EXT{tag}"),
+            contract_or_mint: format!("0x{tag:02x}"),
+        }
+    }
+
+    fn order_id(tag: u8) -> OrderId {
+        OrderId::new(Hash256([tag; 32]))
+    }
+
+    /// A DEX-tuned config: no epoch rollover noise, an optional per-fill fee.
+    fn dex_config(fee_bps: u16) -> ChainConfig {
+        let mut config = ChainConfig {
+            dex: DexConfig {
+                min_order_amount: Amount::ZERO,
+                default_deadline_blocks: 5,
+                fee_bps,
+            },
+            ..ChainConfig::default()
+        };
+        // Disable the height-boundary epoch rollover so a DEX block advances only
+        // DEX state (no reward minting), keeping the supply-invariant assertions
+        // about exactly the order flow.
+        config.staking.blocks_per_epoch = 0;
+        config
+    }
+
+    /// Genesis funding four native accounts and seeding each with `ext_units` of
+    /// two external assets, so any of them can be a buyer (locks native) or a
+    /// seller (locks the external base).
+    fn dex_fixture(
+        config: &ChainConfig,
+        ext_units: u128,
+    ) -> (ChainState, Keypair, Keypair, Keypair, Keypair) {
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let carol = Keypair::from_seed([3u8; 32]);
+        let dave = Keypair::from_seed([4u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: [&alice, &bob, &carol, &dave]
+                .iter()
+                .map(|kp| GenesisAccount {
+                    address: kp.address(),
+                    balance: Amount::from_webc(1_000),
+                })
+                .collect(),
+            validators: Vec::new(),
+        };
+        let mut state = ChainState::from_genesis(&genesis).expect("dex genesis");
+        // Seed external-asset balances directly (bridged assets are not part of the
+        // native supply invariant, so this does not disturb `balanced`).
+        for kp in [&alice, &bob, &carol, &dave] {
+            for tag in [1u8, 2] {
+                state.asset_balances.insert(
+                    (ext_asset(tag), kp.address()),
+                    Amount::from_units(ext_units),
+                );
+            }
+        }
+        (state, alice, bob, carol, dave)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_order(
+        keypair: &Keypair,
+        nonce: u64,
+        id: OrderId,
+        pair: TradingPair,
+        side: OrderSide,
+        amount: u128,
+        price: u128,
+        deadline_height: u64,
+        fill_or_cancel: bool,
+    ) -> Transaction {
+        Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::SubmitOrder {
+                order_id: id,
+                pair,
+                side,
+                amount: Amount::from_units(amount),
+                limit_price: Price::new(price),
+                deadline_height,
+                fill_or_cancel,
+            },
+            FeeBid {
+                gas_limit: 20_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("submit order signs")
+    }
+
+    fn cancel_order(keypair: &Keypair, nonce: u64, id: OrderId) -> Transaction {
+        Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::CancelOrder { order_id: id },
+            FeeBid {
+                gas_limit: 20_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("cancel order signs")
+    }
+
+    /// Builds one block at `height` carrying `txs`, running the DEX batch pass.
+    fn dex_block(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        height: u64,
+        txs: Vec<Transaction>,
+    ) -> Result<Block, ChainError> {
+        build_block(
+            state,
+            config,
+            BlockBuildInput {
+                chain_id: config.chain_id.clone(),
+                height,
+                epoch: 0,
+                previous_hash: Hash256::ZERO,
+                proposer: Keypair::from_seed([1u8; 32]).address(),
+                timestamp_ms: height.saturating_mul(1_000).max(1),
+            },
+            txs,
+            Vec::new(),
+        )
+    }
+
+    fn native_balance(state: &ChainState, addr: Address) -> Amount {
+        state
+            .accounts
+            .get(&addr)
+            .map(|a| a.balance)
+            .unwrap_or(Amount::ZERO)
+    }
+
+    fn ext_balance(state: &ChainState, asset: &AssetId, addr: Address) -> Amount {
+        state
+            .asset_balances
+            .get(&(asset.clone(), addr))
+            .copied()
+            .unwrap_or(Amount::ZERO)
+    }
+
+    #[test]
+    fn crossing_orders_fill_at_one_uniform_price_and_supply_balances() {
+        // Pair (base = EXT1, quote = native WEBC): a buyer locks native, a seller
+        // locks EXT. A buy 100 @ 10 and a sell 100 @ 8 cross; the marginal spread
+        // [8, 10] clears at the midpoint 9, both fully fill in the same block.
+        // Driven through `settle_dex_batch` directly so the settlement events can be
+        // inspected (the block path discards them like oracle-settlement events).
+        let config = dex_config(0);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 1_000);
+        state.current_height = 1;
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let alice_native_before = native_balance(&state, alice.address());
+        let bob_native_before = native_balance(&state, bob.address());
+
+        state
+            .execute_transaction(
+                &submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                &config,
+            )
+            .expect("alice submits");
+        state
+            .execute_transaction(
+                &submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+                &config,
+            )
+            .expect("bob submits");
+        let events = state.settle_dex_batch(&config).expect("batch settles");
+
+        // Both orders fully filled and removed.
+        assert!(state.dex_orders.is_empty(), "both orders fully filled");
+        assert_eq!(state.dex_escrow, Amount::ZERO, "escrow fully settled");
+
+        // Every fill in the batch trades at the single clearing price 9.
+        let clearing: Vec<Price> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::OrderFilled { clearing_price, .. } => Some(*clearing_price),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clearing, vec![Price::new(9), Price::new(9)]);
+
+        // Buyer received 100 EXT and paid 100*9 = 900 native (locked 1000, refunded
+        // the 100 price improvement). Fees for this block are only the tx fees.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), alice.address()),
+            Amount::from_units(1_100)
+        );
+        let fee_per_submit = Amount::from_units(10_000); // 10_000 units * 1 base unit
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            alice_native_before
+                .checked_sub(Amount::from_units(900))
+                .and_then(|a| a.checked_sub(fee_per_submit))
+                .unwrap()
+        );
+        // Seller delivered 100 EXT and received 900 native.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), bob.address()),
+            Amount::from_units(900)
+        );
+        assert_eq!(
+            native_balance(&state, bob.address()),
+            bob_native_before
+                .checked_add(Amount::from_units(900))
+                .and_then(|a| a.checked_sub(fee_per_submit))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn non_crossing_orders_stay_pending_and_retry() {
+        // Buy 100 @ 8 and sell 100 @ 10 do not cross; both stay pending across
+        // blocks (chain-native retry) until a crossing order arrives.
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("non-crossing block");
+        assert_eq!(
+            state.dex_orders.len(),
+            2,
+            "non-crossing orders stay pending"
+        );
+
+        // An empty block retries them; still no cross, still pending.
+        dex_block(&mut state, &config, 2, Vec::new()).expect("retry block");
+        assert_eq!(state.dex_orders.len(), 2);
+
+        // Carol adds a crossing sell @ 8; now the buy @ 8 fills against it.
+        dex_block(
+            &mut state,
+            &config,
+            3,
+            vec![submit_order(
+                &carol,
+                0,
+                order_id(3),
+                pair.clone(),
+                OrderSide::Sell,
+                100,
+                8,
+                50,
+                false,
+            )],
+        )
+        .expect("crossing block");
+        // Alice's buy (100 @ 8) and Carol's sell (100 @ 8) cleared and were removed;
+        // Bob's non-crossing sell @ 10 remains pending.
+        assert!(!state.dex_orders.contains_key(&order_id(1)));
+        assert!(!state.dex_orders.contains_key(&order_id(3)));
+        assert!(state.dex_orders.contains_key(&order_id(2)));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn short_side_is_rationed_prorata_with_no_dust_and_the_remainder_retries() {
+        // Three buyers of 100 each (limit 10) against one seller of 100 (limit 8).
+        // Demand 300 > supply 100, so buyers are rationed pro-rata to 100:
+        // cumulative rounding gives [33, 33, 34], summing to exactly 100 (no dust).
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, dave) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &carol,
+                    0,
+                    order_id(3),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &dave,
+                    0,
+                    order_id(4),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("prorata block");
+
+        // The seller fully filled and is gone; the three buyers keep pro-rata
+        // remainders whose fills sum to exactly the 100 that traded.
+        assert!(!state.dex_orders.contains_key(&order_id(4)));
+        let fills: Vec<u128> = [order_id(1), order_id(2), order_id(3)]
+            .iter()
+            .map(|id| {
+                let order = &state.dex_orders[id];
+                Amount::from_units(100).0 - order.remaining.0
+            })
+            .collect();
+        assert_eq!(fills, vec![33, 33, 34]);
+        assert_eq!(fills.iter().sum::<u128>(), 100, "no dust lost");
+        // Remainders retry: each buyer still has an order with the residual amount.
+        for (id, filled) in [order_id(1), order_id(2), order_id(3)].iter().zip(&fills) {
+            assert_eq!(
+                state.dex_orders[id].remaining,
+                Amount::from_units(100 - filled)
+            );
+        }
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn uniform_price_gives_no_participant_a_worse_price_than_a_peer() {
+        // Two buyers with different limits (10 and 12) and one seller (8). Both
+        // buyers trade at the identical clearing price — the aggressive buyer is not
+        // charged more than the marginal one (no intra-block ordering advantage).
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, _d) = dex_fixture(&config, 1_000);
+        state.current_height = 1;
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        for tx in [
+            submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                10,
+                50,
+                false,
+            ),
+            submit_order(
+                &carol,
+                0,
+                order_id(3),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                12,
+                50,
+                false,
+            ),
+            submit_order(
+                &bob,
+                0,
+                order_id(2),
+                pair.clone(),
+                OrderSide::Sell,
+                100,
+                8,
+                50,
+                false,
+            ),
+        ] {
+            state.execute_transaction(&tx, &config).expect("submit");
+        }
+        let events = state.settle_dex_batch(&config).expect("batch settles");
+
+        // Both buy fills carry the same clearing price and the same per-unit quote.
+        let buy_fills: Vec<(Price, u128, u128)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::OrderFilled {
+                    side: OrderSide::Buy,
+                    clearing_price,
+                    filled,
+                    quote,
+                    ..
+                } => Some((*clearing_price, filled.0, quote.0)),
+                _ => None,
+            })
+            .collect::<Vec<(Price, u128, u128)>>();
+        assert_eq!(buy_fills.len(), 2);
+        let price = buy_fills[0].0;
+        for (p, filled, quote) in &buy_fills {
+            assert_eq!(*p, price, "both buyers clear at one uniform price");
+            // Per-unit price is identical: quote == filled * clearing_price.
+            assert_eq!(*quote, filled * price.get());
+        }
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn fill_or_cancel_cancels_an_unfilled_order_same_block() {
+        // A fill-or-cancel buy with no crossing counter-order is cancelled and fully
+        // refunded in the same block it is submitted.
+        let config = dex_config(0);
+        let (mut state, alice, _b, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let before = native_balance(&state, alice.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                8,
+                50,
+                true,
+            )],
+        )
+        .expect("foc block");
+        assert!(
+            state.dex_orders.is_empty(),
+            "unfilled FoC order cancels same block"
+        );
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        // Alice paid only the transaction fee; her 100*8 lock was refunded.
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            before.checked_sub(Amount::from_units(10_000)).unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn fill_or_cancel_partial_fill_cancels_the_remainder_same_block() {
+        // A FoC buy of 100 @ 10 against a sell of 40 @ 8: 40 fills at the clearing
+        // price, the 60 remainder is cancelled and refunded the same block.
+        let config = dex_config(0);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    true,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    40,
+                    8,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("foc partial block");
+        // Both orders gone: the seller fully filled, the FoC buyer filled 40 and
+        // cancelled the remaining 60.
+        assert!(state.dex_orders.is_empty());
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), alice.address()),
+            Amount::from_units(1_040)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn an_order_past_its_deadline_auto_refunds() {
+        // An order with deadline height 1 settles in block 1 (no cross) then expires
+        // at block 2, refunding its lock.
+        let config = dex_config(0);
+        let (mut state, alice, _b, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let before = native_balance(&state, alice.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                8,
+                1,
+                false,
+            )],
+        )
+        .expect("submit block");
+        assert!(
+            state.dex_orders.contains_key(&order_id(1)),
+            "still live on its deadline block"
+        );
+
+        dex_block(&mut state, &config, 2, Vec::new()).expect("expiry block");
+        assert!(
+            !state.dex_orders.contains_key(&order_id(1)),
+            "expired past its deadline"
+        );
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            before.checked_sub(Amount::from_units(10_000)).unwrap(),
+            "lock refunded on expiry; only the tx fee is spent"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn cancel_refunds_the_locked_remainder() {
+        // Submit in block 1, cancel in block 2; the batch pass refunds the lock.
+        let config = dex_config(0);
+        let (mut state, alice, _b, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let before = native_balance(&state, alice.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![submit_order(
+                &alice,
+                0,
+                order_id(1),
+                pair.clone(),
+                OrderSide::Buy,
+                100,
+                8,
+                50,
+                false,
+            )],
+        )
+        .expect("submit block");
+        // Escrow holds the 100*8 = 800 native lock while the order is live.
+        assert_eq!(state.dex_escrow, Amount::from_units(800));
+
+        dex_block(
+            &mut state,
+            &config,
+            2,
+            vec![cancel_order(&alice, 1, order_id(1))],
+        )
+        .expect("cancel block");
+        assert!(state.dex_orders.is_empty(), "cancelled order removed");
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            before.checked_sub(Amount::from_units(20_000)).unwrap(),
+            "lock refunded; two tx fees spent (submit + cancel)"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn two_disjoint_pairs_settle_independently() {
+        // A crossing pair on EXT1 and a crossing pair on EXT2 both settle in one
+        // block without interacting.
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, dave) = dex_fixture(&config, 1_000);
+        let pair1 = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let pair2 = TradingPair::new(ext_asset(2), AssetId::NativeWebc);
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair1.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair1.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &carol,
+                    0,
+                    order_id(3),
+                    pair2.clone(),
+                    OrderSide::Buy,
+                    50,
+                    20,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &dave,
+                    0,
+                    order_id(4),
+                    pair2.clone(),
+                    OrderSide::Sell,
+                    50,
+                    18,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("two-pair block");
+        // Both pairs fully cleared and every order was removed.
+        assert!(state.dex_orders.is_empty());
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        // EXT1 traded 100 at pc 9; EXT2 traded 50 at pc 19.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), alice.address()),
+            Amount::from_units(1_100)
+        );
+        assert_eq!(
+            ext_balance(&state, &ext_asset(2), carol.address()),
+            Amount::from_units(1_050)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_fill_fee_on_a_native_quote_is_split_and_supply_balances() {
+        // With a 100 bps (1%) per-fill fee and a native quote, the seller's proceeds
+        // are taxed and the fee is split 50/50 burn/validator. Supply still balances.
+        let config = dex_config(100);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        let burned_before = state.burned_fees;
+        let pool_before = state.validator_fee_pool;
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    8,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("fee block");
+        // Gross proceeds 100*9 = 900; fee 1% = 9; seller nets 891.
+        // The 9-unit fee (split 4 burned / 5 validator) is on top of the two tx fees.
+        let submit_fees_burned = Amount::from_units(10_000); // 2 tx * 5_000 burned half
+        assert_eq!(
+            state.burned_fees,
+            burned_before
+                .checked_add(submit_fees_burned)
+                .and_then(|b| b.checked_add(Amount::from_units(4)))
+                .unwrap()
+        );
+        assert_eq!(
+            state.validator_fee_pool,
+            pool_before
+                .checked_add(Amount::from_units(10_000))
+                .and_then(|p| p.checked_add(Amount::from_units(5)))
+                .unwrap()
+        );
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn settlement_is_deterministic_and_identical_on_build_and_import() {
+        // The batch pass is a pure function of committed state + height, so a second
+        // producer builds the identical block and an importer reproduces it exactly.
+        let config = dex_config(30);
+        let build_once = || {
+            let (mut state, alice, bob, carol, dave) = dex_fixture(&config, 1_000);
+            let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+            let block = dex_block(
+                &mut state,
+                &config,
+                1,
+                vec![
+                    submit_order(
+                        &alice,
+                        0,
+                        order_id(1),
+                        pair.clone(),
+                        OrderSide::Buy,
+                        100,
+                        10,
+                        50,
+                        false,
+                    ),
+                    submit_order(
+                        &carol,
+                        0,
+                        order_id(3),
+                        pair.clone(),
+                        OrderSide::Buy,
+                        70,
+                        9,
+                        50,
+                        false,
+                    ),
+                    submit_order(
+                        &bob,
+                        0,
+                        order_id(2),
+                        pair.clone(),
+                        OrderSide::Sell,
+                        120,
+                        8,
+                        50,
+                        false,
+                    ),
+                    submit_order(
+                        &dave,
+                        0,
+                        order_id(4),
+                        pair.clone(),
+                        OrderSide::Sell,
+                        30,
+                        9,
+                        50,
+                        false,
+                    ),
+                ],
+            )
+            .expect("block builds");
+            (state, block)
+        };
+        let (producer_a, block_a) = build_once();
+        let (producer_b, block_b) = build_once();
+        assert_eq!(block_a.header, block_b.header, "deterministic across runs");
+        assert_eq!(
+            producer_a.state_root().unwrap(),
+            producer_b.state_root().unwrap()
+        );
+
+        // An importer re-executes the block onto fresh genesis and lands identically.
+        let (mut importer, _a, _b, _c, _d) = dex_fixture(&config, 1_000);
+        apply_block(&mut importer, &config, &block_a).expect("import");
+        assert_eq!(
+            importer.state_root().unwrap(),
+            producer_a.state_root().unwrap(),
+            "build == import"
+        );
+        assert_eq!(importer.dex_orders, producer_a.dex_orders);
+        assert_eq!(importer.dex_escrow, producer_a.dex_escrow);
+        assert!(importer.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn bincode_restart_preserves_orders_escrow_and_state_root() {
+        // A crash-restart round trip through the on-disk bincode config must
+        // preserve every live order, the escrow scalar, and the committed state root.
+        let config = dex_config(0);
+        let (mut state, alice, bob, carol, _d) = dex_fixture(&config, 1_000);
+        let pair = TradingPair::new(ext_asset(1), AssetId::NativeWebc);
+        // One partial fill (remainder retries) plus a pending non-crossing order, so
+        // both a live remainder and escrow are non-trivial across the restart.
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    100,
+                    10,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    40,
+                    8,
+                    50,
+                    false,
+                ),
+                submit_order(
+                    &carol,
+                    0,
+                    order_id(3),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    100,
+                    20,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("mixed block");
+        assert!(!state.dex_orders.is_empty());
+        assert!(!state.dex_escrow.is_zero());
+
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.dex_orders, state.dex_orders);
+        assert_eq!(restored.dex_escrow, state.dex_escrow);
+        assert_eq!(restored.current_height, state.current_height);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            state.state_root().unwrap(),
+            "orders and escrow are committed by the state root across a restart"
+        );
+        assert!(restored.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn a_native_base_sell_locks_and_settles_through_dex_escrow() {
+        // Orientation check: pair (base = native WEBC, quote = EXT). A sell of native
+        // WEBC locks native into `dex_escrow`; the buyer pays EXT. Exercises the
+        // native-base escrow routing (the mirror of the native-quote tests above).
+        let config = dex_config(0);
+        let (mut state, alice, bob, _c, _d) = dex_fixture(&config, 100_000);
+        let pair = TradingPair::new(AssetId::NativeWebc, ext_asset(1));
+        let bob_native_before = native_balance(&state, bob.address());
+        dex_block(
+            &mut state,
+            &config,
+            1,
+            vec![
+                // Bob sells 500 native WEBC @ 8 EXT each (locks 500 native).
+                submit_order(
+                    &bob,
+                    0,
+                    order_id(2),
+                    pair.clone(),
+                    OrderSide::Sell,
+                    500,
+                    8,
+                    50,
+                    false,
+                ),
+                // Alice buys 500 native WEBC @ 10 EXT each (locks 5000 EXT).
+                submit_order(
+                    &alice,
+                    0,
+                    order_id(1),
+                    pair.clone(),
+                    OrderSide::Buy,
+                    500,
+                    10,
+                    50,
+                    false,
+                ),
+            ],
+        )
+        .expect("native-base block");
+        assert!(state.dex_orders.is_empty());
+        assert_eq!(
+            state.dex_escrow,
+            Amount::ZERO,
+            "native base escrow fully settled"
+        );
+        // Alice received 500 native WEBC; Bob delivered 500 (minus his tx fee).
+        assert_eq!(
+            native_balance(&state, alice.address()),
+            // started 1000 WEBC, minus tx fee, plus 500 received.
+            Amount::from_webc(1_000)
+                .checked_sub(Amount::from_units(10_000))
+                .and_then(|a| a.checked_add(Amount::from_units(500)))
+                .unwrap()
+        );
+        assert_eq!(
+            native_balance(&state, bob.address()),
+            bob_native_before
+                .checked_sub(Amount::from_units(500))
+                .and_then(|a| a.checked_sub(Amount::from_units(10_000)))
+                .unwrap()
+        );
+        // Alice paid 500*9 = 4500 EXT; Bob received 4500 EXT.
+        assert_eq!(
+            ext_balance(&state, &ext_asset(1), bob.address()),
+            Amount::from_units(104_500)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    // ----- native fungible tokens (Phase 13a, §15) -----
+
+    /// The application namespace all native-token tests create under.
+    fn token_namespace() -> Hash256 {
+        Hash256([0x77; 32])
+    }
+
+    /// A valid sample token metadata record (name "Acme Dollar", symbol "ACME").
+    fn sample_token_metadata() -> crate::TokenMetadata {
+        crate::TokenMetadata::new(
+            b"Acme Dollar".to_vec(),
+            b"ACME".to_vec(),
+            6,
+            Hash256([0x1f; 32]),
+        )
+        .expect("valid metadata")
+    }
+
+    /// Genesis funding a token creator (also the default authority holder), a
+    /// holder, and an outsider — all with room for the creation deposit + fees.
+    fn token_fixture() -> (ChainConfig, ChainState, Keypair, Keypair, Keypair) {
+        let config = ChainConfig::default();
+        let creator = Keypair::from_seed([51u8; 32]);
+        let holder = Keypair::from_seed([52u8; 32]);
+        let outsider = Keypair::from_seed([53u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: creator.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: holder.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: outsider.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("token genesis");
+        (config, state, creator, holder, outsider)
+    }
+
+    /// The token units `addr` holds of `token_id` (0 when the entry is pruned).
+    fn token_balance(state: &ChainState, token_id: TokenId, addr: Address) -> u128 {
+        state
+            .token_balances
+            .get(&(token_id, addr))
+            .map_or(0, |a| a.0)
+    }
+
+    /// Creates a token owned by `creator` and returns its derived id.
+    #[allow(clippy::too_many_arguments)]
+    fn create_token(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        creator: &Keypair,
+        nonce: u64,
+        create_nonce: u64,
+        mint_authority: Option<Address>,
+        freeze_authority: Option<Address>,
+        initial_supply: Amount,
+        initial_recipient: Address,
+    ) -> Result<TokenId, ChainError> {
+        mandate_exec(
+            state,
+            config,
+            creator,
+            nonce,
+            Operation::CreateToken {
+                namespace: token_namespace(),
+                create_nonce,
+                metadata: sample_token_metadata(),
+                mint_authority,
+                freeze_authority,
+                initial_supply,
+                initial_recipient,
+            },
+        )?;
+        Ok(TokenId::derive(
+            token_namespace(),
+            creator.address(),
+            create_nonce,
+        ))
+    }
+
+    #[test]
+    fn create_records_token_and_reads_back_with_supply_balanced() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        let creator_liquid_before = balance(&state, creator.address());
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            creator.address(),
+        )
+        .expect("create succeeds");
+
+        let record = state.tokens.get(&token_id).expect("token exists");
+        assert_eq!(record.creator, creator.address());
+        assert_eq!(record.mint_authority, Some(creator.address()));
+        assert_eq!(record.freeze_authority, Some(creator.address()));
+        assert!(!record.paused);
+        assert_eq!(record.issued_supply, Amount::from_units(1_000));
+        assert_eq!(record.metadata.symbol, b"ACME");
+        // The initial supply is credited to the recipient.
+        assert_eq!(token_balance(&state, token_id, creator.address()), 1_000);
+
+        // The deposit is locked into token_deposits; native supply still balances
+        // (only the deposit + fee left the creator's liquid balance — no WEBC minted
+        // or burned by token creation).
+        let deposit = config.token.creation_deposit;
+        assert_eq!(state.token_deposits, deposit);
+        let report = state.supply_invariant_report().unwrap();
+        assert!(report.balanced);
+        assert_eq!(report.token_deposits, deposit);
+        assert!(balance(&state, creator.address()) < creator_liquid_before);
+
+        // The per-token supply invariant holds: issued == held.
+        let tok = state.token_supply_report(token_id).unwrap();
+        assert!(tok.balanced);
+        assert_eq!(tok.issued, Amount::from_units(1_000));
+        assert_eq!(tok.held, Amount::from_units(1_000));
+    }
+
+    #[test]
+    fn duplicate_token_id_is_rejected() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("first create");
+        // Same (namespace, creator, create_nonce) derives the same id: rejected.
+        let before = state.clone();
+        let err = create_token(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            0,
+            Some(creator.address()),
+            None,
+            Amount::ZERO,
+            creator.address(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAlreadyExists));
+        assert_eq!(state, before, "rejected duplicate leaves state unchanged");
+    }
+
+    #[test]
+    fn over_length_metadata_and_bad_decimals_are_rejected_on_apply() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        let bad_create = |metadata: crate::TokenMetadata, nonce: u64| Operation::CreateToken {
+            namespace: token_namespace(),
+            create_nonce: nonce,
+            metadata,
+            mint_authority: Some(creator.address()),
+            freeze_authority: None,
+            initial_supply: Amount::ZERO,
+            initial_recipient: creator.address(),
+        };
+        // Over-length name.
+        let mut m = sample_token_metadata();
+        m.name = vec![0x61; crate::MAX_TOKEN_NAME_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 0)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidTokenMetadata));
+        // Over-length symbol.
+        let mut m = sample_token_metadata();
+        m.symbol = vec![0x61; crate::MAX_TOKEN_SYMBOL_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 1)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidTokenMetadata));
+        // Out-of-range decimals.
+        let mut m = sample_token_metadata();
+        m.decimals = crate::MAX_TOKEN_DECIMALS + 1;
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 2)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidTokenMetadata));
+        // No token was recorded and no deposit was locked on any rejected create.
+        assert!(state.tokens.is_empty());
+        assert_eq!(state.token_deposits, Amount::ZERO);
+    }
+
+    #[test]
+    fn mint_requires_authority_and_raises_supply() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("create");
+        // A non-authority cannot mint.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(500),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenMintNotAuthorized));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+        // The authority mints: recipient credited, issued_supply raised.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(500),
+            },
+        )
+        .expect("authority mint");
+        assert_eq!(token_balance(&state, token_id, holder.address()), 500);
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(500)
+        );
+        // Both invariants hold, and no native WEBC was created by the mint.
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn mint_to_frozen_account_is_rejected() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("create");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(100),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+    }
+
+    #[test]
+    fn burn_reduces_holder_and_supply_with_guards() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        // Burning more than held is rejected.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(2_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenInsufficientBalance));
+        assert_eq!(state, before, "rejected burn leaves state unchanged");
+        // Burning while frozen is rejected.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(100),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+        // Thaw, then a burn reduces the holder AND the issued supply by the same.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::ThawTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("thaw");
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(400),
+            },
+        )
+        .expect("burn");
+        assert_eq!(token_balance(&state, token_id, holder.address()), 600);
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(600)
+        );
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn transfer_moves_balance_prunes_zero_and_guards() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        // Insufficient balance is rejected.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(2_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenInsufficientBalance));
+        assert_eq!(state, before, "rejected transfer leaves state unchanged");
+        // A full-balance transfer moves the units and PRUNES the zero sender entry.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .expect("transfer all");
+        assert_eq!(token_balance(&state, token_id, outsider.address()), 1_000);
+        assert!(
+            !state
+                .token_balances
+                .contains_key(&(token_id, holder.address())),
+            "a sender balance that reaches zero is pruned"
+        );
+        // A transfer conserves supply: issued_supply is unchanged and both invariants
+        // still hold.
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(1_000)
+        );
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        // Pausing rejects further transfers.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetTokenPaused {
+                token_id,
+                paused: true,
+            },
+        )
+        .expect("pause");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(10),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenPaused));
+        // Unpause, then a frozen RECIPIENT rejects the transfer.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetTokenPaused {
+                token_id,
+                paused: false,
+            },
+        )
+        .expect("unpause");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze recipient");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(10),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+    }
+
+    #[test]
+    fn freeze_blocks_sending_and_thaw_restores_it() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        // Freeze the SENDER: a transfer from it is rejected.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(100),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+        // Thaw: the transfer now succeeds.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::ThawTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("thaw");
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(100),
+            },
+        )
+        .expect("transfer after thaw");
+        assert_eq!(token_balance(&state, token_id, outsider.address()), 100);
+        assert_eq!(token_balance(&state, token_id, holder.address()), 900);
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn authority_transfer_moves_control_and_renounce_is_permanent() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("create");
+        // Transfer the mint authority from creator to holder.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .expect("transfer mint authority");
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().mint_authority,
+            Some(holder.address())
+        );
+        // The OLD authority (creator) can no longer mint.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintToken {
+                token_id,
+                recipient: creator.address(),
+                amount: Amount::from_units(1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenMintNotAuthorized));
+        // The NEW authority (holder) can mint.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(50),
+            },
+        )
+        .expect("new authority mint");
+        // A non-authority cannot transfer/renounce the authority.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: Some(outsider.address()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAuthorityNotAuthorized));
+        // The current authority (holder) RENOUNCES minting: Some -> None, permanent.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            1,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: None,
+            },
+        )
+        .expect("renounce mint");
+        assert_eq!(state.tokens.get(&token_id).unwrap().mint_authority, None);
+        // Minting is now impossible for anyone.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenMintNotAuthorized));
+        // The renounced authority can NEVER be restored (a Phase 13 criterion).
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAuthorityNotAuthorized));
+        // Renouncing the freeze authority likewise permanently disables freezing.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Freeze,
+                new_authority: None,
+            },
+        )
+        .expect("renounce freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenFreezeNotAuthorized));
+    }
+
+    #[test]
+    fn both_supply_invariants_hold_after_every_step() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let assert_both = |state: &ChainState, token_id: TokenId| {
+            assert!(
+                state.supply_invariant_report().unwrap().balanced,
+                "native WEBC supply must stay balanced (token ops never mint/burn WEBC)"
+            );
+            assert!(
+                state.token_supply_report(token_id).unwrap().balanced,
+                "per-token supply must equal the sum of held balances"
+            );
+        };
+        // Create with an initial mint to the creator.
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            creator.address(),
+        )
+        .expect("create");
+        assert_both(&state, token_id);
+        // Mint more to the holder.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(500),
+            },
+        )
+        .expect("mint");
+        assert_both(&state, token_id);
+        // Burn part of the creator's own balance.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(200),
+            },
+        )
+        .expect("burn");
+        assert_both(&state, token_id);
+        // Transfer from the holder to the outsider.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(300),
+            },
+        )
+        .expect("transfer");
+        assert_both(&state, token_id);
+        // Final tallies: issued = 1000 + 500 - 200 = 1300; held sums to 1300.
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(1_300)
+        );
+        assert_eq!(token_balance(&state, token_id, creator.address()), 800);
+        assert_eq!(token_balance(&state, token_id, holder.address()), 200);
+        assert_eq!(token_balance(&state, token_id, outsider.address()), 300);
+        assert_eq!(
+            state.token_supply_report(token_id).unwrap().held,
+            Amount::from_units(1_300)
+        );
+    }
+
+    #[test]
+    fn token_state_is_committed_by_the_state_root() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let root_empty = state.state_root().unwrap();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        let root_after_create = state.state_root().unwrap();
+        assert_ne!(
+            root_after_create, root_empty,
+            "creating a token moves the state root"
+        );
+        // A bincode restart preserves the token collections and the deposit scalar,
+        // so the committed state root is stable across a crash/restart.
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.tokens, state.tokens);
+        assert_eq!(restored.token_balances, state.token_balances);
+        assert_eq!(restored.frozen_token_accounts, state.frozen_token_accounts);
+        assert_eq!(restored.token_deposits, state.token_deposits);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            root_after_create,
+            "token state is committed by the state root across a restart"
+        );
+        // Freezing an account moves the frozen sub-root and thus the state root.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        assert_ne!(
+            state.state_root().unwrap(),
+            root_after_create,
+            "freezing an account moves the state root"
+        );
+    }
+
+    // ----- native NFTs (Phase 13b, §15) -----
+
+    fn nft_namespace() -> Hash256 {
+        Hash256([0x99; 32])
+    }
+
+    /// A valid sample collection metadata record (name "Acme Apes", symbol "APE").
+    fn sample_nft_metadata() -> crate::NftMetadata {
+        crate::NftMetadata::new(b"Acme Apes".to_vec(), b"APE".to_vec(), Hash256([0x2f; 32]))
+            .expect("valid metadata")
+    }
+
+    /// Creates a collection owned by `creator` and returns its derived id.
+    #[allow(clippy::too_many_arguments)]
+    fn create_collection(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        creator: &Keypair,
+        nonce: u64,
+        create_nonce: u64,
+        mint_authority: Option<Address>,
+        freeze_authority: Option<Address>,
+        max_supply: Option<u64>,
+        royalty_bps: u16,
+    ) -> Result<NftCollectionId, ChainError> {
+        mandate_exec(
+            state,
+            config,
+            creator,
+            nonce,
+            Operation::CreateNftCollection {
+                namespace: nft_namespace(),
+                create_nonce,
+                metadata: sample_nft_metadata(),
+                mint_authority,
+                freeze_authority,
+                max_supply,
+                royalty_bps,
+            },
+        )?;
+        Ok(NftCollectionId::derive(
+            nft_namespace(),
+            creator.address(),
+            create_nonce,
+        ))
+    }
+
+    /// Mints one item and returns its chain-assigned [`NftId`] (from the receipt
+    /// event, proving the id is discoverable from the receipt).
+    fn mint_nft(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        signer: &Keypair,
+        nonce: u64,
+        collection_id: NftCollectionId,
+        recipient: Address,
+    ) -> Result<NftId, ChainError> {
+        let receipt = mandate_exec(
+            state,
+            config,
+            signer,
+            nonce,
+            Operation::MintNft {
+                collection_id,
+                recipient,
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )?;
+        Ok(receipt
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::NftMinted { nft_id, .. } => Some(*nft_id),
+                _ => None,
+            })
+            .expect("mint event carries the nft id"))
+    }
+
+    /// Asserts BOTH invariants: native WEBC supply is balanced, and the
+    /// per-collection item invariant `minted - burned == live items` holds.
+    fn assert_nft_invariants(state: &ChainState, collection_id: NftCollectionId) {
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "native WEBC supply must stay balanced across every NFT op"
+        );
+        assert!(
+            state
+                .nft_collection_supply_report(collection_id)
+                .unwrap()
+                .balanced,
+            "minted - burned must equal the live item count"
+        );
+    }
+
+    #[test]
+    fn create_records_collection_and_reads_back_with_supply_balanced() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        let creator_liquid_before = balance(&state, creator.address());
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Some(3),
+            500,
+        )
+        .expect("create succeeds");
+
+        let record = state
+            .nft_collections
+            .get(&collection_id)
+            .expect("collection exists");
+        assert_eq!(record.creator, creator.address());
+        assert_eq!(record.mint_authority, Some(creator.address()));
+        assert_eq!(record.freeze_authority, Some(creator.address()));
+        assert!(!record.paused);
+        assert_eq!(record.next_serial, 0);
+        assert_eq!(record.minted_count, 0);
+        assert_eq!(record.burned_count, 0);
+        assert_eq!(record.max_supply, Some(3));
+        assert_eq!(record.royalty_bps, 500);
+        assert_eq!(record.metadata.symbol, b"APE");
+
+        // The deposit is locked into nft_deposits; native supply still balances (only
+        // the deposit + fee left the creator's liquid balance — no WEBC minted/burned
+        // by collection creation).
+        let deposit = config.nft.creation_deposit;
+        assert_eq!(state.nft_deposits, deposit);
+        let report = state.supply_invariant_report().unwrap();
+        assert!(report.balanced);
+        assert_eq!(report.nft_deposits, deposit);
+        assert!(balance(&state, creator.address()) < creator_liquid_before);
+
+        // The per-collection item invariant holds from creation: 0 minted, 0 live.
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn duplicate_collection_id_is_rejected() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("first create");
+        // Same (namespace, creator, create_nonce) derives the same id: rejected.
+        let before = state.clone();
+        let err = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftCollectionAlreadyExists));
+        assert_eq!(state, before, "rejected duplicate leaves state unchanged");
+    }
+
+    #[test]
+    fn over_length_metadata_and_bad_royalty_are_rejected_on_apply() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        let bad_create = |metadata: crate::NftMetadata, royalty_bps: u16, nonce: u64| {
+            Operation::CreateNftCollection {
+                namespace: nft_namespace(),
+                create_nonce: nonce,
+                metadata,
+                mint_authority: Some(creator.address()),
+                freeze_authority: None,
+                max_supply: None,
+                royalty_bps,
+            }
+        };
+        // Over-length name.
+        let mut m = sample_nft_metadata();
+        m.name = vec![0x61; crate::MAX_NFT_NAME_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 0, 0)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidNftMetadata));
+        // Over-length symbol.
+        let mut m = sample_nft_metadata();
+        m.symbol = vec![0x61; crate::MAX_NFT_SYMBOL_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 0, 1)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidNftMetadata));
+        // Out-of-range royalty.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            bad_create(sample_nft_metadata(), crate::MAX_NFT_ROYALTY_BPS + 1, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::InvalidNftMetadata));
+        // No collection was recorded and no deposit was locked on any rejected create.
+        assert!(state.nft_collections.is_empty());
+        assert_eq!(state.nft_deposits, Amount::ZERO);
+    }
+
+    #[test]
+    fn mint_requires_authority_and_creates_item_owned_by_recipient() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        // A non-authority cannot mint.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::MintNft {
+                collection_id,
+                recipient: holder.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMintNotAuthorized));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+
+        // The authority mints: item owned by recipient, counters/serial bumped.
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint succeeds");
+        assert_eq!(nft_id, NftId::new(collection_id, 0));
+        let item = state.nft_items.get(&nft_id).expect("item exists");
+        assert_eq!(item.owner, holder.address());
+        assert!(!item.frozen);
+        assert_eq!(item.item_metadata_hash, Hash256([0xab; 32]));
+        let record = state.nft_collections.get(&collection_id).unwrap();
+        assert_eq!(record.next_serial, 1);
+        assert_eq!(record.minted_count, 1);
+        assert_eq!(record.burned_count, 0);
+        assert_nft_invariants(&state, collection_id);
+
+        // A second mint assigns serial 1 (monotonic).
+        let nft_id_1 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            collection_id,
+            holder.address(),
+        )
+        .expect("second mint");
+        assert_eq!(nft_id_1, NftId::new(collection_id, 1));
+        assert_eq!(
+            state
+                .nft_collections
+                .get(&collection_id)
+                .unwrap()
+                .next_serial,
+            2
+        );
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn mint_past_max_supply_is_rejected() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            Some(2),
+            0,
+        )
+        .expect("create");
+        mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 0");
+        mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 1");
+        // The cap of 2 is now reached; a third mint is rejected.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::MintNft {
+                collection_id,
+                recipient: holder.address(),
+                item_metadata_hash: Hash256([0xac; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMaxSupplyReached));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn mint_into_paused_collection_is_rejected() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused: true,
+            },
+        )
+        .expect("pause");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintNft {
+                collection_id,
+                recipient: holder.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftCollectionPaused));
+    }
+
+    #[test]
+    fn transfer_requires_owner_and_moves_ownership() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+
+        // A non-owner cannot transfer.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftNotOwner));
+        assert_eq!(state, before, "rejected transfer leaves state unchanged");
+
+        // The owner transfers: ownership moves; the item key is the only item written.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .expect("transfer");
+        assert_eq!(
+            state.nft_items.get(&nft_id).unwrap().owner,
+            outsider.address()
+        );
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn transfer_of_frozen_item_or_paused_collection_is_rejected() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+
+        // Pause blocks transfer.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused: true,
+            },
+        )
+        .expect("pause");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftCollectionPaused));
+        // Unpause, then freeze the item: transfer blocked by the frozen flag.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused: false,
+            },
+        )
+        .expect("unpause");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            4,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftItemFrozen));
+        // Ownership never moved.
+        assert_eq!(
+            state.nft_items.get(&nft_id).unwrap().owner,
+            holder.address()
+        );
+    }
+
+    #[test]
+    fn freeze_blocks_transfer_and_burn_until_thawed() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+
+        // A non-authority cannot freeze.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftFreezeNotAuthorized));
+
+        // Freeze, then transfer and burn are both rejected.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("freeze");
+        assert!(state.nft_items.get(&nft_id).unwrap().frozen);
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnNft {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftItemFrozen));
+
+        // Thaw, then the owner can transfer.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::ThawNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("thaw");
+        assert!(!state.nft_items.get(&nft_id).unwrap().frozen);
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .expect("transfer after thaw");
+        assert_eq!(
+            state.nft_items.get(&nft_id).unwrap().owner,
+            outsider.address()
+        );
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn burn_removes_item_bumps_counter_and_serial_is_never_reminted() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id_0 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 0");
+        let _nft_id_1 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 1");
+
+        // A non-owner cannot burn.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::BurnNft {
+                collection_id,
+                serial: nft_id_0.serial,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftNotOwner));
+
+        // The owner burns serial 0: item removed, burned_count bumped, next_serial
+        // UNCHANGED (still 2).
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnNft {
+                collection_id,
+                serial: nft_id_0.serial,
+            },
+        )
+        .expect("burn");
+        assert!(!state.nft_items.contains_key(&nft_id_0));
+        let record = state.nft_collections.get(&collection_id).unwrap();
+        assert_eq!(record.burned_count, 1);
+        assert_eq!(record.next_serial, 2, "next_serial never decrements");
+        assert_eq!(record.minted_count, 2);
+        assert_nft_invariants(&state, collection_id);
+
+        // The next mint assigns serial 2 — the burned serial 0 is NEVER reminted.
+        // (The rejected non-owner burn above did not commit, so the creator's nonce
+        // is still 3.)
+        let nft_id_2 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint after burn");
+        assert_eq!(nft_id_2, NftId::new(collection_id, 2));
+        assert!(!state.nft_items.contains_key(&NftId::new(collection_id, 0)));
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn nft_authority_transfer_moves_control_and_renounce_is_permanent() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+
+        // Transfer the mint authority to the holder; the old holder (creator) can no
+        // longer mint, and the new holder can.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .expect("transfer mint authority");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintNft {
+                collection_id,
+                recipient: outsider.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMintNotAuthorized));
+        mint_nft(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            collection_id,
+            outsider.address(),
+        )
+        .expect("new authority mints");
+
+        // The new holder renounces the mint authority (Some -> None): PERMANENT.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            1,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Mint,
+                new_authority: None,
+            },
+        )
+        .expect("renounce mint authority");
+        assert_eq!(
+            state
+                .nft_collections
+                .get(&collection_id)
+                .unwrap()
+                .mint_authority,
+            None
+        );
+        // Nobody can mint anymore.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::MintNft {
+                collection_id,
+                recipient: outsider.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMintNotAuthorized));
+        // And the renounce is UNRECOVERABLE: no one can re-grant a None authority.
+        // (The rejected mint above did not commit, so the holder's nonce is still 2.)
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftAuthorityNotAuthorized));
+
+        // Freeze authority renounce is likewise permanent: freezing then rejected.
+        // (The creator's rejected mint did not commit, so its nonce is still 2.)
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Freeze,
+                new_authority: None,
+            },
+        )
+        .expect("renounce freeze authority");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftFreezeNotAuthorized));
+    }
+
+    #[test]
+    fn nft_state_is_committed_by_the_state_root() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let root_empty = state.state_root().unwrap();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+        let root_after_create = state.state_root().unwrap();
+        assert_ne!(
+            root_after_create, root_empty,
+            "creating a collection moves the state root"
+        );
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+        let root_after_mint = state.state_root().unwrap();
+        assert_ne!(
+            root_after_mint, root_after_create,
+            "minting an item moves the state root"
+        );
+
+        // A bincode restart preserves the collections, items, and deposit scalar, so
+        // the committed state root is stable across a crash/restart.
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.nft_collections, state.nft_collections);
+        assert_eq!(restored.nft_items, state.nft_items);
+        assert_eq!(restored.nft_deposits, state.nft_deposits);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            root_after_mint,
+            "nft state is committed by the state root across a restart"
+        );
+
+        // Freezing the item moves the item sub-root and thus the state root.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("freeze");
+        assert_ne!(
+            state.state_root().unwrap(),
+            root_after_mint,
+            "freezing an item moves the state root"
+        );
     }
 }

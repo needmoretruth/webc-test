@@ -138,6 +138,148 @@ describe("WebcNodeClient HTTP", () => {
     expect(receipt.disclaimer.length).toBeGreaterThan(0);
   });
 
+  it("parses the validator set with derived stakes and a tagged status", async () => {
+    const { fetchImpl } = fakeFetch({
+      "GET /v1/validators": {
+        ok: true,
+        status: 200,
+        body: {
+          api_version: "v1",
+          validators: [
+            {
+              operator: "webc1op1",
+              consensus_key: HASH,
+              self_stake: "100000000000000",
+              delegated_stake: "50000000000000",
+              commission_bps: 500,
+              status: "Active",
+              bootstrap: false,
+              accumulated_rewards: "0",
+              total_stake: "150000000000000",
+            },
+            {
+              operator: "webc1op2",
+              consensus_key: HASH,
+              self_stake: "1",
+              delegated_stake: "0",
+              commission_bps: 0,
+              status: { Jailed: { reason: "double sign" } },
+              bootstrap: false,
+              accumulated_rewards: "0",
+              total_stake: "1",
+            },
+          ],
+        },
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+    const response = await client.getValidators();
+    expect(response.apiVersion).toBe("v1");
+    expect(response.validators).toHaveLength(2);
+    expect(response.validators[0].operator).toBe("webc1op1");
+    expect(response.validators[0].selfStake).toBe(100_000_000_000_000n);
+    expect(response.validators[0].delegatedStake).toBe(50_000_000_000_000n);
+    expect(response.validators[0].commissionBps).toBe(500);
+    expect(response.validators[0].totalStake).toBe(150_000_000_000_000n);
+    expect(response.validators[0].status).toBe("Active");
+    expect(response.validators[1].status).toEqual({ Jailed: { reason: "double sign" } });
+  });
+
+  it("parses a single validator", async () => {
+    const { fetchImpl } = fakeFetch({
+      "GET /v1/validators/webc1op1": {
+        ok: true,
+        status: 200,
+        body: {
+          operator: "webc1op1",
+          consensus_key: HASH,
+          self_stake: "100000000000000",
+          delegated_stake: "0",
+          commission_bps: 1000,
+          status: "Draining",
+          bootstrap: false,
+          accumulated_rewards: "7",
+          total_stake: "100000000000000",
+        },
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+    const validator = await client.getValidator("webc1op1");
+    expect(validator.operator).toBe("webc1op1");
+    expect(validator.consensusKey).toBe(HASH);
+    expect(validator.status).toBe("Draining");
+    expect(validator.accumulatedRewards).toBe(7n);
+    expect(validator.totalStake).toBe(100_000_000_000_000n);
+  });
+
+  it("throws a typed NodeApiError on a 404 for a missing validator", async () => {
+    const { fetchImpl } = fakeFetch({
+      "GET /v1/validators/webc1missing": {
+        ok: false,
+        status: 404,
+        body: { error: "not found", kind: "not_found" },
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+    await expect(client.getValidator("webc1missing")).rejects.toMatchObject({
+      name: "NodeApiError",
+      status: 404,
+      kind: "not_found",
+    });
+  });
+
+  it("parses the supply-invariant report as bigints", async () => {
+    const { fetchImpl } = fakeFetch({
+      "GET /v1/supply": {
+        ok: true,
+        status: 200,
+        body: {
+          issued: "1002000000000000000000",
+          liquid: "1000000000000000000000",
+          staked: "2000000000000000000",
+          delegated: "0",
+          unbonding: "0",
+          escrowed: "0",
+          lane_fees: "0",
+          pending_rewards: "0",
+          fee_reward_pool: "0",
+          burned: "0",
+          slashed: "0",
+          accounted: "1002000000000000000000",
+          balanced: true,
+        },
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+    const supply = await client.getSupply();
+    expect(supply.issued).toBe(1_002_000_000_000_000_000_000n);
+    expect(supply.staked).toBe(2_000_000_000_000_000_000n);
+    expect(supply.accounted).toBe(1_002_000_000_000_000_000_000n);
+    expect(supply.balanced).toBe(true);
+  });
+
+  it("rejects a validator with an unknown status variant", async () => {
+    const { fetchImpl } = fakeFetch({
+      "GET /v1/validators/webc1bad": {
+        ok: true,
+        status: 200,
+        body: {
+          operator: "webc1bad",
+          consensus_key: HASH,
+          self_stake: "1",
+          delegated_stake: "0",
+          commission_bps: 0,
+          status: "Frozen",
+          bootstrap: false,
+          accumulated_rewards: "0",
+          total_stake: "1",
+        },
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+    await expect(client.getValidator("webc1bad")).rejects.toThrow(/validator status/u);
+  });
+
   it("rejects a malformed response shape", async () => {
     const { fetchImpl } = fakeFetch({
       "GET /v1/health": { ok: true, status: 200, body: { api_version: "v1" } },

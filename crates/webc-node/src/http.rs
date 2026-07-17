@@ -47,7 +47,7 @@ use webc_storage::KvStore;
 
 use crate::service::{
     AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NodeService, SealSummary,
-    SubmitReceipt, API_VERSION,
+    SubmitReceipt, ValidatorSummary, ValidatorsResponse, API_VERSION,
 };
 
 /// Default maximum request body size (1 MiB), bounding hostile payloads.
@@ -281,6 +281,9 @@ where
         .route("/v1/fees", get(fees::<K>))
         .route("/v1/accounts/{address}", get(account::<K>))
         .route("/v1/accounts/{address}/proof", get(account_proof::<K>))
+        .route("/v1/validators", get(validators::<K>))
+        .route("/v1/validators/{address}", get(validator::<K>))
+        .route("/v1/supply", get(supply::<K>))
         .route("/v1/objects/{id}", get(object::<K>))
         .route("/v1/blocks/height/{height}", get(block_by_height::<K>))
         .route("/v1/blocks/hash/{hash}", get(block_by_hash::<K>))
@@ -306,6 +309,26 @@ async fn account<K: KvStore>(
 ) -> Result<Json<AccountSummary>, ApiRejection> {
     let address = parse_address(&address)?;
     Ok(Json(state.service().account(address)?))
+}
+
+async fn validators<K: KvStore>(
+    State(state): State<AppState<K>>,
+) -> Result<Json<ValidatorsResponse>, ApiRejection> {
+    Ok(Json(state.service().validators()?))
+}
+
+async fn validator<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(address): Path<String>,
+) -> Result<Json<ValidatorSummary>, ApiRejection> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.service().validator(address)?))
+}
+
+async fn supply<K: KvStore>(
+    State(state): State<AppState<K>>,
+) -> Result<Json<webc_chain::SupplyInvariantReport>, ApiRejection> {
+    Ok(Json(state.service().supply()?))
 }
 
 async fn account_proof<K: KvStore>(

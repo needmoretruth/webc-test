@@ -5,14 +5,23 @@
 //! keys each native operation is expected to touch. Runtime enforcement lives in
 //! `state` and fails atomically if execution diverges from that signed list.
 
+use crate::contract::{
+    ContractManifest, CONTRACT_DECLARED_KEY_UNITS, CONTRACT_INPUT_BYTE_UNITS,
+    CONTRACT_INVOKE_BASE_UNITS,
+};
+use crate::namespace::namespace_state_key_hash;
+use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
-    ChainId, ExternalChain, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
-    ProtocolStateKey, ProtocolVersion, SessionKeyConstraints, SessionKeyId, SlashingEvidence,
-    StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
-    SIGNING_DOMAIN,
+    ChainId, Epoch, ExternalChain, MandateCounterpartyPolicy, MandateId, NftAuthorityKind,
+    NftCollectionId, NftMetadata, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
+    ProtocolStateKey, ProtocolVersion, ServiceId, ServicePaymentFlags, ServicePrice, ServiceStatus,
+    SessionKeyConstraints, SessionKeyId, SlashingEvidence, StateKey, TokenAuthorityKind, TokenId,
+    TokenMetadata, UnbondingRequestId, CURRENT_PROTOCOL_VERSION,
+    LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, SignatureBytes};
 
 /// Signed transaction access list used for enforcement and parallel scheduling.
@@ -205,6 +214,20 @@ pub enum Operation {
         /// New account owner.
         new_owner: Address,
     },
+    /// Deletes an owned object and settles its storage deposit (§15.22).
+    ///
+    /// Refunds the configured `refund_bps` share of the object's recorded storage
+    /// deposit to the owner's liquid balance and burns the remainder as the
+    /// occupancy fee, then removes the object. Mirrors the other owned-object
+    /// operations' owner, namespace, and expected-version authorization.
+    DeleteObject {
+        /// Existing object identity.
+        object_id: ObjectId,
+        /// Signed namespace that must match stored object metadata.
+        namespace: Hash256,
+        /// Current revision expected by the sender.
+        expected_version: ObjectVersion,
+    },
     /// Moves native base units between account records.
     Transfer {
         /// Recipient native account.
@@ -256,6 +279,15 @@ pub enum Operation {
         /// Validator identifying the sender's position.
         validator: Address,
     },
+    /// Compounds the sender's accumulated operator rewards directly into its own
+    /// self-stake, without a claim-then-restake round trip.
+    CompoundValidatorRewards,
+    /// Compounds accumulated delegation rewards directly into that delegation
+    /// position, subject to the operator/delegator ratio.
+    CompoundDelegatorRewards {
+        /// Validator identifying the sender's position.
+        validator: Address,
+    },
     /// Submits objectively verifiable signed slashing evidence.
     SubmitSlashingEvidence {
         /// Signed artifact; subjective labels are not accepted.
@@ -295,6 +327,611 @@ pub enum Operation {
         /// Replay-protected source message; real-fund proofs remain disabled.
         message: BridgeMessage,
     },
+    /// Registers the sender as the fee sponsor for an application namespace (§15.35).
+    ///
+    /// Creates the per-app sponsor record, sets the app-chosen per-day spend cap
+    /// (rejected if above the protocol hard cap), and moves `initial_funding`
+    /// native base units from the sender's liquid balance into the sponsor budget.
+    RegisterAppSponsor {
+        /// Application namespace this sponsor underwrites (the same namespace used
+        /// by the app's objects — "application" is the sponsoring unit).
+        namespace: Hash256,
+        /// App-chosen maximum sponsored fee spend per day-window, in base units,
+        /// bounded by `SponsorshipConfig::max_app_daily_budget`.
+        daily_budget_cap: Amount,
+        /// Initial native base units moved from liquid balance into the budget.
+        initial_funding: Amount,
+    },
+    /// Adds native base units to an existing application sponsor budget.
+    ///
+    /// Only the sponsor owner may fund it. Moves `amount` from the sender's liquid
+    /// balance into the app's sponsor budget.
+    FundAppSponsor {
+        /// Existing application namespace whose sponsor budget is topped up.
+        namespace: Hash256,
+        /// Native base units moved from liquid balance into the budget.
+        amount: Amount,
+    },
+    /// Withdraws unspent native base units from an application sponsor budget.
+    ///
+    /// Only the sponsor owner may withdraw. Moves `amount` from the app's sponsor
+    /// budget back to the owner's liquid balance; fails if it exceeds the budget.
+    WithdrawAppSponsor {
+        /// Existing application namespace whose sponsor budget is drawn down.
+        namespace: Hash256,
+        /// Native base units returned to the owner's liquid balance.
+        amount: Amount,
+    },
+    /// Claims an unclaimed application namespace for the sender (§8 isolation).
+    ///
+    /// Records the sender as the owner of `namespace` in the namespace registry.
+    /// Fails if the namespace is already registered. Locks no native units — it is
+    /// purely an ownership record, so only the ordinary transaction fee moves.
+    /// Ownership is **not** required to create objects under a namespace today;
+    /// gating object creation on ownership is a later-phase policy decision.
+    RegisterNamespace {
+        /// Application namespace the sender claims.
+        namespace: Hash256,
+    },
+    /// Transfers a registered application namespace to a new owner (§8 isolation).
+    ///
+    /// Only the current owner may transfer. Fails if the namespace is not
+    /// registered or the sender is not its owner. Moves no native units.
+    TransferNamespace {
+        /// Registered application namespace being transferred.
+        namespace: Hash256,
+        /// Account that becomes the new owner.
+        new_owner: Address,
+    },
+    /// Creates a native oracle feed for a flat fee (§15.6 permissionless-for-a-fee).
+    ///
+    /// Records a canonical [`crate::Feed`] owned by the sender and charges the
+    /// configured feed-creation fee (burned). Fails if the feed id already exists.
+    CreateFeed {
+        /// Caller-chosen collision-resistant feed identity.
+        feed_id: crate::FeedId,
+    },
+    /// Registers the sender as a bonded reporter on an existing feed (§15.17).
+    ///
+    /// Locks the feed's frozen bond from the sender's liquid balance into the
+    /// `oracle_bonds` bucket. Fails if the feed is missing or the sender is
+    /// already registered on it.
+    RegisterReporter {
+        /// Feed the sender bonds to report on.
+        feed_id: crate::FeedId,
+    },
+    /// Deregisters the sender from a feed and returns its bond (§15.17).
+    ///
+    /// Removes the sender's reporter record and returns the feed's bond to the
+    /// sender's liquid balance. Fails if the sender is not registered.
+    DeregisterReporter {
+        /// Feed the sender leaves.
+        feed_id: crate::FeedId,
+    },
+    /// Submits the sender's latest value for a feed (§9 median aggregation).
+    ///
+    /// Records the value and the epoch it was submitted for (liveness). The feed's
+    /// aggregate is the median of all registered reporters' latest values. Fails
+    /// if the sender is not a registered reporter on the feed.
+    SubmitReport {
+        /// Feed being reported to.
+        feed_id: crate::FeedId,
+        /// The reporter's latest integer value in the feed's own units.
+        value: crate::FeedValue,
+    },
+    /// Pays a read fee into a feed's revenue pool (§15.17 consumers pay).
+    ///
+    /// Moves `amount` from the payer's liquid balance into the feed's accrued
+    /// revenue (`oracle_revenue` bucket); settlement later distributes it to the
+    /// feed's reporters weighted by accuracy and liveness. Fails if the feed is
+    /// missing or `amount` is zero.
+    PayFeedRead {
+        /// Feed whose value the payer is consuming on-chain.
+        feed_id: crate::FeedId,
+        /// Native base units paid into the feed's revenue pool.
+        amount: Amount,
+    },
+    /// Submits a DEX order intent for per-block uniform-price batch settlement
+    /// (§15.13/§15.18/§15.37).
+    ///
+    /// Locks the order's input into the `dex_escrow` bucket (a `Sell` locks
+    /// `amount` base; a `Buy` locks `amount × limit_price` quote), records the
+    /// order under `StateKey::dex_order(order_id)`, and lets the block's batch
+    /// settle it against crossing counter-orders at one uniform clearing price. An
+    /// unfilled remainder retries in later batches until filled, cancelled, or its
+    /// `deadline_height` passes (unless `fill_or_cancel`, which cancels any
+    /// remainder the same block). Default lane only. Fails if the order id already
+    /// exists, the pair is degenerate, the amount/price is zero (or below the
+    /// configured minimum), or the deadline is already in the past.
+    SubmitOrder {
+        /// Caller-chosen collision-resistant order identity (known at signing time
+        /// so the access list can name the order's state key).
+        order_id: crate::OrderId,
+        /// Oriented trading pair; `amount` is in `base`, price in `quote`.
+        pair: crate::TradingPair,
+        /// Buy (acquire base, pay quote) or sell (dispose base, receive quote).
+        side: crate::OrderSide,
+        /// Order size in base-asset base units.
+        amount: Amount,
+        /// Limit price in quote base-units per base base-unit (a buy pays at most,
+        /// a sell receives at least, this price).
+        limit_price: crate::Price,
+        /// Last block height at which the order may still settle; `0` means "use the
+        /// configured default retry window from the submission height".
+        deadline_height: u64,
+        /// Immediate-or-cancel: cancel any amount unfilled in the batch it joins
+        /// instead of retrying.
+        fill_or_cancel: bool,
+    },
+    /// Cancels a live DEX order and refunds its remaining locked input (§15.37).
+    ///
+    /// Only the order's owner may cancel. Refunds the currently-locked remainder
+    /// (a `Buy`'s `remaining × limit_price` quote, a `Sell`'s `remaining` base) to
+    /// the owner and removes the record. Default lane only. Fails if the order does
+    /// not exist or the sender is not its owner.
+    CancelOrder {
+        /// Identity of the order to cancel.
+        order_id: crate::OrderId,
+    },
+    /// Registers an interim Rust-authored contract for a flat, burned fee
+    /// (Phase 7a, ADR-0014 interim path (c)).
+    ///
+    /// Commits the signed [`ContractManifest`] under `StateKey::module(code_id)`
+    /// and charges the configured registration fee (burned, supply-neutral, like
+    /// feed creation). Fails if `code_id` is already registered or the manifest is
+    /// malformed. Registers no untrusted bytecode — the manifest names an audited
+    /// built-in handler.
+    RegisterContract {
+        /// The contract's committed interface record (identity, namespace,
+        /// declared footprint, ABI/gas-schedule versions, built-in handler).
+        manifest: ContractManifest,
+    },
+    /// Invokes a registered contract's handler behind the native declared-access
+    /// and gas discipline (Phase 7a, ADR-0014 interim path (c)).
+    ///
+    /// Looks up the manifest by `code_id`, binds this signed operation to it
+    /// (`namespace` and `declared_keys` must match the manifest exactly), meters
+    /// the call against the sender's `gas_limit`, runs the audited handler over
+    /// only its declared footprint, and commits its state writes. An over-gas call
+    /// or an undeclared access rolls the whole transaction back atomically.
+    InvokeContract {
+        /// Registered contract identity (the manifest / `StateKey::module` key).
+        code_id: Hash256,
+        /// Application namespace the contract's state lives under; must equal the
+        /// manifest's `namespace`. Carried in the signed operation so the access
+        /// list is self-contained and the scheduler needs no manifest lookup.
+        namespace: Hash256,
+        /// The application key-hashes this call declares; must equal the manifest
+        /// `footprint`. Each becomes a `StateKey::application(namespace, key_hash)`
+        /// read_write in the access list.
+        declared_keys: Vec<Hash256>,
+        /// Bounded opaque input forwarded verbatim to the handler.
+        #[serde(with = "crate::hex_bytes")]
+        input: Vec<u8>,
+    },
+    /// Grants a pre-funded agent mandate and escrows its budget (Phase 9a, §15.32).
+    ///
+    /// Principal-signed (the sender is the principal). Derives the mandate id from
+    /// `(sender, agent_key, grant_nonce)`, moves `budget_total` native base units
+    /// from the sender's liquid balance into the `mandate_escrow` bucket, and
+    /// records a [`crate::Mandate`]. Fails if the derived id already exists, the
+    /// grant parameters are invalid, or the sender cannot cover `budget_total`
+    /// plus the transaction fee. Default lane only.
+    GrantMandate {
+        /// The agent's Ed25519 signing key authorized to spend under this mandate.
+        agent_key: PublicKeyBytes,
+        /// Principal-chosen uniquifier so one principal may hold several mandates
+        /// for the same agent key; part of the derived mandate id.
+        grant_nonce: u64,
+        /// Total native base units authorized over the mandate's whole life.
+        budget_total: Amount,
+        /// Last consensus epoch (inclusive) in which the mandate may be spent.
+        expiry_epoch: Epoch,
+        /// Maximum native principal one mandate-signed spend may move.
+        per_tx_max: Amount,
+        /// Maximum spends per rate-limit window; `0` means unlimited.
+        rate_limit_per_day: u32,
+        /// Which counterparties the mandate's spends may pay.
+        counterparty_policy: MandateCounterpartyPolicy,
+    },
+    /// Adds native base units to an existing mandate's budget (Phase 9a, §15.32).
+    ///
+    /// Principal-signed. Moves `amount` from the sender's liquid balance into the
+    /// `mandate_escrow` bucket and raises the mandate's `budget_total`. Only the
+    /// mandate's principal may top it up; a revoked mandate cannot be topped up.
+    /// Default lane only.
+    TopUpMandate {
+        /// The mandate to top up.
+        mandate_id: MandateId,
+        /// Native base units moved from liquid balance into the mandate budget.
+        amount: Amount,
+    },
+    /// Spends against a mandate, signed by the agent key (Phase 9a, §15.32).
+    ///
+    /// Signed by the mandate's `agent_key` (the sender is the agent's own
+    /// address). The runtime enforces, atomically, that the mandate exists, is not
+    /// revoked, is unexpired, that `amount <= per_tx_max`, that `spent + amount +
+    /// fee <= budget_total`, that the recipient is permitted, and that the per-day
+    /// rate limit is not exceeded. On success it moves `amount` to the recipient
+    /// and routes the fee through the normal burn/reward split — both drawn from
+    /// the mandate escrow, so the agent needs no balance of its own. Default lane
+    /// only.
+    SpendUnderMandate {
+        /// The mandate authorizing (and funding) this spend.
+        mandate_id: MandateId,
+        /// Recipient account credited the spent principal.
+        recipient: Address,
+        /// Native principal moved to the recipient (excludes the fee).
+        amount: Amount,
+    },
+    /// Revokes a mandate and returns its unspent remainder (Phase 9a, §15.32).
+    ///
+    /// Principal-signed. Returns `budget_total - spent` from the `mandate_escrow`
+    /// bucket to the principal's liquid balance and marks the mandate revoked so no
+    /// further spend succeeds; revocation is effective from the block it lands in.
+    /// Also the reclaim path for an expired mandate. Default lane only.
+    RevokeMandate {
+        /// The mandate to revoke and reclaim.
+        mandate_id: MandateId,
+    },
+    /// Registers a service in the native registry (Phase 9b, §15.5).
+    ///
+    /// Owner-signed (the sender is the entry's `owner` and pay-to account).
+    /// Derives the service id from `(namespace, sender, create_nonce)` and records
+    /// a [`crate::ServiceEntry`] at revision [`crate::INITIAL_SERVICE_REVISION`]
+    /// with status [`crate::ServiceStatus::Active`]. It records data only and locks
+    /// NO native units; the spam price is this operation's HIGH `required_units`,
+    /// so the ordinary transaction fee (which flows through the normal burn / fee-
+    /// pool split) makes registration permissionless-for-a-fee. Fails if the derived
+    /// id already exists or the entry is malformed (over-length/over-count/empty
+    /// required field). Any authorization lane may pay the fee.
+    RegisterService {
+        /// Application namespace the entry lives under; bound into the service id.
+        namespace: Hash256,
+        /// Owner-chosen uniquifier so one owner may register several services under
+        /// one namespace; part of the derived service id.
+        create_nonce: u64,
+        /// Taxonomy tags a mandate allowlist may reference (bounded count).
+        categories: BTreeSet<Hash256>,
+        /// Short human/machine label, lowercase hex on the wire (bounded length).
+        #[serde(with = "crate::service_registry::bounded_title_hex")]
+        title: Vec<u8>,
+        /// HTTPS URL or on-chain entrypoint reference, lowercase hex (bounded).
+        #[serde(with = "crate::service_registry::bounded_endpoint_hex")]
+        endpoint: Vec<u8>,
+        /// Manifest reference hash for the machine-readable interface description.
+        interface: Hash256,
+        /// Priced operations the service exposes (bounded count).
+        pricing: Vec<ServicePrice>,
+        /// Accepted payment flows.
+        payment_flags: ServicePaymentFlags,
+    },
+    /// Updates a registered service's mutable fields (Phase 9b, §15.5).
+    ///
+    /// Owner-only. Replaces the entry's categories, title, endpoint, interface,
+    /// pricing, and payment flows, keeping its owner, namespace, and status, and
+    /// bumps `revision`. Only the CURRENT revision lives in committed active state.
+    /// Fails if the service does not exist (`ServiceNotFound`), the sender is not
+    /// its owner (`ServiceNotOwner`), or the resulting entry is malformed
+    /// (`InvalidServiceEntry`). Any authorization lane may pay the fee.
+    UpdateService {
+        /// Identity of the service to update.
+        service_id: ServiceId,
+        /// Replacement taxonomy tags (bounded count).
+        categories: BTreeSet<Hash256>,
+        /// Replacement label, lowercase hex on the wire (bounded length).
+        #[serde(with = "crate::service_registry::bounded_title_hex")]
+        title: Vec<u8>,
+        /// Replacement endpoint reference, lowercase hex (bounded length).
+        #[serde(with = "crate::service_registry::bounded_endpoint_hex")]
+        endpoint: Vec<u8>,
+        /// Replacement manifest reference hash.
+        interface: Hash256,
+        /// Replacement priced operations (bounded count).
+        pricing: Vec<ServicePrice>,
+        /// Replacement accepted payment flows.
+        payment_flags: ServicePaymentFlags,
+    },
+    /// Pauses, retires, or reactivates a registered service (Phase 9b, §15.5).
+    ///
+    /// Owner-only. Sets the entry's lifecycle `status` and bumps `revision`. A
+    /// Paused or Retired service rejects service-scoped spends. Fails if the
+    /// service does not exist (`ServiceNotFound`) or the sender is not its owner
+    /// (`ServiceNotOwner`). Any authorization lane may pay the fee.
+    SetServiceStatus {
+        /// Identity of the service whose status changes.
+        service_id: ServiceId,
+        /// The new lifecycle status.
+        status: ServiceStatus,
+    },
+    /// Spends against a mandate to pay a registered service (Phase 9b, §15.5).
+    ///
+    /// Signed by the mandate's `agent_key` (same auth model as
+    /// [`Self::SpendUnderMandate`]). Pays the SERVICE's `owner` account from the
+    /// mandate escrow, enforcing — O(1), no registry scan — every Phase 9a mandate
+    /// check (exists, not revoked, not expired, `amount <= per_tx_max`, `spent +
+    /// amount + fee <= budget_total`, daily rate limit) PLUS the counterparty policy
+    /// resolved against the registry ([`MandateCounterpartyPolicy::permits_service`]:
+    /// the service owner satisfies a recipient allowlist, and an active service's
+    /// categories resolve a category allowlist), and additionally requires the
+    /// service to be [`crate::ServiceStatus::Active`] (`ServiceNotActive`). On
+    /// success it credits `amount` to the service owner and routes the fee exactly
+    /// as [`Self::SpendUnderMandate`], both drawn from the mandate escrow. The
+    /// service owner (the registry pay-to) is state-derived, so a caller must
+    /// additionally declare its account in the signed access list — the runtime
+    /// resolves it from the entry, exactly the HTTP-402 pay-to check
+    /// ([`Transaction::for_service_spend`] builds this list). Default lane only.
+    SpendUnderMandateToService {
+        /// The mandate authorizing (and funding) this spend.
+        mandate_id: MandateId,
+        /// The service whose owner is credited the spent principal.
+        service_id: ServiceId,
+        /// Native principal moved to the service owner (excludes the fee).
+        amount: Amount,
+    },
+    /// Creates a native fungible token (Phase 13a, §15).
+    ///
+    /// Creator-signed (the sender is the token's `creator`). Derives the token id
+    /// from `(namespace, sender, create_nonce)` and records a
+    /// [`crate::TokenRecord`] with the given authorities. It LOCKS a native WEBC
+    /// creation deposit (`ChainConfig::token.creation_deposit`) from the creator's
+    /// liquid balance into the `token_deposits` bucket — an anti-spam price that is
+    /// NON-REFUNDABLE for the token's life; token creation NEVER mints or burns
+    /// native WEBC. Optionally mints `initial_supply` to `initial_recipient` at
+    /// creation. Fails if the derived id already exists (`TokenAlreadyExists`) or
+    /// the metadata is malformed (`InvalidTokenMetadata`). Any authorization lane
+    /// may pay the fee.
+    CreateToken {
+        /// Application namespace the token lives under; bound into the token id.
+        namespace: Hash256,
+        /// Creator-chosen uniquifier so one creator may create several tokens
+        /// under one namespace; part of the derived token id.
+        create_nonce: u64,
+        /// Bounded metadata (name, symbol, decimals, off-chain commitment).
+        metadata: TokenMetadata,
+        /// Initial mint authority; `None` creates the token with minting
+        /// permanently renounced (a fixed supply equal to `initial_supply`).
+        mint_authority: Option<Address>,
+        /// Initial freeze authority; `None` creates the token with freezing
+        /// permanently renounced.
+        freeze_authority: Option<Address>,
+        /// Amount minted to `initial_recipient` at creation (may be zero).
+        initial_supply: Amount,
+        /// Account credited `initial_supply` at creation.
+        initial_recipient: Address,
+    },
+    /// Mints new units of a token to a recipient (Phase 13a, §15).
+    ///
+    /// Must be signed by the token's current `mint_authority`; rejected if that
+    /// authority is `None` (minting renounced) or the signer differs
+    /// (`TokenMintNotAuthorized`). Increases the token's `issued_supply` and
+    /// credits `recipient`. Rejected if `recipient` is frozen
+    /// (`TokenAccountFrozen`). Moves no native WEBC beyond the fee. Any
+    /// authorization lane may pay the fee.
+    MintToken {
+        /// Token to mint.
+        token_id: TokenId,
+        /// Account credited the newly minted units.
+        recipient: Address,
+        /// Units minted.
+        amount: Amount,
+    },
+    /// Burns units of a token from the signer's own balance (Phase 13a, §15).
+    ///
+    /// A holder burns their OWN balance: decreases their balance and the token's
+    /// `issued_supply`. Rejected if the holder is frozen (`TokenAccountFrozen`) or
+    /// holds less than `amount` (`TokenInsufficientBalance`). Any authorization
+    /// lane may pay the fee.
+    BurnToken {
+        /// Token to burn.
+        token_id: TokenId,
+        /// Units burned from the signer's balance.
+        amount: Amount,
+    },
+    /// Transfers token units from the signer to a recipient (Phase 13a, §15).
+    ///
+    /// Holder→recipient. Rejected if the token is paused (`TokenPaused`), the
+    /// sender or recipient is frozen (`TokenAccountFrozen`), or the sender holds
+    /// less than `amount` (`TokenInsufficientBalance`). A sender balance that
+    /// reaches zero is pruned. This writes ONLY the two `(token, account)` balance
+    /// keys (the token record is read-only, consulted for the paused flag), so an
+    /// ordinary transfer never writes a global per-token object (a Phase 13
+    /// acceptance criterion). Any authorization lane may pay the fee.
+    TransferToken {
+        /// Token to transfer.
+        token_id: TokenId,
+        /// Account credited the transferred units.
+        recipient: Address,
+        /// Units transferred.
+        amount: Amount,
+    },
+    /// Pauses or unpauses all transfers of a token (Phase 13a, §15).
+    ///
+    /// Only the token's current `mint_authority` may pause/unpause (the Phase 13a
+    /// simplification keeps a single privileged authority rather than a dedicated
+    /// pause authority); rejected if minting is renounced
+    /// (`TokenMintNotAuthorized`). While paused, [`Self::TransferToken`] is
+    /// rejected. Any authorization lane may pay the fee.
+    SetTokenPaused {
+        /// Token whose paused flag changes.
+        token_id: TokenId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// Freezes one account's balance of a token (Phase 13a, §15).
+    ///
+    /// Freeze-authority-signed; rejected if freezing is renounced or the signer is
+    /// not the current freeze authority (`TokenFreezeNotAuthorized`). A frozen
+    /// account can neither send nor receive the token. Any authorization lane may
+    /// pay the fee.
+    FreezeTokenAccount {
+        /// Token whose account is frozen.
+        token_id: TokenId,
+        /// Account to freeze.
+        account: Address,
+    },
+    /// Thaws (unfreezes) one account's balance of a token (Phase 13a, §15).
+    ///
+    /// Freeze-authority-signed (the same authority check as
+    /// [`Self::FreezeTokenAccount`]). Removes the `(token, account)` freeze marker.
+    /// Any authorization lane may pay the fee.
+    ThawTokenAccount {
+        /// Token whose account is thawed.
+        token_id: TokenId,
+        /// Account to thaw.
+        account: Address,
+    },
+    /// Transfers or permanently renounces one of a token's authorities (Phase 13a,
+    /// §15).
+    ///
+    /// The CURRENT holder of the named authority may transfer it to a new address
+    /// (`Some`) or permanently renounce it (`None`). Rejected if the current
+    /// authority is already `None` (nothing to transfer) or the signer is not the
+    /// current authority (`TokenAuthorityNotAuthorized`). Renouncement is
+    /// PERMANENT: a `None` authority can never be restored (a Phase 13 acceptance
+    /// criterion, "revoked authority cannot return"). Any authorization lane may
+    /// pay the fee.
+    SetTokenAuthority {
+        /// Token whose authority changes.
+        token_id: TokenId,
+        /// Which authority (mint or freeze) is transferred/renounced.
+        authority_kind: TokenAuthorityKind,
+        /// New holder, or `None` to permanently renounce.
+        new_authority: Option<Address>,
+    },
+    /// Creates a native NFT collection (Phase 13b, §15).
+    ///
+    /// Creator-signed (the sender is the collection's `creator`). Derives the
+    /// collection id from `(namespace, sender, create_nonce)` and records an
+    /// [`crate::NftCollection`] with the given authorities, optional supply cap, and
+    /// royalty commitment. It LOCKS a native WEBC creation deposit
+    /// (`ChainConfig::nft.creation_deposit`) from the creator's liquid balance into
+    /// the `nft_deposits` bucket — an anti-spam price that is NON-REFUNDABLE for the
+    /// collection's life; creation NEVER mints or burns native WEBC and mints no
+    /// items (minting is a separate [`Self::MintNft`]). Fails if the derived id
+    /// already exists (`NftCollectionAlreadyExists`) or the metadata/royalty is
+    /// malformed (`InvalidNftMetadata`). Any authorization lane may pay the fee.
+    CreateNftCollection {
+        /// Application namespace the collection lives under; bound into the id.
+        namespace: Hash256,
+        /// Creator-chosen uniquifier so one creator may create several collections
+        /// under one namespace; part of the derived collection id.
+        create_nonce: u64,
+        /// Bounded metadata (name, symbol, off-chain commitment).
+        metadata: NftMetadata,
+        /// Initial mint authority; `None` creates the collection with minting
+        /// permanently renounced (a collection that can never mint an item).
+        mint_authority: Option<Address>,
+        /// Initial freeze authority; `None` creates the collection with freezing
+        /// permanently renounced.
+        freeze_authority: Option<Address>,
+        /// Optional hard cap on the total number of items ever minted (`None` = no
+        /// cap).
+        max_supply: Option<u64>,
+        /// Creator royalty commitment in basis points (≤ 10_000). Recorded only; the
+        /// chain does NOT enforce royalties on transfer (a marketplace concern).
+        royalty_bps: u16,
+    },
+    /// Mints a new item of a collection to a recipient (Phase 13b, §15).
+    ///
+    /// Must be signed by the collection's current `mint_authority`; rejected if that
+    /// authority is `None` (minting renounced) or the signer differs
+    /// (`NftMintNotAuthorized`). Assigns `serial = next_serial`, increments
+    /// `next_serial` and `minted_count`, and creates the item owned by `recipient`.
+    /// Rejected if the collection is paused (`NftCollectionPaused`) or the cap is
+    /// reached (`NftMaxSupplyReached`). The minted [`crate::NftId`] is carried in the
+    /// receipt event. Moves no native WEBC beyond the fee. Any authorization lane may
+    /// pay the fee.
+    MintNft {
+        /// Collection to mint into.
+        collection_id: NftCollectionId,
+        /// Account that will own the newly minted item.
+        recipient: Address,
+        /// Fixed-size commitment to the item's off-chain metadata.
+        item_metadata_hash: Hash256,
+    },
+    /// Transfers one NFT item from its owner to a recipient (Phase 13b, §15).
+    ///
+    /// Signed by the CURRENT item owner (`NftNotOwner` otherwise). Moves ownership of
+    /// the single item. Rejected if the item is frozen (`NftItemFrozen`), the
+    /// collection is paused (`NftCollectionPaused`), or the item does not exist
+    /// (`NftItemNotFound`). This writes ONLY the one item key (the collection record
+    /// is read-only, consulted for the paused flag), so an ordinary transfer never
+    /// writes a global per-collection object (a Phase 13 acceptance criterion). Any
+    /// authorization lane may pay the fee.
+    TransferNft {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to transfer.
+        serial: u64,
+        /// Account credited ownership of the item.
+        recipient: Address,
+    },
+    /// Burns one NFT item held by the signer (Phase 13b, §15).
+    ///
+    /// The CURRENT owner burns their own item: removes it and increments
+    /// `burned_count`. Rejected if the item is frozen (`NftItemFrozen`), not owned by
+    /// the signer (`NftNotOwner`), or absent (`NftItemNotFound`). `next_serial` is
+    /// NOT decremented, so a burned serial is never reminted. Any authorization lane
+    /// may pay the fee.
+    BurnNft {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to burn.
+        serial: u64,
+    },
+    /// Pauses or unpauses minting of a collection (Phase 13b, §15).
+    ///
+    /// Only the collection's current `mint_authority` may pause/unpause (the Phase
+    /// 13b simplification keeps a single privileged authority rather than a dedicated
+    /// pause authority); rejected if minting is renounced (`NftMintNotAuthorized`).
+    /// While paused, [`Self::MintNft`] is rejected. Any authorization lane may pay the
+    /// fee.
+    SetNftCollectionPaused {
+        /// Collection whose paused flag changes.
+        collection_id: NftCollectionId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// Freezes one NFT item (Phase 13b, §15).
+    ///
+    /// Freeze-authority-signed; rejected if freezing is renounced or the signer is
+    /// not the current freeze authority (`NftFreezeNotAuthorized`), or the item is
+    /// absent (`NftItemNotFound`). A frozen item can be neither transferred nor
+    /// burned. Any authorization lane may pay the fee.
+    FreezeNftItem {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to freeze.
+        serial: u64,
+    },
+    /// Thaws (unfreezes) one NFT item (Phase 13b, §15).
+    ///
+    /// Freeze-authority-signed (the same authority check as [`Self::FreezeNftItem`]).
+    /// Clears the item's `frozen` flag. Any authorization lane may pay the fee.
+    ThawNftItem {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to thaw.
+        serial: u64,
+    },
+    /// Transfers or permanently renounces one of a collection's authorities
+    /// (Phase 13b, §15).
+    ///
+    /// The CURRENT holder of the named authority may transfer it to a new address
+    /// (`Some`) or permanently renounce it (`None`). Rejected if the current
+    /// authority is already `None` (nothing to transfer) or the signer is not the
+    /// current authority (`NftAuthorityNotAuthorized`). Renouncement is PERMANENT: a
+    /// `None` authority can never be restored (a Phase 13 acceptance criterion,
+    /// "revoked authority cannot return"). Any authorization lane may pay the fee.
+    SetNftAuthority {
+        /// Collection whose authority changes.
+        collection_id: NftCollectionId,
+        /// Which authority (mint or freeze) is transferred/renounced.
+        authority_kind: NftAuthorityKind,
+        /// New holder, or `None` to permanently renounce.
+        new_authority: Option<Address>,
+    },
 }
 
 impl Operation {
@@ -310,19 +947,136 @@ impl Operation {
             | Self::RotatePostQuantumRoot { .. } => 25_000,
             Self::InstallSessionKey { .. } | Self::RevokeSessionKey { .. } => 15_000,
             Self::OpenAuthorizationLane { .. } | Self::FundAuthorizationLane { .. } => 10_000,
-            Self::CreateObject { .. } | Self::MutateObject { .. } | Self::TransferObject { .. } => {
-                20_000
-            }
+            Self::CreateObject { .. }
+            | Self::MutateObject { .. }
+            | Self::TransferObject { .. }
+            | Self::DeleteObject { .. } => 20_000,
             Self::RegisterValidator { .. } => 25_000,
             Self::Delegate { .. }
             | Self::Undelegate { .. }
             | Self::UnstakeValidator { .. }
             | Self::ClaimUnbonded { .. } => 10_000,
             Self::ClaimValidatorRewards | Self::ClaimDelegatorRewards { .. } => 5_000,
+            Self::CompoundValidatorRewards | Self::CompoundDelegatorRewards { .. } => 7_500,
             Self::SubmitSlashingEvidence { .. } => 20_000,
             Self::BridgeLock { .. } | Self::BridgeBurn { .. } => 50_000,
             Self::BridgeMint { .. } | Self::BridgeRelease { .. } => 75_000,
+            Self::RegisterAppSponsor { .. }
+            | Self::FundAppSponsor { .. }
+            | Self::WithdrawAppSponsor { .. } => 10_000,
+            Self::RegisterNamespace { .. } | Self::TransferNamespace { .. } => 10_000,
+            // A grant creates one record and locks its budget; top-up/revoke move
+            // units on one record; a spend moves units and writes one record —
+            // comparable to the other single-record locked-value operations.
+            Self::GrantMandate { .. }
+            | Self::TopUpMandate { .. }
+            | Self::SpendUnderMandate { .. }
+            | Self::RevokeMandate { .. } => 10_000,
+            // Registration is permissionless-for-a-fee: it records data and locks
+            // no native units, so the anti-spam price is a HIGH ordinary fee (the
+            // fee flows through the normal burn / fee-pool split, no new bucket).
+            Self::RegisterService { .. } => 20_000,
+            // Update / status-change rewrite one existing record; a service-scoped
+            // spend moves units and writes one record — comparable to the other
+            // single-record management / locked-value operations.
+            Self::UpdateService { .. }
+            | Self::SetServiceStatus { .. }
+            | Self::SpendUnderMandateToService { .. } => 10_000,
+            // Token creation is permissionless-for-a-fee: it records a record,
+            // locks a native deposit, and optionally mints — so the anti-spam price
+            // is a HIGH ordinary fee (comparable to contract registration).
+            Self::CreateToken { .. } => 30_000,
+            // Mint/burn/transfer move units on one or two balance records (transfer
+            // is the hot path); comparable to a native Transfer plus a record touch.
+            Self::MintToken { .. } | Self::BurnToken { .. } | Self::TransferToken { .. } => 1_000,
+            // Pause/freeze/thaw/authority rewrite one record or one freeze marker —
+            // single-record management operations.
+            Self::SetTokenPaused { .. }
+            | Self::FreezeTokenAccount { .. }
+            | Self::ThawTokenAccount { .. }
+            | Self::SetTokenAuthority { .. } => 5_000,
+            // NFT collection creation is permissionless-for-a-fee: it records a
+            // record and locks a native deposit — the anti-spam price is a HIGH
+            // ordinary fee (comparable to token/contract creation).
+            Self::CreateNftCollection { .. } => 30_000,
+            // Mint/transfer/burn move one item and (for mint/burn) bump one record's
+            // counters — comparable to a native token mint/burn/transfer.
+            Self::MintNft { .. } | Self::TransferNft { .. } | Self::BurnNft { .. } => 1_000,
+            // Pause/freeze/thaw/authority rewrite one collection record or one item —
+            // single-record management operations.
+            Self::SetNftCollectionPaused { .. }
+            | Self::FreezeNftItem { .. }
+            | Self::ThawNftItem { .. }
+            | Self::SetNftAuthority { .. } => 5_000,
+            Self::CreateFeed { .. } => 15_000,
+            Self::RegisterReporter { .. }
+            | Self::DeregisterReporter { .. }
+            | Self::PayFeedRead { .. } => 10_000,
+            Self::SubmitReport { .. } => 5_000,
+            // A submit locks input and writes one order record; a cancel refunds and
+            // removes it — comparable to the other single-record locked-value ops.
+            // The batch settlement itself is a block-level cost amortized across all
+            // orders (§15.13), not charged to a single submit.
+            Self::SubmitOrder { .. } | Self::CancelOrder { .. } => 10_000,
+            // Registration validates a manifest, writes one record, and burns the
+            // fee — comparable to feed creation plus a record write.
+            Self::RegisterContract { .. } => 30_000,
+            // A contract call's admission cost is ahead-of-time boundable
+            // (ADR-0014 §3): a base plus the declared footprint size and input
+            // length. This is the fee settled up front; the runtime additionally
+            // meters per-host-op consumption against `gas_limit` during execution
+            // and hard-stops (fail-closed rollback) if it is exceeded. Saturating
+            // arithmetic keeps this panic-free on hostile lengths; the real input
+            // bound is enforced at execution.
+            Self::InvokeContract {
+                input,
+                declared_keys,
+                ..
+            } => {
+                let input_units = u64::try_from(input.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(CONTRACT_INPUT_BYTE_UNITS);
+                let key_units = u64::try_from(declared_keys.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(CONTRACT_DECLARED_KEY_UNITS);
+                CONTRACT_INVOKE_BASE_UNITS
+                    .saturating_add(input_units)
+                    .saturating_add(key_units)
+            }
         }
+    }
+
+    /// The application namespace whose LOCALIZED base fee prices this operation.
+    ///
+    /// Only the object operations (create/mutate/transfer/delete) are
+    /// namespace-scoped and therefore priced by their namespace's own localized
+    /// base fee (Phase 6 §8 "Application isolation"): they carry object state under
+    /// a namespace, and that namespace's congestion should move only its own price.
+    /// Every other operation returns `None` and keeps the global base fee — this
+    /// includes account-scoped operations like `Transfer`/staking *and* the
+    /// sponsor- and namespace-registry management operations, which merely name a
+    /// namespace to address a record rather than transacting object state under it.
+    pub fn fee_namespace(&self) -> Option<Hash256> {
+        match self {
+            Self::CreateObject { namespace, .. }
+            | Self::MutateObject { namespace, .. }
+            | Self::TransferObject { namespace, .. }
+            | Self::DeleteObject { namespace, .. } => Some(*namespace),
+            _ => None,
+        }
+    }
+
+    /// Whether this operation may have its fee paid by an application sponsor.
+    ///
+    /// Fee sponsorship is deliberately restricted to **simple operations** at
+    /// launch (§15.35): only a native `Transfer` qualifies. Critical, structural,
+    /// staking, bridge, object, and sponsor-management operations are never
+    /// sponsorable, so a sponsor budget can only ever underwrite ordinary
+    /// user-facing payments. The allowlist is intentionally minimal and can be
+    /// widened later with measurement; it is defined in code (not config) so the
+    /// set of sponsorable operations is fixed by the protocol, not by a sponsor.
+    pub fn is_sponsorable(&self) -> bool {
+        matches!(self, Self::Transfer { .. })
     }
 
     /// Builds the exact current-version access list for this native operation.
@@ -389,18 +1143,37 @@ impl Operation {
                 object_id,
                 namespace,
                 ..
+            }
+            | Self::DeleteObject {
+                object_id,
+                namespace,
+                ..
             } => {
                 push_unique_key(&mut read_write, StateKey::object(*object_id));
                 push_unique_key(
                     &mut read_write,
                     StateKey::application(*namespace, object_id.hash()),
                 );
+                // Create/mutate/delete lock or release a native storage deposit
+                // from the sender's liquid balance, so they also touch the sender
+                // account. TransferObject only reassigns ownership and leaves the
+                // deposit in place, so it does not declare the account key.
+                if matches!(
+                    self,
+                    Self::CreateObject { .. }
+                        | Self::MutateObject { .. }
+                        | Self::DeleteObject { .. }
+                ) {
+                    push_unique_key(&mut read_write, StateKey::account(sender));
+                }
             }
             Self::Transfer { to, .. } => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::account(*to));
             }
-            Self::RegisterValidator { .. } | Self::ClaimValidatorRewards => {
+            Self::RegisterValidator { .. }
+            | Self::ClaimValidatorRewards
+            | Self::CompoundValidatorRewards => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::validator(sender));
             }
@@ -428,6 +1201,16 @@ impl Operation {
             Self::ClaimDelegatorRewards { validator } => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::delegation(sender, *validator));
+            }
+            Self::CompoundDelegatorRewards { validator } => {
+                // Same footprint as `Delegate`: the reward is restaked into the
+                // position, touching the delegator account, the validator, the
+                // delegation record, and the validator's exit queue (its queued
+                // operator exit bounds the ratio).
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::validator(*validator));
+                push_unique_key(&mut read_write, StateKey::delegation(sender, *validator));
+                push_unique_key(&mut read_write, StateKey::unbonding_queue(*validator));
             }
             Self::SubmitSlashingEvidence { evidence } => {
                 push_unique_key(&mut read_write, StateKey::validator(evidence.validator()));
@@ -502,6 +1285,347 @@ impl Operation {
                     );
                 }
             }
+            Self::RegisterAppSponsor { namespace, .. }
+            | Self::FundAppSponsor { namespace, .. }
+            | Self::WithdrawAppSponsor { namespace, .. } => {
+                // Sponsor management moves native units between the owner's liquid
+                // balance and the app's sponsor budget, so it writes both the
+                // sender account and the app's sponsor state key.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::application(*namespace, sponsor_state_key_hash()),
+                );
+            }
+            Self::RegisterNamespace { namespace } | Self::TransferNamespace { namespace, .. } => {
+                // The registry claim/transfer only reads and writes the namespace's
+                // registry record; it moves no native units, so it does not declare
+                // the sender account beyond what the fee lane already covers. The
+                // record is domain-separated from object and sponsor state under the
+                // same namespace by `namespace_state_key_hash()`.
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::application(*namespace, namespace_state_key_hash()),
+                );
+            }
+            Self::CreateFeed { feed_id } => {
+                // Creating a feed burns the creation fee from the sender's liquid
+                // balance and writes the new feed-registry record.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::oracle_feed(*feed_id));
+            }
+            Self::RegisterReporter { feed_id } | Self::DeregisterReporter { feed_id } => {
+                // Registering locks the feed's bond from liquid; deregistering
+                // returns it. Both read the feed (for its bond/existence) and write
+                // the sender's reporter record and account.
+                push_unique_key(&mut read_only, StateKey::oracle_feed(*feed_id));
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::oracle_reporter(*feed_id, sender));
+            }
+            Self::SubmitReport { feed_id, .. } => {
+                // Reporting moves no native units (only the ordinary tx fee): it
+                // reads the feed for existence and writes the reporter record.
+                push_unique_key(&mut read_only, StateKey::oracle_feed(*feed_id));
+                push_unique_key(&mut read_write, StateKey::oracle_reporter(*feed_id, sender));
+            }
+            Self::PayFeedRead { feed_id, .. } => {
+                // A read fee moves units from the payer's liquid balance into the
+                // feed's revenue pool, so it writes both the account and the feed.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::oracle_feed(*feed_id));
+            }
+            Self::SubmitOrder {
+                order_id,
+                pair,
+                side,
+                ..
+            } => {
+                // A submit locks the order's input from the sender and writes the new
+                // order record. The native fee already touches the sender account
+                // (default-lane base). When the locked leg is a NON-native asset, the
+                // lock debits that asset balance, so declare it; the locked leg is the
+                // quote for a buy and the base for a sell. The block-level batch pass
+                // that later fills/refunds the order is not access-list-bound.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::dex_order(*order_id));
+                let locked_asset = match side {
+                    crate::OrderSide::Buy => &pair.quote,
+                    crate::OrderSide::Sell => &pair.base,
+                };
+                if *locked_asset != AssetId::NativeWebc {
+                    push_unique_key(
+                        &mut read_write,
+                        StateKey::asset_balance(locked_asset.clone(), sender),
+                    );
+                }
+            }
+            Self::CancelOrder { order_id } => {
+                // Cancel only marks the order for the block-level batch pass (which
+                // performs the possibly-non-native refund without an access list),
+                // so the transaction itself only writes the sender account (fee) and
+                // the order record. Carrying just an order id keeps a cancel's signed
+                // access list independent of the order's asset legs.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::dex_order(*order_id));
+            }
+            Self::RegisterContract { manifest } => {
+                // Registration burns the fee from liquid and writes the contract's
+                // module (manifest) record. The account key is already in the
+                // default-lane base; declare the module record it creates.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::module(manifest.code_id));
+            }
+            Self::GrantMandate {
+                agent_key,
+                grant_nonce,
+                ..
+            } => {
+                // A grant locks the budget from the principal's liquid balance and
+                // writes the new mandate record. The mandate id is derived from the
+                // signer (principal), the agent key, and the grant nonce, so the
+                // access list names the exact record at signing time.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::mandate(MandateId::derive(sender, agent_key, *grant_nonce)),
+                );
+            }
+            Self::TopUpMandate { mandate_id, .. } | Self::RevokeMandate { mandate_id } => {
+                // Top-up moves liquid into escrow; revoke returns the remainder to
+                // liquid. Both touch the principal account and the mandate record.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
+            }
+            Self::SpendUnderMandate {
+                mandate_id,
+                recipient,
+                ..
+            } => {
+                // The sender is the agent; the mandate escrow funds both the
+                // principal moved and the fee, so no principal account key is
+                // needed. The agent account (default-lane base) carries the spend's
+                // nonce/replay state; declare the mandate record and the recipient.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
+                push_unique_key(&mut read_write, StateKey::account(*recipient));
+            }
+            Self::RegisterService {
+                namespace,
+                create_nonce,
+                ..
+            } => {
+                // Registration records only the service-registry entry and moves no
+                // native units (the ordinary, spam-priced fee is drawn from the
+                // fee lane, already covered by the default-lane base). The service
+                // id is derived from the signer (owner), the namespace, and the
+                // create nonce, so the access list names the exact record at signing
+                // time (mirroring GrantMandate's derived id).
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::service(ServiceId::derive(*namespace, sender, *create_nonce)),
+                );
+            }
+            Self::UpdateService { service_id, .. } | Self::SetServiceStatus { service_id, .. } => {
+                // Update / status change only reads and writes the entry's record;
+                // it moves no native units, so it does not declare the sender account
+                // beyond the fee lane already covered by the default-lane base.
+                push_unique_key(&mut read_write, StateKey::service(*service_id));
+            }
+            Self::SpendUnderMandateToService {
+                mandate_id,
+                service_id,
+                ..
+            } => {
+                // The sender is the agent; the mandate escrow funds both the
+                // principal moved and the fee. The agent account (default-lane base)
+                // carries the spend's nonce/replay state; the mandate record is
+                // written and the service entry is read to resolve the pay-to owner.
+                // The service OWNER (the registry pay-to) account is state-derived —
+                // it is not in the operation — so a caller adds it here via
+                // `Transaction::for_service_spend`; the base list below is otherwise
+                // complete.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
+                push_unique_key(&mut read_only, StateKey::service(*service_id));
+            }
+            Self::CreateToken {
+                namespace,
+                create_nonce,
+                initial_supply,
+                initial_recipient,
+                ..
+            } => {
+                // Creation locks a native deposit from the creator's liquid balance
+                // and writes the new token record. The account key is in the
+                // default-lane base; declare it explicitly so a non-default fee lane
+                // is covered too. When it mints an initial supply, it also writes the
+                // recipient's per-account token balance. The token id is derived from
+                // the signer (creator), the namespace, and the create nonce, so the
+                // access list names the exact record at signing time.
+                let token_id = TokenId::derive(*namespace, sender, *create_nonce);
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::token(token_id));
+                if !initial_supply.is_zero() {
+                    push_unique_key(
+                        &mut read_write,
+                        StateKey::token_balance(token_id, *initial_recipient),
+                    );
+                }
+            }
+            Self::MintToken {
+                token_id,
+                recipient,
+                ..
+            } => {
+                // Mint raises issued_supply (writes the record) and credits the
+                // recipient's per-account token balance. Moves no native units
+                // beyond the fee (already covered by the lane base).
+                push_unique_key(&mut read_write, StateKey::token(*token_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::token_balance(*token_id, *recipient),
+                );
+            }
+            Self::BurnToken { token_id, .. } => {
+                // Burn lowers issued_supply (writes the record) and debits the
+                // signer's per-account token balance.
+                push_unique_key(&mut read_write, StateKey::token(*token_id));
+                push_unique_key(&mut read_write, StateKey::token_balance(*token_id, sender));
+            }
+            Self::TransferToken {
+                token_id,
+                recipient,
+                ..
+            } => {
+                // The token record is READ-ONLY (only its paused flag is consulted);
+                // the two per-account balance keys are the ONLY writes, so an
+                // ordinary transfer never writes a global per-token object (a Phase
+                // 13 acceptance criterion). Both parties' freeze markers are declared
+                // READS so the parallel scheduler serializes this transfer against a
+                // FreezeTokenAccount/ThawTokenAccount of either party — otherwise a
+                // transfer and a concurrent freeze of the same account could race
+                // (freeze bypass + nondeterministic state root under parallel exec).
+                push_unique_key(&mut read_only, StateKey::token(*token_id));
+                push_unique_key(&mut read_write, StateKey::token_balance(*token_id, sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::token_balance(*token_id, *recipient),
+                );
+                push_unique_key(&mut read_only, StateKey::token_freeze(*token_id, sender));
+                push_unique_key(
+                    &mut read_only,
+                    StateKey::token_freeze(*token_id, *recipient),
+                );
+            }
+            Self::SetTokenPaused { token_id, .. } | Self::SetTokenAuthority { token_id, .. } => {
+                // Pause / authority change rewrite one token record; move no native
+                // units, so they declare only the record beyond the fee lane base.
+                push_unique_key(&mut read_write, StateKey::token(*token_id));
+            }
+            Self::FreezeTokenAccount { token_id, account }
+            | Self::ThawTokenAccount { token_id, account } => {
+                // The record is read to check the freeze authority; the freeze marker
+                // is the only write. Freezing moves no native units.
+                push_unique_key(&mut read_only, StateKey::token(*token_id));
+                push_unique_key(&mut read_write, StateKey::token_freeze(*token_id, *account));
+            }
+            Self::CreateNftCollection {
+                namespace,
+                create_nonce,
+                ..
+            } => {
+                // Creation locks a native deposit from the creator's liquid balance
+                // and writes the new collection record. The account key is in the
+                // default-lane base; declare it explicitly so a non-default fee lane
+                // is covered too. It mints no item, so no item key is written. The
+                // collection id is derived from the signer (creator), the namespace,
+                // and the create nonce, so the access list names the exact record at
+                // signing time (mirrors CreateToken/CreateObject).
+                let collection_id = NftCollectionId::derive(*namespace, sender, *create_nonce);
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::nft_collection(collection_id));
+            }
+            Self::MintNft { collection_id, .. } => {
+                // A mint bumps `next_serial`/`minted_count` (writes the collection
+                // record) and creates ONE brand-new item at the chain-assigned
+                // `serial = next_serial`. That serial is state-dependent and NOT known
+                // at signing time, so the new item key cannot be pre-declared. This is
+                // safe because the collection record is declared READ_WRITE: every
+                // mint of a collection therefore serializes on it, so two mints can
+                // never race on the fresh serial, and any later op that references the
+                // item (transfer/burn/freeze/thaw — which DO read/write the collection
+                // record) is serialized after the mint. The fresh item is thus created
+                // under the collection record's write scope; see the matching handler
+                // note in `state.rs`.
+                push_unique_key(&mut read_write, StateKey::nft_collection(*collection_id));
+            }
+            Self::TransferNft {
+                collection_id,
+                serial,
+                ..
+            } => {
+                // The collection record is READ-ONLY (only its paused flag is
+                // consulted); the single item key is the ONLY write, so an ordinary
+                // transfer never writes a global per-collection object (a Phase 13
+                // acceptance criterion). The item's `frozen` flag lives ON the item
+                // record we already write, so it needs no separate declaration — the
+                // read_write item key covers both the owner/frozen reads and the
+                // ownership write, and the read-only collection key covers the paused
+                // read.
+                push_unique_key(&mut read_only, StateKey::nft_collection(*collection_id));
+                push_unique_key(&mut read_write, StateKey::nft_item(*collection_id, *serial));
+            }
+            Self::BurnNft {
+                collection_id,
+                serial,
+            } => {
+                // A burn removes the item (writes the item key) and bumps
+                // `burned_count` (writes the collection record). The owner and frozen
+                // checks read the item key we already write.
+                push_unique_key(&mut read_write, StateKey::nft_collection(*collection_id));
+                push_unique_key(&mut read_write, StateKey::nft_item(*collection_id, *serial));
+            }
+            Self::SetNftCollectionPaused { collection_id, .. }
+            | Self::SetNftAuthority { collection_id, .. } => {
+                // Pause / authority change rewrite one collection record; move no
+                // native units, so they declare only the record beyond the fee lane
+                // base.
+                push_unique_key(&mut read_write, StateKey::nft_collection(*collection_id));
+            }
+            Self::FreezeNftItem {
+                collection_id,
+                serial,
+            }
+            | Self::ThawNftItem {
+                collection_id,
+                serial,
+            } => {
+                // The collection record is read to check the freeze authority; the
+                // item's `frozen` flag is the only write. Freezing moves no native
+                // units.
+                push_unique_key(&mut read_only, StateKey::nft_collection(*collection_id));
+                push_unique_key(&mut read_write, StateKey::nft_item(*collection_id, *serial));
+            }
+            Self::InvokeContract {
+                code_id,
+                namespace,
+                declared_keys,
+                ..
+            } => {
+                // The manifest record is read to resolve and bind the contract;
+                // the declared footprint keys (which must equal the manifest's) are
+                // the contract's application state, declared read_write so the
+                // signed access list and the scheduler agree with the manifest.
+                // The example contract moves no native value, so no extra account
+                // key beyond the default-lane fee source is required.
+                push_unique_key(&mut read_only, StateKey::module(*code_id));
+                for key_hash in declared_keys {
+                    push_unique_key(
+                        &mut read_write,
+                        StateKey::application(*namespace, *key_hash),
+                    );
+                }
+            }
         }
         if !matches!(
             self,
@@ -543,7 +1667,14 @@ fn push_unique_key(keys: &mut Vec<StateKey>, key: StateKey) {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// `Serialize` is implemented manually (below) so the optional `sponsor` field is
+// omitted in the self-describing (JSON) encoding when absent — keeping every
+// non-sponsored transaction byte-identical to the pre-sponsorship struct — while
+// always being written in the non-self-describing binary codec (bincode), where a
+// skipped field would desynchronize positional decoding. `Deserialize` stays
+// derived: `#[serde(default)]` restores `None` from an absent JSON field, and the
+// binary codec always carries the field.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
     /// Protocol schema version that interprets every signed field.
@@ -568,6 +1699,71 @@ pub struct Transaction {
     pub fee: FeeBid,
     /// Ed25519 signature over canonical signing bytes, or `None` before signing.
     pub signature: Option<SignatureBytes>,
+    /// Optional sponsoring application namespace (fee sponsorship, §15.35).
+    ///
+    /// When `Some(namespace)`, the sender opts into having that application's
+    /// pre-funded sponsor budget pay this transaction's fee, subject to hard
+    /// per-user / per-operation / per-app-per-day caps and the simple-operation
+    /// restriction ([`Operation::is_sponsorable`]). Sponsorship is **best-effort
+    /// (fail-open)**: if any cap or the budget does not permit it — or the
+    /// operation is not sponsorable — the sender pays normally, never more than
+    /// the fee already authorized by `fee`. Must use the default authorization
+    /// lane.
+    ///
+    /// `None` is the default and is **omitted from the wire**, so every existing
+    /// (non-sponsored) transaction serializes byte-for-byte as before and the
+    /// frozen `WEBC_SIGNED_TRANSACTION_V4` signing vectors are unchanged. The
+    /// field is a purely additive, backward-compatible superset of V4.
+    ///
+    /// It is declared **last** so the manual [`Serialize`] impl can append it
+    /// only for the JSON encoding when present. `#[serde(default)]` restores
+    /// `None` when an absent JSON field is decoded; the binary codec always
+    /// carries the field, so positional decoding never desynchronizes.
+    #[serde(default)]
+    pub sponsor: Option<Hash256>,
+}
+
+impl Serialize for Transaction {
+    /// Serializes a transaction, omitting an absent `sponsor` in JSON only.
+    ///
+    /// In a self-describing encoding (JSON — the signing/hashing and cross-language
+    /// path) a `None` sponsor is omitted, so a non-sponsored transaction is
+    /// byte-identical to the pre-sponsorship struct and the frozen
+    /// `WEBC_SIGNED_TRANSACTION_V4` vectors, the transaction hash, and the browser
+    /// SDK are all unchanged. In a non-self-describing binary codec (bincode, used
+    /// to gossip transactions on the network wire) the field is ALWAYS written,
+    /// because skipping any field there would misalign every field decoded after
+    /// it. Field order matches the struct declaration so the derived
+    /// `Deserialize` reads binary fields positionally.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let omit_sponsor = serializer.is_human_readable() && self.sponsor.is_none();
+        let field_count = if omit_sponsor { 11 } else { 12 };
+        let mut state = serializer.serialize_struct("Transaction", field_count)?;
+        state.serialize_field("protocol_version", &self.protocol_version)?;
+        state.serialize_field("chain_id", &self.chain_id)?;
+        state.serialize_field("sender", &self.sender)?;
+        state.serialize_field("public_key", &self.public_key)?;
+        state.serialize_field("authorization_lane", &self.authorization_lane)?;
+        state.serialize_field(
+            "authorization_policy_revision",
+            &self.authorization_policy_revision,
+        )?;
+        state.serialize_field("nonce", &self.nonce)?;
+        state.serialize_field("operation", &self.operation)?;
+        state.serialize_field("access_list", &self.access_list)?;
+        state.serialize_field("fee", &self.fee)?;
+        state.serialize_field("signature", &self.signature)?;
+        if omit_sponsor {
+            state.skip_field("sponsor")?;
+        } else {
+            state.serialize_field("sponsor", &self.sponsor)?;
+        }
+        state.end()
+    }
 }
 
 impl Transaction {
@@ -675,6 +1871,7 @@ impl Transaction {
             operation,
             access_list,
             fee,
+            sponsor: None,
             signature: None,
         }
     }
@@ -687,6 +1884,94 @@ impl Transaction {
         fee: FeeBid,
     ) -> Result<Self, ChainError> {
         Self::for_operation_in_lane(keypair, AuthorizationLaneId::DEFAULT, nonce, operation, fee)
+    }
+
+    /// Builds access (including the sponsor state key), opts into fee sponsorship
+    /// by `sponsor_namespace`, and signs for the devnet chain's default lane.
+    ///
+    /// Sponsorship is best-effort and applies only on the default lane and only
+    /// to sponsorable operations; the runtime enforces the hard caps and falls
+    /// open to normal self-payment when they do not permit it. The returned
+    /// access list is a superset covering both the sponsored and the self-pay
+    /// execution paths, so neither path can trigger an undeclared/unused
+    /// access-list failure.
+    pub fn for_sponsored_operation(
+        keypair: &Keypair,
+        nonce: u64,
+        operation: Operation,
+        fee: FeeBid,
+        sponsor_namespace: Hash256,
+    ) -> Result<Self, ChainError> {
+        let sender = keypair.address();
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::application(sponsor_namespace, sponsor_state_key_hash()),
+        );
+        let mut tx = Self::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            keypair.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            LEGACY_AUTHORIZATION_POLICY_REVISION,
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sponsor = Some(sponsor_namespace);
+        tx.sign(keypair)?;
+        Ok(tx)
+    }
+
+    /// Builds and signs a mandate spend that pays a registered service's owner
+    /// (Phase 9b, §15.5).
+    ///
+    /// The service `owner` (the registry pay-to account) is state-derived, so the
+    /// pure default access list cannot name it; the agent resolves it by reading
+    /// the on-chain service entry — the same pay-to check the HTTP-402 flow
+    /// performs — and passes it here so the signed access list declares the
+    /// credited account. If the owner changes on-chain before this lands, the spend
+    /// fails closed on the access-list mismatch, exactly like a stale recipient in
+    /// [`Operation::SpendUnderMandate`]. Signs for the devnet chain's default lane;
+    /// the signer is the mandate's agent key.
+    pub fn for_service_spend(
+        agent_keypair: &Keypair,
+        nonce: u64,
+        mandate_id: MandateId,
+        service_id: ServiceId,
+        amount: Amount,
+        service_owner: Address,
+        fee: FeeBid,
+    ) -> Result<Self, ChainError> {
+        let operation = Operation::SpendUnderMandateToService {
+            mandate_id,
+            service_id,
+            amount,
+        };
+        let sender = agent_keypair.address();
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::account(service_owner),
+        );
+        let mut tx = Self::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            agent_keypair.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            LEGACY_AUTHORIZATION_POLICY_REVISION,
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign(agent_keypair)?;
+        Ok(tx)
     }
 
     /// Builds and signs on devnet under an already installed policy revision.
@@ -856,6 +2141,10 @@ impl Transaction {
     /// The `signature` field itself is intentionally excluded from signing,
     /// so the same struct can carry its own signature without circularity.
     fn signing_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        // `sponsor` is skipped when `None`, so a non-sponsored transaction's
+        // signing payload is byte-identical to the frozen V4 vectors; a sponsored
+        // transaction adds exactly one `sponsor` key. The signed field binds the
+        // sponsor choice to the sender's signature.
         #[derive(Serialize)]
         struct SigningPayload<'a> {
             domain: &'static str,
@@ -869,6 +2158,8 @@ impl Transaction {
             operation: &'a Operation,
             access_list: &'a AccessList,
             fee: FeeBid,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sponsor: Option<Hash256>,
         }
 
         let payload = SigningPayload {
@@ -883,6 +2174,7 @@ impl Transaction {
             operation: &self.operation,
             access_list: &self.access_list,
             fee: self.fee,
+            sponsor: self.sponsor,
         };
         crate::canonical::canonical_json_bytes(&payload)
     }
@@ -928,6 +2220,8 @@ mod tests {
             operation: &'a Operation,
             access_list: &'a AccessList,
             fee: FeeBid,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sponsor: Option<Hash256>,
         }
         let payload = SigningPayload {
             domain: SIGNING_DOMAIN,
@@ -941,6 +2235,7 @@ mod tests {
             operation: &tx.operation,
             access_list: &tx.access_list,
             fee: tx.fee,
+            sponsor: tx.sponsor,
         };
         crate::canonical::canonical_json_string(&payload).unwrap()
     }
@@ -1159,6 +2454,631 @@ mod tests {
         value["BridgeLock"]["recipient"] =
             serde_json::Value::String("ab".repeat(crate::bridge::MAX_BRIDGE_RECIPIENT_BYTES + 1));
         assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn delete_object_operation_has_a_stable_wire_vector() {
+        // Pins the canonical JSON shape of the storage-deposit DeleteObject
+        // operation (§15.22) so a browser SDK mirror must reproduce these exact
+        // field names and sorted-key order. Adding this variant leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched, because
+        // serde tags variants by name and existing variants are unchanged.
+        let operation = Operation::DeleteObject {
+            object_id: ObjectId::new(Hash256([0x33; 32])),
+            namespace: Hash256([0x55; 32]),
+            expected_version: ObjectVersion::new(4),
+        };
+        let canonical =
+            crate::canonical::canonical_json_string(&operation).expect("delete object serializes");
+        let expected = format!(
+            r#"{{"DeleteObject":{{"expected_version":4,"namespace":"{ns}","object_id":"{id}"}}}}"#,
+            ns = "55".repeat(32),
+            id = "33".repeat(32),
+        );
+        assert_eq!(canonical, expected);
+
+        // The decode is strict (deny_unknown_fields), matching its sibling ops.
+        let mut value = serde_json::to_value(&operation).expect("serializes");
+        value["DeleteObject"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn sponsor_management_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the three sponsor-management operations
+        // (§15.35) so a browser SDK mirror must reproduce these exact field names
+        // and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged).
+        let namespace = Hash256([0x55; 32]);
+        let register = Operation::RegisterAppSponsor {
+            namespace,
+            daily_budget_cap: Amount::from_units(50_000),
+            initial_funding: Amount::from_units(100_000),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&register).unwrap(),
+            format!(
+                r#"{{"RegisterAppSponsor":{{"daily_budget_cap":"50000","initial_funding":"100000","namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+        let fund = Operation::FundAppSponsor {
+            namespace,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&fund).unwrap(),
+            format!(
+                r#"{{"FundAppSponsor":{{"amount":"7","namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+        let withdraw = Operation::WithdrawAppSponsor {
+            namespace,
+            amount: Amount::from_units(9),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&withdraw).unwrap(),
+            format!(
+                r#"{{"WithdrawAppSponsor":{{"amount":"9","namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&register).unwrap();
+        value["RegisterAppSponsor"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn namespace_registry_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the two namespace-registry operations (§8
+        // application isolation) so a browser SDK mirror must reproduce these exact
+        // field names and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged).
+        let namespace = Hash256([0x55; 32]);
+        let new_owner = Keypair::from_seed([2u8; 32]).address();
+        let register = Operation::RegisterNamespace { namespace };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&register).unwrap(),
+            format!(
+                r#"{{"RegisterNamespace":{{"namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+        let transfer = Operation::TransferNamespace {
+            namespace,
+            new_owner,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&transfer).unwrap(),
+            format!(
+                r#"{{"TransferNamespace":{{"namespace":"{ns}","new_owner":"{owner}"}}}}"#,
+                ns = "55".repeat(32),
+                owner = new_owner.to_base58(),
+            )
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&register).unwrap();
+        value["RegisterNamespace"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn oracle_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the five native-oracle operations (Phase 7,
+        // §15.17) so a browser SDK mirror must reproduce these exact field names
+        // and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Note the feed value
+        // is a decimal STRING (like Amount), never a bare JSON number.
+        let feed_id = crate::FeedId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let create = Operation::CreateFeed { feed_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&create).unwrap(),
+            format!(r#"{{"CreateFeed":{{"feed_id":"{id}"}}}}"#),
+        );
+        let register = Operation::RegisterReporter { feed_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&register).unwrap(),
+            format!(r#"{{"RegisterReporter":{{"feed_id":"{id}"}}}}"#),
+        );
+        let deregister = Operation::DeregisterReporter { feed_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&deregister).unwrap(),
+            format!(r#"{{"DeregisterReporter":{{"feed_id":"{id}"}}}}"#),
+        );
+        let report = Operation::SubmitReport {
+            feed_id,
+            value: crate::FeedValue::new(-123_456_789_012_345),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&report).unwrap(),
+            format!(r#"{{"SubmitReport":{{"feed_id":"{id}","value":"-123456789012345"}}}}"#),
+        );
+        let pay = Operation::PayFeedRead {
+            feed_id,
+            amount: Amount::from_units(42),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&pay).unwrap(),
+            format!(r#"{{"PayFeedRead":{{"amount":"42","feed_id":"{id}"}}}}"#),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateFeed"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn mandate_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the four agent-mandate operations (Phase 9a,
+        // §15.32) so a browser SDK mirror must reproduce these exact field names
+        // and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Amounts are decimal
+        // STRINGS (like Amount), never bare JSON numbers.
+        let mandate_id = crate::MandateId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let agent = Keypair::from_seed([9u8; 32]).public_key();
+        let recipient = Keypair::from_seed([2u8; 32]).address();
+
+        // GrantMandate carries an enum policy, so round-trip it rather than pin a
+        // large fixed string; the simpler three are pinned exactly below.
+        let grant = Operation::GrantMandate {
+            agent_key: agent,
+            grant_nonce: 3,
+            budget_total: Amount::from_units(1_000),
+            expiry_epoch: Epoch::new(100),
+            per_tx_max: Amount::from_units(100),
+            rate_limit_per_day: 5,
+            counterparty_policy: MandateCounterpartyPolicy::Open,
+        };
+        let text = serde_json::to_string(&grant).expect("grant serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), grant);
+
+        let top_up = Operation::TopUpMandate {
+            mandate_id,
+            amount: Amount::from_units(5),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&top_up).unwrap(),
+            format!(r#"{{"TopUpMandate":{{"amount":"5","mandate_id":"{id}"}}}}"#),
+        );
+        let spend = Operation::SpendUnderMandate {
+            mandate_id,
+            recipient,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&spend).unwrap(),
+            format!(
+                r#"{{"SpendUnderMandate":{{"amount":"7","mandate_id":"{id}","recipient":"{rec}"}}}}"#,
+                rec = recipient.to_base58(),
+            )
+        );
+        let revoke = Operation::RevokeMandate { mandate_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&revoke).unwrap(),
+            format!(r#"{{"RevokeMandate":{{"mandate_id":"{id}"}}}}"#),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&revoke).unwrap();
+        value["RevokeMandate"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn service_registry_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the four service-registry operations (Phase 9b,
+        // §15.5) so a browser SDK mirror must reproduce these exact field names and
+        // sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Byte-string fields are
+        // lowercase hex (like bridge addresses); amounts are decimal STRINGS.
+        use std::collections::BTreeSet;
+        let namespace = Hash256([0x55; 32]);
+        let interface = Hash256([0x1f; 32]);
+        let service_id = ServiceId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let mut categories = BTreeSet::new();
+        categories.insert(Hash256([0xc1; 32]));
+        let pricing = vec![ServicePrice {
+            operation: Hash256([0x0b; 32]),
+            price: Amount::from_units(1_000),
+            unit: b"call".to_vec(),
+        }];
+        let payment_flags = ServicePaymentFlags {
+            on_chain_direct: true,
+            http_402: false,
+            subscription: false,
+        };
+
+        // RegisterService / UpdateService carry sets, lists, and bounded byte
+        // strings, so round-trip them rather than pin a large fixed string; the two
+        // simpler ops are pinned exactly below.
+        let register = Operation::RegisterService {
+            namespace,
+            create_nonce: 7,
+            categories: categories.clone(),
+            title: b"inference".to_vec(),
+            endpoint: b"https://api.example/infer".to_vec(),
+            interface,
+            pricing: pricing.clone(),
+            payment_flags,
+        };
+        let text = serde_json::to_string(&register).expect("register serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), register);
+        // The title field is lowercase hex on the wire ("inference" = 696e...).
+        assert!(text.contains(&format!("\"title\":\"{}\"", hex::encode("inference"))));
+
+        let update = Operation::UpdateService {
+            service_id,
+            categories,
+            title: b"inference-v2".to_vec(),
+            endpoint: b"https://api.example/infer".to_vec(),
+            interface,
+            pricing,
+            payment_flags,
+        };
+        let text = serde_json::to_string(&update).expect("update serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), update);
+
+        let set_status = Operation::SetServiceStatus {
+            service_id,
+            status: ServiceStatus::Paused,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&set_status).unwrap(),
+            format!(r#"{{"SetServiceStatus":{{"service_id":"{id}","status":"Paused"}}}}"#),
+        );
+
+        let spend = Operation::SpendUnderMandateToService {
+            mandate_id: MandateId::new(Hash256([0x99; 32])),
+            service_id,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&spend).unwrap(),
+            format!(
+                r#"{{"SpendUnderMandateToService":{{"amount":"7","mandate_id":"{mid}","service_id":"{id}"}}}}"#,
+                mid = "99".repeat(32),
+            )
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        // The bounded hex codec additionally rejects an over-length title.
+        let mut value = serde_json::to_value(&set_status).unwrap();
+        value["SetServiceStatus"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&register).unwrap();
+        value["RegisterService"]["title"] = serde_json::Value::String(
+            "61".repeat(crate::service_registry::MAX_SERVICE_TITLE_BYTES + 1),
+        );
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn token_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the native token operations (Phase 13a, §15) so
+        // a browser SDK mirror must reproduce these exact field names and sorted-key
+        // order. Adding these variants leaves the frozen `every_native_operation_...`
+        // cross-language vector untouched (serde tags variants by name; existing
+        // variants are unchanged). Byte-string fields are lowercase hex; amounts are
+        // decimal STRINGS; addresses are base58; an Option is the address or null.
+        let token_id = TokenId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let recipient = Keypair::from_seed([9u8; 32]).address();
+        let rcpt = recipient.to_base58();
+        let account = Keypair::from_seed([10u8; 32]).address();
+        let acct = account.to_base58();
+
+        // CreateToken carries the nested TokenMetadata struct, so round-trip it and
+        // confirm the metadata name is lowercase hex on the wire.
+        let create = Operation::CreateToken {
+            namespace: Hash256([0x55; 32]),
+            create_nonce: 7,
+            metadata: TokenMetadata::new(
+                b"Acme Dollar".to_vec(),
+                b"ACME".to_vec(),
+                6,
+                Hash256([0x1f; 32]),
+            )
+            .expect("valid metadata"),
+            mint_authority: Some(recipient),
+            freeze_authority: None,
+            initial_supply: Amount::from_units(1_000),
+            initial_recipient: recipient,
+        };
+        let text = serde_json::to_string(&create).expect("create serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), create);
+        assert!(text.contains(&format!("\"name\":\"{}\"", hex::encode("Acme Dollar"))));
+
+        let mint = Operation::MintToken {
+            token_id,
+            recipient,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&mint).unwrap(),
+            format!(r#"{{"MintToken":{{"amount":"7","recipient":"{rcpt}","token_id":"{id}"}}}}"#),
+        );
+
+        let burn = Operation::BurnToken {
+            token_id,
+            amount: Amount::from_units(3),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&burn).unwrap(),
+            format!(r#"{{"BurnToken":{{"amount":"3","token_id":"{id}"}}}}"#),
+        );
+
+        let transfer = Operation::TransferToken {
+            token_id,
+            recipient,
+            amount: Amount::from_units(5),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&transfer).unwrap(),
+            format!(
+                r#"{{"TransferToken":{{"amount":"5","recipient":"{rcpt}","token_id":"{id}"}}}}"#
+            ),
+        );
+
+        let pause = Operation::SetTokenPaused {
+            token_id,
+            paused: true,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&pause).unwrap(),
+            format!(r#"{{"SetTokenPaused":{{"paused":true,"token_id":"{id}"}}}}"#),
+        );
+
+        let freeze = Operation::FreezeTokenAccount { token_id, account };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&freeze).unwrap(),
+            format!(r#"{{"FreezeTokenAccount":{{"account":"{acct}","token_id":"{id}"}}}}"#),
+        );
+
+        let thaw = Operation::ThawTokenAccount { token_id, account };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&thaw).unwrap(),
+            format!(r#"{{"ThawTokenAccount":{{"account":"{acct}","token_id":"{id}"}}}}"#),
+        );
+
+        // Authority transfer (Some) pins the address; renounce (None) pins null.
+        let grant_auth = Operation::SetTokenAuthority {
+            token_id,
+            authority_kind: TokenAuthorityKind::Mint,
+            new_authority: Some(recipient),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&grant_auth).unwrap(),
+            format!(
+                r#"{{"SetTokenAuthority":{{"authority_kind":"Mint","new_authority":"{rcpt}","token_id":"{id}"}}}}"#
+            ),
+        );
+        let renounce = Operation::SetTokenAuthority {
+            token_id,
+            authority_kind: TokenAuthorityKind::Freeze,
+            new_authority: None,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&renounce).unwrap(),
+            format!(
+                r#"{{"SetTokenAuthority":{{"authority_kind":"Freeze","new_authority":null,"token_id":"{id}"}}}}"#
+            ),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations,
+        // and the bounded hex codec rejects an over-length metadata name.
+        let mut value = serde_json::to_value(&mint).unwrap();
+        value["MintToken"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateToken"]["metadata"]["name"] =
+            serde_json::Value::String("61".repeat(crate::token::MAX_TOKEN_NAME_BYTES + 1));
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn nft_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the native NFT operations (Phase 13b, §15) so a
+        // browser SDK mirror must reproduce these exact field names and sorted-key
+        // order. Adding these variants leaves the frozen `every_native_operation_...`
+        // cross-language vector untouched (serde tags variants by name; existing
+        // variants are unchanged). Byte-string fields are lowercase hex; hashes are
+        // 32-byte lowercase hex; addresses are base58; an Option is the address/value
+        // or null.
+        let collection_id = crate::NftCollectionId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let recipient = Keypair::from_seed([9u8; 32]).address();
+        let rcpt = recipient.to_base58();
+        let item_hash = Hash256([0x3a; 32]);
+        let item_hex = "3a".repeat(32);
+
+        // CreateNftCollection carries the nested NftMetadata struct, so round-trip it
+        // and confirm the metadata name is lowercase hex on the wire.
+        let create = Operation::CreateNftCollection {
+            namespace: Hash256([0x55; 32]),
+            create_nonce: 7,
+            metadata: crate::NftMetadata::new(
+                b"Acme Apes".to_vec(),
+                b"APE".to_vec(),
+                Hash256([0x1f; 32]),
+            )
+            .expect("valid metadata"),
+            mint_authority: Some(recipient),
+            freeze_authority: None,
+            max_supply: Some(10_000),
+            royalty_bps: 500,
+        };
+        let text = serde_json::to_string(&create).expect("create serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), create);
+        assert!(text.contains(&format!("\"name\":\"{}\"", hex::encode("Acme Apes"))));
+
+        let mint = Operation::MintNft {
+            collection_id,
+            recipient,
+            item_metadata_hash: item_hash,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&mint).unwrap(),
+            format!(
+                r#"{{"MintNft":{{"collection_id":"{id}","item_metadata_hash":"{item_hex}","recipient":"{rcpt}"}}}}"#
+            ),
+        );
+
+        let transfer = Operation::TransferNft {
+            collection_id,
+            serial: 3,
+            recipient,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&transfer).unwrap(),
+            format!(
+                r#"{{"TransferNft":{{"collection_id":"{id}","recipient":"{rcpt}","serial":3}}}}"#
+            ),
+        );
+
+        let burn = Operation::BurnNft {
+            collection_id,
+            serial: 3,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&burn).unwrap(),
+            format!(r#"{{"BurnNft":{{"collection_id":"{id}","serial":3}}}}"#),
+        );
+
+        let pause = Operation::SetNftCollectionPaused {
+            collection_id,
+            paused: true,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&pause).unwrap(),
+            format!(r#"{{"SetNftCollectionPaused":{{"collection_id":"{id}","paused":true}}}}"#),
+        );
+
+        let freeze = Operation::FreezeNftItem {
+            collection_id,
+            serial: 3,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&freeze).unwrap(),
+            format!(r#"{{"FreezeNftItem":{{"collection_id":"{id}","serial":3}}}}"#),
+        );
+
+        let thaw = Operation::ThawNftItem {
+            collection_id,
+            serial: 3,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&thaw).unwrap(),
+            format!(r#"{{"ThawNftItem":{{"collection_id":"{id}","serial":3}}}}"#),
+        );
+
+        // Authority transfer (Some) pins the address; renounce (None) pins null.
+        let grant_auth = Operation::SetNftAuthority {
+            collection_id,
+            authority_kind: crate::NftAuthorityKind::Mint,
+            new_authority: Some(recipient),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&grant_auth).unwrap(),
+            format!(
+                r#"{{"SetNftAuthority":{{"authority_kind":"Mint","collection_id":"{id}","new_authority":"{rcpt}"}}}}"#
+            ),
+        );
+        let renounce = Operation::SetNftAuthority {
+            collection_id,
+            authority_kind: crate::NftAuthorityKind::Freeze,
+            new_authority: None,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&renounce).unwrap(),
+            format!(
+                r#"{{"SetNftAuthority":{{"authority_kind":"Freeze","collection_id":"{id}","new_authority":null}}}}"#
+            ),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations,
+        // and the bounded hex codec rejects an over-length metadata name.
+        let mut value = serde_json::to_value(&mint).unwrap();
+        value["MintNft"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateNftCollection"]["metadata"]["name"] =
+            serde_json::Value::String("61".repeat(crate::nft::MAX_NFT_NAME_BYTES + 1));
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn sponsor_field_is_omitted_when_absent_and_signed_when_present() {
+        // A non-sponsored transaction must serialize without a `sponsor` key, so
+        // the frozen V4 vectors and the TS SDK stay valid; a sponsored one signs
+        // over exactly one added `sponsor` key bound to the sender's signature.
+        let sender = Keypair::from_seed([1u8; 32]);
+        let recipient = Keypair::from_seed([2u8; 32]);
+        let namespace = Hash256([0xab; 32]);
+
+        let plain = Transaction::for_operation(
+            &sender,
+            0,
+            Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            },
+            FeeBid::default(),
+        )
+        .unwrap();
+        assert!(
+            !canonical_signing_text(&plain).contains("sponsor"),
+            "an absent sponsor is omitted from the signed payload"
+        );
+        assert!(
+            !crate::canonical::canonical_json_string(&plain)
+                .unwrap()
+                .contains("sponsor"),
+            "an absent sponsor is omitted from the wire encoding"
+        );
+
+        let sponsored = Transaction::for_sponsored_operation(
+            &sender,
+            0,
+            Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            },
+            FeeBid::default(),
+            namespace,
+        )
+        .unwrap();
+        assert_eq!(sponsored.sponsor, Some(namespace));
+        assert!(
+            canonical_signing_text(&sponsored)
+                .contains(&format!(r#""sponsor":"{}""#, "ab".repeat(32))),
+            "a present sponsor is part of the signed payload"
+        );
+        // The signed payload binds the sponsor: the signature verifies, and the
+        // declared access list covers the sponsor state key.
+        sponsored.verify().expect("sponsored signature verifies");
+        assert!(sponsored.access_list.read_write.iter().any(|k| matches!(
+            &k.kind,
+            crate::StateKeyKind::Application { namespace: ns, key_hash }
+                if *ns == namespace && *key_hash == sponsor_state_key_hash()
+        )));
+
+        // Round-trips through canonical JSON preserving the sponsor field.
+        let text = crate::canonical::canonical_json_string(&sponsored).unwrap();
+        let decoded: Transaction = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded, sponsored);
     }
 
     #[test]

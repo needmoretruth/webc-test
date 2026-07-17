@@ -137,9 +137,10 @@ supply-chain (`cargo-deny`), JS advisory (`pnpm audit --prod`), and fuzz gates.
 **Every open finding in `docs/review/findings.md` is resolved** — reproduced with
 a failing test first, fixed, tested, and marked resolved there with its commit
 hash (AGENTS.md pitfall 7). This satisfies the Phase 5.5 core-freeze gate's
-"resolve every open blocking finding first." `main` is green on the full
-workspace gate (fmt, clippy `-D warnings`, `cargo test --workspace`, rustdoc,
-`webc-node demo`, SDK `pnpm check`).
+"resolve every open blocking finding first." The working branch
+(`claude/agent-md-review-6a392q`) is green on the full workspace gate (fmt,
+clippy `-D warnings`, `cargo test --workspace`, rustdoc, `webc-node demo`, SDK
+`pnpm check`); `main` holds the same tree up to the H2 hardening follow-up.
 
 What landed this session (per-finding detail + commit hashes in `findings.md`):
 
@@ -168,14 +169,378 @@ What landed this session (per-finding detail + commit hashes in `findings.md`):
   contract-compile invariant in ADR-0006. E4/E5 direction recorded there; E7
   phase-gated (no VM).
 
-### Phase 5 details and later roadmap
+### Adversarial re-verification pass (2026-07-17)
 
-The next phase per `development-plan.md` is **Phase 5 economics**, which opens
-with **owner-owned decisions that must be brought to the owner with a threat
-model at the freeze, not decided unilaterally**: the slashing-severity
-percentages and downtime schedule, and the §15.2 bootstrap-phase issuance
-proposal. After Phase 5 comes the **Phase 5.5 core freeze + independent security
-review**, whose per-finding prerequisite this session satisfied.
+After the backlog was cleared, an adversarial verification pass (parallel
+subagents, each told to *refute* a fix by reading the code, not just confirm its
+tests) re-checked the highest-risk fixes. It surfaced **one additional real
+defect** in the H2 mempool eviction, now fixed (commit `370f231`): the eviction
+rule ranked purely by effective fee and was *runnability-blind*, so a gapped-nonce
+bid (never sealable — `select_block` skips gaps, so it never pays) could evict an
+honest *runnable* transaction for free — the exact "free churn" the guard claimed
+to prevent. Eviction now ranks by `(is_runnable, effective_fee)`; a non-runnable
+bid can no longer displace a runnable entry. All other high-risk fixes
+(F1, E1, E2, SC1/SC2, U1, G1, E6, S4/S7, ST1, H1, C8) were independently confirmed
+SOUND. Lesson for future sessions: after tests pass, run an adversarial pass that
+tries to *break* each fix — a green test suite proves the tested cases, not the
+absence of the vector.
+
+### Branch note
+
+The Phase 5–13 work (economics, localized fees, sponsorship, namespaces, oracle,
+interim contract runtime, DEX, agent mandate + service registry, tokens, NFTs,
+application governance) was developed on **`claude/agent-md-review-6a392q`** and
+**integrated into `main`** on 2026-07-17. A separately assigned **transaction-system**
+goal develops independently on its own `codex/transaction-system` branch and is
+**not** merged here (per the branch-isolation workflow in `AGENTS.md`); the three
+Codex commits already on `main` (repo restore + workflow docs) are preserved by
+this integration. Further work continues on `main`.
+
+### Exact next work
+
+**Phase 5 economics is UNBLOCKED (owner direction taken 2026-07-17).** Recorded
+in `docs/decision-record.md` (§ "Consensus and slashing" → the 2026-07-17
+subsections):
+
+- **Slashing severity = DIRECTION only; exact numbers DEFERRED.** The owner
+  directed keeping severity in a **flexible config** with provisional defaults
+  and finalizing the numbers later by referencing Ethereum/Solana/Sui/Polkadot/
+  Cardano (design → **ADR-0012**). Direction: severe = large whole-pool slash +
+  Tombstone; correlated ramp for coordinated attacks; **liveness handled by an
+  Ethereum-style inactivity leak** so a >1/3-offline event does NOT permanently
+  halt the (Tendermint-style) chain — offline stake is drained until the online
+  set regains >2/3. Burn (not redistribute) is fixed. **Do NOT hardcode final
+  magnitudes**; keep everything parameterized until the owner confirms.
+- **Bootstrap issuance = DECIDED: stake-keyed with a supply-% cap + published
+  sunset criteria** (base 10%→1% schedule unchanged, resumes on bootstrap exit).
+  This one is not deferred.
+
+The slashing EXECUTION mechanism (evidence→slash→burn→tombstone, replay-guarded)
+is already built and test-covered; the current 80/90/100% defaults are
+**un-approved placeholders** to keep as flexible provisional values (do not
+present as final). Remaining Phase 5 work: (1) **ADR-0012** — inactivity-leak +
+slashing-posture design comparing the 5 reference chains, with the tunable
+parameters and the owner-decision points flagged; (2) **inactivity-leak
+scaffolding** — config struct + participation/finality-gap tracking (design-
+independent parts), consensus recovery-mode gated on the ADR being confirmed;
+(3) **bootstrap issuance** (decided; stake-keyed capped budget + sunset); then
+the lighter tasks — compounding, public validator perf/reward/slash endpoints,
+faucet devnet staking UX, stake-locked-grant / vest-by-operation primitives
+(Phase 16). After Phase 5 comes the **Phase 5.5 core freeze + independent
+security review**, whose per-finding prerequisite this session satisfied.
+
+### Phase 5 progress (2026-07-17)
+
+Landed this session (each reproduce/test → gate → commit → push; full workspace
+gate green incl. SDK):
+
+- **Task 10 — public validator/supply endpoints:** `GET /v1/validators`,
+  `/v1/validators/{addr}`, `/v1/supply`; SDK node-client `getValidators/
+  getValidator/getSupply`.
+- **Task 12 — bootstrap issuance (decided):** opt-in `ChainConfig.bootstrap_issuance`;
+  stake-keyed budget capped by the base per-period budget; sunset epoch; supply
+  conserved.
+- **Task 6b — compounding:** `CompoundValidatorRewards` / `CompoundDelegatorRewards`
+  restake accrued rewards in place (supply-neutral, ratio-guarded).
+- **Task 11 — faucet-funded staking UX:** `stake-register/-delegate/-undelegate/
+  -claim` + `faucet-stake` CLI subcommands over the in-process service.
+- **Task 13 — grant/vest primitive:** `grants::StakeGrant` (stake-locked,
+  vest-by-credited-epoch, forfeit-reverts); Phase 16 accounting integration
+  deferred.
+- **ADR-0012 + flexible scaffolding:** the Ethereum/Solana/Sui/Polkadot/Cardano
+  comparison and the inactivity-leak + correlation-scaled slashing design;
+  `InactivityLeakConfig` (opt-in, disabled) with tested per-epoch leak math;
+  `SlashingPolicy` marked provisional.
+
+### Phase 6 progress (2026-07-17)
+
+Started Phase 6 (parallel execution / localized fees / storage deposits). The
+scheduler (deterministic parallel batches + serializable order, SC1/SC2), the
+end-to-end signed access-list declarations, and namespace-keyed object state
+were already implemented. Landed this session:
+
+- **Storage deposit + deletion rebate (§15.22) — DONE, wired:** `StoragePricing`
+  config; `CreateObject` locks a byte-proportional deposit, `MutateObject`
+  adjusts on resize, new `Operation::DeleteObject` refunds `refund_bps` and burns
+  the remainder; `storage_deposits` supply bucket reconciles the invariant;
+  per-object `StateObject.deposit`. **State-commitment domain bumped V7→V8** and
+  the object leaf V1→V2 (committed shapes changed). Full workspace gate green.
+- **ADR-0013 hot/cold tiering boundary** — the archive-node interface + proof /
+  restore-on-demand design (builds on ADR-0011).
+- **Fixed the long-standing `consensus_import_failure` flake** (a harness
+  broadcast/peer-registration race — now waits for both connection directions;
+  8/8 green where it was ~2/3).
+
+**zstd compression (§15.19/15.24) — DONE (both tiers).** Storage-layer (webc-storage,
+transparent redb value compression) and wire-frame (webc-net envelope, same tag
+convention, 4 MiB streamed decompression cap as a zip-bomb defense since wire
+frames are attacker-controlled, `NET_PROTOCOL_VERSION` 2→3). Both cargo-deny clean.
+
+**Fee sponsorship / paymaster (§15.35) — DONE, wired.** Registered apps pre-fund a
+budget that pays users' fees within hard deterministic caps (ops per user/app/day,
+per-op fee, per-app daily budget; "day" = epoch window). New `sponsorship` module
+(`RegisterAppSponsor`/`FundAppSponsor`/`WithdrawAppSponsor`, `AppSponsor`,
+`SponsorshipConfig`); opt-in `Transaction.sponsor: Option<Hash256>` (fail-open to
+self-pay when over-cap/ineligible/unregistered; Transfer-only). `sponsor_budgets`
+supply bucket; **state-commitment domain V8→V9**; non-sponsored txs stay
+byte-identical (manual `Transaction` Serialize keeps `sponsor` out of the JSON wire
+when absent). **TS SDK support DONE** too — `signTransaction` gains an optional
+`sponsor`, byte-parity verified against the frozen `WEBC_SIGNED_TRANSACTION_V4`
+vector for both the absent (identical) and present cases. §15.35 is complete
+end-to-end (Rust + SDK).
+
+**Application namespace registry — DONE.** `RegisterNamespace`/`TransferNamespace`
+claim/transfer an app namespace to an owner (`namespaces` map, `namespace` module);
+object ops stay UNGATED (open namespaces; gating is a deferred later-phase policy);
+supply unaffected; state-commitment domain V9→V10.
+
+**Sharded examples — DONE.** `crates/webc-chain/tests/sharded_parallel_execution.rs`
+(8 tests) demonstrates namespace/account isolation at the scheduler for
+tokens/games/swaps/site-sessions (disjoint ⇒ one parallel batch + order-independent
+execution; shared resource ⇒ serialized). Swaps and shared-session contention are
+asserted at the scheduler level only (no native DEX / cross-owner object write yet
+— later phases).
+
+**Localized (per-namespace) fee pricing + fair block packing — DONE, wired
+(§8/§7).** Object operations are priced by their namespace's own EIP-1559 base
+fee, adjusted each block from only that namespace's usage vs a per-namespace
+target (`FeePolicy::per_namespace_target_units`), so one app's congestion never
+raises another's price; account-scoped ops keep the global base fee. Every
+localized fee is floored at the network-wide `min_base_fee_per_unit`, and a
+namespace back at the floor sheds its committed record (bounded `namespace_fees`
+map). Fair packing caps a single namespace at
+`FeePolicy::namespace_block_share_bps` of `max_block_units` — a hard
+`build_block`/`apply_block` validity rule plus mempool `select_block` shaping, so
+one hot app cannot monopolize a block. New config knobs are serde-defaulted
+testnet placeholders (§15.35). **State-commitment domain V10→V11** (added
+`namespace_fee_root`); the map locks no native units so the supply invariant is
+unchanged; new `NamespaceBlockShareExceeded` error. Acceptance tests: A's
+congestion not raising B's price, the floor, fair packing admitting other
+namespaces, unaffected account transfers, supply reconciliation, bincode
+crash-restart of the fee state with a stable root, and cross-run determinism.
+Full workspace gate green (fmt/clippy -D warnings/test/doc/demo).
+
+**Varint amount encoding (§15.14) — DONE.** The binary bincode paths (wire +
+storage-at-rest) switched to `with_varint_encoding()`, so `Amount` (and every
+binary integer) is compact; `Amount`'s serde is untouched and the canonical-JSON
+decimal-string path is byte-identical, so `state_root`, signing (`SIGNING_DOMAIN`),
+and the SDK are unchanged (SDK gate green unchanged). **`NET_PROTOCOL_VERSION`
+3→4** (a v3 frame is refused before body decode); N6 frame-size protection
+preserved; storage-at-rest layout changed (ephemeral prototype, no migration).
+
+### Phase 6 — major code items COMPLETE (2026-07-17)
+
+All Phase 6 code-completable tasks are done and pushed, full workspace + SDK gate
+green: storage deposit + deletion rebate (§15.22); zstd compression at rest and on
+the wire (§15.24); fee sponsorship / paymaster (§15.35, Rust + SDK); application
+namespace registry; sharded parallel-execution examples; localized per-namespace
+fee pricing + fair block packing; varint amount encoding (§15.14). The scheduler /
+declared-access / parallel-batch foundation (SC1/SC2) was already in place. The
+state-commitment domain moved V7→V11 across these (each bump E8-guarded, supply
+invariant preserved). ADR-0013 records the hot/cold tiering boundary
+(implementation may lag). **Two items remain non-blocking:** (1) multi-dimensional
+per-resource congestion metering (today one execution-unit scalar per namespace —
+a refinement; the acceptance criteria "one app's congestion doesn't raise
+another's price" and "fair capacity bounds saturation" are already met); (2) the
+TPS benchmarks (100/500/1000/2000 gates) need real reference hardware, not a cloud
+container (a known deferred non-finding).
+
+### Phase 7 progress
+
+**Native oracle — DONE.** New `oracle` module: `CreateFeed`/`RegisterReporter`/
+`DeregisterReporter`/`SubmitReport`/`PayFeedRead`; integer median (lower-mid
+tie-break) over reporters' latest values; read-fee revenue settled every
+`settlement_epochs`, split accuracy- (inverse-distance) and liveness-weighted with
+the F1 dust-carry (supply-neutral). Locked `oracle_bonds` + `oracle_revenue`
+buckets in the supply invariant; feeds/reporters committed via new sub-roots;
+state-commitment domain **V11→V12**. Reporter slashing deferred (ADR-0012 owner
+decision) — outliers simply earn zero revenue. Deferred oracle refinements (later
+`oracle-economics.md` steps): first-party publisher class, cold-start seeding, app
+subscriptions, once-per-block pull gating, freshness-gating the displayed aggregate.
+
+**Contract runtime (Phase 7a) — design landed; interim framework IN PROGRESS.**
+**ADR-0014** (docs/adr/0014-contract-runtime.md) records the design: ship the
+interim native/Rust-authored path first (a contract is a Rust handler behind the
+same declared-access + gas discipline as native ops, with an on-chain manifest),
+then restricted WASM as the general engine, with the Weft machine manifest (§15.41)
+as the ABI sidecar; the (c)→(a) migration is state-free via the versioned ABI.
+Owner-owned decisions flagged in the ADR (do not decide alone): the final engine
+(restricted WASM vs bespoke bytecode) and the manifest trust/verification model.
+The **interim framework is DONE** — `contract` module, `ContractManifest` registry,
+`RegisterContract`/`InvokeContract` ops, a `Contract` trait routing all state access
+through `StateAccessRecorder` against the manifest's declared `StateKey::application`
+footprint (declared-access enforced + parallel-schedulable), deterministic gas
+metering (admission + metered execution) with atomic over-gas rollback, and a
+`KeyValueContract` example; registration fee burned (supply-neutral);
+state-commitment domain V12→V13. NO WASM / untrusted-code loading (deferred).
+
+**Phase 7a WASM engine — OWNER-GATED, do NOT build yet.** ADR-0014 explicitly
+defers the final engine choice (restricted WASM vs bespoke bytecode) and the
+manifest trust/verification model to the owner at the ADR-0006 evidence gate. The
+interim ABI is versioned so the (c)→(a) migration is state-free once the owner
+decides. **Phase 7b (Weft language)** is a separate large project whose name is
+owner-renamable (owner-deferred) — not autonomous work here.
+
+### Phase 8 — native DEX batch settlement (§15.37) — CORE DONE
+
+Mandatory per-block **uniform-price batch settlement** (MEV-resistant) is
+implemented (`dex` module): `SubmitOrder`/`CancelOrder`, orders lock input into a
+`dex_escrow` bucket, `settle_dex_batch` runs in `build_block`/`apply_block` at one
+deterministic clearing price per pair (two-pointer crossing, integer-midpoint
+tie-rule so no fill breaches its limit), long side rationed dust-free by
+cumulative-rounding pro-rata; chain-native retry until `deadline_height`/cancel;
+`fill_or_cancel`. New `current_height` scalar; state-commitment domain V13→V14;
+supply invariant reconciles; build==import deterministic. **Deferred delegated
+mechanics** (§15.13/15.18/15.37): AMM/shared-pool curve pricing, multi-hop
+routing, finer tick sizes, complex slippage — later refinements.
+
+### Phase 9 — agent commerce (§15.5/§15.32)
+
+**Mandate — DONE (9a).** The spec (`agent-commerce.md` §2) is explicit that a
+mandate is a SEPARATE primitive from session keys: session keys authorize the
+owner's own device flows; a mandate authorizes a DISTINCT agent identity with its
+own key and audit trail. Implemented as `mandate.rs`: a PRE-FUNDED, instantly-
+revocable on-chain mandate (`GrantMandate`/`TopUpMandate`/`SpendUnderMandate`/
+`RevokeMandate`) enforcing budget + per-tx max + expiry + daily rate-limit +
+counterparty policy (Open | Allowlist of recipients/category tags), no
+re-delegation, agent-key-signed spends, full audit trail. New `mandate_escrow`
+supply bucket (grant locks, spend draws, revoke/expire-reclaim returns the
+remainder); state-commitment domain V14→V15; adversarial coverage of every
+rejection path + supply-balanced assertions. Merged 69a4840.
+
+**Service registry — DONE (9b).** A bounded, namespace-scoped, fee-priced
+native registry (`service_registry.rs`, §15.5b/§3 of `agent-commerce.md`) where
+services publish machine-readable categories/prices/interfaces for agent
+discovery — built like the oracle-feed / namespace registries, only the current
+revision in committed state (monotonic `revision`; history is archival). Closes
+the mandate category-allowlist loop with a service-scoped spend
+(`SpendUnderMandateToService`) that resolves `Category` tags against a service's
+registered categories. Domain V15→V16. Merged 161522d.
+
+**M1 fee-cap fix (post-9b adversarial review) — DONE.** A read-only adversarial
+review of the merged mandate found the per-tx cap bounded only the principal
+`amount`, not `amount + fee`; since the agent-chosen fee is drawn from the same
+escrow, one high-fee spend could drain the whole budget past `per_tx_max` /
+`rate_limit_per_day` (value extraction, supply stayed conserved). Both spend arms
+now reject `amount + total_fee > per_tx_max` and zero-amount spends; reproduced
+first (`fee_bid_cannot_inflate_a_spend_past_per_tx_max`). Validation-only, no
+domain bump. Recorded as finding M1 in `docs/review/findings.md`. Commit 13c7b9e.
+
+**Phase 9 native core is COMPLETE.** The tail (SDK agent toolkit, HTTP-402
+challenge/verify middleware, docs-as-data registry snapshot, flagship
+marketplace demo) is SDK/integration/external, matching the deliberately partial
+wallet-focused SDK (it covers Transfer/Stake/Delegate/InstallSessionKey only —
+oracle/DEX/contract/namespace/sponsor/mandate/service all await the consolidated
+SDK/platform phase, development-plan Phase 12). Those are not per-feature work.
+
+**Follow-ups (later, mostly non-consensus):** HTTP-402 payment flow (§4) and the
+SDK agent toolkit (mandate management UI, agent discover→validate→pay→retry
+client, service challenge/verify middleware) are SDK/integration-level. The
+docs-as-data registry snapshot and the flagship agent-marketplace showcase ride
+on the primitives above.
+
+### Phase 13 — native tokens / NFTs / app governance
+
+**Fungible tokens — DONE (13a).** A SELF-CONTAINED native token space
+(`token.rs`), deliberately separate from the bridge `AssetId`/`asset_balances`
+to avoid entangling with the production-bridge trust model and the SDK codec:
+own `TokenId` (namespace/creator/nonce-derived), own zero-pruned
+`token_balances`, own `frozen_token_accounts`. Ops CreateToken / MintToken /
+BurnToken / TransferToken / SetTokenPaused / FreezeTokenAccount / ThawTokenAccount
+/ SetTokenAuthority. Authorities are `Option<Address>` — renounce (`Some→None`) is
+PERMANENT. TWO invariants both enforced+tested: native WEBC supply stays balanced
+(non-refundable creation deposit locked into a new `token_deposits` bucket; mint/
+burn never touch WEBC) and per-token `sum(balances)==issued_supply`. Transfers
+write only the two `(token,addr)` balance keys — no global mint bottleneck. Domain
+V16→V17. Merged 4cc47ca. **Post-merge adversarial review** confirmed supply/
+authority/native-WEBC/arithmetic/determinism clean and found one latent defect
+(**T1**): `TransferToken` read freeze state without declaring the `TokenFreeze`
+keys, so under the (not-yet-wired) parallel executor a transfer could share a
+batch with a concurrent freeze and race. Fixed by declaring both parties' freeze
+markers as reads on the transfer path (+ scheduler regression test
+`token_transfer_serializes_against_a_freeze_of_either_party`). Finding 2 (a token's
+own freeze authority can freeze many accounts) is within that token's trust model
+and cost-bounded — informational, no change.
+
+**NFTs — DONE (13b).** Native NFT collections (`nft.rs`) with single-owner items
+keyed by `(collection_id, serial)`: CreateNftCollection / MintNft / TransferNft /
+BurnNft plus per-collection pause, per-item freeze/thaw, and permanent authority
+transfer/renounce. Monotonic `next_serial` (burned serials never reminted),
+optional `max_supply`, recorded-but-unenforced `royalty_bps`. Two invariants both
+enforced+tested: native WEBC supply balanced (deposit locked into a new
+`nft_deposits` bucket) and `minted_count - burned_count == live items`. Transfers
+write only the one item key; MintNft serializes on the collection record (serial
+is chain-assigned). Domain V17→V18. Merged 200c4fa. **Post-merge adversarial
+review returned CLEAN** — the subagent had applied the token-T1 lesson
+(declared==actual access verified end-to-end, mint/op races checked via
+`parallel_batches`); only a stale pause doc comment was corrected. Two invariants,
+authority renounce permanence, freeze/pause gating, and supply neutrality all
+verified.
+
+**Next: Phase 13c — application governance** (development-plan Phase 13:
+"governance instances — snapshots, quorum, timelocks, delegation, execution
+policy"). Native, autonomous. Design: a governance-instance registry (proposal +
+voting with a stake- or token-weighted snapshot taken at proposal time to prevent
+double-voting / after-snapshot manipulation — a Phase 13 acceptance criterion),
+quorum + timelock before execution, vote delegation, and a bounded execution
+policy. Decide the weight source (native stake vs a governance token) as
+design-within-scope. Same determinism + domain-bump + E8 + adversarial-review
+discipline. This completes Phase 13; the deferred cross-phase tail (SDK toolkit,
+HTTP-402, benchmarks, bridges, mainnet) remains owner-gated/external.
+
+### Original Phase 13 rationale — native tokens / NFTs / app governance
+
+Chosen next because it is the cleanest FULLY-AUTONOMOUS native block: spec-decided
+(§15, development-plan Phase 13), builds directly on the existing multi-asset
+`asset_balances`, the storage-deposit system (§15.22, deposit-based spam pricing),
+and the established native-registry / sub-root / domain-bump patterns, with NO
+owner-gated dependency. Skipping ahead of Phases 10-12 is deliberate: **Phase 10**
+(succinct proofs / PQ) needs the owner-gated archival trust anchor (ADR-0011) and
+external proof-backend/benchmark choices; **Phase 11** (fast path) is deep
+consensus work needing reference-hardware benchmarks + an adopt-by-ADR DAG-BFT
+decision + committee-sampling ADR; **Phase 12** is the consolidated SDK/platform
+phase. Their autonomous slivers (e.g. object inclusion proofs vs the current root)
+can be picked up later. Phase 13 core to build: native token/NFT registry +
+metadata commitments; mint/burn/freeze/pause/authority-transfer/revocation;
+transfer-policy hooks without a global mint bottleneck; deposit-based creation
+fees. App-governance instances (snapshots/quorum/timelocks/delegation) follow as a
+second unit. Build with worktree subagents, frequent commit+push, gate+merge each,
+and keep the supply invariant + a domain bump + E8 coverage for any new committed
+map/scalar. **Owner-gated (do NOT decide alone):** ADR-0012 slashing numbers +
+inactivity-leak wiring, WASM engine + manifest trust (ADR-0014), Weft rename,
+bridge trust model (Phase 14/18), weak-subjectivity anchor (ADR-0011), mainnet
+governance emergency powers, founder comp (§15.4). Later phases (14 bridges, 16-19
+testnet/mainnet/production) are increasingly owner-gated or need external
+resources — surface to the owner rather than deciding alone.
+
+### Original Phase 7 plan summary — contract runtime, native oracle, then Weft
+
+Per `development-plan.md` Phase 7 (sequencing owner-confirmed): **7a** a sandboxed
+contract runtime with declared-access enforcement + interim Rust authoring ships
+first; the **native oracle** (feed registry + bonded reporters + median
+aggregation, §15.17/15.21 economics — see `oracle-economics.md`); then **7b** the
+Weft language + tooling (later, separate project — `weft-language-plan.md`; the
+design is decided, do not re-litigate; the name is owner-renamable). This is a
+large phase — decompose it, keep using worktree subagents with frequent
+commit+push, gate + merge each. Owner-deferred items unchanged (ADR-0012 slashing
+numbers + inactivity-leak wiring; production-bridge trust model; weak-subjectivity
+anchor; governance emergency powers; Weft rename; founder comp §15.4).
+
+**Note on commit signing:** this environment's ssh signing key
+(`/home/claude/.ssh/commit_signing_key.pub`) is a 0-byte placeholder, so no commit
+can be signed — every branch commit is correctly authored `Claude
+<noreply@anthropic.com>` but shows "Unverified" on GitHub. Unavoidable here; not a
+code issue. The stop-hook's rebase remedy cannot add signatures without a real key. The **TPS benchmarks** (100/500/1000/2000 gates) need real reference
+hardware, not a cloud container (a known deferred non-finding) — implement the
+features here; the published-claim benchmarks run on real machines later.
+
+**Deferred within Phase 5 (owner-gated / consensus-safety, tracked in ADR-0012):**
+the slashing severity numbers, correlated-slashing behavior, the downtime→jail
+path, and the inactivity-leak consensus wiring (recovery mode) all await the
+owner confirming ADR-0012's recovery family + constants. Other severe evidence
+types (invalid-transition, fraudulent-bridge) need their objective artifacts,
+which are later-phase (runtime / bridge). Tasks 1–7 (ratio/minimums/queues/
+snapshots/commission/rewards/inflation) were already implemented and test-covered.
 
 **Owner-owned items still deferred** (do not decide alone; full list in AGENTS.md
 "User decisions still required later"): the Phase-5 economics numbers above; the

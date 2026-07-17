@@ -11,6 +11,7 @@ use crate::{
     Transaction,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use webc_crypto::{merkle_root, Address, Hash256};
 
 /// Maximum objective slashing artifacts carried by one block.
@@ -72,6 +73,11 @@ pub fn build_block(
     }
 
     let mut next_state = state.clone();
+    // Set the block height before any transaction executes so height-dependent
+    // logic (DEX order deadlines, §15.37) reads a stable committed value; the same
+    // assignment runs on import because `apply_block` re-runs this function with the
+    // block's own height, and `state_root` commits it so all nodes agree.
+    next_state.current_height = input.height;
     let base_fee_for_block = next_state.current_base_fee_per_unit;
     let mut receipts = Vec::with_capacity(transactions.len());
     let mut units_used = 0u64;
@@ -91,24 +97,66 @@ pub fn build_block(
         next_state.apply_block_slashing_evidence(item, config)?;
     }
 
+    // Fair packing (Phase 6 acceptance): a single application namespace may not
+    // consume more than its per-block share cap, so one hot application cannot
+    // monopolize block capacity. Enforced here as a hard consensus validity rule —
+    // `apply_block` re-runs this function, so a Byzantine proposer that over-packs
+    // one namespace produces a block every honest node rejects. The proposer's
+    // mempool selects a compliant, fair set up front (webc-node `select_block`).
+    let namespace_unit_cap = config.fee_policy.namespace_block_unit_cap()?;
+    let mut namespace_units: BTreeMap<Hash256, u64> = BTreeMap::new();
     for transaction in &transactions {
+        let tx_units = transaction.required_units();
         let projected_units = units_used
-            .checked_add(transaction.required_units())
+            .checked_add(tx_units)
             .ok_or(ChainError::ArithmeticOverflow)?;
         if projected_units > config.fee_policy.max_block_units {
             return Err(ChainError::BlockUnitsExceeded {
                 maximum: config.fee_policy.max_block_units,
             });
         }
+        // Object operations are namespace-scoped; enforce the fair-packing cap on
+        // this namespace's running total before executing.
+        let namespace_projected = if let Some(namespace) = transaction.operation.fee_namespace() {
+            let projected = namespace_units
+                .get(&namespace)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(tx_units)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            if projected > namespace_unit_cap {
+                return Err(ChainError::NamespaceBlockShareExceeded {
+                    namespace,
+                    maximum: namespace_unit_cap,
+                });
+            }
+            Some((namespace, projected))
+        } else {
+            None
+        };
         let receipt = next_state.execute_transaction(transaction, config)?;
         units_used = projected_units;
+        if let Some((namespace, projected)) = namespace_projected {
+            namespace_units.insert(namespace, projected);
+        }
         receipts.push(receipt);
     }
 
+    // Mandatory per-block uniform-price DEX batch settlement (§15.13/§15.18/§15.37):
+    // every order submitted this block (and every retrying order) settles together
+    // at one uniform clearing price per pair, so intra-block ordering games cannot
+    // extract value. It runs deterministically here on the whole-block overlay and
+    // identically on import (`apply_block` re-runs this function), with `state_root`
+    // binding the resulting `dex_order_root`/`dex_escrow`. Any failure rolls back
+    // the whole block. Its events are informational; the committed state change is
+    // what `state_root` binds.
+    next_state.settle_dex_batch(config)?;
+
     // Base-fee adjustment is a protocol state update caused by block fullness.
     // The header records the fee used by this block, while `state_root` commits
-    // to the next base fee after the block is finished.
-    next_state.finish_block(units_used, config)?;
+    // to the next global base fee and every congested namespace's next localized
+    // base fee after the block is finished.
+    next_state.finish_block(units_used, &namespace_units, config)?;
     // Record this block's timestamp so the next block must exceed it (E2). This
     // is committed by `state_root`, so all nodes agree on the monotonic clock.
     next_state.last_block_timestamp_ms = input.timestamp_ms;
@@ -247,7 +295,8 @@ mod tests {
     use super::*;
     use crate::{
         Amount, DoubleVoteEvidence, FeeBid, FeePolicy, GenesisAccount, GenesisConfig,
-        GenesisValidator, Operation, SignedVote, SlashingEvidence, ValidatorStatus, Vote, VoteType,
+        GenesisValidator, ObjectId, Operation, SignedVote, SlashingEvidence, ValidatorStatus, Vote,
+        VoteType,
     };
     use webc_crypto::Keypair;
 
@@ -672,6 +721,80 @@ mod tests {
         ));
         // A rejected block leaves the importer's state untouched.
         assert_eq!(importer_state, before);
+    }
+
+    #[test]
+    fn fair_packing_rejects_a_single_namespace_monopolizing_a_block() {
+        // Phase 6 acceptance: a block that packs one application namespace beyond its
+        // fair per-block share is invalid, so a Byzantine proposer cannot let one hot
+        // app monopolize capacity (apply_block re-runs this and rejects it too). Cap
+        // = 100_000 * 5000 / 10_000 = 50_000 units = 2 object ops; a third exceeds it.
+        let config = ChainConfig {
+            fee_policy: FeePolicy {
+                target_block_units: 50_000,
+                max_block_units: 100_000,
+                namespace_block_share_bps: 5_000,
+                ..FeePolicy::default()
+            },
+            ..ChainConfig::default()
+        };
+        let alice = Keypair::from_seed([71u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let namespace = Hash256::digest(b"greedy-app");
+        let object_op = |nonce: u64| {
+            Transaction::for_operation(
+                &alice,
+                nonce,
+                Operation::CreateObject {
+                    object_id: ObjectId::new(Hash256::digest(format!("obj-{nonce}").as_bytes())),
+                    namespace,
+                    data: Vec::new(),
+                },
+                FeeBid {
+                    gas_limit: 30_000,
+                    max_fee_per_unit: 1,
+                    priority_fee_per_unit: 0,
+                },
+            )
+            .expect("object op signs")
+        };
+
+        // Two object ops in one namespace fit the fair share and build a valid block.
+        let mut ok_state = ChainState::from_genesis(&genesis).unwrap();
+        build_block(
+            &mut ok_state,
+            &config,
+            build_input(&config, alice.address()),
+            vec![object_op(0), object_op(1)],
+            Vec::new(),
+        )
+        .expect("two object ops fit the namespace share");
+
+        // A third pushes the namespace past its share cap: the whole block is
+        // rejected and the caller's state is left unchanged.
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            build_block(
+                &mut state,
+                &config,
+                build_input(&config, alice.address()),
+                vec![object_op(0), object_op(1), object_op(2)],
+                Vec::new(),
+            ),
+            Err(ChainError::NamespaceBlockShareExceeded {
+                maximum: 50_000,
+                ..
+            })
+        ));
+        assert_eq!(state, before);
     }
 
     #[test]

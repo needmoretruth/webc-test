@@ -122,6 +122,63 @@ impl InflationSchedule {
     }
 }
 
+/// Bootstrap-phase issuance (§15.2, owner-directed 2026-07-17). During the
+/// labeled bootstrap phase the reward budget is keyed to the *staked* amount and
+/// capped by the base schedule's per-period budget, so a tiny early staking base
+/// cannot capture the full base issuance (the cap binds when stake is thin; the
+/// stake-keying binds when stake is deep). On sunset the base [`InflationSchedule`]
+/// resumes. Values are config, published with the Phase 16 distribution program;
+/// this type is opt-in (`ChainConfig.bootstrap_issuance` defaults to `None`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapIssuance {
+    /// Annual rate in basis points applied to total *active stake* to size the
+    /// bootstrap reward budget (before the base-schedule cap).
+    pub annual_rate_bps: u16,
+    /// The bootstrap phase ends at this epoch (exclusive); at and after it the
+    /// base schedule resumes. Richer sunset criteria (validator count, stake
+    /// dispersion, distribution progress) are published with the Phase 16
+    /// program; this deterministic epoch bound is the on-chain gate.
+    pub sunset_epoch: u64,
+}
+
+impl BootstrapIssuance {
+    /// Whether the bootstrap phase is still active at `epoch`.
+    pub fn is_active(&self, epoch: u64) -> bool {
+        epoch < self.sunset_epoch
+    }
+
+    /// The bootstrap reward budget for one period: `min(stake_keyed, base_cap)`,
+    /// where `stake_keyed = total_active_stake × annual_rate_bps /
+    /// (10_000 × periods_per_year)`. The `min` guarantees the bootstrap budget
+    /// never exceeds what the base schedule would have issued. `periods_per_year`
+    /// must be non-zero (the caller passes the validated schedule value).
+    pub fn budget_for_period(
+        &self,
+        total_active_stake: Amount,
+        periods_per_year: u64,
+        base_period_budget: Amount,
+    ) -> Result<Amount, ChainError> {
+        let denom = u128::from(periods_per_year)
+            .checked_mul(10_000)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if denom == 0 {
+            return Err(ChainError::InvalidInflationSchedule);
+        }
+        let stake_keyed_units = total_active_stake
+            .0
+            .checked_mul(u128::from(self.annual_rate_bps))
+            .ok_or(ChainError::ArithmeticOverflow)?
+            / denom;
+        let stake_keyed = Amount::from_units(stake_keyed_units);
+        // Cap at the base per-period budget (manual min: `Amount` comparison).
+        Ok(if stake_keyed < base_period_budget {
+            stake_keyed
+        } else {
+            base_period_budget
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +211,45 @@ mod tests {
             schedule.validated_periods_per_year(),
             Err(ChainError::InvalidInflationSchedule)
         ));
+    }
+
+    #[test]
+    fn bootstrap_budget_keys_to_stake_and_caps_at_base() {
+        let bootstrap = BootstrapIssuance {
+            annual_rate_bps: 1_000, // 10% annual on staked amount
+            sunset_epoch: 100,
+        };
+        // Stake-keyed budget below the base cap: with active_stake chosen so the
+        // per-period stake-keyed amount is exactly 1_000 units and base is huge,
+        // the stake-keying binds.
+        let active_stake = Amount::from_units(3_650_000);
+        let stake_keyed = bootstrap
+            .budget_for_period(active_stake, 365, Amount::from_units(1_000_000))
+            .expect("stake-keyed budget");
+        assert_eq!(stake_keyed, Amount::from_units(1_000));
+
+        // When the stake-keyed amount would exceed the base per-period budget, the
+        // base cap binds instead (a thin base cannot capture more than the schedule).
+        let capped = bootstrap
+            .budget_for_period(
+                Amount::from_units(u128::from(u64::MAX)),
+                365,
+                Amount::from_units(500),
+            )
+            .expect("capped budget");
+        assert_eq!(capped, Amount::from_units(500));
+    }
+
+    #[test]
+    fn bootstrap_is_active_until_sunset_epoch_exclusive() {
+        let bootstrap = BootstrapIssuance {
+            annual_rate_bps: 1_000,
+            sunset_epoch: 100,
+        };
+        assert!(bootstrap.is_active(0));
+        assert!(bootstrap.is_active(99));
+        assert!(!bootstrap.is_active(100));
+        assert!(!bootstrap.is_active(101));
     }
 
     #[test]

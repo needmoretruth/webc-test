@@ -8,11 +8,18 @@
 
 #![no_main]
 
+use bincode::Options;
 use libfuzzer_sys::fuzz_target;
 use webc_chain::Transaction;
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(tx) = bincode::deserialize::<Transaction>(data) else {
+    // The wire and storage codecs both decode with bincode's variable-length
+    // integer encoding (WEBC §15.14), so fuzz the same config a hostile
+    // gossiped or stored transaction actually hits.
+    let Ok(tx) = bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .deserialize::<Transaction>(data)
+    else {
         return;
     };
     // Deriving canonical bytes / hashing must not panic on a decoded-but-hostile

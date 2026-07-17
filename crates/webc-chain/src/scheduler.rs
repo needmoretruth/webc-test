@@ -157,6 +157,123 @@ mod tests {
     }
 
     #[test]
+    fn token_transfer_serializes_against_a_freeze_of_either_party() {
+        // Regression (token review Finding 1): a TransferToken must declare both
+        // parties' freeze markers as reads so the scheduler serializes it against a
+        // concurrent FreezeTokenAccount of either party. Before the fix the transfer
+        // touched no freeze key and shared a batch with the freeze, so under the
+        // parallel executor the two would race (freeze bypass + nondeterministic
+        // state root). This exercises the real access-list builder via `for_operation`.
+        let holder = Keypair::from_seed([1u8; 32]);
+        let recipient = Keypair::from_seed([2u8; 32]).address();
+        let freeze_authority = Keypair::from_seed([3u8; 32]);
+        let token_id = crate::TokenId::new(Hash256([7u8; 32]));
+
+        let transfer = Transaction::for_operation(
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient,
+                amount: Amount::from_units(1),
+            },
+            FeeBid::default(),
+        )
+        .expect("transfer signs");
+        // Freezing the SENDER conflicts with the transfer's read of that marker.
+        let freeze_sender = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer.clone(), freeze_sender]),
+            vec![vec![0], vec![1]]
+        );
+
+        // Freezing the RECIPIENT is likewise serialized.
+        let freeze_recipient = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: recipient,
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer, freeze_recipient]),
+            vec![vec![0], vec![1]]
+        );
+    }
+
+    #[test]
+    fn nft_transfer_serializes_against_a_freeze_of_the_same_item() {
+        // A TransferNft and a FreezeNftItem of the SAME item both touch the per-item
+        // key (the transfer writes it to move ownership / read the frozen flag; the
+        // freeze writes it to set the flag), so the scheduler must serialize them.
+        // Otherwise a transfer could race a concurrent freeze (freeze bypass +
+        // nondeterministic state root). This exercises the real access-list builder.
+        let owner = Keypair::from_seed([1u8; 32]);
+        let recipient = Keypair::from_seed([2u8; 32]).address();
+        let freeze_authority = Keypair::from_seed([3u8; 32]);
+        let collection_id = crate::NftCollectionId::new(Hash256([7u8; 32]));
+
+        let transfer = Transaction::for_operation(
+            &owner,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: 5,
+                recipient,
+            },
+            FeeBid::default(),
+        )
+        .expect("transfer signs");
+        let freeze_same = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: 5,
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer.clone(), freeze_same]),
+            vec![vec![0], vec![1]],
+            "transfer and freeze of the same item must serialize"
+        );
+
+        // A freeze of a DIFFERENT item shares no item key, so it may batch in
+        // parallel (the collection record is read-only on both, which does not
+        // conflict). This confirms the serialization above is item-specific, not a
+        // blanket per-collection lock.
+        let freeze_other = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: 6,
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer, freeze_other]),
+            vec![vec![0, 1]],
+            "transfer and freeze of different items may run in parallel"
+        );
+    }
+
+    #[test]
     fn conflicting_pairs_keep_their_commit_order_across_batches() {
         // SC1: tx0 touches A; tx1 touches A and C (conflicts tx0); tx2 touches C
         // (conflicts tx1 but not tx0). Greedy first-fit would place tx2 in tx0's
@@ -266,7 +383,49 @@ mod tests {
     }
 
     #[test]
-    fn same_wallet_objects_in_distinct_namespaces_share_a_batch() {
+    fn distinct_wallet_objects_in_distinct_namespaces_share_a_batch() {
+        // Object creation locks a storage deposit from the creator's liquid
+        // balance (§15.22), so two creates by DIFFERENT wallets in different
+        // namespaces still touch disjoint state and can run in parallel — the
+        // namespace/account isolation the scheduler exists to exploit.
+        let operation = |label: &'static [u8]| Operation::CreateObject {
+            object_id: ObjectId::new(Hash256::digest_many([b"object", label])),
+            namespace: Hash256::digest_many([b"namespace", label]),
+            data: label.to_vec(),
+        };
+        let first = Transaction::for_operation_in_lane(
+            &Keypair::from_seed([12u8; 32]),
+            AuthorizationLaneId::new(Hash256::digest(b"lane-a")),
+            0,
+            operation(b"a"),
+            FeeBid {
+                gas_limit: 30_000,
+                ..FeeBid::default()
+            },
+        )
+        .expect("first object signs");
+        let second = Transaction::for_operation_in_lane(
+            &Keypair::from_seed([13u8; 32]),
+            AuthorizationLaneId::new(Hash256::digest(b"lane-b")),
+            0,
+            operation(b"b"),
+            FeeBid {
+                gas_limit: 30_000,
+                ..FeeBid::default()
+            },
+        )
+        .expect("second object signs");
+
+        assert_eq!(parallel_batches(&[first, second]), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn same_wallet_object_creates_serialize_on_the_deposit_funding_account() {
+        // Two creates by the SAME wallet — even in different namespaces and fee
+        // lanes — both lock a storage deposit from that wallet's single liquid
+        // balance, so they conflict on the sender account and must be scheduled
+        // sequentially. This mirrors Sui's shared gas coin serializing an owner's
+        // transactions, and prevents parallel double-spend of the same balance.
         let wallet = Keypair::from_seed([12u8; 32]);
         let operation = |label: &'static [u8]| Operation::CreateObject {
             object_id: ObjectId::new(Hash256::digest_many([b"object", label])),
@@ -296,6 +455,6 @@ mod tests {
         )
         .expect("second object signs");
 
-        assert_eq!(parallel_batches(&[first, second]), vec![vec![0, 1]]);
+        assert_eq!(parallel_batches(&[first, second]), vec![vec![0], vec![1]]);
     }
 }

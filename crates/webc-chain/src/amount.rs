@@ -162,6 +162,71 @@ mod tests {
     }
 
     #[test]
+    fn binary_encoding_is_variable_length_and_round_trips() {
+        use bincode::Options;
+        // The storage-at-rest and wire codecs both use bincode's variable-length
+        // integer encoding (WEBC §15.14). `Amount`'s non-human-readable
+        // `Serialize` emits `serialize_u128`, so under that config a small amount
+        // costs a few bytes instead of the fixed 16 a `u128` takes under fixint.
+        let options = bincode::DefaultOptions::new().with_varint_encoding();
+        for amount in [
+            Amount::ZERO,
+            Amount::from_units(1),
+            Amount::from_units(250),
+            Amount::from_units(255),
+            Amount::from_units(300),
+        ] {
+            let bytes = options.serialize(&amount).expect("amount serializes");
+            assert!(
+                bytes.len() < 16,
+                "a small amount must be shorter than a fixed 16-byte u128 ({} bytes for {})",
+                bytes.len(),
+                amount.0
+            );
+            let restored: Amount = options.deserialize(&bytes).expect("amount deserializes");
+            assert_eq!(restored, amount);
+        }
+        // A near-maximal amount must still round-trip exactly. Under bincode's
+        // varint it pays full width plus a one-byte length marker (17 bytes) — the
+        // accepted §15.14 trade-off: only the very largest balances exceed 16.
+        for amount in [
+            Amount(u128::MAX),
+            Amount(u128::MAX - 1),
+            Amount::from_webc(10_000_000),
+            Amount(u64::MAX as u128),
+        ] {
+            let bytes = options.serialize(&amount).expect("amount serializes");
+            let restored: Amount = options.deserialize(&bytes).expect("amount deserializes");
+            assert_eq!(restored, amount, "round trip for {}", amount.0);
+        }
+    }
+
+    #[test]
+    fn json_encoding_is_unchanged_by_the_binary_varint_switch() {
+        // The load-bearing invariant: switching the BINARY path to varint must
+        // leave the human-readable path byte-identical. JSON still emits the exact
+        // decimal string of base units, which drives the canonical `state_root`,
+        // transaction signing, and the TypeScript SDK — none of which may move.
+        assert_eq!(
+            serde_json::to_string(&Amount::from_units(1)).unwrap(),
+            "\"1\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Amount::from_units(300)).unwrap(),
+            "\"300\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Amount(u128::MAX)).unwrap(),
+            "\"340282366920938463463374607431768211455\""
+        );
+        // The exact base-unit string also round-trips back to the same amount.
+        let value = Amount::from_webc(10_000_000);
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, "\"10000000000000000000\"");
+        assert_eq!(serde_json::from_str::<Amount>(&json).unwrap(), value);
+    }
+
+    #[test]
     fn basis_point_math_does_not_overflow_intermediate_values() {
         assert_eq!(
             Amount(u128::MAX).checked_mul_bps(10_000),

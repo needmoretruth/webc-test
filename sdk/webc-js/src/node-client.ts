@@ -131,6 +131,62 @@ export interface FaucetReceipt {
   readonly disclaimer: string;
 }
 
+/**
+ * A validator's eligibility or penalty state, mirroring the Rust
+ * `ValidatorStatus` serde enum: the unit variants serialize as bare strings and
+ * the data-carrying variants as a single-key tagged object.
+ */
+export type ValidatorStatus =
+  | "Active"
+  | "PendingActivation"
+  | "Draining"
+  | { readonly Jailed: { readonly reason: string } }
+  | { readonly Tombstoned: { readonly reason: string } };
+
+/**
+ * A validator pool snapshot with its derived total stake, as returned by
+ * `GET /v1/validators/{address}` and inside `GET /v1/validators`. All stake and
+ * reward amounts are native base units.
+ */
+export interface ValidatorSummary {
+  readonly operator: string;
+  readonly consensusKey: string;
+  readonly selfStake: bigint;
+  readonly delegatedStake: bigint;
+  readonly commissionBps: number;
+  readonly status: ValidatorStatus;
+  readonly bootstrap: boolean;
+  readonly accumulatedRewards: bigint;
+  readonly totalStake: bigint;
+}
+
+/** The public validator set, as returned by `GET /v1/validators`. */
+export interface ValidatorsResponse {
+  readonly apiVersion: string;
+  readonly validators: readonly ValidatorSummary[];
+}
+
+/**
+ * The deterministic supply-invariant reconciliation, as returned by
+ * `GET /v1/supply`. Every bucket is native base units; `balanced` is true when
+ * gross issuance exactly equals the accounted buckets.
+ */
+export interface SupplyInvariantReport {
+  readonly issued: bigint;
+  readonly liquid: bigint;
+  readonly staked: bigint;
+  readonly delegated: bigint;
+  readonly unbonding: bigint;
+  readonly escrowed: bigint;
+  readonly laneFees: bigint;
+  readonly pendingRewards: bigint;
+  readonly feeRewardPool: bigint;
+  readonly burned: bigint;
+  readonly slashed: bigint;
+  readonly accounted: bigint;
+  readonly balanced: boolean;
+}
+
 /** Handlers for a block subscription. */
 export interface BlockSubscriptionHandlers {
   readonly onBlock: (event: BlockEvent) => void;
@@ -200,6 +256,26 @@ export class WebcNodeClient {
   /** Returns an account snapshot, throwing {@link NodeApiError} (404) if absent. */
   async account(address: string): Promise<AccountView> {
     return parseAccount(await this.#get(`/v1/accounts/${encodeURIComponent(address)}`));
+  }
+
+  /** Returns every validator with its derived total stake. */
+  async getValidators(): Promise<ValidatorsResponse> {
+    return parseValidatorsResponse(await this.#get("/v1/validators"));
+  }
+
+  /**
+   * Returns a single validator by operator address, throwing
+   * {@link NodeApiError} (404) if no such validator exists.
+   */
+  async getValidator(address: string): Promise<ValidatorSummary> {
+    return parseValidatorSummary(
+      await this.#get(`/v1/validators/${encodeURIComponent(address)}`),
+    );
+  }
+
+  /** Returns the supply-invariant reconciliation report. */
+  async getSupply(): Promise<SupplyInvariantReport> {
+    return parseSupplyInvariantReport(await this.#get("/v1/supply"));
   }
 
   /**
@@ -435,15 +511,17 @@ function requireAmount(value: unknown, field: string): bigint {
   return BigInt(value);
 }
 
-/** Requires a hex string of the given byte length, or `null`. */
-function requireHashOrNull(value: unknown, field: string): string | null {
-  if (value === null) {
-    return null;
-  }
+/** Requires a lowercase 32-byte hex string (64 hex chars). */
+function requireHex32(value: unknown, field: string): string {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
-    throw new Error(`node response field ${field} is not a 32-byte hex hash`);
+    throw new Error(`node response field ${field} is not a 32-byte hex string`);
   }
   return value;
+}
+
+/** Requires a 32-byte hex string, or `null`. */
+function requireHashOrNull(value: unknown, field: string): string | null {
+  return value === null ? null : requireHex32(value, field);
 }
 
 function requireString(value: unknown, field: string): string {
@@ -500,6 +578,90 @@ function parseAccount(value: unknown): AccountView {
     address: requireString(value.address, "address"),
     balance: requireAmount(value.account.balance, "account.balance"),
     nonce: requireCount(value.account.nonce, "account.nonce"),
+  });
+}
+
+/**
+ * Parses the serde-tagged `ValidatorStatus` enum. Unit variants arrive as bare
+ * strings; the data-carrying variants arrive as a single-key object.
+ */
+function parseValidatorStatus(value: unknown, field: string): ValidatorStatus {
+  if (value === "Active" || value === "PendingActivation" || value === "Draining") {
+    return value;
+  }
+  if (isRecord(value)) {
+    if (value.Jailed !== undefined) {
+      if (!isRecord(value.Jailed)) {
+        throw new Error(`node response field ${field}.Jailed is malformed`);
+      }
+      return Object.freeze({
+        Jailed: Object.freeze({
+          reason: requireString(value.Jailed.reason, `${field}.Jailed.reason`),
+        }),
+      });
+    }
+    if (value.Tombstoned !== undefined) {
+      if (!isRecord(value.Tombstoned)) {
+        throw new Error(`node response field ${field}.Tombstoned is malformed`);
+      }
+      return Object.freeze({
+        Tombstoned: Object.freeze({
+          reason: requireString(value.Tombstoned.reason, `${field}.Tombstoned.reason`),
+        }),
+      });
+    }
+  }
+  throw new Error(`node response field ${field} is not a valid validator status`);
+}
+
+/** Parses a single validator summary (flattened `Validator` plus total stake). */
+function parseValidatorSummary(value: unknown): ValidatorSummary {
+  if (!isRecord(value)) {
+    throw new Error("node returned a non-object validator");
+  }
+  return Object.freeze({
+    operator: requireString(value.operator, "operator"),
+    consensusKey: requireHex32(value.consensus_key, "consensus_key"),
+    selfStake: requireAmount(value.self_stake, "self_stake"),
+    delegatedStake: requireAmount(value.delegated_stake, "delegated_stake"),
+    commissionBps: requireCount(value.commission_bps, "commission_bps"),
+    status: parseValidatorStatus(value.status, "status"),
+    bootstrap: requireBool(value.bootstrap, "bootstrap"),
+    accumulatedRewards: requireAmount(value.accumulated_rewards, "accumulated_rewards"),
+    totalStake: requireAmount(value.total_stake, "total_stake"),
+  });
+}
+
+function parseValidatorsResponse(value: unknown): ValidatorsResponse {
+  if (!isRecord(value) || !Array.isArray(value.validators)) {
+    throw new Error("node returned a malformed validators response");
+  }
+  return Object.freeze({
+    apiVersion: requireString(value.api_version, "api_version"),
+    validators: Object.freeze(
+      value.validators.map((validator) => parseValidatorSummary(validator)),
+    ),
+  });
+}
+
+function parseSupplyInvariantReport(value: unknown): SupplyInvariantReport {
+  if (!isRecord(value)) {
+    throw new Error("node returned a non-object supply report");
+  }
+  return Object.freeze({
+    issued: requireAmount(value.issued, "issued"),
+    liquid: requireAmount(value.liquid, "liquid"),
+    staked: requireAmount(value.staked, "staked"),
+    delegated: requireAmount(value.delegated, "delegated"),
+    unbonding: requireAmount(value.unbonding, "unbonding"),
+    escrowed: requireAmount(value.escrowed, "escrowed"),
+    laneFees: requireAmount(value.lane_fees, "lane_fees"),
+    pendingRewards: requireAmount(value.pending_rewards, "pending_rewards"),
+    feeRewardPool: requireAmount(value.fee_reward_pool, "fee_reward_pool"),
+    burned: requireAmount(value.burned, "burned"),
+    slashed: requireAmount(value.slashed, "slashed"),
+    accounted: requireAmount(value.accounted, "accounted"),
+    balanced: requireBool(value.balanced, "balanced"),
   });
 }
 
