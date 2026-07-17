@@ -306,6 +306,15 @@ pub struct ChainState {
     pub current_base_fee_per_unit: u64,
     pub current_epoch: u64,
     pub bridge_nonce: u64,
+    /// Consensus timestamp (Unix ms) of the most recently applied block.
+    ///
+    /// E2: block timestamps must strictly increase. `build_block` rejects a
+    /// candidate whose `timestamp_ms` is not greater than this, so a proposer
+    /// cannot rewind or freeze consensus time (which future epoch/expiry/fee
+    /// logic may read). Genesis leaves it `0`, so the first block's timestamp
+    /// only has to be positive.
+    #[serde(default)]
+    pub last_block_timestamp_ms: u64,
 }
 
 /// Deterministic reconciliation of gross native issuance and all value buckets.
@@ -404,6 +413,7 @@ impl Default for ChainState {
             current_base_fee_per_unit: 0,
             current_epoch: 0,
             bridge_nonce: 0,
+            last_block_timestamp_ms: 0,
         }
     }
 }
@@ -1003,10 +1013,14 @@ impl ChainState {
             current_base_fee_per_unit: u64,
             current_epoch: u64,
             bridge_nonce: u64,
+            last_block_timestamp_ms: u64,
         }
 
         let commitment = StateCommitment {
-            domain: "WEBC_STATE_COMMITMENT_V6",
+            // V7 adds `last_block_timestamp_ms` (finding E2). The domain bump is a
+            // deliberate consensus-format change; no external fixture pins the
+            // prior V6 root.
+            domain: "WEBC_STATE_COMMITMENT_V7",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1053,6 +1067,7 @@ impl ChainState {
             current_base_fee_per_unit: self.current_base_fee_per_unit,
             current_epoch: self.current_epoch,
             bridge_nonce: self.bridge_nonce,
+            last_block_timestamp_ms: self.last_block_timestamp_ms,
         };
 
         // Canonical JSON so the state root can, in principle, be recomputed

@@ -139,6 +139,7 @@ impl<K: KvStore> Node<K> {
         // parent-linkage check only enforces equality once a real parent exists.
         let previous_hash = self.tip_hash().unwrap_or(Hash256([0u8; 32]));
         let epoch = self.state.current_epoch;
+        let timestamp_ms = self.monotonic_timestamp(timestamp_ms);
 
         let input = BlockBuildInput {
             chain_id: self.config.chain_id.clone(),
@@ -229,6 +230,7 @@ impl<K: KvStore> Node<K> {
         let height = self.height() + 1;
         let previous_hash = self.tip_hash().unwrap_or(Hash256([0u8; 32]));
         let epoch = self.state.current_epoch;
+        let timestamp_ms = self.monotonic_timestamp(timestamp_ms);
         let input = BlockBuildInput {
             chain_id: self.config.chain_id.clone(),
             height,
@@ -240,6 +242,17 @@ impl<K: KvStore> Node<K> {
         let mut next_state = self.state.clone();
         let block = build_block(&mut next_state, &self.config, input, transactions, evidence)?;
         Ok(block)
+    }
+
+    /// Clamps a supplied wall-clock timestamp so the produced block is strictly
+    /// newer than its parent (E2).
+    ///
+    /// A proposer's clock may lag the chain, or two blocks may fall in the same
+    /// millisecond; `build_block` requires a strictly increasing `timestamp_ms`,
+    /// so honest production must never emit a stale one. Consensus time therefore
+    /// advances by at least one millisecond per block even under a frozen clock.
+    fn monotonic_timestamp(&self, supplied_ms: u64) -> u64 {
+        supplied_ms.max(self.state.last_block_timestamp_ms.saturating_add(1))
     }
 
     /// Validates and durably commits a block produced by another node.
@@ -370,6 +383,47 @@ mod tests {
         // Bob received the transfer.
         let bob_balance = node.state().accounts.get(&bob.address()).unwrap().balance;
         assert_eq!(bob_balance, Amount::from_webc(1_010));
+    }
+
+    #[test]
+    fn produce_block_clamps_timestamp_to_stay_monotonic() {
+        // E2: reusing or lowering the supplied timestamp still yields strictly
+        // increasing block timestamps, so honest production never trips the
+        // monotonicity check.
+        let (genesis, alice, bob) = test_genesis();
+        let mut node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+
+        let b1 = node
+            .produce_block(
+                vec![transfer(&alice, &bob, 1, 0)],
+                Vec::new(),
+                alice.address(),
+                5_000,
+            )
+            .unwrap();
+        assert_eq!(b1.header.timestamp_ms, 5_000);
+
+        // The same wall-clock value is clamped to parent + 1.
+        let b2 = node
+            .produce_block(
+                vec![transfer(&alice, &bob, 1, 1)],
+                Vec::new(),
+                alice.address(),
+                5_000,
+            )
+            .unwrap();
+        assert_eq!(b2.header.timestamp_ms, 5_001);
+
+        // An earlier value is clamped forward too.
+        let b3 = node
+            .produce_block(
+                vec![transfer(&alice, &bob, 1, 2)],
+                Vec::new(),
+                alice.address(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(b3.header.timestamp_ms, 5_002);
     }
 
     #[test]

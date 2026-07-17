@@ -58,6 +58,19 @@ pub fn build_block(
         return Err(ChainError::BlockChainIdMismatch);
     }
 
+    // E2: block timestamps must strictly increase. A proposer cannot rewind or
+    // freeze consensus time, so any logic that later reads `timestamp_ms`
+    // (epoch/expiry/fee) has a monotonic clock. The check runs identically in
+    // `build_block` and `apply_block` (which re-executes this function), so it is
+    // consensus-enforced on every node. Genesis leaves `last_block_timestamp_ms`
+    // at 0, so the first block only needs a positive timestamp.
+    if input.timestamp_ms <= state.last_block_timestamp_ms {
+        return Err(ChainError::NonMonotonicBlockTimestamp {
+            timestamp: input.timestamp_ms,
+            parent: state.last_block_timestamp_ms,
+        });
+    }
+
     let mut next_state = state.clone();
     let base_fee_for_block = next_state.current_base_fee_per_unit;
     let mut receipts = Vec::with_capacity(transactions.len());
@@ -96,6 +109,9 @@ pub fn build_block(
     // The header records the fee used by this block, while `state_root` commits
     // to the next base fee after the block is finished.
     next_state.finish_block(units_used, config)?;
+    // Record this block's timestamp so the next block must exceed it (E2). This
+    // is committed by `state_root`, so all nodes agree on the monotonic clock.
+    next_state.last_block_timestamp_ms = input.timestamp_ms;
 
     let header = BlockHeader {
         protocol_version: config.protocol_version,
@@ -268,6 +284,56 @@ mod tests {
         assert_eq!(block.header.state_root, state.state_root().unwrap());
         assert_ne!(block.header.tx_root, Hash256::ZERO);
         assert_ne!(block.header.receipt_root, Hash256::ZERO);
+    }
+
+    #[test]
+    fn block_timestamps_must_strictly_increase() {
+        // E2: a proposer cannot rewind or freeze consensus time.
+        let config = ChainConfig::default();
+        let alice = Keypair::from_seed([1u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+
+        let block_at = |state: &mut ChainState, height, ts| {
+            build_block(
+                state,
+                &config,
+                BlockBuildInput {
+                    chain_id: config.chain_id.clone(),
+                    height,
+                    epoch: 0,
+                    previous_hash: Hash256::ZERO,
+                    proposer: alice.address(),
+                    timestamp_ms: ts,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+
+        // First block above the genesis parent timestamp (0) succeeds.
+        block_at(&mut state, 1, 5_000).expect("first block");
+        assert_eq!(state.last_block_timestamp_ms, 5_000);
+
+        // Equal or earlier timestamps are rejected and leave state unchanged.
+        for stale in [5_000u64, 4_000] {
+            assert!(matches!(
+                block_at(&mut state, 2, stale),
+                Err(ChainError::NonMonotonicBlockTimestamp { .. })
+            ));
+            assert_eq!(state.last_block_timestamp_ms, 5_000);
+        }
+
+        // A strictly newer timestamp advances the chain clock.
+        block_at(&mut state, 2, 5_001).expect("newer block");
+        assert_eq!(state.last_block_timestamp_ms, 5_001);
     }
 
     fn build_input(config: &ChainConfig, proposer: Address) -> BlockBuildInput {

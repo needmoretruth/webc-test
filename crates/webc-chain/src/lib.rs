@@ -202,6 +202,10 @@ pub enum ChainError {
     TooManyBlockEvidence { actual: usize, maximum: usize },
     #[error("supply invariant does not reconcile")]
     SupplyInvariantViolation,
+    #[error(
+        "block timestamp {timestamp} is not strictly greater than the parent timestamp {parent}"
+    )]
+    NonMonotonicBlockTimestamp { timestamp: u64, parent: u64 },
     #[error("unsupported state-key version: {actual:?}")]
     UnsupportedStateKeyVersion { actual: ProtocolVersion },
     #[error("transaction access list contains duplicates or read/write overlap")]

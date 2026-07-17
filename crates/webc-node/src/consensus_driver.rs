@@ -191,6 +191,23 @@ pub struct ConsensusDriver<K: KvStore> {
 /// Maximum blocks requested per state-sync round.
 const SYNC_BATCH: u32 = 16;
 
+/// Maximum milliseconds a proposed block's timestamp may lead this node's local
+/// clock before the proposal is rejected (E2 future-drift bound).
+///
+/// A proposer with a fast or manipulated clock could otherwise stamp a block far
+/// in the future and grief any epoch/expiry/fee logic that reads block time.
+/// This bound tolerates ordinary clock skew and network delay while rejecting
+/// gross drift. Unlike timestamp *monotonicity* — a deterministic state rule
+/// enforced by `apply_block` — this compares against the local wall clock, so it
+/// lives in the driver, not the state machine.
+const MAX_BLOCK_TIMESTAMP_DRIFT_MS: u64 = 30_000;
+
+/// Returns whether a proposed block timestamp is within the accepted future
+/// drift of the local clock (E2). Pure so it is unit-testable without a clock.
+fn timestamp_within_future_drift(block_timestamp_ms: u64, now_ms: u64) -> bool {
+    block_timestamp_ms <= now_ms.saturating_add(MAX_BLOCK_TIMESTAMP_DRIFT_MS)
+}
+
 /// A block finalized live by the local machine, with its proving certificate.
 type Decided = (Block, FinalityCertificate);
 
@@ -679,6 +696,14 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
         {
             return false;
         }
+        // E2: reject a proposal whose timestamp leads this node's clock by more
+        // than the accepted drift. Monotonicity (timestamp strictly above the
+        // parent) is enforced deterministically inside the apply_block dry-run
+        // below; this clock-based bound additionally stops a proposer stamping a
+        // block far in the future.
+        if !timestamp_within_future_drift(header.timestamp_ms, now_ms()) {
+            return false;
+        }
         // valid(v): dry-run the full deterministic state transition on a
         // scratch clone. Only a block this node could import earns a prevote.
         let mut scratch = self.node.state().clone();
@@ -814,6 +839,24 @@ fn to_net_message(message: ConsensusMessage) -> NetMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn future_drift_bound_tolerates_skew_and_rejects_gross_drift() {
+        // E2: the clock-based future bound tolerates ordinary skew/delay but
+        // rejects a timestamp far ahead of the local clock. Past timestamps are
+        // always within the future bound (monotonicity handles the lower bound).
+        let now = 1_700_000_000_000u64;
+        assert!(timestamp_within_future_drift(now, now));
+        assert!(timestamp_within_future_drift(now - 10_000, now));
+        assert!(timestamp_within_future_drift(
+            now + MAX_BLOCK_TIMESTAMP_DRIFT_MS,
+            now
+        ));
+        assert!(!timestamp_within_future_drift(
+            now + MAX_BLOCK_TIMESTAMP_DRIFT_MS + 1,
+            now
+        ));
+    }
 
     #[test]
     fn timeouts_scale_linearly_with_the_round() {
