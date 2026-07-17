@@ -154,6 +154,15 @@ pub enum Event {
         validator: Address,
         amount: Amount,
     },
+    ValidatorRewardsCompounded {
+        validator: Address,
+        amount: Amount,
+    },
+    DelegatorRewardsCompounded {
+        delegator: Address,
+        validator: Address,
+        amount: Amount,
+    },
     Slashed {
         outcome: SlashingOutcome,
     },
@@ -1991,6 +2000,110 @@ impl ChainState {
                     amount: reward,
                 });
             }
+            Operation::CompoundValidatorRewards => {
+                access.write(StateKey::validator(tx.sender))?;
+                access.write(StateKey::account(tx.sender))?;
+                // Move accumulated operator rewards straight into self-stake. This
+                // shifts units from the pending-rewards bucket to the staked
+                // bucket (supply-neutral) without a claim-then-restake round trip.
+                let reward = {
+                    let validator = self
+                        .validators
+                        .get_mut(&tx.sender)
+                        .ok_or(ChainError::ValidatorNotFound(tx.sender))?;
+                    let reward = validator.accumulated_rewards;
+                    validator.accumulated_rewards = Amount::ZERO;
+                    validator.self_stake = validator
+                        .self_stake
+                        .checked_add(reward)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    validator.refresh_stake_status(&config.staking)?;
+                    reward
+                };
+                let account = self.account_mut(tx.sender)?;
+                account.staked = account
+                    .staked
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::ValidatorRewardsCompounded {
+                    validator: tx.sender,
+                    amount: reward,
+                });
+            }
+            Operation::CompoundDelegatorRewards { validator } => {
+                access.write(StateKey::validator(*validator))?;
+                access.write(StateKey::delegation(tx.sender, *validator))?;
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::unbonding_queue(*validator))?;
+                let target = self
+                    .validators
+                    .get(validator)
+                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
+                if matches!(
+                    target.status,
+                    ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
+                ) {
+                    return Err(ChainError::ValidatorNotActive(*validator));
+                }
+                let reward = self
+                    .delegations
+                    .get(&(tx.sender, *validator))
+                    .ok_or(ChainError::DelegationNotFound)?
+                    .accumulated_rewards;
+                // Adding the reward to the position must respect the operator/
+                // delegator ratio, exactly as a fresh delegation would (a queued
+                // operator exit still cannot back new delegated stake).
+                let queued_operator_stake = self.unbonding.queued_for(
+                    *validator,
+                    *validator,
+                    UnbondingKind::OperatorStake,
+                )?;
+                let available_operator_stake = target
+                    .self_stake
+                    .checked_sub(queued_operator_stake)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let maximum_delegated = available_operator_stake
+                    .checked_mul_u64(4)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let proposed_delegated = target
+                    .delegated_stake
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                if proposed_delegated > maximum_delegated {
+                    return Err(ChainError::DelegationRatioExceeded);
+                }
+
+                {
+                    let delegation = self
+                        .delegations
+                        .get_mut(&(tx.sender, *validator))
+                        .ok_or(ChainError::DelegationNotFound)?;
+                    delegation.accumulated_rewards = Amount::ZERO;
+                    delegation.amount = delegation
+                        .amount
+                        .checked_add(reward)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                }
+                let validator_state = self
+                    .validators
+                    .get_mut(validator)
+                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
+                validator_state.delegated_stake = validator_state
+                    .delegated_stake
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                validator_state.refresh_stake_status(&config.staking)?;
+                let account = self.account_mut(tx.sender)?;
+                account.delegated = account
+                    .delegated
+                    .checked_add(reward)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::DelegatorRewardsCompounded {
+                    delegator: tx.sender,
+                    validator: *validator,
+                    amount: reward,
+                });
+            }
             Operation::SubmitSlashingEvidence { evidence } => {
                 let outcome = self.apply_slashing_evidence(evidence, config, Some(&mut access))?;
                 events.push(Event::Slashed { outcome });
@@ -2850,6 +2963,220 @@ mod tests {
         let expected_stake_keyed = (2 * stake.0) * 1_000 / (10_000 * 365);
         assert_eq!(minted_growth, expected_stake_keyed);
         assert!(minted_growth > 0);
+    }
+
+    #[test]
+    fn compound_validator_rewards_restakes_and_conserves_supply() {
+        // Task 6b: compounding moves accumulated operator rewards straight into
+        // self-stake (pending-rewards bucket -> staked bucket), supply-neutral.
+        let config = ChainConfig::default();
+        let mut state = ChainState::new(&config).expect("empty state");
+        let alice = Keypair::from_seed([41u8; 32]);
+        let self_stake = Amount::from_webc(100);
+        let reward = Amount::from_webc(10);
+        let mut account = Account::with_balance(Amount::from_webc(1));
+        account.staked = self_stake;
+        state.accounts.insert(alice.address(), account);
+        state.validators.insert(
+            alice.address(),
+            Validator {
+                operator: alice.address(),
+                consensus_key: alice.public_key(),
+                self_stake,
+                delegated_stake: Amount::ZERO,
+                commission_bps: 0,
+                status: ValidatorStatus::Active,
+                bootstrap: false,
+                accumulated_rewards: reward,
+            },
+        );
+        state.minted_supply = Amount::from_units(self_stake.0 + reward.0 + Amount::from_webc(1).0);
+        state.inflation_year_start_supply = state.minted_supply;
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let tx = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::CompoundValidatorRewards,
+            FeeBid {
+                gas_limit: 10_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("compound signs");
+        state
+            .execute_transaction(&tx, &config)
+            .expect("compound executes");
+
+        let compounded = self_stake.checked_add(reward).unwrap();
+        let v = state.validators.get(&alice.address()).unwrap();
+        assert_eq!(v.self_stake, compounded);
+        assert_eq!(v.accumulated_rewards, Amount::ZERO);
+        assert_eq!(
+            state.accounts.get(&alice.address()).unwrap().staked,
+            compounded
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn compound_delegator_rewards_restakes_within_ratio_and_conserves_supply() {
+        // Task 6b: compounding a delegation restakes its rewards into the position
+        // (pending -> delegated), supply-neutral, respecting the 4x ratio.
+        let config = ChainConfig::default();
+        let mut state = ChainState::new(&config).expect("empty state");
+        let alice = Keypair::from_seed([42u8; 32]); // operator
+        let bob = Keypair::from_seed([43u8; 32]); // delegator
+        let self_stake = Amount::from_webc(100);
+        let delegated = Amount::from_webc(40);
+        let reward = Amount::from_webc(5);
+
+        let mut op_account = Account::with_balance(Amount::ZERO);
+        op_account.staked = self_stake;
+        state.accounts.insert(alice.address(), op_account);
+        let mut del_account = Account::with_balance(Amount::from_webc(1));
+        del_account.delegated = delegated;
+        state.accounts.insert(bob.address(), del_account);
+        state.validators.insert(
+            alice.address(),
+            Validator {
+                operator: alice.address(),
+                consensus_key: alice.public_key(),
+                self_stake,
+                delegated_stake: delegated,
+                commission_bps: 0,
+                status: ValidatorStatus::Active,
+                bootstrap: false,
+                accumulated_rewards: Amount::ZERO,
+            },
+        );
+        state.delegations.insert(
+            (bob.address(), alice.address()),
+            Delegation {
+                delegator: bob.address(),
+                validator: alice.address(),
+                amount: delegated,
+                accumulated_rewards: reward,
+            },
+        );
+        state.minted_supply =
+            Amount::from_units(self_stake.0 + delegated.0 + reward.0 + Amount::from_webc(1).0);
+        state.inflation_year_start_supply = state.minted_supply;
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let tx = Transaction::for_operation(
+            &bob,
+            0,
+            Operation::CompoundDelegatorRewards {
+                validator: alice.address(),
+            },
+            FeeBid {
+                gas_limit: 10_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("compound signs");
+        state
+            .execute_transaction(&tx, &config)
+            .expect("compound executes");
+
+        let compounded = delegated.checked_add(reward).unwrap();
+        assert_eq!(
+            state
+                .delegations
+                .get(&(bob.address(), alice.address()))
+                .unwrap()
+                .amount,
+            compounded
+        );
+        assert_eq!(
+            state
+                .delegations
+                .get(&(bob.address(), alice.address()))
+                .unwrap()
+                .accumulated_rewards,
+            Amount::ZERO
+        );
+        assert_eq!(
+            state
+                .validators
+                .get(&alice.address())
+                .unwrap()
+                .delegated_stake,
+            compounded
+        );
+        assert_eq!(
+            state.accounts.get(&bob.address()).unwrap().delegated,
+            compounded
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn compound_delegator_rewards_rejects_ratio_violation() {
+        // Compounding cannot push delegated stake past 4x the operator self-stake,
+        // exactly as a fresh delegation cannot.
+        let config = ChainConfig::default();
+        let mut state = ChainState::new(&config).expect("empty state");
+        let alice = Keypair::from_seed([44u8; 32]);
+        let bob = Keypair::from_seed([45u8; 32]);
+        let self_stake = Amount::from_webc(20);
+        let delegated = Amount::from_webc(80); // exactly at the 4x cap
+        let reward = Amount::from_webc(5); // would exceed the cap
+
+        let mut op_account = Account::with_balance(Amount::ZERO);
+        op_account.staked = self_stake;
+        state.accounts.insert(alice.address(), op_account);
+        let mut del_account = Account::with_balance(Amount::from_webc(1));
+        del_account.delegated = delegated;
+        state.accounts.insert(bob.address(), del_account);
+        state.validators.insert(
+            alice.address(),
+            Validator {
+                operator: alice.address(),
+                consensus_key: alice.public_key(),
+                self_stake,
+                delegated_stake: delegated,
+                commission_bps: 0,
+                status: ValidatorStatus::Active,
+                bootstrap: false,
+                accumulated_rewards: Amount::ZERO,
+            },
+        );
+        state.delegations.insert(
+            (bob.address(), alice.address()),
+            Delegation {
+                delegator: bob.address(),
+                validator: alice.address(),
+                amount: delegated,
+                accumulated_rewards: reward,
+            },
+        );
+        state.minted_supply =
+            Amount::from_units(self_stake.0 + delegated.0 + reward.0 + Amount::from_webc(1).0);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let tx = Transaction::for_operation(
+            &bob,
+            0,
+            Operation::CompoundDelegatorRewards {
+                validator: alice.address(),
+            },
+            FeeBid {
+                gas_limit: 10_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("compound signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::DelegationRatioExceeded)
+        ));
+        assert_eq!(state, before, "rejected compound leaves state unchanged");
     }
 
     #[test]

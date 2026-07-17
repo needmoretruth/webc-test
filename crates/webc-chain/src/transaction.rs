@@ -256,6 +256,15 @@ pub enum Operation {
         /// Validator identifying the sender's position.
         validator: Address,
     },
+    /// Compounds the sender's accumulated operator rewards directly into its own
+    /// self-stake, without a claim-then-restake round trip.
+    CompoundValidatorRewards,
+    /// Compounds accumulated delegation rewards directly into that delegation
+    /// position, subject to the operator/delegator ratio.
+    CompoundDelegatorRewards {
+        /// Validator identifying the sender's position.
+        validator: Address,
+    },
     /// Submits objectively verifiable signed slashing evidence.
     SubmitSlashingEvidence {
         /// Signed artifact; subjective labels are not accepted.
@@ -319,6 +328,7 @@ impl Operation {
             | Self::UnstakeValidator { .. }
             | Self::ClaimUnbonded { .. } => 10_000,
             Self::ClaimValidatorRewards | Self::ClaimDelegatorRewards { .. } => 5_000,
+            Self::CompoundValidatorRewards | Self::CompoundDelegatorRewards { .. } => 7_500,
             Self::SubmitSlashingEvidence { .. } => 20_000,
             Self::BridgeLock { .. } | Self::BridgeBurn { .. } => 50_000,
             Self::BridgeMint { .. } | Self::BridgeRelease { .. } => 75_000,
@@ -400,7 +410,9 @@ impl Operation {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::account(*to));
             }
-            Self::RegisterValidator { .. } | Self::ClaimValidatorRewards => {
+            Self::RegisterValidator { .. }
+            | Self::ClaimValidatorRewards
+            | Self::CompoundValidatorRewards => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::validator(sender));
             }
@@ -428,6 +440,16 @@ impl Operation {
             Self::ClaimDelegatorRewards { validator } => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::delegation(sender, *validator));
+            }
+            Self::CompoundDelegatorRewards { validator } => {
+                // Same footprint as `Delegate`: the reward is restaked into the
+                // position, touching the delegator account, the validator, the
+                // delegation record, and the validator's exit queue (its queued
+                // operator exit bounds the ratio).
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::validator(*validator));
+                push_unique_key(&mut read_write, StateKey::delegation(sender, *validator));
+                push_unique_key(&mut read_write, StateKey::unbonding_queue(*validator));
             }
             Self::SubmitSlashingEvidence { evidence } => {
                 push_unique_key(&mut read_write, StateKey::validator(evidence.validator()));
