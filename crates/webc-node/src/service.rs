@@ -21,7 +21,7 @@ use std::sync::Mutex;
 
 use webc_chain::{
     Account, AccountStateProof, Amount, Block, ChainError, FeeBid, ObjectId, Operation,
-    StateObject, Transaction,
+    StateObject, SupplyInvariantReport, Transaction, Validator,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_storage::{KvStore, StorageError};
@@ -173,6 +173,21 @@ pub struct AccountSummary {
     pub account: Account,
 }
 
+/// A validator snapshot with its derived total stake. Public, read-only.
+#[derive(Debug, serde::Serialize)]
+pub struct ValidatorSummary {
+    #[serde(flatten)]
+    pub validator: Validator,
+    pub total_stake: Amount,
+}
+
+/// The public validator set with its API version.
+#[derive(Debug, serde::Serialize)]
+pub struct ValidatorsResponse {
+    pub api_version: &'static str,
+    pub validators: Vec<ValidatorSummary>,
+}
+
 /// The classified outcome of admitting a gossiped transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkAdmission {
@@ -278,6 +293,60 @@ impl<K: KvStore> NodeService<K> {
             .cloned()
             .ok_or(ApiError::NotFound)?;
         Ok(AccountSummary { address, account })
+    }
+
+    /// Returns every validator with its derived total stake, in deterministic
+    /// address order. Public, read-only performance/stake data.
+    pub fn validators(&self) -> Result<ValidatorsResponse, ApiError> {
+        let inner = self.lock();
+        let validators = inner
+            .node
+            .state()
+            .validators
+            .values()
+            .map(|validator| {
+                Ok(ValidatorSummary {
+                    validator: validator.clone(),
+                    total_stake: validator
+                        .total_stake()
+                        .map_err(|error| ApiError::Internal(error.to_string()))?,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(ValidatorsResponse {
+            api_version: API_VERSION,
+            validators,
+        })
+    }
+
+    /// Returns a single validator by operator address, or `NotFound`.
+    pub fn validator(&self, address: Address) -> Result<ValidatorSummary, ApiError> {
+        let inner = self.lock();
+        let validator = inner
+            .node
+            .state()
+            .validators
+            .get(&address)
+            .cloned()
+            .ok_or(ApiError::NotFound)?;
+        let total_stake = validator
+            .total_stake()
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        Ok(ValidatorSummary {
+            validator,
+            total_stake,
+        })
+    }
+
+    /// Returns the deterministic supply-invariant reconciliation (gross issuance
+    /// vs. every value bucket). Public, read-only monetary transparency.
+    pub fn supply(&self) -> Result<SupplyInvariantReport, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .supply_invariant_report()
+            .map_err(|error| ApiError::Internal(error.to_string()))
     }
 
     /// Returns a Merkle proof of an account against the current account root.
@@ -497,7 +566,7 @@ impl<K: KvStore> NodeService<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webc_chain::{ChainConfig, GenesisAccount, GenesisConfig};
+    use webc_chain::{ChainConfig, GenesisAccount, GenesisConfig, GenesisValidator};
     use webc_storage::MemoryKvStore;
 
     const NOW: u64 = 1_000;
@@ -586,6 +655,69 @@ mod tests {
         // A large jump caps at the burst, not beyond.
         faucet.refill_tokens(1_000_000 * FAUCET_GLOBAL_REFILL_MS);
         assert_eq!(faucet.tokens, FAUCET_GLOBAL_BURST);
+    }
+
+    #[test]
+    fn supply_endpoint_reconciles_gross_issuance() {
+        let (service, _alice, _bob, _faucet) = build_service(false);
+        let report = service.supply().expect("supply report");
+        // Genesis funded 1_000 + 1_000 + 1_000_000 WEBC; nothing minted yet, so
+        // gross issuance reconciles exactly against every value bucket.
+        assert_eq!(report.issued, Amount::from_webc(1_002_000));
+        assert!(report.balanced);
+    }
+
+    #[test]
+    fn validator_endpoints_list_and_look_up() {
+        // A service with no validators exposes an empty set and NotFound lookups.
+        let (empty, _a, _b, _f) = build_service(false);
+        assert!(empty
+            .validators()
+            .expect("validators")
+            .validators
+            .is_empty());
+        assert!(matches!(
+            empty.validator(keypair(3).address()),
+            Err(ApiError::NotFound)
+        ));
+
+        // A genesis validator is exposed with its derived total stake.
+        let operator = keypair(7);
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: operator.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: vec![GenesisValidator {
+                operator: operator.address(),
+                consensus_key: operator.public_key(),
+                self_stake: Amount::from_webc(100),
+                commission_bps: 500,
+                bootstrap: false,
+            }],
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let service = NodeService::new(
+            node,
+            NodeServiceOptions {
+                mempool: MempoolConfig::default(),
+                faucet: None,
+                proposer: operator.address(),
+            },
+        );
+
+        let listed = service.validators().expect("validators");
+        assert_eq!(listed.validators.len(), 1);
+        assert_eq!(listed.validators[0].validator.operator, operator.address());
+        assert_eq!(listed.validators[0].total_stake, Amount::from_webc(100));
+
+        let one = service.validator(operator.address()).expect("validator");
+        assert_eq!(one.total_stake, Amount::from_webc(100));
+        assert!(matches!(
+            service.validator(keypair(8).address()),
+            Err(ApiError::NotFound)
+        ));
     }
 
     #[test]
