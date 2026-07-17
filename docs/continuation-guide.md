@@ -259,11 +259,16 @@ were already implemented. Landed this session:
   broadcast/peer-registration race — now waits for both connection directions;
   8/8 green where it was ~2/3).
 
-**Phase 6 remaining (mostly not started):** sponsor/paymaster accounts (§15.35,
+**zstd compression (§15.19/15.24):** storage-layer DONE (webc-storage, transparent
+redb value compression, tag 0x00 raw / 0x01 zstd, <64B/incompressible skip,
+cargo-deny clean). **Wire-frame compression is IN PROGRESS** (webc-net codec, same
+tag convention, with a hard decompressed-size cap as a zip-bomb defense since wire
+frames are attacker-controlled).
+
+**Phase 6 remaining (not started):** sponsor/paymaster accounts (§15.35,
 per-user/app/op/day caps); localized base/priority pricing + network-wide minimum
 + per-resource congestion measurement + fair block packing; varint amount
-encoding (§15.14, a wire-version bump) and **zstd wire/storage compression**
-(§15.19/15.24, on by default); an application namespace registry; sharded
+encoding (§15.14, a wire-version bump); an application namespace registry; sharded
 examples. The **TPS benchmarks** (100/500/1000/2000 gates) need real reference
 hardware, not a cloud container (a known deferred non-finding) — implement the
 features here; the published-claim benchmarks run on real machines later.
