@@ -6,14 +6,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use webc_chain::{
     build_block, Amount, BlockBuildInput, ChainConfig, ChainState, FeeBid, GenesisAccount,
-    GenesisConfig, Operation, Transaction, GENESIS_TOTAL_SUPPLY,
+    GenesisConfig, GenesisValidator, Operation, Transaction, GENESIS_TOTAL_SUPPLY,
 };
-use webc_crypto::{Hash256, Keypair, PublicKeyBytes};
+use webc_crypto::{Address, Hash256, Keypair, PublicKeyBytes};
 use webc_net::{spawn_network, NetworkConfig};
 use webc_node::{
     run_gossip_pump, AppState, FaucetConfig, MempoolConfig, Node, NodeService, NodeServiceOptions,
 };
-use webc_storage::RedbKvStore;
+use webc_storage::{MemoryKvStore, RedbKvStore};
 
 #[derive(Parser)]
 #[command(name = "webc-node")]
@@ -53,6 +53,66 @@ enum Command {
         #[arg(long = "peer")]
         peers: Vec<String>,
     },
+    /// Register the local devnet key as a validator (drives Operation::RegisterValidator).
+    StakeRegister {
+        /// Operator self-stake in whole WEBC (must meet the chain minimum).
+        #[arg(long, default_value_t = 20)]
+        self_stake: u64,
+        /// Validator commission in basis points (0..=max_commission_bps).
+        #[arg(long, default_value_t = 500)]
+        commission_bps: u16,
+        /// Optional 32-byte hex seed for the local key (defaults to a fixed devnet seed).
+        #[arg(long)]
+        seed: Option<String>,
+    },
+    /// Delegate whole WEBC from the local key to a validator (drives Operation::Delegate).
+    StakeDelegate {
+        /// Amount to delegate, in whole WEBC.
+        #[arg(long, default_value_t = 10)]
+        amount: u64,
+        /// Target validator operator address (defaults to the demo's local validator).
+        #[arg(long)]
+        validator: Option<String>,
+        /// Optional 32-byte hex seed for the local key.
+        #[arg(long)]
+        seed: Option<String>,
+    },
+    /// Begin undelegation of whole WEBC from a validator (drives Operation::Undelegate).
+    StakeUndelegate {
+        /// Amount to begin undelegating, in whole WEBC.
+        #[arg(long, default_value_t = 10)]
+        amount: u64,
+        /// Target validator operator address (defaults to the demo's local validator).
+        #[arg(long)]
+        validator: Option<String>,
+        /// Optional 32-byte hex seed for the local key.
+        #[arg(long)]
+        seed: Option<String>,
+    },
+    /// Claim validator and/or delegator rewards (drives the Claim* operations).
+    StakeClaim {
+        /// Claim accumulated operator rewards for the local validator.
+        #[arg(long)]
+        validator_rewards: bool,
+        /// Claim accumulated delegator rewards for the local delegation.
+        #[arg(long)]
+        delegator_rewards: bool,
+        /// Validator the delegator-reward claim targets (defaults to the demo validator).
+        #[arg(long)]
+        validator: Option<String>,
+        /// Optional 32-byte hex seed for the local key.
+        #[arg(long)]
+        seed: Option<String>,
+    },
+    /// Faucet-drip the local key then delegate in one flow (drives faucet + Operation::Delegate).
+    FaucetStake {
+        /// Amount to delegate from the freshly dripped funds, in whole WEBC.
+        #[arg(long, default_value_t = 10)]
+        amount: u64,
+        /// Optional 32-byte hex seed for the local key.
+        #[arg(long)]
+        seed: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -68,6 +128,33 @@ fn main() -> Result<()> {
             p2p_listen,
             peers,
         } => run(data_dir, listen, p2p_listen, peers),
+        Command::StakeRegister {
+            self_stake,
+            commission_bps,
+            seed,
+        } => emit(run_stake_register(self_stake, commission_bps, seed)?),
+        Command::StakeDelegate {
+            amount,
+            validator,
+            seed,
+        } => emit(run_stake_delegate(amount, validator, seed)?),
+        Command::StakeUndelegate {
+            amount,
+            validator,
+            seed,
+        } => emit(run_stake_undelegate(amount, validator, seed)?),
+        Command::StakeClaim {
+            validator_rewards,
+            delegator_rewards,
+            validator,
+            seed,
+        } => emit(run_stake_claim(
+            validator_rewards,
+            delegator_rewards,
+            validator,
+            seed,
+        )?),
+        Command::FaucetStake { amount, seed } => emit(run_faucet_stake(amount, seed)?),
     }
 }
 
@@ -471,4 +558,491 @@ fn sample_genesis(faucet: &Keypair, validator: &Keypair) -> GenesisConfig {
 #[allow(dead_code)]
 fn genesis_previous_hash() -> Hash256 {
     Hash256::ZERO
+}
+
+// ---------------------------------------------------------------------------
+// Devnet staking UX subcommands.
+//
+// These drive the existing native staking operations (RegisterValidator,
+// Delegate, Undelegate, ClaimValidatorRewards, ClaimDelegatorRewards) through
+// the same in-process service path the node uses: build and sign a
+// `Transaction` with `Transaction::for_operation`, submit it to a
+// `NodeService`, and seal a block (`NodeService::submit_and_seal`). Each command
+// runs a self-contained, deterministic local devnet over in-memory storage — no
+// network client, and no wall clock in the consensus path (fixed, increasing
+// timestamps are supplied to sealing). Every balance here is a valueless devnet
+// test unit.
+// ---------------------------------------------------------------------------
+
+/// Default deterministic seed for the CLI's local staking key (devnet only).
+const DEFAULT_LOCAL_SEED: [u8; 32] = [11u8; 32];
+/// Deterministic seed for the demo's target validator that local delegations,
+/// undelegations, and delegator-reward claims act on (devnet only).
+const TARGET_VALIDATOR_SEED: [u8; 32] = [12u8; 32];
+/// Fixed devnet faucet seed, matching the `run` subcommand's valueless faucet.
+const STAKE_FAUCET_SEED: [u8; 32] = [7u8; 32];
+/// Fixed base block timestamp for the deterministic staking demos. Sealing is
+/// fed explicit, increasing timestamps so the consensus path never reads a clock.
+const STAKE_BASE_TS_MS: u64 = 1_700_000_000_000;
+/// Disclaimer attached to every staking-demo summary.
+const STAKE_NOTE: &str = "Local deterministic devnet demo; balances are valueless WEBC test units.";
+
+/// Pretty-prints a command summary as JSON.
+fn emit(value: serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+/// Parses a 32-byte key seed from lowercase hex (64 characters).
+fn parse_seed(text: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(text.trim()).context("--seed must be hex-encoded")?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("--seed must be exactly 32 bytes (64 hex characters)"))
+}
+
+/// Resolves the local staking keypair from an optional hex seed, defaulting to
+/// the fixed devnet seed.
+fn local_keypair(seed: Option<String>) -> Result<Keypair> {
+    let seed = match seed {
+        Some(text) => parse_seed(&text)?,
+        None => DEFAULT_LOCAL_SEED,
+    };
+    Ok(Keypair::from_seed(seed))
+}
+
+/// Resolves a validator target address from an optional base58 argument,
+/// defaulting to the demo's deterministic local validator.
+fn resolve_validator(validator: Option<String>, default: Address) -> Result<Address> {
+    match validator {
+        Some(text) => text
+            .trim()
+            .parse::<Address>()
+            .context("invalid --validator address"),
+        None => Ok(default),
+    }
+}
+
+/// Builds a fee bid that always clears the current base fee.
+fn stake_fee(base_fee_per_unit: u64, gas_limit: u64) -> FeeBid {
+    FeeBid {
+        gas_limit,
+        max_fee_per_unit: base_fee_per_unit.max(1),
+        priority_fee_per_unit: 0,
+    }
+}
+
+/// A `GenesisValidator` backed by the operator keypair's own consensus key.
+fn genesis_validator(
+    keypair: &Keypair,
+    self_stake_webc: u64,
+    commission_bps: u16,
+) -> GenesisValidator {
+    GenesisValidator {
+        operator: keypair.address(),
+        consensus_key: keypair.public_key(),
+        self_stake: Amount::from_webc(self_stake_webc),
+        commission_bps,
+        bootstrap: false,
+    }
+}
+
+/// Opens an in-memory devnet service for the staking demos.
+fn open_staking_service(
+    genesis: &GenesisConfig,
+    faucet: Option<Keypair>,
+    proposer: Address,
+) -> Result<NodeService<MemoryKvStore>> {
+    let node = Node::open(MemoryKvStore::new(), genesis)?;
+    let faucet = faucet.map(|keypair| FaucetConfig {
+        keypair,
+        drip_amount: Amount::from_webc(100),
+        cooldown_ms: 10_000,
+        max_recipient_balance: Amount::from_webc(1_000),
+    });
+    Ok(NodeService::new(
+        node,
+        NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet,
+            proposer,
+        },
+    ))
+}
+
+/// `stake-register`: registers the local key as a validator.
+fn run_stake_register(
+    self_stake_webc: u64,
+    commission_bps: u16,
+    seed: Option<String>,
+) -> Result<serde_json::Value> {
+    let local = local_keypair(seed)?;
+    let genesis = GenesisConfig {
+        chain: ChainConfig::default(),
+        accounts: vec![GenesisAccount {
+            address: local.address(),
+            balance: Amount::from_webc(1_000_000),
+        }],
+        validators: Vec::new(),
+    };
+    let service = open_staking_service(&genesis, None, local.address())?;
+    let base_fee = service.fees().base_fee_per_unit;
+    let tx = Transaction::for_operation(
+        &local,
+        0,
+        Operation::RegisterValidator {
+            consensus_key: local.public_key(),
+            self_stake: Amount::from_webc(self_stake_webc),
+            commission_bps,
+            bootstrap: false,
+        },
+        stake_fee(base_fee, 30_000),
+    )?;
+    let sealed = service.submit_and_seal(tx, STAKE_BASE_TS_MS)?;
+    Ok(serde_json::json!({
+        "command": "stake-register",
+        "local_address": local.address().to_string(),
+        "operation": "RegisterValidator",
+        "self_stake_webc": self_stake_webc,
+        "commission_bps": commission_bps,
+        "sealed_block": sealed,
+        "validator": service.validator(local.address())?,
+        "note": STAKE_NOTE,
+    }))
+}
+
+/// `stake-delegate`: delegates local funds to a validator.
+fn run_stake_delegate(
+    amount_webc: u64,
+    validator: Option<String>,
+    seed: Option<String>,
+) -> Result<serde_json::Value> {
+    let local = local_keypair(seed)?;
+    let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
+    let validator_addr = resolve_validator(validator, target.address())?;
+    let genesis = staking_genesis_with_target(&local, &target);
+    let service = open_staking_service(&genesis, None, local.address())?;
+    let base_fee = service.fees().base_fee_per_unit;
+    let tx = Transaction::for_operation(
+        &local,
+        0,
+        Operation::Delegate {
+            validator: validator_addr,
+            amount: Amount::from_webc(amount_webc),
+        },
+        stake_fee(base_fee, 15_000),
+    )?;
+    let sealed = service.submit_and_seal(tx, STAKE_BASE_TS_MS)?;
+    Ok(serde_json::json!({
+        "command": "stake-delegate",
+        "local_address": local.address().to_string(),
+        "operation": "Delegate",
+        "validator_address": validator_addr.to_string(),
+        "amount_webc": amount_webc,
+        "sealed_block": sealed,
+        "delegator_account": service.account(local.address())?,
+        "validator": service.validator(validator_addr)?,
+        "note": STAKE_NOTE,
+    }))
+}
+
+/// `stake-undelegate`: delegates, then begins undelegation of the same amount.
+fn run_stake_undelegate(
+    amount_webc: u64,
+    validator: Option<String>,
+    seed: Option<String>,
+) -> Result<serde_json::Value> {
+    let local = local_keypair(seed)?;
+    let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
+    let validator_addr = resolve_validator(validator, target.address())?;
+    let genesis = staking_genesis_with_target(&local, &target);
+    let service = open_staking_service(&genesis, None, local.address())?;
+    let base_fee = service.fees().base_fee_per_unit;
+    // Establish a delegation to undelegate from.
+    let delegate = Transaction::for_operation(
+        &local,
+        0,
+        Operation::Delegate {
+            validator: validator_addr,
+            amount: Amount::from_webc(amount_webc),
+        },
+        stake_fee(base_fee, 15_000),
+    )?;
+    let delegation_block = service.submit_and_seal(delegate, STAKE_BASE_TS_MS)?;
+    // Then begin undelegation of the full delegated amount.
+    let undelegate = Transaction::for_operation(
+        &local,
+        1,
+        Operation::Undelegate {
+            validator: validator_addr,
+            amount: Amount::from_webc(amount_webc),
+        },
+        stake_fee(base_fee, 15_000),
+    )?;
+    let undelegation_block = service.submit_and_seal(undelegate, STAKE_BASE_TS_MS + 1_000)?;
+    Ok(serde_json::json!({
+        "command": "stake-undelegate",
+        "local_address": local.address().to_string(),
+        "operation": "Undelegate",
+        "validator_address": validator_addr.to_string(),
+        "amount_webc": amount_webc,
+        "delegation_block": delegation_block,
+        "undelegation_block": undelegation_block,
+        "delegator_account": service.account(local.address())?,
+        "validator": service.validator(validator_addr)?,
+        "note": "Undelegation is queued into the unbonding cooldown; matured principal \
+                 is claimed later. Local deterministic devnet; valueless test units.",
+    }))
+}
+
+/// `stake-claim`: claims validator and/or delegator rewards for the local key.
+///
+/// When neither flag is set, both claims run. The local key is a genesis
+/// validator (so operator rewards can be claimed) and, when a delegator claim is
+/// requested, first opens a small delegation to the target so a position exists.
+fn run_stake_claim(
+    claim_validator: bool,
+    claim_delegator: bool,
+    validator: Option<String>,
+    seed: Option<String>,
+) -> Result<serde_json::Value> {
+    let (do_validator, do_delegator) = if !claim_validator && !claim_delegator {
+        (true, true)
+    } else {
+        (claim_validator, claim_delegator)
+    };
+    let local = local_keypair(seed)?;
+    let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
+    let del_validator = resolve_validator(validator, target.address())?;
+    let genesis = GenesisConfig {
+        chain: ChainConfig::default(),
+        accounts: vec![
+            GenesisAccount {
+                address: local.address(),
+                balance: Amount::from_webc(1_000_000),
+            },
+            GenesisAccount {
+                address: target.address(),
+                balance: Amount::from_webc(1_000),
+            },
+        ],
+        validators: vec![
+            genesis_validator(&local, 100, 500),
+            genesis_validator(&target, 100, 500),
+        ],
+    };
+    let service = open_staking_service(&genesis, None, local.address())?;
+    let base_fee = service.fees().base_fee_per_unit;
+
+    // Ordered operations. A delegator claim first opens a delegation position.
+    let mut ops: Vec<(&str, Operation)> = Vec::new();
+    if do_delegator {
+        ops.push((
+            "delegation_setup",
+            Operation::Delegate {
+                validator: del_validator,
+                amount: Amount::from_webc(1),
+            },
+        ));
+    }
+    if do_validator {
+        ops.push(("validator_rewards", Operation::ClaimValidatorRewards));
+    }
+    if do_delegator {
+        ops.push((
+            "delegator_rewards",
+            Operation::ClaimDelegatorRewards {
+                validator: del_validator,
+            },
+        ));
+    }
+
+    let mut claimed = serde_json::Map::new();
+    for (index, (label, operation)) in ops.into_iter().enumerate() {
+        let tx = Transaction::for_operation(
+            &local,
+            index as u64,
+            operation,
+            stake_fee(base_fee, 30_000),
+        )?;
+        let sealed = service.submit_and_seal(tx, STAKE_BASE_TS_MS + index as u64 * 1_000)?;
+        if label != "delegation_setup" {
+            claimed.insert(label.to_owned(), serde_json::to_value(sealed)?);
+        }
+    }
+
+    Ok(serde_json::json!({
+        "command": "stake-claim",
+        "local_address": local.address().to_string(),
+        "delegator_target": del_validator.to_string(),
+        "claimed": serde_json::Value::Object(claimed),
+        "local_account": service.account(local.address())?,
+        "note": "Rewards accrue at epoch boundaries; on this short-lived local devnet the \
+                 claimable amount is typically zero. Valueless test units.",
+    }))
+}
+
+/// `faucet-stake`: drips valueless devnet funds to the local key, then delegates.
+fn run_faucet_stake(amount_webc: u64, seed: Option<String>) -> Result<serde_json::Value> {
+    let local = local_keypair(seed)?;
+    let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
+    let faucet = Keypair::from_seed(STAKE_FAUCET_SEED);
+    // The local key is intentionally absent from genesis so the faucet can fund it.
+    let genesis = GenesisConfig {
+        chain: ChainConfig::default(),
+        accounts: vec![
+            GenesisAccount {
+                address: faucet.address(),
+                balance: Amount::from_webc(1_000_000),
+            },
+            GenesisAccount {
+                address: target.address(),
+                balance: Amount::from_webc(1_000),
+            },
+        ],
+        validators: vec![genesis_validator(&target, 100, 500)],
+    };
+    let service = open_staking_service(
+        &genesis,
+        Some(Keypair::from_seed(STAKE_FAUCET_SEED)),
+        faucet.address(),
+    )?;
+    // 1) Faucet-drip valueless devnet funds to the local key (seals its own block).
+    let faucet_drip = service.faucet_drip(local.address(), STAKE_BASE_TS_MS)?;
+    // 2) Delegate part of the drip to the target validator.
+    let base_fee = service.fees().base_fee_per_unit;
+    let delegate = Transaction::for_operation(
+        &local,
+        0,
+        Operation::Delegate {
+            validator: target.address(),
+            amount: Amount::from_webc(amount_webc),
+        },
+        stake_fee(base_fee, 15_000),
+    )?;
+    let delegation_block = service.submit_and_seal(delegate, STAKE_BASE_TS_MS + 1_000)?;
+    Ok(serde_json::json!({
+        "command": "faucet-stake",
+        "local_address": local.address().to_string(),
+        "validator_address": target.address().to_string(),
+        "faucet_drip": faucet_drip,
+        "delegated_webc": amount_webc,
+        "delegation_block": delegation_block,
+        "delegator_account": service.account(local.address())?,
+        "validator": service.validator(target.address())?,
+        "note": STAKE_NOTE,
+    }))
+}
+
+/// Genesis that funds the local key and registers the deterministic target
+/// validator (funded and self-staked), shared by the delegate/undelegate demos.
+fn staking_genesis_with_target(local: &Keypair, target: &Keypair) -> GenesisConfig {
+    GenesisConfig {
+        chain: ChainConfig::default(),
+        accounts: vec![
+            GenesisAccount {
+                address: local.address(),
+                balance: Amount::from_webc(1_000_000),
+            },
+            GenesisAccount {
+                address: target.address(),
+                balance: Amount::from_webc(1_000),
+            },
+        ],
+        validators: vec![genesis_validator(target, 100, 500)],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn amount_string(whole: u64) -> String {
+        Amount::from_webc(whole).0.to_string()
+    }
+
+    #[test]
+    fn parse_seed_accepts_32_byte_hex_and_rejects_others() {
+        let hex_seed = "11".repeat(32);
+        assert_eq!(parse_seed(&hex_seed).unwrap(), [0x11u8; 32]);
+        // Wrong length and non-hex are rejected.
+        assert!(parse_seed("1122").is_err());
+        assert!(parse_seed(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn local_keypair_defaults_to_fixed_seed() {
+        let default = local_keypair(None).unwrap();
+        assert_eq!(
+            default.address(),
+            Keypair::from_seed(DEFAULT_LOCAL_SEED).address()
+        );
+        let explicit = local_keypair(Some("11".repeat(32))).unwrap();
+        assert_eq!(
+            explicit.address(),
+            Keypair::from_seed([0x11u8; 32]).address()
+        );
+    }
+
+    #[test]
+    fn resolve_validator_parses_or_defaults() {
+        let default = Keypair::from_seed(TARGET_VALIDATOR_SEED).address();
+        assert_eq!(resolve_validator(None, default).unwrap(), default);
+        let explicit = Keypair::from_seed([5u8; 32]).address();
+        assert_eq!(
+            resolve_validator(Some(explicit.to_string()), default).unwrap(),
+            explicit
+        );
+        assert!(resolve_validator(Some("not-an-address".to_owned()), default).is_err());
+    }
+
+    #[test]
+    fn stake_register_registers_the_local_validator() {
+        let value = run_stake_register(25, 500, None).unwrap();
+        let local = Keypair::from_seed(DEFAULT_LOCAL_SEED).address().to_string();
+        assert_eq!(value["local_address"], local);
+        assert_eq!(value["validator"]["operator"], local);
+        assert_eq!(value["validator"]["self_stake"], amount_string(25));
+        assert_eq!(value["validator"]["commission_bps"], 500);
+        assert_eq!(value["sealed_block"]["height"], 1);
+    }
+
+    #[test]
+    fn stake_delegate_increases_validator_delegated_stake() {
+        let value = run_stake_delegate(10, None, None).unwrap();
+        assert_eq!(value["operation"], "Delegate");
+        assert_eq!(value["validator"]["delegated_stake"], amount_string(10));
+        assert_eq!(value["sealed_block"]["transaction_count"], 1);
+    }
+
+    #[test]
+    fn stake_undelegate_delegates_then_queues() {
+        let value = run_stake_undelegate(5, None, None).unwrap();
+        assert_eq!(value["operation"], "Undelegate");
+        assert_eq!(value["delegation_block"]["height"], 1);
+        assert_eq!(value["undelegation_block"]["height"], 2);
+    }
+
+    #[test]
+    fn stake_claim_runs_both_claims_by_default() {
+        let value = run_stake_claim(false, false, None, None).unwrap();
+        assert!(value["claimed"].get("validator_rewards").is_some());
+        assert!(value["claimed"].get("delegator_rewards").is_some());
+    }
+
+    #[test]
+    fn stake_claim_can_claim_only_validator_rewards() {
+        let value = run_stake_claim(true, false, None, None).unwrap();
+        assert!(value["claimed"].get("validator_rewards").is_some());
+        assert!(value["claimed"].get("delegator_rewards").is_none());
+    }
+
+    #[test]
+    fn faucet_stake_funds_then_delegates() {
+        let value = run_faucet_stake(10, None).unwrap();
+        assert_eq!(value["validator"]["delegated_stake"], amount_string(10));
+        // The drip funded the local key with the devnet faucet amount.
+        assert_eq!(value["faucet_drip"]["amount"], amount_string(100));
+    }
 }
