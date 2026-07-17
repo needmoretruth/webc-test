@@ -340,6 +340,50 @@ describe("transaction signing schema", () => {
     );
   });
 
+  it("rejects non-canonical amount strings to keep Rust u128 parity (X4)", () => {
+    // Rust's Amount serializes as a canonical unsigned decimal (no leading zero,
+    // no sign, within u128). A value Rust would never re-produce must not be
+    // signable, or the signed bytes silently diverge from verification.
+    const validator = "webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem";
+    const overU128 = (2n ** 128n).toString(10);
+    for (const bad of ["01", "-5", "abc", "", " 5", "5 ", "1_000", overU128]) {
+      expect(() => transfer(validator, bad)).toThrow(/amount/u);
+      expect(() => delegate(validator, bad)).toThrow(/amount/u);
+      expect(() => undelegate(validator, bad)).toThrow(/amount/u);
+      expect(() => unstakeValidator(bad)).toThrow(/amount/u);
+      expect(() => registerValidator({
+        consensusKey: "aa".repeat(32),
+        selfStake: bad,
+        commissionBps: 500,
+        bootstrap: false,
+      })).toThrow(/amount/u);
+      expect(() =>
+        bridgeLock({
+          asset: "NativeWebc",
+          destinationChain: "Ethereum",
+          recipient: "abcd",
+          amount: bad,
+        }),
+      ).toThrow(/amount/u);
+      expect(() => openAuthorizationLane("99".repeat(32), bad)).toThrow(/amount/u);
+    }
+    // Session-key constraint amounts are validated too (same parity class).
+    expect(() =>
+      installSessionKey({
+        sessionPublicKey: "11".repeat(32),
+        constraints: { ...sessionConstraints, max_amount_per_use: "05" },
+        postQuantumRootReveal: sessionReveal,
+      }),
+    ).toThrow(/amount/u);
+    // Canonical values still construct.
+    expect(transfer(validator, "0")).toEqual({
+      Transfer: { to: validator, amount: "0" },
+    });
+    expect(transfer(validator, "123456")).toEqual({
+      Transfer: { to: validator, amount: "123456" },
+    });
+  });
+
   it("rejects non-lowercase object id/namespace/data hex to keep Rust parity (X2)", () => {
     // object_id and namespace are Hash256 and data is bounded lowercase hex in
     // Rust; a mixed-case field re-serializes lowercase there, so signing it here

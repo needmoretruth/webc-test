@@ -179,6 +179,7 @@ export function installAuthorizationPolicy(
 }
 
 export function transfer(to: WebcAddress, amount: string): OperationJson {
+  requireCanonicalAmount(amount, "transfer amount");
   return { Transfer: { to, amount } };
 }
 
@@ -187,6 +188,7 @@ export function openAuthorizationLane(
   lane: AuthorizationLaneIdJson,
   feeDeposit: string,
 ): OperationJson {
+  requireCanonicalAmount(feeDeposit, "lane fee deposit");
   return { OpenAuthorizationLane: { lane, fee_deposit: feeDeposit } };
 }
 
@@ -195,6 +197,7 @@ export function fundAuthorizationLane(
   lane: AuthorizationLaneIdJson,
   feeDeposit: string,
 ): OperationJson {
+  requireCanonicalAmount(feeDeposit, "lane fee deposit");
   return { FundAuthorizationLane: { lane, fee_deposit: feeDeposit } };
 }
 
@@ -261,6 +264,7 @@ export function registerValidator(args: {
   commissionBps: number;
   bootstrap: boolean;
 }): OperationJson {
+  requireCanonicalAmount(args.selfStake, "validator self stake");
   return {
     RegisterValidator: {
       consensus_key: args.consensusKey,
@@ -275,6 +279,7 @@ export function delegate(
   validator: WebcAddress,
   amount: string,
 ): OperationJson {
+  requireCanonicalAmount(amount, "delegate amount");
   return { Delegate: { validator, amount } };
 }
 
@@ -282,11 +287,13 @@ export function undelegate(
   validator: WebcAddress,
   amount: string,
 ): OperationJson {
+  requireCanonicalAmount(amount, "undelegate amount");
   return { Undelegate: { validator, amount } };
 }
 
 /** Requests delayed exit of validator operator self-stake. */
 export function unstakeValidator(amount: string): OperationJson {
+  requireCanonicalAmount(amount, "unstake amount");
   return { UnstakeValidator: { amount } };
 }
 
@@ -323,6 +330,7 @@ export function bridgeLock(args: {
   amount: string;
 }): OperationJson {
   requireLowercaseHex(args.recipient, "bridge recipient");
+  requireCanonicalAmount(args.amount, "bridge lock amount");
   return {
     BridgeLock: {
       asset: args.asset,
@@ -341,6 +349,7 @@ export function bridgeBurn(args: {
   amount: string;
 }): OperationJson {
   requireLowercaseHex(args.recipient, "bridge recipient");
+  requireCanonicalAmount(args.amount, "bridge burn amount");
   return {
     BridgeBurn: {
       asset: args.asset,
@@ -367,6 +376,27 @@ function requireLowercaseHex(value: string, label: string): void {
     throw new Error(`invalid lowercase hex for ${label}`);
   }
   hexToBytes(value); // throws on any non-hex character
+}
+
+/** Largest value Rust's `u128` amount encoding can represent. */
+const AMOUNT_U128_MAX = (1n << 128n) - 1n;
+
+/**
+ * Rejects any amount string Rust's `u128` decimal encoding would never produce.
+ *
+ * Rust serializes an `Amount` as a canonical unsigned decimal (no sign, no
+ * leading zero, within `u128`). Signing a non-canonical string (`"01"`, `"-5"`,
+ * `"1_000"`, an over-`u128` value) would silently diverge from Rust's
+ * re-serialization during verification, so fail closed in the constructor. The
+ * length guard also bounds work before the `BigInt` parse.
+ */
+function requireCanonicalAmount(value: string, label: string): void {
+  if (typeof value !== "string" || value.length > 39 || !/^(0|[1-9][0-9]*)$/u.test(value)) {
+    throw new Error(`invalid canonical amount for ${label}`);
+  }
+  if (BigInt(value) > AMOUNT_U128_MAX) {
+    throw new Error(`amount for ${label} exceeds the u128 range`);
+  }
 }
 
 /** Validates a post-quantum root reveal's scheme and hex fields. */
@@ -406,6 +436,10 @@ export function installSessionKey(args: {
   postQuantumRootReveal: PostQuantumRootRevealJson;
 }): OperationJson {
   requireLowercaseHex(args.sessionPublicKey, "session public key");
+  requireCanonicalAmount(args.constraints.max_amount_per_use, "session max amount per use");
+  requireCanonicalAmount(args.constraints.total_amount_budget, "session total amount budget");
+  requireCanonicalAmount(args.constraints.max_fee_per_use, "session max fee per use");
+  requireCanonicalAmount(args.constraints.total_fee_budget, "session total fee budget");
   requireValidReveal(args.postQuantumRootReveal);
   return {
     InstallSessionKey: {
