@@ -1375,6 +1375,116 @@ mod tests {
     }
 
     #[test]
+    fn sponsor_management_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the three sponsor-management operations
+        // (§15.35) so a browser SDK mirror must reproduce these exact field names
+        // and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged).
+        let namespace = Hash256([0x55; 32]);
+        let register = Operation::RegisterAppSponsor {
+            namespace,
+            daily_budget_cap: Amount::from_units(50_000),
+            initial_funding: Amount::from_units(100_000),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&register).unwrap(),
+            format!(
+                r#"{{"RegisterAppSponsor":{{"daily_budget_cap":"50000","initial_funding":"100000","namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+        let fund = Operation::FundAppSponsor {
+            namespace,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&fund).unwrap(),
+            format!(
+                r#"{{"FundAppSponsor":{{"amount":"7","namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+        let withdraw = Operation::WithdrawAppSponsor {
+            namespace,
+            amount: Amount::from_units(9),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&withdraw).unwrap(),
+            format!(
+                r#"{{"WithdrawAppSponsor":{{"amount":"9","namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&register).unwrap();
+        value["RegisterAppSponsor"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn sponsor_field_is_omitted_when_absent_and_signed_when_present() {
+        // A non-sponsored transaction must serialize without a `sponsor` key, so
+        // the frozen V4 vectors and the TS SDK stay valid; a sponsored one signs
+        // over exactly one added `sponsor` key bound to the sender's signature.
+        let sender = Keypair::from_seed([1u8; 32]);
+        let recipient = Keypair::from_seed([2u8; 32]);
+        let namespace = Hash256([0xab; 32]);
+
+        let plain = Transaction::for_operation(
+            &sender,
+            0,
+            Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            },
+            FeeBid::default(),
+        )
+        .unwrap();
+        assert!(
+            !canonical_signing_text(&plain).contains("sponsor"),
+            "an absent sponsor is omitted from the signed payload"
+        );
+        assert!(
+            !crate::canonical::canonical_json_string(&plain)
+                .unwrap()
+                .contains("sponsor"),
+            "an absent sponsor is omitted from the wire encoding"
+        );
+
+        let sponsored = Transaction::for_sponsored_operation(
+            &sender,
+            0,
+            Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            },
+            FeeBid::default(),
+            namespace,
+        )
+        .unwrap();
+        assert_eq!(sponsored.sponsor, Some(namespace));
+        assert!(
+            canonical_signing_text(&sponsored).contains(&format!(r#""sponsor":"{}""#, "ab".repeat(32))),
+            "a present sponsor is part of the signed payload"
+        );
+        // The signed payload binds the sponsor: the signature verifies, and the
+        // declared access list covers the sponsor state key.
+        sponsored.verify().expect("sponsored signature verifies");
+        assert!(sponsored.access_list.read_write.iter().any(|k| matches!(
+            &k.kind,
+            crate::StateKeyKind::Application { namespace: ns, key_hash }
+                if *ns == namespace && *key_hash == sponsor_state_key_hash()
+        )));
+
+        // Round-trips through canonical JSON preserving the sponsor field.
+        let text = crate::canonical::canonical_json_string(&sponsored).unwrap();
+        let decoded: Transaction = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded, sponsored);
+    }
+
+    #[test]
     fn session_and_rotation_operations_have_a_stable_cross_language_wire_vector() {
         // Deterministic placeholder bytes make this a cross-language vector: the
         // TypeScript SDK builds the same four operations and must hash to the same
