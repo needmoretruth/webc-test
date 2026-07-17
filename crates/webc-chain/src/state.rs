@@ -775,11 +775,17 @@ impl ChainState {
             })
             .collect::<Result<Vec<_>, ChainError>>()?;
 
+        // F1: sum every validator's floored share so the outer cross-validator
+        // remainder can be carried forward instead of dropped (see below).
+        let mut distributed_total = Amount::ZERO;
         for (validator_address, validator_total_stake, self_stake, commission_bps) in
             active_validators
         {
             let validator_share = total_reward
                 .checked_mul_ratio(validator_total_stake.0, total_active_stake.0)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            distributed_total = distributed_total
+                .checked_add(validator_share)
                 .ok_or(ChainError::ArithmeticOverflow)?;
             let commission = validator_share
                 .checked_mul_bps(commission_bps)
@@ -852,7 +858,19 @@ impl ChainState {
             .minted_supply
             .checked_add(inflation)
             .ok_or(ChainError::ArithmeticOverflow)?;
-        self.validator_fee_pool = Amount::ZERO;
+        // F1: retain the outer division remainder (total_reward minus the sum of
+        // the floored per-validator shares) in the fee pool, carrying it to the
+        // next epoch. Each validator's share is fully distributed internally (its
+        // inner dust is recaptured to the validator), but the SUM of floored
+        // shares is <= total_reward; the difference is 0..num_validators-1 base
+        // units. Zeroing the pool while minting the full inflation would destroy
+        // those units and break supply conservation (accounted < minted_supply)
+        // by that amount every epoch. Carrying it keeps
+        // accounted_new == minted_old + inflation == minted_new.
+        let outer_leftover = total_reward
+            .checked_sub(distributed_total)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.validator_fee_pool = outer_leftover;
         self.finish_epoch(config, total_reward)
     }
 
@@ -2679,6 +2697,68 @@ mod tests {
             validators: Vec::new(),
         };
         assert!(ChainState::from_genesis(&genesis).is_ok());
+    }
+
+    // ----- F1: epoch-reward supply conservation with multiple validators -----
+
+    fn two_active_validators_with_odd_fee_pool() -> (ChainConfig, ChainState) {
+        let config = ChainConfig::default();
+        let mut state = ChainState::new(&config).expect("empty state");
+        let stake = Amount::from_webc(100);
+        for seed in [21u8, 22u8] {
+            let address = Keypair::from_seed([seed; 32]).address();
+            let mut account = Account::with_balance(Amount::ZERO);
+            account.staked = stake;
+            state.accounts.insert(address, account);
+            state.validators.insert(
+                address,
+                Validator {
+                    operator: address,
+                    consensus_key: PublicKeyBytes([seed; 32]),
+                    self_stake: stake,
+                    delegated_stake: Amount::ZERO,
+                    commission_bps: 0,
+                    status: ValidatorStatus::Active,
+                    bootstrap: false,
+                    accumulated_rewards: Amount::ZERO,
+                },
+            );
+        }
+        // An odd fee pool guarantees the outer remainder: two equal-stake
+        // validators each floor to (pool - 1) / 2, leaving one base unit over.
+        let fee_pool = 101u128;
+        state.validator_fee_pool = Amount::from_units(fee_pool);
+        // Balanced by construction: staked principal plus the fee pool == minted.
+        state.minted_supply = Amount::from_units(2 * stake.0 + fee_pool);
+        // Zero year-start supply => zero inflation; epoch 1 is not a year
+        // boundary, so `apply_epoch_rewards` does not reset the year-start.
+        state.inflation_year_start_supply = Amount::ZERO;
+        state.current_epoch = 1;
+        (config, state)
+    }
+
+    #[test]
+    fn epoch_rewards_conserve_supply_across_multiple_validators() {
+        // F1: the outer cross-validator division remainder must be retained in
+        // the fee pool, not dropped. Dropping it breaks supply conservation by
+        // up to num_validators-1 base units per epoch (invisible with a single
+        // validator, where the whole reward is one exact share).
+        let (config, mut state) = two_active_validators_with_odd_fee_pool();
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "state is balanced before distribution"
+        );
+
+        state
+            .distribute_epoch_rewards(&config)
+            .expect("epoch reward distribution");
+
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "supply must still reconcile after distributing rewards to two validators"
+        );
+        // The remainder that was previously dropped now carries forward.
+        assert_eq!(state.validator_fee_pool, Amount::from_units(1));
     }
 
     // ----- session-key test helpers -----

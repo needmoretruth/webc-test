@@ -113,6 +113,20 @@ pub fn build_block(
     // is committed by `state_root`, so all nodes agree on the monotonic clock.
     next_state.last_block_timestamp_ms = input.timestamp_ms;
 
+    // E1: advance the epoch deterministically at height-derived boundaries,
+    // inside the state transition. Reward distribution, unbonding maturation,
+    // and session-key expiry therefore fire identically on every node — because
+    // `apply_block` re-runs this exact function — instead of only when the demo
+    // called `distribute_epoch_rewards` out of band. The trigger is a pure
+    // function of the committed height, so honest nodes never diverge at the
+    // boundary. `blocks_per_epoch == 0` disables it (unit tests that drive the
+    // epoch directly). The returned events are informational; the committed
+    // state change is what `state_root` binds.
+    let blocks_per_epoch = config.staking.blocks_per_epoch;
+    if blocks_per_epoch != 0 && input.height.is_multiple_of(blocks_per_epoch) {
+        next_state.distribute_epoch_rewards(config)?;
+    }
+
     let header = BlockHeader {
         protocol_version: config.protocol_version,
         chain_id: input.chain_id,
@@ -334,6 +348,54 @@ mod tests {
         // A strictly newer timestamp advances the chain clock.
         block_at(&mut state, 2, 5_001).expect("newer block");
         assert_eq!(state.last_block_timestamp_ms, 5_001);
+    }
+
+    #[test]
+    fn epoch_advances_deterministically_at_height_boundaries() {
+        // E1: the epoch rollover runs inside build_block (re-run by apply_block),
+        // keyed on committed height, so every node advances the epoch identically
+        // instead of only when the demo called distribute_epoch_rewards.
+        let mut config = ChainConfig::default();
+        config.staking.blocks_per_epoch = 2;
+        let alice = Keypair::from_seed([1u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+        assert_eq!(state.current_epoch, 0);
+
+        let build_at = |state: &mut ChainState, height: u64, ts: u64| {
+            let epoch = state.current_epoch;
+            build_block(
+                state,
+                &config,
+                BlockBuildInput {
+                    chain_id: config.chain_id.clone(),
+                    height,
+                    epoch,
+                    previous_hash: Hash256::ZERO,
+                    proposer: alice.address(),
+                    timestamp_ms: ts,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("block builds");
+        };
+
+        build_at(&mut state, 1, 1_000); // not a boundary
+        assert_eq!(state.current_epoch, 0);
+        build_at(&mut state, 2, 2_000); // completes epoch 0
+        assert_eq!(state.current_epoch, 1);
+        build_at(&mut state, 3, 3_000); // not a boundary
+        assert_eq!(state.current_epoch, 1);
+        build_at(&mut state, 4, 4_000); // completes epoch 1
+        assert_eq!(state.current_epoch, 2);
     }
 
     fn build_input(config: &ChainConfig, proposer: Address) -> BlockBuildInput {

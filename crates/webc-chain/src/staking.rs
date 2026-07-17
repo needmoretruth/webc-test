@@ -132,6 +132,20 @@ pub struct StakingConfig {
     pub slashable_unbonding_epochs: u64,
     /// Maximum native base units admitted into cooldown per epoch.
     pub max_unbonding_units_per_epoch: Amount,
+    /// Number of blocks in one consensus epoch.
+    ///
+    /// The epoch rollover (reward distribution, unbonding maturation,
+    /// session-key expiry) fires deterministically when a block's height is a
+    /// multiple of this value, inside the state transition, so every node
+    /// advances the epoch identically (finding E1). `0` disables automatic
+    /// rollover (used only by unit tests that drive the epoch directly).
+    #[serde(default = "default_blocks_per_epoch")]
+    pub blocks_per_epoch: u64,
+}
+
+/// Default blocks per epoch: one devnet minute at the ~1s block target.
+fn default_blocks_per_epoch() -> u64 {
+    60
 }
 
 impl Default for StakingConfig {
@@ -146,6 +160,7 @@ impl Default for StakingConfig {
             unbonding_cooldown_epochs: 7,
             slashable_unbonding_epochs: 7,
             max_unbonding_units_per_epoch: Amount::from_webc(1_000),
+            blocks_per_epoch: default_blocks_per_epoch(),
         }
     }
 }
