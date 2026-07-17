@@ -13,11 +13,12 @@ use crate::namespace::namespace_state_key_hash;
 use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
-    ChainId, Epoch, ExternalChain, MandateCounterpartyPolicy, MandateId, ObjectId, ObjectVersion,
-    PostQuantumRoot, PostQuantumRootReveal, ProtocolStateKey, ProtocolVersion, ServiceId,
-    ServicePaymentFlags, ServicePrice, ServiceStatus, SessionKeyConstraints, SessionKeyId,
-    SlashingEvidence, StateKey, TokenAuthorityKind, TokenId, TokenMetadata, UnbondingRequestId,
-    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
+    ChainId, Epoch, ExternalChain, MandateCounterpartyPolicy, MandateId, NftAuthorityKind,
+    NftCollectionId, NftMetadata, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
+    ProtocolStateKey, ProtocolVersion, ServiceId, ServicePaymentFlags, ServicePrice, ServiceStatus,
+    SessionKeyConstraints, SessionKeyId, SlashingEvidence, StateKey, TokenAuthorityKind, TokenId,
+    TokenMetadata, UnbondingRequestId, CURRENT_PROTOCOL_VERSION,
+    LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -798,6 +799,139 @@ pub enum Operation {
         /// New holder, or `None` to permanently renounce.
         new_authority: Option<Address>,
     },
+    /// Creates a native NFT collection (Phase 13b, §15).
+    ///
+    /// Creator-signed (the sender is the collection's `creator`). Derives the
+    /// collection id from `(namespace, sender, create_nonce)` and records an
+    /// [`crate::NftCollection`] with the given authorities, optional supply cap, and
+    /// royalty commitment. It LOCKS a native WEBC creation deposit
+    /// (`ChainConfig::nft.creation_deposit`) from the creator's liquid balance into
+    /// the `nft_deposits` bucket — an anti-spam price that is NON-REFUNDABLE for the
+    /// collection's life; creation NEVER mints or burns native WEBC and mints no
+    /// items (minting is a separate [`Self::MintNft`]). Fails if the derived id
+    /// already exists (`NftCollectionAlreadyExists`) or the metadata/royalty is
+    /// malformed (`InvalidNftMetadata`). Any authorization lane may pay the fee.
+    CreateNftCollection {
+        /// Application namespace the collection lives under; bound into the id.
+        namespace: Hash256,
+        /// Creator-chosen uniquifier so one creator may create several collections
+        /// under one namespace; part of the derived collection id.
+        create_nonce: u64,
+        /// Bounded metadata (name, symbol, off-chain commitment).
+        metadata: NftMetadata,
+        /// Initial mint authority; `None` creates the collection with minting
+        /// permanently renounced (a collection that can never mint an item).
+        mint_authority: Option<Address>,
+        /// Initial freeze authority; `None` creates the collection with freezing
+        /// permanently renounced.
+        freeze_authority: Option<Address>,
+        /// Optional hard cap on the total number of items ever minted (`None` = no
+        /// cap).
+        max_supply: Option<u64>,
+        /// Creator royalty commitment in basis points (≤ 10_000). Recorded only; the
+        /// chain does NOT enforce royalties on transfer (a marketplace concern).
+        royalty_bps: u16,
+    },
+    /// Mints a new item of a collection to a recipient (Phase 13b, §15).
+    ///
+    /// Must be signed by the collection's current `mint_authority`; rejected if that
+    /// authority is `None` (minting renounced) or the signer differs
+    /// (`NftMintNotAuthorized`). Assigns `serial = next_serial`, increments
+    /// `next_serial` and `minted_count`, and creates the item owned by `recipient`.
+    /// Rejected if the collection is paused (`NftCollectionPaused`) or the cap is
+    /// reached (`NftMaxSupplyReached`). The minted [`crate::NftId`] is carried in the
+    /// receipt event. Moves no native WEBC beyond the fee. Any authorization lane may
+    /// pay the fee.
+    MintNft {
+        /// Collection to mint into.
+        collection_id: NftCollectionId,
+        /// Account that will own the newly minted item.
+        recipient: Address,
+        /// Fixed-size commitment to the item's off-chain metadata.
+        item_metadata_hash: Hash256,
+    },
+    /// Transfers one NFT item from its owner to a recipient (Phase 13b, §15).
+    ///
+    /// Signed by the CURRENT item owner (`NftNotOwner` otherwise). Moves ownership of
+    /// the single item. Rejected if the item is frozen (`NftItemFrozen`), the
+    /// collection is paused (`NftCollectionPaused`), or the item does not exist
+    /// (`NftItemNotFound`). This writes ONLY the one item key (the collection record
+    /// is read-only, consulted for the paused flag), so an ordinary transfer never
+    /// writes a global per-collection object (a Phase 13 acceptance criterion). Any
+    /// authorization lane may pay the fee.
+    TransferNft {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to transfer.
+        serial: u64,
+        /// Account credited ownership of the item.
+        recipient: Address,
+    },
+    /// Burns one NFT item held by the signer (Phase 13b, §15).
+    ///
+    /// The CURRENT owner burns their own item: removes it and increments
+    /// `burned_count`. Rejected if the item is frozen (`NftItemFrozen`), not owned by
+    /// the signer (`NftNotOwner`), or absent (`NftItemNotFound`). `next_serial` is
+    /// NOT decremented, so a burned serial is never reminted. Any authorization lane
+    /// may pay the fee.
+    BurnNft {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to burn.
+        serial: u64,
+    },
+    /// Pauses or unpauses minting of a collection (Phase 13b, §15).
+    ///
+    /// Only the collection's current `mint_authority` may pause/unpause (the Phase
+    /// 13b simplification keeps a single privileged authority rather than a dedicated
+    /// pause authority); rejected if minting is renounced (`NftMintNotAuthorized`).
+    /// While paused, [`Self::MintNft`] is rejected. Any authorization lane may pay the
+    /// fee.
+    SetNftCollectionPaused {
+        /// Collection whose paused flag changes.
+        collection_id: NftCollectionId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// Freezes one NFT item (Phase 13b, §15).
+    ///
+    /// Freeze-authority-signed; rejected if freezing is renounced or the signer is
+    /// not the current freeze authority (`NftFreezeNotAuthorized`), or the item is
+    /// absent (`NftItemNotFound`). A frozen item can be neither transferred nor
+    /// burned. Any authorization lane may pay the fee.
+    FreezeNftItem {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to freeze.
+        serial: u64,
+    },
+    /// Thaws (unfreezes) one NFT item (Phase 13b, §15).
+    ///
+    /// Freeze-authority-signed (the same authority check as [`Self::FreezeNftItem`]).
+    /// Clears the item's `frozen` flag. Any authorization lane may pay the fee.
+    ThawNftItem {
+        /// Collection the item belongs to.
+        collection_id: NftCollectionId,
+        /// Serial of the item to thaw.
+        serial: u64,
+    },
+    /// Transfers or permanently renounces one of a collection's authorities
+    /// (Phase 13b, §15).
+    ///
+    /// The CURRENT holder of the named authority may transfer it to a new address
+    /// (`Some`) or permanently renounce it (`None`). Rejected if the current
+    /// authority is already `None` (nothing to transfer) or the signer is not the
+    /// current authority (`NftAuthorityNotAuthorized`). Renouncement is PERMANENT: a
+    /// `None` authority can never be restored (a Phase 13 acceptance criterion,
+    /// "revoked authority cannot return"). Any authorization lane may pay the fee.
+    SetNftAuthority {
+        /// Collection whose authority changes.
+        collection_id: NftCollectionId,
+        /// Which authority (mint or freeze) is transferred/renounced.
+        authority_kind: NftAuthorityKind,
+        /// New holder, or `None` to permanently renounce.
+        new_authority: Option<Address>,
+    },
 }
 
 impl Operation {
@@ -861,6 +995,19 @@ impl Operation {
             | Self::FreezeTokenAccount { .. }
             | Self::ThawTokenAccount { .. }
             | Self::SetTokenAuthority { .. } => 5_000,
+            // NFT collection creation is permissionless-for-a-fee: it records a
+            // record and locks a native deposit — the anti-spam price is a HIGH
+            // ordinary fee (comparable to token/contract creation).
+            Self::CreateNftCollection { .. } => 30_000,
+            // Mint/transfer/burn move one item and (for mint/burn) bump one record's
+            // counters — comparable to a native token mint/burn/transfer.
+            Self::MintNft { .. } | Self::TransferNft { .. } | Self::BurnNft { .. } => 1_000,
+            // Pause/freeze/thaw/authority rewrite one collection record or one item —
+            // single-record management operations.
+            Self::SetNftCollectionPaused { .. }
+            | Self::FreezeNftItem { .. }
+            | Self::ThawNftItem { .. }
+            | Self::SetNftAuthority { .. } => 5_000,
             Self::CreateFeed { .. } => 15_000,
             Self::RegisterReporter { .. }
             | Self::DeregisterReporter { .. }
@@ -1381,6 +1528,92 @@ impl Operation {
                 // is the only write. Freezing moves no native units.
                 push_unique_key(&mut read_only, StateKey::token(*token_id));
                 push_unique_key(&mut read_write, StateKey::token_freeze(*token_id, *account));
+            }
+            Self::CreateNftCollection {
+                namespace,
+                create_nonce,
+                ..
+            } => {
+                // Creation locks a native deposit from the creator's liquid balance
+                // and writes the new collection record. The account key is in the
+                // default-lane base; declare it explicitly so a non-default fee lane
+                // is covered too. It mints no item, so no item key is written. The
+                // collection id is derived from the signer (creator), the namespace,
+                // and the create nonce, so the access list names the exact record at
+                // signing time (mirrors CreateToken/CreateObject).
+                let collection_id = NftCollectionId::derive(*namespace, sender, *create_nonce);
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::nft_collection(collection_id));
+            }
+            Self::MintNft { collection_id, .. } => {
+                // A mint bumps `next_serial`/`minted_count` (writes the collection
+                // record) and creates ONE brand-new item at the chain-assigned
+                // `serial = next_serial`. That serial is state-dependent and NOT known
+                // at signing time, so the new item key cannot be pre-declared. This is
+                // safe because the collection record is declared READ_WRITE: every
+                // mint of a collection therefore serializes on it, so two mints can
+                // never race on the fresh serial, and any later op that references the
+                // item (transfer/burn/freeze/thaw — which DO read/write the collection
+                // record) is serialized after the mint. The fresh item is thus created
+                // under the collection record's write scope; see the matching handler
+                // note in `state.rs`.
+                push_unique_key(&mut read_write, StateKey::nft_collection(*collection_id));
+            }
+            Self::TransferNft {
+                collection_id,
+                serial,
+                ..
+            } => {
+                // The collection record is READ-ONLY (only its paused flag is
+                // consulted); the single item key is the ONLY write, so an ordinary
+                // transfer never writes a global per-collection object (a Phase 13
+                // acceptance criterion). The item's `frozen` flag lives ON the item
+                // record we already write, so it needs no separate declaration — the
+                // read_write item key covers both the owner/frozen reads and the
+                // ownership write, and the read-only collection key covers the paused
+                // read.
+                push_unique_key(&mut read_only, StateKey::nft_collection(*collection_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::nft_item(*collection_id, *serial),
+                );
+            }
+            Self::BurnNft {
+                collection_id,
+                serial,
+            } => {
+                // A burn removes the item (writes the item key) and bumps
+                // `burned_count` (writes the collection record). The owner and frozen
+                // checks read the item key we already write.
+                push_unique_key(&mut read_write, StateKey::nft_collection(*collection_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::nft_item(*collection_id, *serial),
+                );
+            }
+            Self::SetNftCollectionPaused { collection_id, .. }
+            | Self::SetNftAuthority { collection_id, .. } => {
+                // Pause / authority change rewrite one collection record; move no
+                // native units, so they declare only the record beyond the fee lane
+                // base.
+                push_unique_key(&mut read_write, StateKey::nft_collection(*collection_id));
+            }
+            Self::FreezeNftItem {
+                collection_id,
+                serial,
+            }
+            | Self::ThawNftItem {
+                collection_id,
+                serial,
+            } => {
+                // The collection record is read to check the freeze authority; the
+                // item's `frozen` flag is the only write. Freezing moves no native
+                // units.
+                push_unique_key(&mut read_only, StateKey::nft_collection(*collection_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::nft_item(*collection_id, *serial),
+                );
             }
             Self::InvokeContract {
                 code_id,
@@ -2661,6 +2894,137 @@ mod tests {
         let mut value = serde_json::to_value(&create).unwrap();
         value["CreateToken"]["metadata"]["name"] =
             serde_json::Value::String("61".repeat(crate::token::MAX_TOKEN_NAME_BYTES + 1));
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn nft_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the native NFT operations (Phase 13b, §15) so a
+        // browser SDK mirror must reproduce these exact field names and sorted-key
+        // order. Adding these variants leaves the frozen `every_native_operation_...`
+        // cross-language vector untouched (serde tags variants by name; existing
+        // variants are unchanged). Byte-string fields are lowercase hex; hashes are
+        // 32-byte lowercase hex; addresses are base58; an Option is the address/value
+        // or null.
+        let collection_id = crate::NftCollectionId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let recipient = Keypair::from_seed([9u8; 32]).address();
+        let rcpt = recipient.to_base58();
+        let item_hash = Hash256([0x3a; 32]);
+        let item_hex = "3a".repeat(32);
+
+        // CreateNftCollection carries the nested NftMetadata struct, so round-trip it
+        // and confirm the metadata name is lowercase hex on the wire.
+        let create = Operation::CreateNftCollection {
+            namespace: Hash256([0x55; 32]),
+            create_nonce: 7,
+            metadata: crate::NftMetadata::new(
+                b"Acme Apes".to_vec(),
+                b"APE".to_vec(),
+                Hash256([0x1f; 32]),
+            )
+            .expect("valid metadata"),
+            mint_authority: Some(recipient),
+            freeze_authority: None,
+            max_supply: Some(10_000),
+            royalty_bps: 500,
+        };
+        let text = serde_json::to_string(&create).expect("create serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), create);
+        assert!(text.contains(&format!("\"name\":\"{}\"", hex::encode("Acme Apes"))));
+
+        let mint = Operation::MintNft {
+            collection_id,
+            recipient,
+            item_metadata_hash: item_hash,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&mint).unwrap(),
+            format!(
+                r#"{{"MintNft":{{"collection_id":"{id}","item_metadata_hash":"{item_hex}","recipient":"{rcpt}"}}}}"#
+            ),
+        );
+
+        let transfer = Operation::TransferNft {
+            collection_id,
+            serial: 3,
+            recipient,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&transfer).unwrap(),
+            format!(
+                r#"{{"TransferNft":{{"collection_id":"{id}","recipient":"{rcpt}","serial":3}}}}"#
+            ),
+        );
+
+        let burn = Operation::BurnNft {
+            collection_id,
+            serial: 3,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&burn).unwrap(),
+            format!(r#"{{"BurnNft":{{"collection_id":"{id}","serial":3}}}}"#),
+        );
+
+        let pause = Operation::SetNftCollectionPaused {
+            collection_id,
+            paused: true,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&pause).unwrap(),
+            format!(r#"{{"SetNftCollectionPaused":{{"collection_id":"{id}","paused":true}}}}"#),
+        );
+
+        let freeze = Operation::FreezeNftItem {
+            collection_id,
+            serial: 3,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&freeze).unwrap(),
+            format!(r#"{{"FreezeNftItem":{{"collection_id":"{id}","serial":3}}}}"#),
+        );
+
+        let thaw = Operation::ThawNftItem {
+            collection_id,
+            serial: 3,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&thaw).unwrap(),
+            format!(r#"{{"ThawNftItem":{{"collection_id":"{id}","serial":3}}}}"#),
+        );
+
+        // Authority transfer (Some) pins the address; renounce (None) pins null.
+        let grant_auth = Operation::SetNftAuthority {
+            collection_id,
+            authority_kind: crate::NftAuthorityKind::Mint,
+            new_authority: Some(recipient),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&grant_auth).unwrap(),
+            format!(
+                r#"{{"SetNftAuthority":{{"authority_kind":"Mint","collection_id":"{id}","new_authority":"{rcpt}"}}}}"#
+            ),
+        );
+        let renounce = Operation::SetNftAuthority {
+            collection_id,
+            authority_kind: crate::NftAuthorityKind::Freeze,
+            new_authority: None,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&renounce).unwrap(),
+            format!(
+                r#"{{"SetNftAuthority":{{"authority_kind":"Freeze","collection_id":"{id}","new_authority":null}}}}"#
+            ),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations,
+        // and the bounded hex codec rejects an over-length metadata name.
+        let mut value = serde_json::to_value(&mint).unwrap();
+        value["MintNft"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateNftCollection"]["metadata"]["name"] =
+            serde_json::Value::String("61".repeat(crate::nft::MAX_NFT_NAME_BYTES + 1));
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 

@@ -110,6 +110,20 @@ pub enum StateKeyKind {
         token_id: crate::TokenId,
         account: Address,
     },
+    /// Native NFT-collection authority/supply record for one collection id
+    /// (Phase 13b, §15).
+    NftCollection {
+        collection_id: crate::NftCollectionId,
+    },
+    /// Native NFT item for one `(collection_id, serial)` (Phase 13b, §15).
+    ///
+    /// The per-`(collection, serial)` key is what makes NFT transfers parallel
+    /// schedulable: an ordinary transfer writes only the one item key, never one
+    /// global per-collection record.
+    NftItem {
+        collection_id: crate::NftCollectionId,
+        serial: u64,
+    },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
 }
@@ -267,6 +281,22 @@ impl StateKey {
     /// `token_id` (Phase 13a, §15).
     pub const fn token_freeze(token_id: crate::TokenId, account: Address) -> Self {
         Self::current(StateKeyKind::TokenFreeze { token_id, account })
+    }
+
+    /// Returns the current NFT-collection record key for `collection_id`
+    /// (Phase 13b, §15).
+    pub const fn nft_collection(collection_id: crate::NftCollectionId) -> Self {
+        Self::current(StateKeyKind::NftCollection { collection_id })
+    }
+
+    /// Returns the current NFT item key for `serial` of `collection_id`
+    /// (Phase 13b, §15). This per-item key keeps NFT transfers free of any global
+    /// per-collection bottleneck.
+    pub const fn nft_item(collection_id: crate::NftCollectionId, serial: u64) -> Self {
+        Self::current(StateKeyKind::NftItem {
+            collection_id,
+            serial,
+        })
     }
 
     /// Rejects keys whose schema is not supported by this executable.
@@ -541,6 +571,31 @@ mod tests {
                 acct = holder.to_base58(),
                 id = "88".repeat(32),
             )
+        );
+    }
+
+    #[test]
+    fn nft_state_keys_have_a_stable_cross_language_wire_vector() {
+        // The NFT collection and item keys are new StateKeyKind variants (Phase 13b,
+        // §15). Adding variants leaves the frozen every-state-key vector untouched
+        // (serde tags variants by name), so this separate vector pins the NFT keys'
+        // canonical JSON shape for a browser SDK mirror without moving the old hash.
+        // The per-(collection, serial) item key is what makes ordinary transfers
+        // parallel-schedulable without a global per-collection bottleneck.
+        let collection_id = crate::NftCollectionId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+
+        let collection_key = StateKey::nft_collection(collection_id);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&collection_key).unwrap(),
+            format!(r#"{{"kind":{{"NftCollection":{{"collection_id":"{id}"}}}},"version":1}}"#),
+        );
+        let item_key = StateKey::nft_item(collection_id, 7);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&item_key).unwrap(),
+            format!(
+                r#"{{"kind":{{"NftItem":{{"collection_id":"{id}","serial":7}}}},"version":1}}"#
+            ),
         );
     }
 }
