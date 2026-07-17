@@ -264,11 +264,22 @@ transparent redb value compression) and wire-frame (webc-net envelope, same tag
 convention, 4 MiB streamed decompression cap as a zip-bomb defense since wire
 frames are attacker-controlled, `NET_PROTOCOL_VERSION` 2→3). Both cargo-deny clean.
 
-**Phase 6 remaining:** sponsor/paymaster accounts (§15.35, per-user/app/op/day
-caps) — IN PROGRESS (subagent); then localized base/priority pricing + network-wide
-minimum + per-resource congestion measurement + fair block packing; varint amount
-encoding (§15.14, a wire-version bump); an application namespace registry; sharded
-examples. The **TPS benchmarks** (100/500/1000/2000 gates) need real reference
+**Fee sponsorship / paymaster (§15.35) — DONE, wired.** Registered apps pre-fund a
+budget that pays users' fees within hard deterministic caps (ops per user/app/day,
+per-op fee, per-app daily budget; "day" = epoch window). New `sponsorship` module
+(`RegisterAppSponsor`/`FundAppSponsor`/`WithdrawAppSponsor`, `AppSponsor`,
+`SponsorshipConfig`); opt-in `Transaction.sponsor: Option<Hash256>` (fail-open to
+self-pay when over-cap/ineligible/unregistered; Transfer-only). `sponsor_budgets`
+supply bucket; **state-commitment domain V8→V9**; non-sponsored txs stay
+byte-identical (manual `Transaction` Serialize keeps `sponsor` out of the JSON wire
+when absent). Follow-up (out of scope so far): TS SDK helper to construct sponsored
+transactions.
+
+**Phase 6 remaining:** localized base/priority pricing + network-wide minimum +
+per-resource congestion measurement + fair block packing; varint amount encoding
+(§15.14, a wire-version bump); a first-class application namespace registry (the
+sponsorship feature already keys on app-namespace hashes); sharded examples. TPS
+benchmarks need real hardware (deferred non-finding). The **TPS benchmarks** (100/500/1000/2000 gates) need real reference
 hardware, not a cloud container (a known deferred non-finding) — implement the
 features here; the published-claim benchmarks run on real machines later.
 
