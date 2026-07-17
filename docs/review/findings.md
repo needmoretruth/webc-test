@@ -529,9 +529,13 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
   dependencies (`@noble/*`, `@scure/*`, `micro-key-producer`); production deps
   are clean today. Scoped to production so dev-only tooling advisories
   (vitest/esbuild dev server) do not block the merge gate.
-- **D3 — LOW — duplicate major versions in the lock** (getrandom 0.2/0.3,
-  rand_core 0.6/0.9, thiserror 1/2, tokio-tungstenite 0.24/0.29). Align where
-  feasible; enforce with cargo-deny bans.
+- **D3 — LOW — RESOLVED (commit `607035d`) — duplicate major versions in the
+  lock** (getrandom 0.2/0.3, rand_core 0.6/0.9, thiserror 1/2, tokio-tungstenite
+  0.24/0.29). **Fix:** the one duplicate we directly controlled — a webc-node
+  dev-dependency on tokio-tungstenite 0.24 while axum pulls 0.29 — is aligned to
+  0.29 (single WebSocket stack). The rest are purely transitive through crypto and
+  error crates; `deny.toml` keeps `multiple-versions = "warn"` so they stay visible
+  without blocking the gate, with the rationale documented.
 - **D4 — LOW/known — `fips204 0.4.6`** is a young pre-1.0 crate on the recovery-
   root verify path; keep it pinned behind the `webc-crypto::mldsa` seam (already
   the case) and track RUSTSEC/upstream. **INFO — `bincode 1.3`** is the frozen 1.x
