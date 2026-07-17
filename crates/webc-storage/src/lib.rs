@@ -26,6 +26,7 @@ mod chainstore;
 mod error;
 mod kv;
 mod memory;
+mod record_codec;
 mod redb_store;
 
 pub use chainstore::{BlockCommit, ChainStore, ChainTip, CHAIN_STORE_SCHEMA_VERSION};
