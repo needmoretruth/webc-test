@@ -20,6 +20,10 @@ use crate::fees::{
 use crate::genesis::GenesisConfig;
 use crate::namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
+use crate::oracle::{
+    accuracy_weight, median, Feed, FeedId, FeedValue, OracleConfig, OracleReporter,
+    ORACLE_FEED_LEAF_DOMAIN, ORACLE_REPORTER_LEAF_DOMAIN,
+};
 use crate::session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
     SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyId,
@@ -74,6 +78,13 @@ pub struct ChainConfig {
     /// per-operation / per-app-per-day bounds, simple operations only).
     #[serde(default)]
     pub sponsorship: SponsorshipConfig,
+    /// Native oracle parameters (§15.17): feed-creation fee, minimum reporter
+    /// bond, settlement cadence, and liveness window.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before the oracle decodable;
+    /// the launch values are measurement-tuned placeholders (§15.35 method).
+    #[serde(default)]
+    pub oracle: OracleConfig,
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
@@ -113,6 +124,7 @@ impl Default for ChainConfig {
             bridge: BridgeConfig::default(),
             storage_pricing: StoragePricing::default(),
             sponsorship: SponsorshipConfig::default(),
+            oracle: OracleConfig::default(),
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
@@ -181,6 +193,73 @@ pub enum Event {
         from: Address,
         /// New owner recorded in the registry.
         to: Address,
+    },
+    /// A native oracle feed was created for the creation fee (§15.6/§15.17).
+    FeedCreated {
+        /// New feed identity.
+        feed_id: FeedId,
+        /// Account that created and paid for the feed.
+        creator: Address,
+        /// Frozen reporter bond-size class for this feed.
+        bond: Amount,
+        /// Creation fee burned from the creator's liquid balance.
+        fee_burned: Amount,
+    },
+    /// A reporter registered and bonded on a feed (§15.17).
+    ReporterRegistered {
+        /// Feed the reporter joined.
+        feed_id: FeedId,
+        /// Reporter that bonded.
+        reporter: Address,
+        /// Native base units locked as the bond.
+        bond: Amount,
+    },
+    /// A reporter deregistered and had its bond returned (§15.17).
+    ReporterDeregistered {
+        /// Feed the reporter left.
+        feed_id: FeedId,
+        /// Reporter that unbonded.
+        reporter: Address,
+        /// Native base units returned to the reporter's liquid balance.
+        bond: Amount,
+    },
+    /// A reporter submitted a value to a feed (§9 median aggregation).
+    ReportSubmitted {
+        /// Feed reported to.
+        feed_id: FeedId,
+        /// Reporter that submitted.
+        reporter: Address,
+        /// The submitted integer value.
+        value: FeedValue,
+        /// Epoch the value was reported for (liveness reference).
+        epoch: u64,
+    },
+    /// A consumer paid a read fee into a feed's revenue pool (§15.17).
+    FeedReadPaid {
+        /// Feed whose value was consumed on-chain.
+        feed_id: FeedId,
+        /// Account that paid the read fee.
+        payer: Address,
+        /// Native base units added to the feed's revenue pool.
+        amount: Amount,
+    },
+    /// A feed's accrued read-fee revenue was settled to its reporters (§15.17).
+    ///
+    /// Distributed weighted by accuracy (closeness to the accepted median) and
+    /// liveness (reported within the window); `carried` is the integer-division
+    /// remainder kept in the pool for the next settlement, so nothing is lost.
+    FeedRevenueSettled {
+        /// Feed that was settled.
+        feed_id: FeedId,
+        /// Epoch the settlement was performed for.
+        epoch: u64,
+        /// Accepted median at settlement (the accuracy reference), if any reporter
+        /// had submitted a value.
+        median: Option<FeedValue>,
+        /// Native base units paid out to reporters this settlement.
+        distributed: Amount,
+        /// Native base units carried forward in the pool (division remainder).
+        carried: Amount,
     },
     ValidatorRegistered {
         operator: Address,
@@ -447,6 +526,40 @@ pub struct ChainState {
     /// object creation on ownership is a later-phase policy decision.
     #[serde(default)]
     pub namespaces: BTreeMap<Hash256, NamespaceRecord>,
+    /// Native oracle feed registry, keyed by [`FeedId`] (§15.17).
+    ///
+    /// Each [`Feed`] holds its creator, its frozen reporter bond class, and its
+    /// accrued read-fee revenue awaiting settlement. Committed by the state root
+    /// through a dedicated Merkle sub-root (`ORACLE_FEED_LEAF_DOMAIN`), so any
+    /// change to a feed (including its revenue) changes the state root. A
+    /// `BTreeMap` keeps iteration deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub oracle_feeds: BTreeMap<FeedId, Feed>,
+    /// Native oracle bonded reporters, keyed by `(FeedId, reporter)` (§15.17).
+    ///
+    /// Each [`OracleReporter`] holds the reporter's latest value and the epoch it
+    /// was reported for (liveness). The record's existence means the reporter's
+    /// bond (its feed's `bond`) is locked in `oracle_bonds`. Committed by the
+    /// state root through a dedicated Merkle sub-root (`ORACLE_REPORTER_LEAF_DOMAIN`).
+    #[serde(default)]
+    pub oracle_reporters: BTreeMap<(FeedId, Address), OracleReporter>,
+    /// Refundable native units locked across every oracle reporter bond (§15.17).
+    ///
+    /// Sum of every live reporter's feed `bond`. `RegisterReporter` moves units
+    /// here from the reporter's liquid balance; `DeregisterReporter` moves them
+    /// back. Reconciled by [`SupplyInvariantReport`] as a locked bucket and
+    /// committed by the state root as a scalar (mirroring `sponsor_budgets`).
+    #[serde(default)]
+    pub oracle_bonds: Amount,
+    /// Native units locked across every feed's accrued read-fee revenue (§15.17).
+    ///
+    /// Sum of every [`Feed::revenue`]. `PayFeedRead` moves units here from a
+    /// consumer's liquid balance; epoch settlement moves them out to reporters'
+    /// liquid balances (carrying the integer-division remainder to the next
+    /// settlement). Reconciled by [`SupplyInvariantReport`] as a locked bucket and
+    /// committed by the state root as a scalar.
+    #[serde(default)]
+    pub oracle_revenue: Amount,
     /// Localized (per-application-namespace) base-fee state (Phase 6, §8 isolation).
     ///
     /// Maps a currently-congested application namespace to its [`NamespaceFeeState`]
@@ -507,6 +620,10 @@ pub struct SupplyInvariantReport {
     pub storage_deposits: Amount,
     /// Native units locked across every application fee-sponsor budget (§15.35).
     pub sponsor_budgets: Amount,
+    /// Native units locked across every oracle reporter bond (§15.17).
+    pub oracle_bonds: Amount,
+    /// Native units locked across every feed's accrued read-fee revenue (§15.17).
+    pub oracle_revenue: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -580,6 +697,10 @@ impl Default for ChainState {
             sponsors: BTreeMap::new(),
             sponsor_budgets: Amount::ZERO,
             namespaces: BTreeMap::new(),
+            oracle_feeds: BTreeMap::new(),
+            oracle_reporters: BTreeMap::new(),
+            oracle_bonds: Amount::ZERO,
+            oracle_revenue: Amount::ZERO,
             namespace_fees: BTreeMap::new(),
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
@@ -622,6 +743,9 @@ impl ChainState {
         // Reject a malformed sponsorship window (zero epochs) before any state
         // exists, so a chain never runs with an undefined "per day" boundary.
         genesis.chain.sponsorship.validate()?;
+        // Reject a malformed oracle config (zero settlement cadence or liveness
+        // window) so settlement never divides by zero and liveness is well-defined.
+        genesis.chain.oracle.validate()?;
 
         for account in &genesis.accounts {
             if state.accounts.contains_key(&account.address) {
@@ -762,6 +886,8 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(self.validator_fee_pool))
             .and_then(|amount| amount.checked_add(self.storage_deposits))
             .and_then(|amount| amount.checked_add(self.sponsor_budgets))
+            .and_then(|amount| amount.checked_add(self.oracle_bonds))
+            .and_then(|amount| amount.checked_add(self.oracle_revenue))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -777,6 +903,8 @@ impl ChainState {
             fee_reward_pool: self.validator_fee_pool,
             storage_deposits: self.storage_deposits,
             sponsor_budgets: self.sponsor_budgets,
+            oracle_bonds: self.oracle_bonds,
+            oracle_revenue: self.oracle_revenue,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -1150,6 +1278,18 @@ impl ChainState {
         distributed_reward: Amount,
     ) -> Result<Vec<Event>, ChainError> {
         let event_epoch = self.current_epoch;
+        // Native oracle read-fee settlement (§15.17) runs at the epoch boundary on
+        // the just-completed epoch, before it is incremented, so a report's
+        // liveness is measured against the settlement epoch. Gated by the
+        // configured cadence. Supply-neutral (revenue pool -> reporter liquid, with
+        // the division remainder carried), so it does not disturb the reward math
+        // above. Runs on the same whole-epoch overlay, so any failure rolls the
+        // epoch advance back atomically.
+        let oracle_events = if config.oracle.is_settlement_epoch(self.current_epoch) {
+            self.settle_oracle_feeds(config, self.current_epoch)?
+        } else {
+            Vec::new()
+        };
         let next_epoch = self
             .current_epoch
             .checked_add(1)
@@ -1164,6 +1304,7 @@ impl ChainState {
             epoch: event_epoch,
             total: distributed_reward,
         }];
+        events.extend(oracle_events);
         for transition in transitions {
             match transition {
                 UnbondingTransition::Admitted {
@@ -1295,11 +1436,15 @@ impl ChainState {
             unbonding_root: Hash256,
             sponsor_root: Hash256,
             namespace_root: Hash256,
+            oracle_feed_root: Hash256,
+            oracle_reporter_root: Hash256,
             namespace_fee_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
             storage_deposits: Amount,
             sponsor_budgets: Amount,
+            oracle_bonds: Amount,
+            oracle_revenue: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
@@ -1310,6 +1455,15 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V12 adds the native oracle (Phase 7, §15.17): the `oracle_feed_root`
+            // and `oracle_reporter_root` sub-roots commit every feed record
+            // (creator, bond class, accrued revenue) and every bonded-reporter
+            // record (latest value, report epoch), and the `oracle_bonds` and
+            // `oracle_revenue` scalars commit the two aggregate locked buckets
+            // (mirroring how `sponsor_budgets`/`storage_deposits` pair with their
+            // sub-roots). So a create/register/report/pay/settle/deregister always
+            // changes the state root. The domain bump is a deliberate
+            // consensus-format change; no external fixture pins a prior root.
             // V11 adds localized (per-application-namespace) fee state (Phase 6, §8
             // isolation): the `namespace_fee_root` sub-root commits every congested
             // namespace's localized base fee, so a localized-fee change changes the
@@ -1325,7 +1479,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V11",
+            domain: "WEBC_STATE_COMMITMENT_V12",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1374,6 +1528,14 @@ impl ChainState {
             // (§8 isolation): a claim or ownership transfer changes this root and
             // therefore the state root.
             namespace_root: ordered_value_root(NAMESPACE_LEAF_DOMAIN, self.namespaces.iter())?,
+            // Native oracle registry committed by its own ordered sub-roots (§15.17):
+            // a feed change (including accrued revenue) or a reporter change
+            // (register/report/deregister) changes these roots and the state root.
+            oracle_feed_root: ordered_value_root(ORACLE_FEED_LEAF_DOMAIN, self.oracle_feeds.iter())?,
+            oracle_reporter_root: ordered_value_root(
+                ORACLE_REPORTER_LEAF_DOMAIN,
+                self.oracle_reporters.iter(),
+            )?,
             // Localized per-namespace fee state committed by its own ordered sub-root
             // (Phase 6, §8 isolation): a change to any namespace's localized base fee
             // changes this root and therefore the state root.
@@ -1385,6 +1547,8 @@ impl ChainState {
             slashed_units: self.slashed_units,
             storage_deposits: self.storage_deposits,
             sponsor_budgets: self.sponsor_budgets,
+            oracle_bonds: self.oracle_bonds,
+            oracle_revenue: self.oracle_revenue,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
@@ -2787,6 +2951,152 @@ impl ChainState {
                     to: *new_owner,
                 });
             }
+            Operation::CreateFeed { feed_id } => {
+                // Permissionless-for-a-fee (§15.6): default lane only (the creation
+                // fee draws from the sender's liquid balance) and the fee is BURNED,
+                // so a creation is never free. Supply-neutral: liquid -> burned.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_feed(*feed_id))?;
+                if self.oracle_feeds.contains_key(feed_id) {
+                    return Err(ChainError::OracleFeedAlreadyExists);
+                }
+                let creation_fee = config.oracle.feed_creation_fee;
+                self.debit_native(tx.sender, creation_fee)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(creation_fee)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let bond = config.oracle.min_reporter_bond;
+                self.oracle_feeds.insert(*feed_id, Feed::new(tx.sender, bond));
+                events.push(Event::FeedCreated {
+                    feed_id: *feed_id,
+                    creator: tx.sender,
+                    bond,
+                    fee_burned: creation_fee,
+                });
+            }
+            Operation::RegisterReporter { feed_id } => {
+                // Default lane only: the bond draws from the sender's liquid
+                // balance. Supply-neutral: liquid -> oracle_bonds.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.read(StateKey::oracle_feed(*feed_id))?;
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
+                // The bond is the feed's frozen bond class (reading it also
+                // confirms the feed exists).
+                let bond = self
+                    .oracle_feeds
+                    .get(feed_id)
+                    .ok_or(ChainError::OracleFeedNotFound)?
+                    .bond;
+                if self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
+                    return Err(ChainError::OracleReporterAlreadyRegistered);
+                }
+                self.debit_native(tx.sender, bond)?;
+                self.oracle_bonds = self
+                    .oracle_bonds
+                    .checked_add(bond)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.oracle_reporters
+                    .insert((*feed_id, tx.sender), OracleReporter::new());
+                events.push(Event::ReporterRegistered {
+                    feed_id: *feed_id,
+                    reporter: tx.sender,
+                    bond,
+                });
+            }
+            Operation::DeregisterReporter { feed_id } => {
+                // Default lane only: the bond returns to the sender's liquid
+                // balance. Supply-neutral: oracle_bonds -> liquid.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.read(StateKey::oracle_feed(*feed_id))?;
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
+                // The reporter's locked bond equals its feed's frozen bond.
+                let bond = self
+                    .oracle_feeds
+                    .get(feed_id)
+                    .ok_or(ChainError::OracleFeedNotFound)?
+                    .bond;
+                if !self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
+                    return Err(ChainError::OracleReporterNotFound);
+                }
+                self.oracle_bonds = self
+                    .oracle_bonds
+                    .checked_sub(bond)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.oracle_reporters.remove(&(*feed_id, tx.sender));
+                self.credit_native(tx.sender, bond)?;
+                events.push(Event::ReporterDeregistered {
+                    feed_id: *feed_id,
+                    reporter: tx.sender,
+                    bond,
+                });
+            }
+            Operation::SubmitReport { feed_id, value } => {
+                // Reporting moves no native units (only the ordinary tx fee), so it
+                // may run on any authorization lane. It records the value and the
+                // epoch it was reported for (liveness).
+                access.read(StateKey::oracle_feed(*feed_id))?;
+                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
+                if !self.oracle_feeds.contains_key(feed_id) {
+                    return Err(ChainError::OracleFeedNotFound);
+                }
+                let epoch = self.current_epoch;
+                let reporter = self
+                    .oracle_reporters
+                    .get_mut(&(*feed_id, tx.sender))
+                    .ok_or(ChainError::OracleReporterNotFound)?;
+                reporter.value = Some(*value);
+                reporter.reported_epoch = epoch;
+                events.push(Event::ReportSubmitted {
+                    feed_id: *feed_id,
+                    reporter: tx.sender,
+                    value: *value,
+                    epoch,
+                });
+            }
+            Operation::PayFeedRead { feed_id, amount } => {
+                // A consumer pays a read fee into the feed's revenue pool
+                // (§15.17). Default lane only: the payment draws from the payer's
+                // liquid balance. Supply-neutral: liquid -> oracle_revenue.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::OracleRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::oracle_feed(*feed_id))?;
+                if amount.is_zero() {
+                    return Err(ChainError::OracleReadAmountZero);
+                }
+                if !self.oracle_feeds.contains_key(feed_id) {
+                    return Err(ChainError::OracleFeedNotFound);
+                }
+                self.debit_native(tx.sender, *amount)?;
+                self.oracle_revenue = self
+                    .oracle_revenue
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let feed = self
+                    .oracle_feeds
+                    .get_mut(feed_id)
+                    .ok_or(ChainError::OracleFeedNotFound)?;
+                feed.revenue = feed
+                    .revenue
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::FeedReadPaid {
+                    feed_id: *feed_id,
+                    payer: tx.sender,
+                    amount: *amount,
+                });
+            }
         }
 
         access.finish()?;
@@ -3213,6 +3523,163 @@ impl ChainState {
             .checked_sub(total_fee)
             .ok_or(ChainError::ArithmeticOverflow)?;
         Ok(true)
+    }
+
+    /// Returns the current median aggregate of a feed, or `None` (§9, §15.21).
+    ///
+    /// The aggregate is the deterministic integer [`median`] of every registered
+    /// reporter's latest submitted value (see the lower-mid tie-break rule on
+    /// [`median`]). Returns `None` if the feed does not exist or no reporter has
+    /// yet submitted a value.
+    ///
+    /// This is a pure read (a query), not an operation: display-only reads are
+    /// free (§15.21) and pay no fee, and a browser reads the committed reporter
+    /// state via a light-client proof. Freshness-gating the aggregate to only
+    /// live reporters is a deferred refinement — liveness is applied at revenue
+    /// settlement, not to the displayed value — so this method needs no epoch or
+    /// config input and is a pure function of committed state.
+    pub fn feed_value(&self, feed_id: FeedId) -> Option<FeedValue> {
+        if !self.oracle_feeds.contains_key(&feed_id) {
+            return None;
+        }
+        let values: Vec<FeedValue> = self
+            .oracle_reporters
+            .iter()
+            .filter(|((fid, _), _)| *fid == feed_id)
+            .filter_map(|(_, reporter)| reporter.value)
+            .collect();
+        median(&values)
+    }
+
+    /// Settles every feed's accrued read-fee revenue for settlement `epoch`.
+    ///
+    /// Deterministic: feeds are settled in sorted `FeedId` order. Supply-neutral:
+    /// see [`ChainState::settle_one_feed`]. Reporter slashing (persistent-outlier
+    /// penalties) is deliberately NOT applied here — §15.6/§15.17 defer slashing
+    /// mechanics to the security documents and the severity schedule is an
+    /// owner-deferred decision (ADR-0012); an outlier instead earns zero revenue
+    /// because its accuracy weight decays to zero.
+    fn settle_oracle_feeds(
+        &mut self,
+        config: &ChainConfig,
+        epoch: u64,
+    ) -> Result<Vec<Event>, ChainError> {
+        // Snapshot the feed ids first so the per-feed mutation does not alias an
+        // outstanding immutable borrow of the map. Sorted iteration is deterministic.
+        let feed_ids: Vec<FeedId> = self.oracle_feeds.keys().copied().collect();
+        let mut events = Vec::new();
+        for feed_id in feed_ids {
+            if let Some(event) = self.settle_one_feed(feed_id, config, epoch)? {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    /// Distributes one feed's accrued revenue to its reporters for `epoch`.
+    ///
+    /// The accepted median is the integer [`median`] of the feed's reporters'
+    /// latest values. Each reporter's score is its integer [`accuracy_weight`]
+    /// (closeness to that median) if it is live (reported within
+    /// `liveness_window_epochs` of `epoch`), else zero. Revenue is split
+    /// proportionally to score with floored shares; the integer-division
+    /// remainder stays in the feed's pool for the next settlement, exactly like
+    /// the F1 epoch-reward dust carry, so nothing is minted or lost.
+    ///
+    /// Supply move: `oracle_revenue` (and the feed's `revenue`) decrease by the
+    /// distributed total, and reporters' liquid balances increase by the same
+    /// total; the carried remainder stays locked in the feed's `revenue`. Returns
+    /// `None` (revenue fully carried, no state move) when the feed has no accrued
+    /// revenue, no reporter has submitted a value, or no reporter is live.
+    fn settle_one_feed(
+        &mut self,
+        feed_id: FeedId,
+        config: &ChainConfig,
+        epoch: u64,
+    ) -> Result<Option<Event>, ChainError> {
+        let revenue = match self.oracle_feeds.get(&feed_id) {
+            Some(feed) => feed.revenue,
+            None => return Ok(None),
+        };
+        if revenue.is_zero() {
+            return Ok(None);
+        }
+        // Collect this feed's reporters that have submitted a value, in sorted
+        // address order (BTreeMap iteration), so scoring is deterministic.
+        let reporters: Vec<(Address, FeedValue, u64)> = self
+            .oracle_reporters
+            .iter()
+            .filter(|((fid, _), _)| *fid == feed_id)
+            .filter_map(|((_, address), reporter)| {
+                reporter
+                    .value
+                    .map(|value| (*address, value, reporter.reported_epoch))
+            })
+            .collect();
+        let values: Vec<FeedValue> = reporters.iter().map(|(_, value, _)| *value).collect();
+        let Some(median_value) = median(&values) else {
+            // No reporter has a value: carry the accrued revenue untouched.
+            return Ok(None);
+        };
+        // Score = accuracy weight, gated by liveness (a stale reporter earns 0).
+        let scores: Vec<(Address, u128)> = reporters
+            .iter()
+            .map(|(address, value, reported_epoch)| {
+                let score = if config.oracle.report_is_live(*reported_epoch, epoch) {
+                    accuracy_weight(*value, median_value)
+                } else {
+                    0
+                };
+                (*address, score)
+            })
+            .collect();
+        let total_score = scores
+            .iter()
+            .try_fold(0u128, |total, (_, score)| {
+                total.checked_add(*score).ok_or(ChainError::ArithmeticOverflow)
+            })?;
+        if total_score == 0 {
+            // No live reporter earned a positive weight: carry the revenue.
+            return Ok(None);
+        }
+        // Proportional floored distribution; the remainder is carried (F1 pattern).
+        let mut distributed = Amount::ZERO;
+        for (address, score) in &scores {
+            if *score == 0 {
+                continue;
+            }
+            let share = revenue
+                .checked_mul_ratio(*score, total_score)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            if share.is_zero() {
+                continue;
+            }
+            self.credit_native(*address, share)?;
+            distributed = distributed
+                .checked_add(share)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        let carried = revenue
+            .checked_sub(distributed)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        // Move the distributed total out of the locked revenue bucket; the carried
+        // remainder stays locked in the feed's pool for the next settlement.
+        self.oracle_revenue = self
+            .oracle_revenue
+            .checked_sub(distributed)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let feed = self
+            .oracle_feeds
+            .get_mut(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?;
+        feed.revenue = carried;
+        Ok(Some(Event::FeedRevenueSettled {
+            feed_id,
+            epoch,
+            median: Some(median_value),
+            distributed,
+            carried,
+        }))
     }
 
     fn debit_asset_or_native(
@@ -3825,6 +4292,12 @@ mod tests {
             }),
             ("sponsor_budgets", |s| {
                 s.sponsor_budgets = Amount::from_units(s.sponsor_budgets.0 + 1)
+            }),
+            ("oracle_bonds", |s| {
+                s.oracle_bonds = Amount::from_units(s.oracle_bonds.0 + 1)
+            }),
+            ("oracle_revenue", |s| {
+                s.oracle_revenue = Amount::from_units(s.oracle_revenue.0 + 1)
             }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)

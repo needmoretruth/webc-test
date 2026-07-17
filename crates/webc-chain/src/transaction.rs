@@ -376,6 +376,54 @@ pub enum Operation {
         /// Account that becomes the new owner.
         new_owner: Address,
     },
+    /// Creates a native oracle feed for a flat fee (§15.6 permissionless-for-a-fee).
+    ///
+    /// Records a canonical [`crate::Feed`] owned by the sender and charges the
+    /// configured feed-creation fee (burned). Fails if the feed id already exists.
+    CreateFeed {
+        /// Caller-chosen collision-resistant feed identity.
+        feed_id: crate::FeedId,
+    },
+    /// Registers the sender as a bonded reporter on an existing feed (§15.17).
+    ///
+    /// Locks the feed's frozen bond from the sender's liquid balance into the
+    /// `oracle_bonds` bucket. Fails if the feed is missing or the sender is
+    /// already registered on it.
+    RegisterReporter {
+        /// Feed the sender bonds to report on.
+        feed_id: crate::FeedId,
+    },
+    /// Deregisters the sender from a feed and returns its bond (§15.17).
+    ///
+    /// Removes the sender's reporter record and returns the feed's bond to the
+    /// sender's liquid balance. Fails if the sender is not registered.
+    DeregisterReporter {
+        /// Feed the sender leaves.
+        feed_id: crate::FeedId,
+    },
+    /// Submits the sender's latest value for a feed (§9 median aggregation).
+    ///
+    /// Records the value and the epoch it was submitted for (liveness). The feed's
+    /// aggregate is the median of all registered reporters' latest values. Fails
+    /// if the sender is not a registered reporter on the feed.
+    SubmitReport {
+        /// Feed being reported to.
+        feed_id: crate::FeedId,
+        /// The reporter's latest integer value in the feed's own units.
+        value: crate::FeedValue,
+    },
+    /// Pays a read fee into a feed's revenue pool (§15.17 consumers pay).
+    ///
+    /// Moves `amount` from the payer's liquid balance into the feed's accrued
+    /// revenue (`oracle_revenue` bucket); settlement later distributes it to the
+    /// feed's reporters weighted by accuracy and liveness. Fails if the feed is
+    /// missing or `amount` is zero.
+    PayFeedRead {
+        /// Feed whose value the payer is consuming on-chain.
+        feed_id: crate::FeedId,
+        /// Native base units paid into the feed's revenue pool.
+        amount: Amount,
+    },
 }
 
 impl Operation {
@@ -409,6 +457,11 @@ impl Operation {
             | Self::FundAppSponsor { .. }
             | Self::WithdrawAppSponsor { .. } => 10_000,
             Self::RegisterNamespace { .. } | Self::TransferNamespace { .. } => 10_000,
+            Self::CreateFeed { .. } => 15_000,
+            Self::RegisterReporter { .. }
+            | Self::DeregisterReporter { .. }
+            | Self::PayFeedRead { .. } => 10_000,
+            Self::SubmitReport { .. } => 5_000,
         }
     }
 
@@ -673,6 +726,38 @@ impl Operation {
                     &mut read_write,
                     StateKey::application(*namespace, namespace_state_key_hash()),
                 );
+            }
+            Self::CreateFeed { feed_id } => {
+                // Creating a feed burns the creation fee from the sender's liquid
+                // balance and writes the new feed-registry record.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::oracle_feed(*feed_id));
+            }
+            Self::RegisterReporter { feed_id } | Self::DeregisterReporter { feed_id } => {
+                // Registering locks the feed's bond from liquid; deregistering
+                // returns it. Both read the feed (for its bond/existence) and write
+                // the sender's reporter record and account.
+                push_unique_key(&mut read_only, StateKey::oracle_feed(*feed_id));
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::oracle_reporter(*feed_id, sender),
+                );
+            }
+            Self::SubmitReport { feed_id, .. } => {
+                // Reporting moves no native units (only the ordinary tx fee): it
+                // reads the feed for existence and writes the reporter record.
+                push_unique_key(&mut read_only, StateKey::oracle_feed(*feed_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::oracle_reporter(*feed_id, sender),
+                );
+            }
+            Self::PayFeedRead { feed_id, .. } => {
+                // A read fee moves units from the payer's liquid balance into the
+                // feed's revenue pool, so it writes both the account and the feed.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::oracle_feed(*feed_id));
             }
         }
         if !matches!(
@@ -1565,6 +1650,56 @@ mod tests {
         // The decode is strict (deny_unknown_fields), matching sibling operations.
         let mut value = serde_json::to_value(&register).unwrap();
         value["RegisterNamespace"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn oracle_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the five native-oracle operations (Phase 7,
+        // §15.17) so a browser SDK mirror must reproduce these exact field names
+        // and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Note the feed value
+        // is a decimal STRING (like Amount), never a bare JSON number.
+        let feed_id = crate::FeedId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let create = Operation::CreateFeed { feed_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&create).unwrap(),
+            format!(r#"{{"CreateFeed":{{"feed_id":"{id}"}}}}"#),
+        );
+        let register = Operation::RegisterReporter { feed_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&register).unwrap(),
+            format!(r#"{{"RegisterReporter":{{"feed_id":"{id}"}}}}"#),
+        );
+        let deregister = Operation::DeregisterReporter { feed_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&deregister).unwrap(),
+            format!(r#"{{"DeregisterReporter":{{"feed_id":"{id}"}}}}"#),
+        );
+        let report = Operation::SubmitReport {
+            feed_id,
+            value: crate::FeedValue::new(-123_456_789_012_345),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&report).unwrap(),
+            format!(
+                r#"{{"SubmitReport":{{"feed_id":"{id}","value":"-123456789012345"}}}}"#
+            ),
+        );
+        let pay = Operation::PayFeedRead {
+            feed_id,
+            amount: Amount::from_units(42),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&pay).unwrap(),
+            format!(r#"{{"PayFeedRead":{{"amount":"42","feed_id":"{id}"}}}}"#),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateFeed"]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 

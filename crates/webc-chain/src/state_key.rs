@@ -81,6 +81,13 @@ pub enum StateKeyKind {
         namespace: Hash256,
         key_hash: Hash256,
     },
+    /// Native oracle feed-registry record for one feed id.
+    OracleFeed { feed_id: crate::FeedId },
+    /// Native oracle bonded-reporter record for one reporter on one feed.
+    OracleReporter {
+        feed_id: crate::FeedId,
+        reporter: Address,
+    },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
 }
@@ -187,6 +194,16 @@ impl StateKey {
     /// Returns a current protocol-singleton key.
     pub const fn protocol(field: ProtocolStateKey) -> Self {
         Self::current(StateKeyKind::Protocol { field })
+    }
+
+    /// Returns the current oracle feed-registry key for `feed_id`.
+    pub const fn oracle_feed(feed_id: crate::FeedId) -> Self {
+        Self::current(StateKeyKind::OracleFeed { feed_id })
+    }
+
+    /// Returns the current oracle reporter key for `reporter` on `feed_id`.
+    pub const fn oracle_reporter(feed_id: crate::FeedId, reporter: Address) -> Self {
+        Self::current(StateKeyKind::OracleReporter { feed_id, reporter })
     }
 
     /// Rejects keys whose schema is not supported by this executable.
@@ -361,6 +378,33 @@ mod tests {
         assert_eq!(
             Hash256::digest(bytes).to_hex(),
             "86b42dee5ac735a7435d64b12b3f6f958e90c03ac03173ef6f98ec88169c9e20"
+        );
+    }
+
+    #[test]
+    fn oracle_state_keys_have_a_stable_cross_language_wire_vector() {
+        // The oracle feed and reporter keys are new StateKeyKind variants (Phase 7,
+        // §15.17). Adding variants leaves the frozen vector above untouched (serde
+        // tags variants by name), so this separate vector pins the oracle keys'
+        // canonical JSON shape for a browser SDK mirror without moving the old hash.
+        let reporter = Keypair::from_seed([7u8; 32]).address();
+        let feed_id = crate::FeedId::new(Hash256([0x88; 32]));
+        let feed_key = StateKey::oracle_feed(feed_id);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&feed_key).unwrap(),
+            format!(
+                r#"{{"kind":{{"OracleFeed":{{"feed_id":"{id}"}}}},"version":1}}"#,
+                id = "88".repeat(32),
+            )
+        );
+        let reporter_key = StateKey::oracle_reporter(feed_id, reporter);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&reporter_key).unwrap(),
+            format!(
+                r#"{{"kind":{{"OracleReporter":{{"feed_id":"{id}","reporter":"{rep}"}}}},"version":1}}"#,
+                id = "88".repeat(32),
+                rep = reporter.to_base58(),
+            )
         );
     }
 }
