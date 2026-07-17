@@ -1,5 +1,0 @@
-# cargo-fuzz build output and generated data — all regenerable, none committed.
-/target
-/corpus
-/artifacts
-/coverage

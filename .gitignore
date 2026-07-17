@@ -1,8 +1,0 @@
-/target
-**/node_modules
-**/dist
-.pnpm-store
-.coverage
-.DS_Store
-.env
-*.log
