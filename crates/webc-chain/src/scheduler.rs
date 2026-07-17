@@ -214,6 +214,66 @@ mod tests {
     }
 
     #[test]
+    fn nft_transfer_serializes_against_a_freeze_of_the_same_item() {
+        // A TransferNft and a FreezeNftItem of the SAME item both touch the per-item
+        // key (the transfer writes it to move ownership / read the frozen flag; the
+        // freeze writes it to set the flag), so the scheduler must serialize them.
+        // Otherwise a transfer could race a concurrent freeze (freeze bypass +
+        // nondeterministic state root). This exercises the real access-list builder.
+        let owner = Keypair::from_seed([1u8; 32]);
+        let recipient = Keypair::from_seed([2u8; 32]).address();
+        let freeze_authority = Keypair::from_seed([3u8; 32]);
+        let collection_id = crate::NftCollectionId::new(Hash256([7u8; 32]));
+
+        let transfer = Transaction::for_operation(
+            &owner,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: 5,
+                recipient,
+            },
+            FeeBid::default(),
+        )
+        .expect("transfer signs");
+        let freeze_same = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: 5,
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer.clone(), freeze_same]),
+            vec![vec![0], vec![1]],
+            "transfer and freeze of the same item must serialize"
+        );
+
+        // A freeze of a DIFFERENT item shares no item key, so it may batch in
+        // parallel (the collection record is read-only on both, which does not
+        // conflict). This confirms the serialization above is item-specific, not a
+        // blanket per-collection lock.
+        let freeze_other = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: 6,
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer, freeze_other]),
+            vec![vec![0, 1]],
+            "transfer and freeze of different items may run in parallel"
+        );
+    }
+
+    #[test]
     fn conflicting_pairs_keep_their_commit_order_across_batches() {
         // SC1: tx0 touches A; tx1 touches A and C (conflicts tx0); tx2 touches C
         // (conflicts tx1 but not tx0). Greedy first-fit would place tx2 in tx0's

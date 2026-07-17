@@ -29,6 +29,10 @@ use crate::fees::{
 use crate::genesis::GenesisConfig;
 use crate::mandate::{Mandate, MandateConfig, MandateId, MANDATE_LEAF_DOMAIN};
 use crate::namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
+use crate::nft::{
+    NftAuthorityKind, NftCollection, NftCollectionId, NftConfig, NftId, NftItem,
+    NFT_COLLECTION_LEAF_DOMAIN, NFT_ITEM_LEAF_DOMAIN,
+};
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
 use crate::oracle::{
     accuracy_weight, median, Feed, FeedId, FeedValue, OracleConfig, OracleReporter,
@@ -133,6 +137,13 @@ pub struct ChainConfig {
     /// the launch value is a measurement-tuned placeholder (§15.35 method).
     #[serde(default)]
     pub token: TokenConfig,
+    /// Native NFT parameters (Phase 13b, §15): the flat native creation deposit
+    /// locked (non-refundable) as an anti-spam price per collection.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before native NFTs decodable; the
+    /// launch value is a measurement-tuned placeholder (§15.35 method).
+    #[serde(default)]
+    pub nft: NftConfig,
     /// Total native supply, in base units, that the genesis allocation must sum
     /// to. `Some` on production genesis — mainnet and devnet both pin
     /// [`GENESIS_TOTAL_SUPPLY`] — so `ChainState::from_genesis` rejects any
@@ -175,6 +186,7 @@ impl Default for ChainConfig {
             session_keys: SessionKeyConfig::default(),
             mandate: MandateConfig::default(),
             token: TokenConfig::default(),
+            nft: NftConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
             inactivity_leak: None,
@@ -708,6 +720,66 @@ pub enum Event {
         /// New holder, or `None` if the authority was permanently renounced.
         new_authority: Option<Address>,
     },
+    /// A native NFT collection was created (Phase 13b, §15).
+    NftCollectionCreated {
+        /// Identity of the created collection.
+        collection_id: NftCollectionId,
+        /// Account that created the collection (its `creator`).
+        creator: Address,
+        /// Application namespace the collection lives under.
+        namespace: Hash256,
+        /// Native deposit locked (non-refundable) as the anti-spam price.
+        deposit: Amount,
+    },
+    /// An NFT item was minted to a recipient (Phase 13b, §15).
+    NftMinted {
+        /// Full identity of the minted item (`(collection, serial)`).
+        nft_id: NftId,
+        /// Account that owns the newly minted item.
+        recipient: Address,
+        /// Per-item off-chain metadata commitment.
+        item_metadata_hash: Hash256,
+    },
+    /// An NFT item changed owner (Phase 13b, §15).
+    NftTransferred {
+        /// Identity of the transferred item.
+        nft_id: NftId,
+        /// Previous owner.
+        from: Address,
+        /// New owner.
+        to: Address,
+    },
+    /// An NFT item was burned (Phase 13b, §15).
+    NftBurned {
+        /// Identity of the burned item.
+        nft_id: NftId,
+        /// Owner who burned the item.
+        owner: Address,
+    },
+    /// A collection's paused flag changed (Phase 13b, §15).
+    NftCollectionPausedChanged {
+        /// Collection whose paused flag changed.
+        collection_id: NftCollectionId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// An NFT item was frozen or thawed (Phase 13b, §15).
+    NftItemFreezeChanged {
+        /// Identity of the item whose freeze state changed.
+        nft_id: NftId,
+        /// Whether the item is now frozen.
+        frozen: bool,
+    },
+    /// A collection authority was transferred or permanently renounced
+    /// (Phase 13b, §15).
+    NftAuthorityChanged {
+        /// Collection whose authority changed.
+        collection_id: NftCollectionId,
+        /// Which authority (mint or freeze) changed.
+        authority_kind: NftAuthorityKind,
+        /// New holder, or `None` if the authority was permanently renounced.
+        new_authority: Option<Address>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -968,6 +1040,46 @@ pub struct ChainState {
     /// are NOT part of this native reconciliation.
     #[serde(default)]
     pub token_deposits: Amount,
+    /// Native NFT collections, keyed by [`NftCollectionId`] (Phase 13b, §15).
+    ///
+    /// Each [`NftCollection`] holds a collection's creator, bounded metadata, its two
+    /// configurable authorities (`Option`, where `None` is a permanent renounce), its
+    /// paused flag, the monotonic `next_serial` mint counter, the running
+    /// minted/burned counts, the optional supply cap, and the royalty commitment. A
+    /// collection exists only after an explicit [`Operation::CreateNftCollection`].
+    /// This is a SEPARATE identity space from fungible `tokens` / `token_balances`.
+    /// Committed by the state root through a dedicated Merkle sub-root
+    /// (`NFT_COLLECTION_LEAF_DOMAIN`), so a create, mint, burn, pause, or authority
+    /// change changes the state root. NFT items are NOT fungible balances and do not
+    /// enter the native WEBC supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub nft_collections: BTreeMap<NftCollectionId, NftCollection>,
+    /// Native NFT items, keyed by [`NftId`] = `(collection, serial)` (Phase 13b, §15).
+    ///
+    /// The per-[`NftId`] key is what makes ordinary [`Operation::TransferNft`]
+    /// parallel-schedulable: a transfer writes only the one item entry, never one
+    /// global per-collection object. A burned item is REMOVED (there is no tombstone;
+    /// the serial is never reminted because `next_serial` only grows), so the map
+    /// holds exactly the live items. The item's `frozen` flag lives ON the item
+    /// record (there is no separate freeze set). Committed by the state root through a
+    /// dedicated Merkle sub-root (`NFT_ITEM_LEAF_DOMAIN`). For every collection,
+    /// `minted_count - burned_count == count(live items)` (the per-collection item
+    /// invariant, checked by [`ChainState::nft_collection_supply_report`]).
+    #[serde(default)]
+    pub nft_items: BTreeMap<NftId, NftItem>,
+    /// Native units LOCKED across every live NFT collection's non-refundable creation
+    /// deposit (Phase 13b, §15).
+    ///
+    /// Sum of every [`Operation::CreateNftCollection`]'s
+    /// `ChainConfig::nft.creation_deposit`. Creation moves units here from the
+    /// creator's liquid balance; they stay locked for the collection's life (a
+    /// non-refundable anti-spam price). Reconciled by [`SupplyInvariantReport`] as a
+    /// locked bucket and committed by the state root as a scalar (mirroring
+    /// `token_deposits`). NFT items are a separate, non-fungible asset and are NOT
+    /// part of this native reconciliation.
+    #[serde(default)]
+    pub nft_deposits: Amount,
     /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
     ///
     /// Each [`ContractManifest`] describes one registered contract (its identity,
@@ -1069,6 +1181,8 @@ pub struct SupplyInvariantReport {
     pub mandate_escrow: Amount,
     /// Native units locked across every live token's creation deposit (§15).
     pub token_deposits: Amount,
+    /// Native units locked across every live NFT collection's creation deposit (§15).
+    pub nft_deposits: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -1092,6 +1206,27 @@ pub struct TokenSupplyReport {
     /// Checked sum of every held balance for this token.
     pub held: Amount,
     /// Whether `issued` exactly equals `held`.
+    pub balanced: bool,
+}
+
+/// Deterministic per-collection item reconciliation (Phase 13b, §15).
+///
+/// For any one collection, the running counters must satisfy
+/// `minted_count - burned_count == count(live NftItems in that collection)`. NFT
+/// items are NOT fungible balances and this report never enters
+/// [`SupplyInvariantReport`]; it exists so tests and RPC callers can assert the
+/// per-collection item invariant after any NFT state transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NftCollectionSupplyReport {
+    /// Total items ever minted in this collection.
+    pub minted: u64,
+    /// Total items ever burned in this collection.
+    pub burned: u64,
+    /// `minted - burned`: the number of items that should be live.
+    pub expected_live: u64,
+    /// Actual count of live [`NftItem`] entries for this collection.
+    pub live_items: u64,
+    /// Whether `expected_live` exactly equals `live_items`.
     pub balanced: bool,
 }
 
@@ -1171,6 +1306,9 @@ impl Default for ChainState {
             token_balances: BTreeMap::new(),
             frozen_token_accounts: BTreeSet::new(),
             token_deposits: Amount::ZERO,
+            nft_collections: BTreeMap::new(),
+            nft_items: BTreeMap::new(),
+            nft_deposits: Amount::ZERO,
             contracts: BTreeMap::new(),
             contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
@@ -1370,6 +1508,7 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(self.dex_escrow))
             .and_then(|amount| amount.checked_add(self.mandate_escrow))
             .and_then(|amount| amount.checked_add(self.token_deposits))
+            .and_then(|amount| amount.checked_add(self.nft_deposits))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -1390,6 +1529,7 @@ impl ChainState {
             dex_escrow: self.dex_escrow,
             mandate_escrow: self.mandate_escrow,
             token_deposits: self.token_deposits,
+            nft_deposits: self.nft_deposits,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -1929,6 +2069,8 @@ impl ChainState {
             token_root: Hash256,
             token_balance_root: Hash256,
             frozen_token_root: Hash256,
+            nft_collection_root: Hash256,
+            nft_item_root: Hash256,
             contract_root: Hash256,
             contract_state_root: Hash256,
             namespace_fee_root: Hash256,
@@ -1941,6 +2083,7 @@ impl ChainState {
             dex_escrow: Amount,
             mandate_escrow: Amount,
             token_deposits: Amount,
+            nft_deposits: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
@@ -1952,6 +2095,21 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V18 adds the native NFT system (Phase 13b, §15): the
+            // `nft_collection_root` sub-root commits every collection record
+            // (creator, bounded metadata, both `Option` authorities, paused flag,
+            // monotonic `next_serial`, minted/burned counts, optional supply cap,
+            // royalty commitment), the `nft_item_root` sub-root commits every live
+            // `(NftId, NftItem)` (single owner, per-item metadata commitment, frozen
+            // flag), and the `nft_deposits` scalar commits the aggregate locked native
+            // creation-deposit bucket (a SEPARATE bucket from `token_deposits`,
+            // matching the fungible-token precedent). So a create / mint / transfer /
+            // burn / pause / freeze / thaw / authority change always changes the state
+            // root. NFT items are a SEPARATE, non-fungible asset from native WEBC and
+            // never enter the native supply reconciliation; the only native units that
+            // move are the ordinary fee and the creation deposit. The domain bump is a
+            // deliberate consensus-format change; no external fixture pins a prior
+            // root.
             // V17 adds the native fungible-token system (Phase 13a, §15): the
             // `token_root` sub-root commits every token record (creator, bounded
             // metadata, both `Option` authorities, paused flag, issued supply), the
@@ -2028,7 +2186,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V17",
+            domain: "WEBC_STATE_COMMITMENT_V18",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -2119,6 +2277,17 @@ impl ChainState {
                 FROZEN_TOKEN_LEAF_DOMAIN,
                 self.frozen_token_accounts.iter(),
             )?,
+            // Native NFT system committed by its own ordered sub-roots (Phase 13b,
+            // §15): a create/mint/burn/pause/authority change moves
+            // `nft_collection_root`; a mint/transfer/burn/freeze/thaw moves
+            // `nft_item_root`; any of them changes the state root. The `nft_deposits`
+            // scalar (below) commits the aggregate locked native creation-deposit
+            // bucket.
+            nft_collection_root: ordered_value_root(
+                NFT_COLLECTION_LEAF_DOMAIN,
+                self.nft_collections.iter(),
+            )?,
+            nft_item_root: ordered_value_root(NFT_ITEM_LEAF_DOMAIN, self.nft_items.iter())?,
             // Interim contract runtime committed by its own ordered sub-roots (Phase
             // 7a, ADR-0014): registering a contract changes `contract_root`; any
             // contract state write changes `contract_state_root`; either changes the
@@ -2144,6 +2313,7 @@ impl ChainState {
             dex_escrow: self.dex_escrow,
             mandate_escrow: self.mandate_escrow,
             token_deposits: self.token_deposits,
+            nft_deposits: self.nft_deposits,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
@@ -4537,6 +4707,305 @@ impl ChainState {
                     new_authority: *new_authority,
                 });
             }
+            Operation::CreateNftCollection {
+                namespace,
+                create_nonce,
+                metadata,
+                mint_authority,
+                freeze_authority,
+                max_supply,
+                royalty_bps,
+            } => {
+                // Self-contained native NFT collection creation (§15): records a
+                // collection in its OWN identity space and locks a NON-REFUNDABLE
+                // native creation deposit (liquid -> nft_deposits) as the anti-spam
+                // price. Creation NEVER mints or burns native WEBC and mints no items.
+                // The account key is declared explicitly so a non-default fee lane is
+                // covered (mirrors CreateToken).
+                let collection_id = NftCollectionId::derive(*namespace, tx.sender, *create_nonce);
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::nft_collection(collection_id))?;
+                if self.nft_collections.contains_key(&collection_id) {
+                    return Err(ChainError::NftCollectionAlreadyExists);
+                }
+                // Validate metadata + royalty before locking any deposit; a malformed
+                // record fails closed and rolls the whole transaction back.
+                let record = NftCollection::new(
+                    tx.sender,
+                    metadata.clone(),
+                    *mint_authority,
+                    *freeze_authority,
+                    *max_supply,
+                    *royalty_bps,
+                )?;
+                // Lock the deposit; `debit_native` fails closed if the creator cannot
+                // afford it, so a collection can never exist without its deposit.
+                let deposit = config.nft.creation_deposit;
+                self.debit_native(tx.sender, deposit)?;
+                self.nft_deposits = self
+                    .nft_deposits
+                    .checked_add(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.nft_collections.insert(collection_id, record);
+                events.push(Event::NftCollectionCreated {
+                    collection_id,
+                    creator: tx.sender,
+                    namespace: *namespace,
+                    deposit,
+                });
+            }
+            Operation::MintNft {
+                collection_id,
+                recipient,
+                item_metadata_hash,
+            } => {
+                // Mint bumps `next_serial`/`minted_count` (writes the collection
+                // record) and creates ONE brand-new item at the chain-assigned
+                // `serial = next_serial`. Reads of the collection's authority, paused
+                // flag, cap, and counters are all covered by the read_write collection
+                // declaration.
+                access.write(StateKey::nft_collection(*collection_id))?;
+                let (serial, next_serial, next_minted) = {
+                    let collection = self
+                        .nft_collections
+                        .get(collection_id)
+                        .ok_or(ChainError::NftCollectionNotFound)?;
+                    // Authorize against the CURRENT mint authority: a renounced (None)
+                    // authority rejects, and any non-authority signer rejects.
+                    match collection.mint_authority {
+                        Some(authority) if authority == tx.sender => {}
+                        _ => return Err(ChainError::NftMintNotAuthorized),
+                    }
+                    // A paused collection cannot mint.
+                    if collection.paused {
+                        return Err(ChainError::NftCollectionPaused);
+                    }
+                    // Enforce the optional cap on total items ever minted. Because a
+                    // burned serial is never reminted, burning does not free capacity.
+                    if let Some(cap) = collection.max_supply {
+                        if collection.minted_count >= cap {
+                            return Err(ChainError::NftMaxSupplyReached);
+                        }
+                    }
+                    let serial = collection.next_serial;
+                    let next_serial = serial.checked_add(1).ok_or(ChainError::NftSerialOverflow)?;
+                    let next_minted = collection
+                        .minted_count
+                        .checked_add(1)
+                        .ok_or(ChainError::NftSerialOverflow)?;
+                    (serial, next_serial, next_minted)
+                };
+                let nft_id = NftId::new(*collection_id, serial);
+                // The new item's key is state-dependent (serial == next_serial) and
+                // cannot be pre-declared in the signed access list, so the item is
+                // created under the collection record's WRITE scope rather than via
+                // the access recorder: the collection record is declared read_write,
+                // so every mint of this collection serializes on it and no concurrent
+                // transaction can reference this fresh serial. This is the ONE
+                // deliberate exception (a chain-assigned id); every other item access
+                // (transfer/burn/freeze/thaw) names a caller-supplied serial and DOES
+                // declare its item key. See the matching note in `transaction.rs`.
+                self.nft_items
+                    .insert(nft_id, NftItem::new_owned(*recipient, *item_metadata_hash));
+                // Commit the bumped counters after the item write releases the borrow.
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                collection.next_serial = next_serial;
+                collection.minted_count = next_minted;
+                events.push(Event::NftMinted {
+                    nft_id,
+                    recipient: *recipient,
+                    item_metadata_hash: *item_metadata_hash,
+                });
+            }
+            Operation::TransferNft {
+                collection_id,
+                serial,
+                recipient,
+            } => {
+                // The collection record is READ-ONLY (only its paused flag is
+                // consulted); the single item key is the ONLY write — an ordinary
+                // transfer never writes a global per-collection object (Phase 13
+                // acceptance criterion). The item's `frozen` flag lives ON the item
+                // key we already write, so it needs no separate declaration.
+                access.read(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                let paused = self
+                    .nft_collections
+                    .get(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?
+                    .paused;
+                if paused {
+                    return Err(ChainError::NftCollectionPaused);
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let item = self
+                    .nft_items
+                    .get_mut(&nft_id)
+                    .ok_or(ChainError::NftItemNotFound)?;
+                // Only the current owner may transfer.
+                if item.owner != tx.sender {
+                    return Err(ChainError::NftNotOwner);
+                }
+                // A frozen item cannot be transferred.
+                if item.frozen {
+                    return Err(ChainError::NftItemFrozen);
+                }
+                let from = item.owner;
+                item.owner = *recipient;
+                events.push(Event::NftTransferred {
+                    nft_id,
+                    from,
+                    to: *recipient,
+                });
+            }
+            Operation::BurnNft {
+                collection_id,
+                serial,
+            } => {
+                // A burn removes the item (writes the item key) and bumps
+                // `burned_count` (writes the collection record). `next_serial` is NOT
+                // decremented, so a burned serial is never reminted.
+                access.write(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                if !self.nft_collections.contains_key(collection_id) {
+                    return Err(ChainError::NftCollectionNotFound);
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let (owner, frozen) = {
+                    let item = self
+                        .nft_items
+                        .get(&nft_id)
+                        .ok_or(ChainError::NftItemNotFound)?;
+                    (item.owner, item.frozen)
+                };
+                // Only the current owner may burn, and a frozen item cannot be burned.
+                if owner != tx.sender {
+                    return Err(ChainError::NftNotOwner);
+                }
+                if frozen {
+                    return Err(ChainError::NftItemFrozen);
+                }
+                self.nft_items.remove(&nft_id);
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                collection.burned_count = collection
+                    .burned_count
+                    .checked_add(1)
+                    .ok_or(ChainError::NftSerialOverflow)?;
+                events.push(Event::NftBurned { nft_id, owner });
+            }
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused,
+            } => {
+                access.write(StateKey::nft_collection(*collection_id))?;
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                // Only the current mint authority may pause/unpause (Phase 13b keeps a
+                // single privileged authority); a renounced (None) mint authority
+                // rejects.
+                match collection.mint_authority {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::NftMintNotAuthorized),
+                }
+                collection.paused = *paused;
+                events.push(Event::NftCollectionPausedChanged {
+                    collection_id: *collection_id,
+                    paused: *paused,
+                });
+            }
+            Operation::FreezeNftItem {
+                collection_id,
+                serial,
+            } => {
+                access.read(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                // Authorize against the CURRENT freeze authority; a renounced (None)
+                // authority rejects.
+                let authority = self
+                    .nft_collections
+                    .get(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::NftFreezeNotAuthorized),
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let item = self
+                    .nft_items
+                    .get_mut(&nft_id)
+                    .ok_or(ChainError::NftItemNotFound)?;
+                item.frozen = true;
+                events.push(Event::NftItemFreezeChanged {
+                    nft_id,
+                    frozen: true,
+                });
+            }
+            Operation::ThawNftItem {
+                collection_id,
+                serial,
+            } => {
+                access.read(StateKey::nft_collection(*collection_id))?;
+                access.write(StateKey::nft_item(*collection_id, *serial))?;
+                let authority = self
+                    .nft_collections
+                    .get(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::NftFreezeNotAuthorized),
+                }
+                let nft_id = NftId::new(*collection_id, *serial);
+                let item = self
+                    .nft_items
+                    .get_mut(&nft_id)
+                    .ok_or(ChainError::NftItemNotFound)?;
+                item.frozen = false;
+                events.push(Event::NftItemFreezeChanged {
+                    nft_id,
+                    frozen: false,
+                });
+            }
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind,
+                new_authority,
+            } => {
+                access.write(StateKey::nft_collection(*collection_id))?;
+                let collection = self
+                    .nft_collections
+                    .get_mut(collection_id)
+                    .ok_or(ChainError::NftCollectionNotFound)?;
+                let current = match authority_kind {
+                    NftAuthorityKind::Mint => collection.mint_authority,
+                    NftAuthorityKind::Freeze => collection.freeze_authority,
+                };
+                // Only the CURRENT holder may transfer/renounce. A renounced (None)
+                // authority has nothing to transfer, so it can never be restored —
+                // renouncement is PERMANENT (a Phase 13 acceptance criterion).
+                match current {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::NftAuthorityNotAuthorized),
+                }
+                match authority_kind {
+                    NftAuthorityKind::Mint => collection.mint_authority = *new_authority,
+                    NftAuthorityKind::Freeze => collection.freeze_authority = *new_authority,
+                }
+                events.push(Event::NftAuthorityChanged {
+                    collection_id: *collection_id,
+                    authority_kind: *authority_kind,
+                    new_authority: *new_authority,
+                });
+            }
             Operation::RegisterContract { manifest } => {
                 // Default lane only: the registration fee draws from and burns
                 // liquid (supply-neutral, like feed creation). The manifest record
@@ -5120,6 +5589,46 @@ impl ChainState {
             issued,
             held,
             balanced: issued == held,
+        })
+    }
+
+    /// Reconciles one collection's mint/burn counters against its live item count
+    /// (Phase 13b, §15).
+    ///
+    /// For any collection, `minted_count - burned_count` must equal the number of
+    /// live [`NftItem`] entries for that collection. NFT items are a SEPARATE,
+    /// non-fungible asset from native WEBC and never enter
+    /// [`Self::supply_invariant_report`]. Returns [`ChainError::NftCollectionNotFound`]
+    /// if the collection does not exist, or [`ChainError::ArithmeticOverflow`] if the
+    /// counters are inconsistent (which the state transitions never allow).
+    pub fn nft_collection_supply_report(
+        &self,
+        collection_id: NftCollectionId,
+    ) -> Result<NftCollectionSupplyReport, ChainError> {
+        let collection = self
+            .nft_collections
+            .get(&collection_id)
+            .ok_or(ChainError::NftCollectionNotFound)?;
+        let minted = collection.minted_count;
+        let burned = collection.burned_count;
+        let expected_live = collection.live_count()?;
+        // Count live items for exactly this collection. Items are keyed by
+        // `NftId { collection, serial }`, so this scans the whole item map; a
+        // per-collection secondary index is a later optimization if needed.
+        let mut live_items: u64 = 0;
+        for nft_id in self.nft_items.keys() {
+            if nft_id.collection == collection_id {
+                live_items = live_items
+                    .checked_add(1)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+            }
+        }
+        Ok(NftCollectionSupplyReport {
+            minted,
+            burned,
+            expected_live,
+            live_items,
+            balanced: expected_live == live_items,
         })
     }
 
@@ -6292,6 +6801,9 @@ mod tests {
             }),
             ("token_deposits", |s| {
                 s.token_deposits = Amount::from_units(s.token_deposits.0 + 1)
+            }),
+            ("nft_deposits", |s| {
+                s.nft_deposits = Amount::from_units(s.nft_deposits.0 + 1)
             }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
@@ -16648,6 +17160,923 @@ mod tests {
             state.state_root().unwrap(),
             root_after_create,
             "freezing an account moves the state root"
+        );
+    }
+
+    // ----- native NFTs (Phase 13b, §15) -----
+
+    fn nft_namespace() -> Hash256 {
+        Hash256([0x99; 32])
+    }
+
+    /// A valid sample collection metadata record (name "Acme Apes", symbol "APE").
+    fn sample_nft_metadata() -> crate::NftMetadata {
+        crate::NftMetadata::new(b"Acme Apes".to_vec(), b"APE".to_vec(), Hash256([0x2f; 32]))
+            .expect("valid metadata")
+    }
+
+    /// Creates a collection owned by `creator` and returns its derived id.
+    #[allow(clippy::too_many_arguments)]
+    fn create_collection(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        creator: &Keypair,
+        nonce: u64,
+        create_nonce: u64,
+        mint_authority: Option<Address>,
+        freeze_authority: Option<Address>,
+        max_supply: Option<u64>,
+        royalty_bps: u16,
+    ) -> Result<NftCollectionId, ChainError> {
+        mandate_exec(
+            state,
+            config,
+            creator,
+            nonce,
+            Operation::CreateNftCollection {
+                namespace: nft_namespace(),
+                create_nonce,
+                metadata: sample_nft_metadata(),
+                mint_authority,
+                freeze_authority,
+                max_supply,
+                royalty_bps,
+            },
+        )?;
+        Ok(NftCollectionId::derive(
+            nft_namespace(),
+            creator.address(),
+            create_nonce,
+        ))
+    }
+
+    /// Mints one item and returns its chain-assigned [`NftId`] (from the receipt
+    /// event, proving the id is discoverable from the receipt).
+    fn mint_nft(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        signer: &Keypair,
+        nonce: u64,
+        collection_id: NftCollectionId,
+        recipient: Address,
+    ) -> Result<NftId, ChainError> {
+        let receipt = mandate_exec(
+            state,
+            config,
+            signer,
+            nonce,
+            Operation::MintNft {
+                collection_id,
+                recipient,
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )?;
+        Ok(receipt
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::NftMinted { nft_id, .. } => Some(*nft_id),
+                _ => None,
+            })
+            .expect("mint event carries the nft id"))
+    }
+
+    /// Asserts BOTH invariants: native WEBC supply is balanced, and the
+    /// per-collection item invariant `minted - burned == live items` holds.
+    fn assert_nft_invariants(state: &ChainState, collection_id: NftCollectionId) {
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "native WEBC supply must stay balanced across every NFT op"
+        );
+        assert!(
+            state
+                .nft_collection_supply_report(collection_id)
+                .unwrap()
+                .balanced,
+            "minted - burned must equal the live item count"
+        );
+    }
+
+    #[test]
+    fn create_records_collection_and_reads_back_with_supply_balanced() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        let creator_liquid_before = balance(&state, creator.address());
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Some(3),
+            500,
+        )
+        .expect("create succeeds");
+
+        let record = state
+            .nft_collections
+            .get(&collection_id)
+            .expect("collection exists");
+        assert_eq!(record.creator, creator.address());
+        assert_eq!(record.mint_authority, Some(creator.address()));
+        assert_eq!(record.freeze_authority, Some(creator.address()));
+        assert!(!record.paused);
+        assert_eq!(record.next_serial, 0);
+        assert_eq!(record.minted_count, 0);
+        assert_eq!(record.burned_count, 0);
+        assert_eq!(record.max_supply, Some(3));
+        assert_eq!(record.royalty_bps, 500);
+        assert_eq!(record.metadata.symbol, b"APE");
+
+        // The deposit is locked into nft_deposits; native supply still balances (only
+        // the deposit + fee left the creator's liquid balance — no WEBC minted/burned
+        // by collection creation).
+        let deposit = config.nft.creation_deposit;
+        assert_eq!(state.nft_deposits, deposit);
+        let report = state.supply_invariant_report().unwrap();
+        assert!(report.balanced);
+        assert_eq!(report.nft_deposits, deposit);
+        assert!(balance(&state, creator.address()) < creator_liquid_before);
+
+        // The per-collection item invariant holds from creation: 0 minted, 0 live.
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn duplicate_collection_id_is_rejected() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("first create");
+        // Same (namespace, creator, create_nonce) derives the same id: rejected.
+        let before = state.clone();
+        let err = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftCollectionAlreadyExists));
+        assert_eq!(state, before, "rejected duplicate leaves state unchanged");
+    }
+
+    #[test]
+    fn over_length_metadata_and_bad_royalty_are_rejected_on_apply() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        let bad_create = |metadata: crate::NftMetadata, royalty_bps: u16, nonce: u64| {
+            Operation::CreateNftCollection {
+                namespace: nft_namespace(),
+                create_nonce: nonce,
+                metadata,
+                mint_authority: Some(creator.address()),
+                freeze_authority: None,
+                max_supply: None,
+                royalty_bps,
+            }
+        };
+        // Over-length name.
+        let mut m = sample_nft_metadata();
+        m.name = vec![0x61; crate::MAX_NFT_NAME_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 0, 0)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidNftMetadata));
+        // Over-length symbol.
+        let mut m = sample_nft_metadata();
+        m.symbol = vec![0x61; crate::MAX_NFT_SYMBOL_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 0, 1)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidNftMetadata));
+        // Out-of-range royalty.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            bad_create(sample_nft_metadata(), crate::MAX_NFT_ROYALTY_BPS + 1, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::InvalidNftMetadata));
+        // No collection was recorded and no deposit was locked on any rejected create.
+        assert!(state.nft_collections.is_empty());
+        assert_eq!(state.nft_deposits, Amount::ZERO);
+    }
+
+    #[test]
+    fn mint_requires_authority_and_creates_item_owned_by_recipient() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        // A non-authority cannot mint.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::MintNft {
+                collection_id,
+                recipient: holder.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMintNotAuthorized));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+
+        // The authority mints: item owned by recipient, counters/serial bumped.
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint succeeds");
+        assert_eq!(nft_id, NftId::new(collection_id, 0));
+        let item = state.nft_items.get(&nft_id).expect("item exists");
+        assert_eq!(item.owner, holder.address());
+        assert!(!item.frozen);
+        assert_eq!(item.item_metadata_hash, Hash256([0xab; 32]));
+        let record = state.nft_collections.get(&collection_id).unwrap();
+        assert_eq!(record.next_serial, 1);
+        assert_eq!(record.minted_count, 1);
+        assert_eq!(record.burned_count, 0);
+        assert_nft_invariants(&state, collection_id);
+
+        // A second mint assigns serial 1 (monotonic).
+        let nft_id_1 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            collection_id,
+            holder.address(),
+        )
+        .expect("second mint");
+        assert_eq!(nft_id_1, NftId::new(collection_id, 1));
+        assert_eq!(
+            state
+                .nft_collections
+                .get(&collection_id)
+                .unwrap()
+                .next_serial,
+            2
+        );
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn mint_past_max_supply_is_rejected() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            Some(2),
+            0,
+        )
+        .expect("create");
+        mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 0");
+        mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 1");
+        // The cap of 2 is now reached; a third mint is rejected.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::MintNft {
+                collection_id,
+                recipient: holder.address(),
+                item_metadata_hash: Hash256([0xac; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMaxSupplyReached));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn mint_into_paused_collection_is_rejected() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused: true,
+            },
+        )
+        .expect("pause");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintNft {
+                collection_id,
+                recipient: holder.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftCollectionPaused));
+    }
+
+    #[test]
+    fn transfer_requires_owner_and_moves_ownership() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+
+        // A non-owner cannot transfer.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftNotOwner));
+        assert_eq!(state, before, "rejected transfer leaves state unchanged");
+
+        // The owner transfers: ownership moves; the item key is the only item written.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .expect("transfer");
+        assert_eq!(
+            state.nft_items.get(&nft_id).unwrap().owner,
+            outsider.address()
+        );
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn transfer_of_frozen_item_or_paused_collection_is_rejected() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+
+        // Pause blocks transfer.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused: true,
+            },
+        )
+        .expect("pause");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftCollectionPaused));
+        // Unpause, then freeze the item: transfer blocked by the frozen flag.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::SetNftCollectionPaused {
+                collection_id,
+                paused: false,
+            },
+        )
+        .expect("unpause");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            4,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftItemFrozen));
+        // Ownership never moved.
+        assert_eq!(
+            state.nft_items.get(&nft_id).unwrap().owner,
+            holder.address()
+        );
+    }
+
+    #[test]
+    fn freeze_blocks_transfer_and_burn_until_thawed() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+
+        // A non-authority cannot freeze.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftFreezeNotAuthorized));
+
+        // Freeze, then transfer and burn are both rejected.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("freeze");
+        assert!(state.nft_items.get(&nft_id).unwrap().frozen);
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnNft {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftItemFrozen));
+
+        // Thaw, then the owner can transfer.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::ThawNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("thaw");
+        assert!(!state.nft_items.get(&nft_id).unwrap().frozen);
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferNft {
+                collection_id,
+                serial: nft_id.serial,
+                recipient: outsider.address(),
+            },
+        )
+        .expect("transfer after thaw");
+        assert_eq!(
+            state.nft_items.get(&nft_id).unwrap().owner,
+            outsider.address()
+        );
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn burn_removes_item_bumps_counter_and_serial_is_never_reminted() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            None,
+            0,
+        )
+        .expect("create");
+        let nft_id_0 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 0");
+        let _nft_id_1 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint 1");
+
+        // A non-owner cannot burn.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::BurnNft {
+                collection_id,
+                serial: nft_id_0.serial,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftNotOwner));
+
+        // The owner burns serial 0: item removed, burned_count bumped, next_serial
+        // UNCHANGED (still 2).
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnNft {
+                collection_id,
+                serial: nft_id_0.serial,
+            },
+        )
+        .expect("burn");
+        assert!(!state.nft_items.contains_key(&nft_id_0));
+        let record = state.nft_collections.get(&collection_id).unwrap();
+        assert_eq!(record.burned_count, 1);
+        assert_eq!(record.next_serial, 2, "next_serial never decrements");
+        assert_eq!(record.minted_count, 2);
+        assert_nft_invariants(&state, collection_id);
+
+        // The next mint assigns serial 2 — the burned serial 0 is NEVER reminted.
+        // (The rejected non-owner burn above did not commit, so the creator's nonce
+        // is still 3.)
+        let nft_id_2 = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint after burn");
+        assert_eq!(nft_id_2, NftId::new(collection_id, 2));
+        assert!(!state.nft_items.contains_key(&NftId::new(collection_id, 0)));
+        assert_nft_invariants(&state, collection_id);
+    }
+
+    #[test]
+    fn nft_authority_transfer_moves_control_and_renounce_is_permanent() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+
+        // Transfer the mint authority to the holder; the old holder (creator) can no
+        // longer mint, and the new holder can.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .expect("transfer mint authority");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintNft {
+                collection_id,
+                recipient: outsider.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMintNotAuthorized));
+        mint_nft(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            collection_id,
+            outsider.address(),
+        )
+        .expect("new authority mints");
+
+        // The new holder renounces the mint authority (Some -> None): PERMANENT.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            1,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Mint,
+                new_authority: None,
+            },
+        )
+        .expect("renounce mint authority");
+        assert_eq!(
+            state
+                .nft_collections
+                .get(&collection_id)
+                .unwrap()
+                .mint_authority,
+            None
+        );
+        // Nobody can mint anymore.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::MintNft {
+                collection_id,
+                recipient: outsider.address(),
+                item_metadata_hash: Hash256([0xab; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftMintNotAuthorized));
+        // And the renounce is UNRECOVERABLE: no one can re-grant a None authority.
+        // (The rejected mint above did not commit, so the holder's nonce is still 2.)
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftAuthorityNotAuthorized));
+
+        // Freeze authority renounce is likewise permanent: freezing then rejected.
+        // (The creator's rejected mint did not commit, so its nonce is still 2.)
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetNftAuthority {
+                collection_id,
+                authority_kind: crate::NftAuthorityKind::Freeze,
+                new_authority: None,
+            },
+        )
+        .expect("renounce freeze authority");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NftFreezeNotAuthorized));
+    }
+
+    #[test]
+    fn nft_state_is_committed_by_the_state_root() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let root_empty = state.state_root().unwrap();
+        let collection_id = create_collection(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            None,
+            0,
+        )
+        .expect("create");
+        let root_after_create = state.state_root().unwrap();
+        assert_ne!(
+            root_after_create, root_empty,
+            "creating a collection moves the state root"
+        );
+        let nft_id = mint_nft(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            collection_id,
+            holder.address(),
+        )
+        .expect("mint");
+        let root_after_mint = state.state_root().unwrap();
+        assert_ne!(
+            root_after_mint, root_after_create,
+            "minting an item moves the state root"
+        );
+
+        // A bincode restart preserves the collections, items, and deposit scalar, so
+        // the committed state root is stable across a crash/restart.
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.nft_collections, state.nft_collections);
+        assert_eq!(restored.nft_items, state.nft_items);
+        assert_eq!(restored.nft_deposits, state.nft_deposits);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            root_after_mint,
+            "nft state is committed by the state root across a restart"
+        );
+
+        // Freezing the item moves the item sub-root and thus the state root.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::FreezeNftItem {
+                collection_id,
+                serial: nft_id.serial,
+            },
+        )
+        .expect("freeze");
+        assert_ne!(
+            state.state_root().unwrap(),
+            root_after_mint,
+            "freezing an item moves the state root"
         );
     }
 }
