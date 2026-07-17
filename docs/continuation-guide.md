@@ -129,9 +129,10 @@ supply-chain (`cargo-deny`), JS advisory (`pnpm audit --prod`), and fuzz gates.
 **Every open finding in `docs/review/findings.md` is resolved** — reproduced with
 a failing test first, fixed, tested, and marked resolved there with its commit
 hash (AGENTS.md pitfall 7). This satisfies the Phase 5.5 core-freeze gate's
-"resolve every open blocking finding first." `main` is green on the full
-workspace gate (fmt, clippy `-D warnings`, `cargo test --workspace`, rustdoc,
-`webc-node demo`, SDK `pnpm check`).
+"resolve every open blocking finding first." The working branch
+(`claude/agent-md-review-6a392q`) is green on the full workspace gate (fmt,
+clippy `-D warnings`, `cargo test --workspace`, rustdoc, `webc-node demo`, SDK
+`pnpm check`); `main` holds the same tree up to the H2 hardening follow-up.
 
 What landed this session (per-finding detail + commit hashes in `findings.md`):
 
@@ -159,6 +160,29 @@ What landed this session (per-finding detail + commit hashes in `findings.md`):
   committee sampling, ADR-0011 historical state + weak-subjectivity;
   contract-compile invariant in ADR-0006. E4/E5 direction recorded there; E7
   phase-gated (no VM).
+
+### Adversarial re-verification pass (2026-07-17)
+
+After the backlog was cleared, an adversarial verification pass (parallel
+subagents, each told to *refute* a fix by reading the code, not just confirm its
+tests) re-checked the highest-risk fixes. It surfaced **one additional real
+defect** in the H2 mempool eviction, now fixed (commit `370f231`): the eviction
+rule ranked purely by effective fee and was *runnability-blind*, so a gapped-nonce
+bid (never sealable — `select_block` skips gaps, so it never pays) could evict an
+honest *runnable* transaction for free — the exact "free churn" the guard claimed
+to prevent. Eviction now ranks by `(is_runnable, effective_fee)`; a non-runnable
+bid can no longer displace a runnable entry. All other high-risk fixes
+(F1, E1, E2, SC1/SC2, U1, G1, E6, S4/S7, ST1, H1, C8) were independently confirmed
+SOUND. Lesson for future sessions: after tests pass, run an adversarial pass that
+tries to *break* each fix — a green test suite proves the tested cases, not the
+absence of the vector.
+
+### Branch note
+
+Work now lives on the designated branch **`claude/agent-md-review-6a392q`** (the
+earlier findings-backlog commits were on `main`; the designated branch was
+fast-forwarded to include all of them and is the branch to keep developing on).
+`main` and the designated branch are in sync.
 
 ### Exact next work
 
