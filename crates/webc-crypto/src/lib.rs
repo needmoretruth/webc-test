@@ -13,7 +13,8 @@ mod signature;
 pub use address::Address;
 pub use hash::Hash256;
 pub use merkle::{
-    merkle_proof, merkle_root, verify_merkle_proof, MerkleDirection, MerkleProof, MerkleProofStep,
+    merkle_parent, merkle_proof, merkle_root, verify_merkle_proof, MerkleDirection, MerkleProof,
+    MerkleProofStep,
 };
 pub use mldsa::{
     ml_dsa65_keygen, ml_dsa65_verify, MlDsa65PublicKey, MlDsa65SecretKey, ML_DSA_65_PUBLIC_KEY_LEN,
