@@ -428,6 +428,48 @@ pub enum Operation {
         /// Native base units paid into the feed's revenue pool.
         amount: Amount,
     },
+    /// Submits a DEX order intent for per-block uniform-price batch settlement
+    /// (§15.13/§15.18/§15.37).
+    ///
+    /// Locks the order's input into the `dex_escrow` bucket (a `Sell` locks
+    /// `amount` base; a `Buy` locks `amount × limit_price` quote), records the
+    /// order under `StateKey::dex_order(order_id)`, and lets the block's batch
+    /// settle it against crossing counter-orders at one uniform clearing price. An
+    /// unfilled remainder retries in later batches until filled, cancelled, or its
+    /// `deadline_height` passes (unless `fill_or_cancel`, which cancels any
+    /// remainder the same block). Default lane only. Fails if the order id already
+    /// exists, the pair is degenerate, the amount/price is zero (or below the
+    /// configured minimum), or the deadline is already in the past.
+    SubmitOrder {
+        /// Caller-chosen collision-resistant order identity (known at signing time
+        /// so the access list can name the order's state key).
+        order_id: crate::OrderId,
+        /// Oriented trading pair; `amount` is in `base`, price in `quote`.
+        pair: crate::TradingPair,
+        /// Buy (acquire base, pay quote) or sell (dispose base, receive quote).
+        side: crate::OrderSide,
+        /// Order size in base-asset base units.
+        amount: Amount,
+        /// Limit price in quote base-units per base base-unit (a buy pays at most,
+        /// a sell receives at least, this price).
+        limit_price: crate::Price,
+        /// Last block height at which the order may still settle; `0` means "use the
+        /// configured default retry window from the submission height".
+        deadline_height: u64,
+        /// Immediate-or-cancel: cancel any amount unfilled in the batch it joins
+        /// instead of retrying.
+        fill_or_cancel: bool,
+    },
+    /// Cancels a live DEX order and refunds its remaining locked input (§15.37).
+    ///
+    /// Only the order's owner may cancel. Refunds the currently-locked remainder
+    /// (a `Buy`'s `remaining × limit_price` quote, a `Sell`'s `remaining` base) to
+    /// the owner and removes the record. Default lane only. Fails if the order does
+    /// not exist or the sender is not its owner.
+    CancelOrder {
+        /// Identity of the order to cancel.
+        order_id: crate::OrderId,
+    },
     /// Registers an interim Rust-authored contract for a flat, burned fee
     /// (Phase 7a, ADR-0014 interim path (c)).
     ///
@@ -502,6 +544,11 @@ impl Operation {
             | Self::DeregisterReporter { .. }
             | Self::PayFeedRead { .. } => 10_000,
             Self::SubmitReport { .. } => 5_000,
+            // A submit locks input and writes one order record; a cancel refunds and
+            // removes it — comparable to the other single-record locked-value ops.
+            // The batch settlement itself is a block-level cost amortized across all
+            // orders (§15.13), not charged to a single submit.
+            Self::SubmitOrder { .. } | Self::CancelOrder { .. } => 10_000,
             // Registration validates a manifest, writes one record, and burns the
             // fee — comparable to feed creation plus a record write.
             Self::RegisterContract { .. } => 30_000,
@@ -817,6 +864,40 @@ impl Operation {
                 // feed's revenue pool, so it writes both the account and the feed.
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::oracle_feed(*feed_id));
+            }
+            Self::SubmitOrder {
+                order_id,
+                pair,
+                side,
+                ..
+            } => {
+                // A submit locks the order's input from the sender and writes the new
+                // order record. The native fee already touches the sender account
+                // (default-lane base). When the locked leg is a NON-native asset, the
+                // lock debits that asset balance, so declare it; the locked leg is the
+                // quote for a buy and the base for a sell. The block-level batch pass
+                // that later fills/refunds the order is not access-list-bound.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::dex_order(*order_id));
+                let locked_asset = match side {
+                    crate::OrderSide::Buy => &pair.quote,
+                    crate::OrderSide::Sell => &pair.base,
+                };
+                if *locked_asset != AssetId::NativeWebc {
+                    push_unique_key(
+                        &mut read_write,
+                        StateKey::asset_balance(locked_asset.clone(), sender),
+                    );
+                }
+            }
+            Self::CancelOrder { order_id } => {
+                // Cancel only marks the order for the block-level batch pass (which
+                // performs the possibly-non-native refund without an access list),
+                // so the transaction itself only writes the sender account (fee) and
+                // the order record. Carrying just an order id keeps a cancel's signed
+                // access list independent of the order's asset legs.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::dex_order(*order_id));
             }
             Self::RegisterContract { manifest } => {
                 // Registration burns the fee from liquid and writes the contract's

@@ -73,6 +73,11 @@ pub fn build_block(
     }
 
     let mut next_state = state.clone();
+    // Set the block height before any transaction executes so height-dependent
+    // logic (DEX order deadlines, §15.37) reads a stable committed value; the same
+    // assignment runs on import because `apply_block` re-runs this function with the
+    // block's own height, and `state_root` commits it so all nodes agree.
+    next_state.current_height = input.height;
     let base_fee_for_block = next_state.current_base_fee_per_unit;
     let mut receipts = Vec::with_capacity(transactions.len());
     let mut units_used = 0u64;
@@ -136,6 +141,16 @@ pub fn build_block(
         }
         receipts.push(receipt);
     }
+
+    // Mandatory per-block uniform-price DEX batch settlement (§15.13/§15.18/§15.37):
+    // every order submitted this block (and every retrying order) settles together
+    // at one uniform clearing price per pair, so intra-block ordering games cannot
+    // extract value. It runs deterministically here on the whole-block overlay and
+    // identically on import (`apply_block` re-runs this function), with `state_root`
+    // binding the resulting `dex_order_root`/`dex_escrow`. Any failure rolls back
+    // the whole block. Its events are informational; the committed state change is
+    // what `state_root` binds.
+    next_state.settle_dex_batch(config)?;
 
     // Base-fee adjustment is a protocol state update caused by block fullness.
     // The header records the fee used by this block, while `state_root` commits

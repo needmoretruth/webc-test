@@ -14,6 +14,7 @@ pub mod bridge;
 pub mod canonical;
 pub mod consensus;
 pub mod contract;
+pub mod dex;
 pub mod fees;
 pub mod genesis;
 pub mod grants;
@@ -65,6 +66,10 @@ pub use contract::{
     CONTRACT_STATE_LEAF_DOMAIN, MAX_CONTRACT_FOOTPRINT_KEYS, MAX_CONTRACT_INPUT_BYTES,
     MAX_CONTRACT_STATE_VALUE_BYTES,
 };
+pub use dex::{
+    prorata_fills, uniform_clearing_price, DexConfig, Order, OrderId, OrderSide, Price,
+    TradingPair, DEX_ORDER_LEAF_DOMAIN,
+};
 pub use fees::{
     next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
     StoragePricing, StorageRefund, NAMESPACE_FEE_LEAF_DOMAIN,
@@ -100,7 +105,8 @@ pub use staking::{
     Delegation, StakingConfig, Validator, ValidatorStatus, SEVEN_DAY_TARGET_AT_ONE_MINUTE_EPOCHS,
 };
 pub use state::{
-    AccountStateProof, ChainConfig, ChainState, Event, Receipt, SupplyInvariantReport,
+    AccountStateProof, ChainConfig, ChainState, Event, OrderCloseReason, Receipt,
+    SupplyInvariantReport,
 };
 pub use state_key::{ProtocolStateKey, StateKey, StateKeyKind, MAX_TRANSACTION_STATE_KEYS};
 pub use transaction::{AccessList, FeeBid, Operation, Transaction};
@@ -314,6 +320,24 @@ pub enum ChainError {
     OracleRequiresDefaultLane,
     #[error("oracle read-fee payment must be greater than zero")]
     OracleReadAmountZero,
+    #[error("DEX configuration is invalid (per-fill fee basis points exceed 10000)")]
+    InvalidDexConfig,
+    #[error("DEX trading pair is invalid (base and quote must differ)")]
+    InvalidTradingPair,
+    #[error("a DEX order already exists for this order id")]
+    DexOrderAlreadyExists,
+    #[error("no DEX order exists for this order id")]
+    DexOrderNotFound,
+    #[error("only the order owner may cancel this DEX order")]
+    DexOrderNotOwner,
+    #[error("this DEX operation must use the default authorization lane")]
+    DexRequiresDefaultLane,
+    #[error("DEX order amount is zero or below the configured minimum")]
+    DexOrderAmountTooSmall,
+    #[error("DEX order limit price must be greater than zero")]
+    DexOrderPriceZero,
+    #[error("DEX order deadline height is before the current block height")]
+    DexOrderDeadlineInPast,
     #[error("application namespace is already registered")]
     NamespaceAlreadyRegistered,
     #[error("application namespace is not registered")]
