@@ -396,25 +396,61 @@ supply bucket (grant locks, spend draws, revoke/expire-reclaim returns the
 remainder); state-commitment domain V14→V15; adversarial coverage of every
 rejection path + supply-balanced assertions. Merged 69a4840.
 
-**Service registry — in progress (9b).** A bounded, namespace-scoped, fee-priced
+**Service registry — DONE (9b).** A bounded, namespace-scoped, fee-priced
 native registry (`service_registry.rs`, §15.5b/§3 of `agent-commerce.md`) where
 services publish machine-readable categories/prices/interfaces for agent
 discovery — built like the oracle-feed / namespace registries, only the current
 revision in committed state (monotonic `revision`; history is archival). Closes
 the mandate category-allowlist loop with a service-scoped spend
 (`SpendUnderMandateToService`) that resolves `Category` tags against a service's
-registered categories. Domain V15→V16.
+registered categories. Domain V15→V16. Merged 161522d.
+
+**M1 fee-cap fix (post-9b adversarial review) — DONE.** A read-only adversarial
+review of the merged mandate found the per-tx cap bounded only the principal
+`amount`, not `amount + fee`; since the agent-chosen fee is drawn from the same
+escrow, one high-fee spend could drain the whole budget past `per_tx_max` /
+`rate_limit_per_day` (value extraction, supply stayed conserved). Both spend arms
+now reject `amount + total_fee > per_tx_max` and zero-amount spends; reproduced
+first (`fee_bid_cannot_inflate_a_spend_past_per_tx_max`). Validation-only, no
+domain bump. Recorded as finding M1 in `docs/review/findings.md`. Commit 13c7b9e.
+
+**Phase 9 native core is COMPLETE.** The tail (SDK agent toolkit, HTTP-402
+challenge/verify middleware, docs-as-data registry snapshot, flagship
+marketplace demo) is SDK/integration/external, matching the deliberately partial
+wallet-focused SDK (it covers Transfer/Stake/Delegate/InstallSessionKey only —
+oracle/DEX/contract/namespace/sponsor/mandate/service all await the consolidated
+SDK/platform phase, development-plan Phase 12). Those are not per-feature work.
 
 **Follow-ups (later, mostly non-consensus):** HTTP-402 payment flow (§4) and the
 SDK agent toolkit (mandate management UI, agent discover→validate→pay→retry
 client, service challenge/verify middleware) are SDK/integration-level. The
 docs-as-data registry snapshot and the flagship agent-marketplace showcase ride
-on the primitives above. Then the remaining phases (10 proofs/PQ, 11
-fast-path+benchmarks, 12 web platform, 13 tokens/NFTs, 14 bridges, 15 validator
-ops, 16 testnet/distribution, 17 mainnet gates, 18 production bridges, 19 phase-2)
-are increasingly owner-gated (bridge trust model, mainnet) or need external
-resources (real-hardware benchmarks, independent audits, live bridges) — surface
-those to the owner rather than deciding alone.
+on the primitives above.
+
+### Autonomous continuation: Phase 13 — native tokens / NFTs / app governance
+
+Chosen next because it is the cleanest FULLY-AUTONOMOUS native block: spec-decided
+(§15, development-plan Phase 13), builds directly on the existing multi-asset
+`asset_balances`, the storage-deposit system (§15.22, deposit-based spam pricing),
+and the established native-registry / sub-root / domain-bump patterns, with NO
+owner-gated dependency. Skipping ahead of Phases 10-12 is deliberate: **Phase 10**
+(succinct proofs / PQ) needs the owner-gated archival trust anchor (ADR-0011) and
+external proof-backend/benchmark choices; **Phase 11** (fast path) is deep
+consensus work needing reference-hardware benchmarks + an adopt-by-ADR DAG-BFT
+decision + committee-sampling ADR; **Phase 12** is the consolidated SDK/platform
+phase. Their autonomous slivers (e.g. object inclusion proofs vs the current root)
+can be picked up later. Phase 13 core to build: native token/NFT registry +
+metadata commitments; mint/burn/freeze/pause/authority-transfer/revocation;
+transfer-policy hooks without a global mint bottleneck; deposit-based creation
+fees. App-governance instances (snapshots/quorum/timelocks/delegation) follow as a
+second unit. Build with worktree subagents, frequent commit+push, gate+merge each,
+and keep the supply invariant + a domain bump + E8 coverage for any new committed
+map/scalar. **Owner-gated (do NOT decide alone):** ADR-0012 slashing numbers +
+inactivity-leak wiring, WASM engine + manifest trust (ADR-0014), Weft rename,
+bridge trust model (Phase 14/18), weak-subjectivity anchor (ADR-0011), mainnet
+governance emergency powers, founder comp (§15.4). Later phases (14 bridges, 16-19
+testnet/mainnet/production) are increasingly owner-gated or need external
+resources — surface to the owner rather than deciding alone.
 
 ### Original Phase 7 plan summary — contract runtime, native oracle, then Weft
 
