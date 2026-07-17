@@ -509,6 +509,23 @@ mod tests {
         ));
     }
 
+    /// A frame carrying the previous wire version (v3, the last fixed-int format)
+    /// is rejected at the clear header before its varint body is ever decoded, so
+    /// a v3 and a v4 node cleanly refuse to peer rather than misparse (WEBC §15.14
+    /// encoding change gated behind the `NET_PROTOCOL_VERSION` 3 → 4 bump).
+    #[test]
+    fn rejects_the_previous_wire_version() {
+        assert_eq!(NET_PROTOCOL_VERSION, 4, "this test pins the v3 → v4 bump");
+        let message = NetMessage::Transaction(Box::new(sample_transaction()));
+        let mut encoded = encode_message(&message).unwrap();
+        // Stamp the little-endian version field (bytes 4..6) back to 3.
+        encoded[4..6].copy_from_slice(&3u16.to_le_bytes());
+        assert!(matches!(
+            decode_message(&encoded).unwrap_err(),
+            NetError::UnsupportedVersion { actual: 3 }
+        ));
+    }
+
     #[test]
     fn rejects_trailing_bytes() {
         let message = NetMessage::Transaction(Box::new(sample_transaction()));
