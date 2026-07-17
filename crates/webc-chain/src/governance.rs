@@ -129,6 +129,29 @@ pub const GOVERNANCE_VOTE_LEAF_DOMAIN: &[u8] = b"WEBC_GOV_VOTE_LEAF_V1";
 /// most one.
 pub const MAX_GOVERNANCE_BPS: u16 = 10_000;
 
+/// Native application-governance chain parameters (Phase 13c, §15).
+///
+/// The launch value is a measurement-tuned placeholder; the METHOD (a flat native
+/// deposit locked for the instance's life) is fixed. `#[serde(default)]` via the
+/// derived [`Default`] keeps a genesis written before governance decodable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernanceParams {
+    /// Native base units LOCKED from the creator's liquid balance into the
+    /// `governance_deposits` bucket at instance creation. NON-REFUNDABLE for the
+    /// instance's life — an anti-spam price. Placeholder: 1 WEBC.
+    pub creation_deposit: Amount,
+}
+
+impl Default for GovernanceParams {
+    fn default() -> Self {
+        Self {
+            // 1 WEBC: a spam-resistant placeholder deposit (§15.22 method).
+            creation_deposit: Amount::from_webc(1),
+        }
+    }
+}
+
 /// Opaque, non-secret, namespace-scoped identity of one governance instance.
 ///
 /// Derived as `SHA-256("WEBC_GOV_INSTANCE_ID_V1" || namespace || creator ||
@@ -288,8 +311,7 @@ impl GovernanceConfig {
         if self.voting_period_epochs == 0 {
             return Err(ChainError::InvalidGovernanceConfig);
         }
-        if self.quorum_bps > MAX_GOVERNANCE_BPS
-            || self.approval_threshold_bps > MAX_GOVERNANCE_BPS
+        if self.quorum_bps > MAX_GOVERNANCE_BPS || self.approval_threshold_bps > MAX_GOVERNANCE_BPS
         {
             return Err(ChainError::InvalidGovernanceConfig);
         }
@@ -613,10 +635,19 @@ mod tests {
     #[test]
     fn proposal_id_derivation_is_deterministic_and_nonce_separated() {
         let instance = GovernanceInstanceId::new(Hash256([0x11; 32]));
-        assert_eq!(ProposalId::derive(instance, 0), ProposalId::derive(instance, 0));
-        assert_ne!(ProposalId::derive(instance, 0), ProposalId::derive(instance, 1));
+        assert_eq!(
+            ProposalId::derive(instance, 0),
+            ProposalId::derive(instance, 0)
+        );
+        assert_ne!(
+            ProposalId::derive(instance, 0),
+            ProposalId::derive(instance, 1)
+        );
         let other = GovernanceInstanceId::new(Hash256([0x12; 32]));
-        assert_ne!(ProposalId::derive(instance, 0), ProposalId::derive(other, 0));
+        assert_ne!(
+            ProposalId::derive(instance, 0),
+            ProposalId::derive(other, 0)
+        );
     }
 
     #[test]

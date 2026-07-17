@@ -27,6 +27,12 @@ use crate::fees::{
     StoragePricing, NAMESPACE_FEE_LEAF_DOMAIN,
 };
 use crate::genesis::GenesisConfig;
+use crate::governance::{
+    gov_vote_escrow_address, GovProposalStatus, GovernanceAction, GovernanceInstance,
+    GovernanceInstanceId, GovernanceParams, Proposal as GovernanceProposal, ProposalId, VoteChoice,
+    VoteRecord, GOVERNANCE_INSTANCE_LEAF_DOMAIN, GOVERNANCE_PROPOSAL_LEAF_DOMAIN,
+    GOVERNANCE_VOTE_LEAF_DOMAIN,
+};
 use crate::mandate::{Mandate, MandateConfig, MandateId, MANDATE_LEAF_DOMAIN};
 use crate::namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 use crate::nft::{
@@ -144,6 +150,13 @@ pub struct ChainConfig {
     /// launch value is a measurement-tuned placeholder (§15.35 method).
     #[serde(default)]
     pub nft: NftConfig,
+    /// Native application-governance parameters (Phase 13c, §15): the flat native
+    /// creation deposit locked (non-refundable) as an anti-spam price per instance.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before governance decodable; the
+    /// launch value is a measurement-tuned placeholder (§15.35 method).
+    #[serde(default)]
+    pub governance: GovernanceParams,
     /// Total native supply, in base units, that the genesis allocation must sum
     /// to. `Some` on production genesis — mainnet and devnet both pin
     /// [`GENESIS_TOTAL_SUPPLY`] — so `ChainState::from_genesis` rejects any
@@ -187,6 +200,7 @@ impl Default for ChainConfig {
             mandate: MandateConfig::default(),
             token: TokenConfig::default(),
             nft: NftConfig::default(),
+            governance: GovernanceParams::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
             inactivity_leak: None,
@@ -780,6 +794,82 @@ pub enum Event {
         /// New holder, or `None` if the authority was permanently renounced.
         new_authority: Option<Address>,
     },
+    /// A native governance instance was created (Phase 13c, §15).
+    GovernanceInstanceCreated {
+        /// Identity of the created instance.
+        instance_id: GovernanceInstanceId,
+        /// Account that created the instance (its `creator`).
+        creator: Address,
+        /// Application namespace the instance lives under.
+        namespace: Hash256,
+        /// Fungible token that denominates voting weight.
+        weight_token: TokenId,
+        /// Native deposit locked (non-refundable) as the anti-spam price.
+        deposit: Amount,
+    },
+    /// A governance instance's treasury was funded (Phase 13c, §15).
+    GovernanceTreasuryFunded {
+        /// Instance whose treasury grew.
+        instance_id: GovernanceInstanceId,
+        /// Account that funded the treasury.
+        funder: Address,
+        /// Native base units moved into the treasury.
+        amount: Amount,
+        /// Treasury balance after the fund.
+        treasury: Amount,
+    },
+    /// A governance proposal was opened (Phase 13c, §15).
+    GovernanceProposalOpened {
+        /// Identity of the opened proposal.
+        proposal_id: ProposalId,
+        /// Instance the proposal belongs to.
+        instance_id: GovernanceInstanceId,
+        /// Account that opened the proposal.
+        proposer: Address,
+        /// Last epoch votes are accepted.
+        voting_ends_epoch: u64,
+    },
+    /// A lock-to-vote ballot was cast (Phase 13c, §15).
+    GovernanceVoteCast {
+        /// Proposal voted on.
+        proposal_id: ProposalId,
+        /// Account that voted.
+        voter: Address,
+        /// The voter's choice.
+        choice: VoteChoice,
+        /// Weight-token units locked as this vote's weight.
+        weight: Amount,
+    },
+    /// A governance proposal was resolved (Phase 13c, §15).
+    GovernanceProposalResolved {
+        /// Proposal resolved.
+        proposal_id: ProposalId,
+        /// Resolved status (`Passed` or `Defeated`).
+        status: GovProposalStatus,
+        /// Execution-available epoch, set when the proposal passes.
+        eta_epoch: Option<u64>,
+    },
+    /// A passed governance proposal was executed (Phase 13c, §15).
+    GovernanceProposalExecuted {
+        /// Proposal executed.
+        proposal_id: ProposalId,
+        /// Instance the proposal belongs to.
+        instance_id: GovernanceInstanceId,
+    },
+    /// A passed governance proposal lapsed unexecuted (Phase 13c, §15).
+    GovernanceProposalExpired {
+        /// Proposal that expired.
+        proposal_id: ProposalId,
+    },
+    /// A voter reclaimed their locked weight after resolution (Phase 13c, §15).
+    GovernanceVoteReclaimed {
+        /// Proposal whose lock was reclaimed.
+        proposal_id: ProposalId,
+        /// Account that reclaimed.
+        voter: Address,
+        /// Weight-token units returned to the voter.
+        weight: Amount,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1080,6 +1170,65 @@ pub struct ChainState {
     /// part of this native reconciliation.
     #[serde(default)]
     pub nft_deposits: Amount,
+    /// Native application-governance instances, keyed by [`GovernanceInstanceId`]
+    /// (Phase 13c, §15).
+    ///
+    /// Each [`GovernanceInstance`] holds its creator, the fungible token that
+    /// denominates voting weight, its immutable rule set, the native-WEBC `treasury`
+    /// it controls, and the monotonic proposal-nonce counter. An instance exists
+    /// only after an explicit [`Operation::CreateGovernanceInstance`]. Committed by
+    /// the state root through a dedicated Merkle sub-root
+    /// (`GOVERNANCE_INSTANCE_LEAF_DOMAIN`), so a create, a treasury fund, or a
+    /// proposal open (which bumps the nonce) changes the state root. A `BTreeMap`
+    /// keeps iteration deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub governance_instances: BTreeMap<GovernanceInstanceId, GovernanceInstance>,
+    /// Native governance proposals, keyed by [`ProposalId`] (Phase 13c, §15).
+    ///
+    /// Each [`GovernanceProposal`] holds its instance, proposer, the snapshot weight
+    /// token and rule set captured at open, its bounded typed action, epoch bounds,
+    /// execution-availability epoch, lifecycle status, and running weight tallies.
+    /// A proposal exists only after an explicit [`Operation::OpenProposal`] and is
+    /// never removed (its terminal status is a permanent record). Committed by the
+    /// state root through a dedicated Merkle sub-root
+    /// (`GOVERNANCE_PROPOSAL_LEAF_DOMAIN`), so an open, a vote (tally), a resolve, or
+    /// an execute changes the state root. A `BTreeMap` keeps iteration deterministic
+    /// in the hashed/consensus path.
+    #[serde(default)]
+    pub governance_proposals: BTreeMap<ProposalId, GovernanceProposal>,
+    /// Native governance vote locks, keyed by `(ProposalId, voter)` (Phase 13c, §15).
+    ///
+    /// Each [`VoteRecord`] holds one voter's choice and the weight-token units they
+    /// LOCKED into the proposal escrow. Its presence prevents a second vote from the
+    /// same voter (double-vote protection); an [`Operation::ReclaimVote`] removes it
+    /// after the proposal resolves, so the map holds exactly the currently-locked
+    /// votes. Committed by the state root through a dedicated Merkle sub-root
+    /// (`GOVERNANCE_VOTE_LEAF_DOMAIN`). The locked weight itself lives in
+    /// `token_balances` under the proposal's escrow address, so it is a token asset,
+    /// not native WEBC, and does not enter the native supply reconciliation. A
+    /// `BTreeMap` keeps iteration deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub governance_votes: BTreeMap<(ProposalId, Address), VoteRecord>,
+    /// Native units LOCKED across every governance instance's non-refundable
+    /// creation deposit (Phase 13c, §15).
+    ///
+    /// Sum of every [`Operation::CreateGovernanceInstance`]'s
+    /// `ChainConfig::governance.creation_deposit`. Creation moves units here from the
+    /// creator's liquid balance; they stay locked for the instance's life (a
+    /// non-refundable anti-spam price). Reconciled by [`SupplyInvariantReport`] as a
+    /// locked bucket and committed by the state root as a scalar (mirroring
+    /// `token_deposits`/`nft_deposits`).
+    #[serde(default)]
+    pub governance_deposits: Amount,
+    /// Native units held across every governance instance's treasury (Phase 13c, §15).
+    ///
+    /// Sum of every [`GovernanceInstance::treasury`]. [`Operation::FundGovernanceTreasury`]
+    /// moves units here from a funder's liquid balance; a passed
+    /// [`GovernanceAction::TreasuryTransfer`] moves them out to a recipient's liquid
+    /// balance on execution. Reconciled by [`SupplyInvariantReport`] as a locked
+    /// bucket and committed by the state root as a scalar (mirroring `mandate_escrow`).
+    #[serde(default)]
+    pub governance_treasury: Amount,
     /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
     ///
     /// Each [`ContractManifest`] describes one registered contract (its identity,
@@ -1183,6 +1332,10 @@ pub struct SupplyInvariantReport {
     pub token_deposits: Amount,
     /// Native units locked across every live NFT collection's creation deposit (§15).
     pub nft_deposits: Amount,
+    /// Native units locked across every governance instance's creation deposit (§15).
+    pub governance_deposits: Amount,
+    /// Native units held across every governance instance's treasury (§15).
+    pub governance_treasury: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -1309,6 +1462,11 @@ impl Default for ChainState {
             nft_collections: BTreeMap::new(),
             nft_items: BTreeMap::new(),
             nft_deposits: Amount::ZERO,
+            governance_instances: BTreeMap::new(),
+            governance_proposals: BTreeMap::new(),
+            governance_votes: BTreeMap::new(),
+            governance_deposits: Amount::ZERO,
+            governance_treasury: Amount::ZERO,
             contracts: BTreeMap::new(),
             contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
@@ -1509,6 +1667,8 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(self.mandate_escrow))
             .and_then(|amount| amount.checked_add(self.token_deposits))
             .and_then(|amount| amount.checked_add(self.nft_deposits))
+            .and_then(|amount| amount.checked_add(self.governance_deposits))
+            .and_then(|amount| amount.checked_add(self.governance_treasury))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -1530,6 +1690,8 @@ impl ChainState {
             mandate_escrow: self.mandate_escrow,
             token_deposits: self.token_deposits,
             nft_deposits: self.nft_deposits,
+            governance_deposits: self.governance_deposits,
+            governance_treasury: self.governance_treasury,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -2071,6 +2233,9 @@ impl ChainState {
             frozen_token_root: Hash256,
             nft_collection_root: Hash256,
             nft_item_root: Hash256,
+            governance_instance_root: Hash256,
+            governance_proposal_root: Hash256,
+            governance_vote_root: Hash256,
             contract_root: Hash256,
             contract_state_root: Hash256,
             namespace_fee_root: Hash256,
@@ -2084,6 +2249,8 @@ impl ChainState {
             mandate_escrow: Amount,
             token_deposits: Amount,
             nft_deposits: Amount,
+            governance_deposits: Amount,
+            governance_treasury: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
@@ -2095,6 +2262,24 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V19 adds native application governance (Phase 13c, §15): the
+            // `governance_instance_root` sub-root commits every instance record
+            // (creator, weight token, immutable config, native treasury, proposal
+            // nonce), the `governance_proposal_root` sub-root commits every proposal
+            // (instance, proposer, weight/config snapshot, bounded action, epoch
+            // bounds, eta, status, tallies), and the `governance_vote_root` sub-root
+            // commits every live `((proposal, voter), VoteRecord)` lock, while the
+            // `governance_deposits` scalar commits the aggregate locked native
+            // creation-deposit bucket and the `governance_treasury` scalar commits the
+            // aggregate native treasury bucket (mirroring how
+            // `token_deposits`/`mandate_escrow` pair with their sub-roots). So a
+            // create / fund / open / vote / resolve / execute / reclaim always changes
+            // the state root. Voting WEIGHT is locked weight-token balance (a token
+            // asset committed by `token_balance_root`), so it never enters the native
+            // supply reconciliation; the only native units that move are the ordinary
+            // fee, the creation deposit, and the treasury fund/payout. The domain bump
+            // is a deliberate consensus-format change; no external fixture pins a prior
+            // root.
             // V18 adds the native NFT system (Phase 13b, §15): the
             // `nft_collection_root` sub-root commits every collection record
             // (creator, bounded metadata, both `Option` authorities, paused flag,
@@ -2186,7 +2371,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V18",
+            domain: "WEBC_STATE_COMMITMENT_V19",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -2288,6 +2473,25 @@ impl ChainState {
                 self.nft_collections.iter(),
             )?,
             nft_item_root: ordered_value_root(NFT_ITEM_LEAF_DOMAIN, self.nft_items.iter())?,
+            // Native application-governance system committed by its own ordered
+            // sub-roots (Phase 13c, §15): a create/fund/open moves
+            // `governance_instance_root`; an open/vote/resolve/execute moves
+            // `governance_proposal_root`; a vote/reclaim moves `governance_vote_root`;
+            // any of them changes the state root. The `governance_deposits` and
+            // `governance_treasury` scalars (below) commit the two aggregate locked
+            // native buckets.
+            governance_instance_root: ordered_value_root(
+                GOVERNANCE_INSTANCE_LEAF_DOMAIN,
+                self.governance_instances.iter(),
+            )?,
+            governance_proposal_root: ordered_value_root(
+                GOVERNANCE_PROPOSAL_LEAF_DOMAIN,
+                self.governance_proposals.iter(),
+            )?,
+            governance_vote_root: ordered_value_root(
+                GOVERNANCE_VOTE_LEAF_DOMAIN,
+                self.governance_votes.iter(),
+            )?,
             // Interim contract runtime committed by its own ordered sub-roots (Phase
             // 7a, ADR-0014): registering a contract changes `contract_root`; any
             // contract state write changes `contract_state_root`; either changes the
@@ -2314,6 +2518,8 @@ impl ChainState {
             mandate_escrow: self.mandate_escrow,
             token_deposits: self.token_deposits,
             nft_deposits: self.nft_deposits,
+            governance_deposits: self.governance_deposits,
+            governance_treasury: self.governance_treasury,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
@@ -5006,6 +5212,480 @@ impl ChainState {
                     new_authority: *new_authority,
                 });
             }
+            Operation::CreateGovernanceInstance {
+                namespace,
+                create_nonce,
+                weight_token,
+                config: gov_config,
+            } => {
+                // Self-contained native governance instance creation (§15): records
+                // an instance in its OWN identity space and locks a NON-REFUNDABLE
+                // native creation deposit (liquid -> governance_deposits) as the
+                // anti-spam price. Creation NEVER mints or burns native WEBC. The
+                // account key is declared explicitly so a non-default fee lane is
+                // covered (mirrors CreateToken).
+                let instance_id =
+                    GovernanceInstanceId::derive(*namespace, tx.sender, *create_nonce);
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::governance_instance(instance_id))?;
+                access.read(StateKey::token(*weight_token))?;
+                if self.governance_instances.contains_key(&instance_id) {
+                    return Err(ChainError::GovernanceInstanceAlreadyExists);
+                }
+                // The instance must bind an EXISTING fungible token; otherwise votes
+                // and quorum could never resolve.
+                if !self.tokens.contains_key(weight_token) {
+                    return Err(ChainError::TokenNotFound);
+                }
+                // Validate the config before locking any deposit; a malformed config
+                // fails closed and rolls the whole transaction back.
+                let instance = GovernanceInstance::new(tx.sender, *weight_token, *gov_config)?;
+                let deposit = config.governance.creation_deposit;
+                self.debit_native(tx.sender, deposit)?;
+                self.governance_deposits = self
+                    .governance_deposits
+                    .checked_add(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.governance_instances.insert(instance_id, instance);
+                events.push(Event::GovernanceInstanceCreated {
+                    instance_id,
+                    creator: tx.sender,
+                    namespace: *namespace,
+                    weight_token: *weight_token,
+                    deposit,
+                });
+            }
+            Operation::FundGovernanceTreasury {
+                instance_id,
+                amount,
+            } => {
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::governance_instance(*instance_id))?;
+                if !self.governance_instances.contains_key(instance_id) {
+                    return Err(ChainError::GovernanceInstanceNotFound);
+                }
+                // Move native units liquid -> treasury bucket (supply-neutral). The
+                // debit fails closed if the funder cannot afford it, so the treasury
+                // can never grow without a matching liquid decrease.
+                self.debit_native(tx.sender, *amount)?;
+                self.governance_treasury = self
+                    .governance_treasury
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let instance = self
+                    .governance_instances
+                    .get_mut(instance_id)
+                    .ok_or(ChainError::GovernanceInstanceNotFound)?;
+                instance.treasury = instance
+                    .treasury
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let treasury = instance.treasury;
+                events.push(Event::GovernanceTreasuryFunded {
+                    instance_id: *instance_id,
+                    funder: tx.sender,
+                    amount: *amount,
+                    treasury,
+                });
+            }
+            Operation::OpenProposal {
+                instance_id,
+                action,
+            } => {
+                access.write(StateKey::governance_instance(*instance_id))?;
+                // Read the instance (weight token, config, nonce, treasury) under an
+                // immutable borrow first, then mutate after the proposal write.
+                let (weight_token, gov_config, proposal_nonce, treasury) = {
+                    let instance = self
+                        .governance_instances
+                        .get(instance_id)
+                        .ok_or(ChainError::GovernanceInstanceNotFound)?;
+                    (
+                        instance.weight_token,
+                        instance.config,
+                        instance.next_proposal_nonce,
+                        instance.treasury,
+                    )
+                };
+                // The proposer must currently hold at least the proposal threshold of
+                // the weight token. The balance key is declared read (state-derived
+                // weight token); recorded here so observed == declared on success.
+                access.read(StateKey::token_balance(weight_token, tx.sender))?;
+                let held = self
+                    .token_balances
+                    .get(&(weight_token, tx.sender))
+                    .copied()
+                    .unwrap_or(Amount::ZERO);
+                if held < gov_config.proposal_threshold {
+                    return Err(ChainError::GovernanceProposalThresholdNotMet);
+                }
+                // Sanity-check a treasury payout against the CURRENT treasury.
+                // Execution re-checks the LIVE treasury (mandatory), since it can
+                // shrink via a competing payout between open and execute.
+                if let GovernanceAction::TreasuryTransfer { amount, .. } = action {
+                    if *amount > treasury {
+                        return Err(ChainError::GovernanceTreasuryInsufficient);
+                    }
+                }
+                let proposal_id = ProposalId::derive(*instance_id, proposal_nonce);
+                let created_epoch = self.current_epoch;
+                let voting_ends_epoch = created_epoch
+                    .checked_add(gov_config.voting_period_epochs)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                // The new proposal key is state-dependent (the nonce) and cannot be
+                // pre-declared in the signed access list, so the proposal is created
+                // under the instance record's WRITE scope (mirrors MintNft's fresh
+                // serial): the instance record is declared read_write, so every open
+                // of this instance serializes on it and no concurrent transaction can
+                // reference this fresh proposal id.
+                self.governance_proposals.insert(
+                    proposal_id,
+                    GovernanceProposal {
+                        instance_id: *instance_id,
+                        proposer: tx.sender,
+                        weight_token,
+                        config: gov_config,
+                        action: action.clone(),
+                        created_epoch,
+                        voting_ends_epoch,
+                        eta_epoch: None,
+                        status: GovProposalStatus::Active,
+                        yes: Amount::ZERO,
+                        no: Amount::ZERO,
+                        abstain: Amount::ZERO,
+                    },
+                );
+                // Bump the monotonic nonce after the proposal write releases the
+                // borrow, so a proposal id is never reused.
+                let instance = self
+                    .governance_instances
+                    .get_mut(instance_id)
+                    .ok_or(ChainError::GovernanceInstanceNotFound)?;
+                instance.next_proposal_nonce = proposal_nonce
+                    .checked_add(1)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::GovernanceProposalOpened {
+                    proposal_id,
+                    instance_id: *instance_id,
+                    proposer: tx.sender,
+                    voting_ends_epoch,
+                });
+            }
+            Operation::CastVote {
+                proposal_id,
+                choice,
+                weight_amount,
+            } => {
+                access.write(StateKey::governance_proposal(*proposal_id))?;
+                access.write(StateKey::governance_vote(*proposal_id, tx.sender))?;
+                // Read the proposal (weight token, status, voting window) under an
+                // immutable borrow first.
+                let (weight_token, status, voting_ends) = {
+                    let proposal = self
+                        .governance_proposals
+                        .get(proposal_id)
+                        .ok_or(ChainError::GovernanceProposalNotFound)?;
+                    (
+                        proposal.weight_token,
+                        proposal.status,
+                        proposal.voting_ends_epoch,
+                    )
+                };
+                let escrow = gov_vote_escrow_address(*proposal_id);
+                // Declare the token record (paused), both freeze markers, and both
+                // balance keys UNCONDITIONALLY before the value checks, so the
+                // observed access always equals the declaration and the parallel
+                // scheduler serializes this vote against a freeze/thaw of either the
+                // voter or the escrow (mirrors TransferToken).
+                access.read(StateKey::token(weight_token))?;
+                access.read(StateKey::token_freeze(weight_token, tx.sender))?;
+                access.read(StateKey::token_freeze(weight_token, escrow))?;
+                access.write(StateKey::token_balance(weight_token, tx.sender))?;
+                access.write(StateKey::token_balance(weight_token, escrow))?;
+                // A zero-weight lock is a no-op that would still block a later real
+                // vote (the lock is the double-vote guard), so reject it.
+                if weight_amount.is_zero() {
+                    return Err(ChainError::GovernanceVoteWeightZero);
+                }
+                if status != GovProposalStatus::Active {
+                    return Err(ChainError::GovernanceProposalNotActive);
+                }
+                if self.current_epoch > voting_ends {
+                    return Err(ChainError::GovernanceVotingClosed);
+                }
+                // A voter may vote only ONCE per proposal (they already locked).
+                if self
+                    .governance_votes
+                    .contains_key(&(*proposal_id, tx.sender))
+                {
+                    return Err(ChainError::GovernanceAlreadyVoted);
+                }
+                // Respect the weight token's freeze/pause exactly as TransferToken
+                // does: a paused token or a frozen voter/escrow blocks the lock.
+                if self
+                    .tokens
+                    .get(&weight_token)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .paused
+                {
+                    return Err(ChainError::TokenPaused);
+                }
+                if self
+                    .frozen_token_accounts
+                    .contains(&(weight_token, tx.sender))
+                    || self.frozen_token_accounts.contains(&(weight_token, escrow))
+                {
+                    return Err(ChainError::TokenAccountFrozen);
+                }
+                // LOCK: move weight-token units voter -> escrow. The debit fails
+                // closed on an insufficient balance, so a voter locks only what they
+                // hold. Because this is a MOVE within `token_balances`, the per-token
+                // invariant `sum(balances) == issued_supply` is preserved, and the
+                // recorded weight is the IMMUTABLE locked amount — a later transfer or
+                // mint cannot inflate it (no after-snapshot manipulation), and the
+                // units are no longer in the voter's balance to lock again (no double
+                // voting).
+                self.debit_token(weight_token, tx.sender, *weight_amount)?;
+                self.credit_token(weight_token, escrow, *weight_amount)?;
+                self.governance_votes.insert(
+                    (*proposal_id, tx.sender),
+                    VoteRecord {
+                        choice: *choice,
+                        weight: *weight_amount,
+                    },
+                );
+                let proposal = self
+                    .governance_proposals
+                    .get_mut(proposal_id)
+                    .ok_or(ChainError::GovernanceProposalNotFound)?;
+                match choice {
+                    VoteChoice::Yes => {
+                        proposal.yes = proposal
+                            .yes
+                            .checked_add(*weight_amount)
+                            .ok_or(ChainError::ArithmeticOverflow)?
+                    }
+                    VoteChoice::No => {
+                        proposal.no = proposal
+                            .no
+                            .checked_add(*weight_amount)
+                            .ok_or(ChainError::ArithmeticOverflow)?
+                    }
+                    VoteChoice::Abstain => {
+                        proposal.abstain = proposal
+                            .abstain
+                            .checked_add(*weight_amount)
+                            .ok_or(ChainError::ArithmeticOverflow)?
+                    }
+                }
+                events.push(Event::GovernanceVoteCast {
+                    proposal_id: *proposal_id,
+                    voter: tx.sender,
+                    choice: *choice,
+                    weight: *weight_amount,
+                });
+            }
+            Operation::ResolveProposal { proposal_id } => {
+                access.write(StateKey::governance_proposal(*proposal_id))?;
+                let (weight_token, status, voting_ends) = {
+                    let proposal = self
+                        .governance_proposals
+                        .get(proposal_id)
+                        .ok_or(ChainError::GovernanceProposalNotFound)?;
+                    (
+                        proposal.weight_token,
+                        proposal.status,
+                        proposal.voting_ends_epoch,
+                    )
+                };
+                // The weight token's issued supply is the quorum DENOMINATOR (a
+                // documented choice: voting WEIGHT is the immutable locked amount, so
+                // double-voting/weight-manipulation are prevented regardless of
+                // supply; the denominator only scales the participation bar). Declared
+                // read so resolve serializes against a concurrent mint/burn.
+                access.read(StateKey::token(weight_token))?;
+                // Idempotent: only an Active proposal may be resolved.
+                if status != GovProposalStatus::Active {
+                    return Err(ChainError::GovernanceAlreadyResolved);
+                }
+                // Callable only AFTER voting ends.
+                if self.current_epoch <= voting_ends {
+                    return Err(ChainError::GovernanceVotingOpen);
+                }
+                let issued_supply = self
+                    .tokens
+                    .get(&weight_token)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .issued_supply;
+                let (new_status, eta) = {
+                    let proposal = self
+                        .governance_proposals
+                        .get(proposal_id)
+                        .ok_or(ChainError::GovernanceProposalNotFound)?;
+                    // Both quorum-not-met and approval-not-met resolve to Defeated;
+                    // only quorum AND approval yield Passed (with the timelock eta).
+                    if proposal.quorum_met(issued_supply)? && proposal.approval_met()? {
+                        let eta = proposal
+                            .voting_ends_epoch
+                            .checked_add(proposal.config.timelock_epochs)
+                            .ok_or(ChainError::ArithmeticOverflow)?;
+                        (GovProposalStatus::Passed, Some(eta))
+                    } else {
+                        (GovProposalStatus::Defeated, None)
+                    }
+                };
+                let proposal = self
+                    .governance_proposals
+                    .get_mut(proposal_id)
+                    .ok_or(ChainError::GovernanceProposalNotFound)?;
+                proposal.status = new_status;
+                proposal.eta_epoch = eta;
+                events.push(Event::GovernanceProposalResolved {
+                    proposal_id: *proposal_id,
+                    status: new_status,
+                    eta_epoch: eta,
+                });
+            }
+            Operation::ExecuteProposal { proposal_id } => {
+                access.write(StateKey::governance_proposal(*proposal_id))?;
+                let (instance_id, action, status, eta_opt, voting_period) = {
+                    let proposal = self
+                        .governance_proposals
+                        .get(proposal_id)
+                        .ok_or(ChainError::GovernanceProposalNotFound)?;
+                    (
+                        proposal.instance_id,
+                        proposal.action.clone(),
+                        proposal.status,
+                        proposal.eta_epoch,
+                        proposal.config.voting_period_epochs,
+                    )
+                };
+                if status != GovProposalStatus::Passed {
+                    return Err(ChainError::GovernanceProposalNotPassed);
+                }
+                // A Passed proposal always carries an eta (set at resolve).
+                let eta = eta_opt.ok_or(ChainError::GovernanceProposalNotPassed)?;
+                if self.current_epoch < eta {
+                    return Err(ChainError::GovernanceTimelockNotElapsed);
+                }
+                // Execution window `[eta, eta + voting_period)`: past it a stale
+                // approval can no longer act on the treasury and the proposal expires
+                // (the canonical governance "expired" state). `voting_period` is
+                // non-zero, so the window is always non-empty.
+                let window_end = eta
+                    .checked_add(voting_period)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let expired = self.current_epoch >= window_end;
+                // Record the payout access in BOTH branches so observed == declared
+                // regardless of expiry: a TreasuryTransfer always declares the
+                // instance + recipient keys; a Signaling proposal declares neither.
+                match &action {
+                    GovernanceAction::TreasuryTransfer { recipient, amount } => {
+                        access.write(StateKey::governance_instance(instance_id))?;
+                        access.write(StateKey::account(*recipient))?;
+                        if expired {
+                            let proposal = self
+                                .governance_proposals
+                                .get_mut(proposal_id)
+                                .ok_or(ChainError::GovernanceProposalNotFound)?;
+                            proposal.status = GovProposalStatus::Expired;
+                            events.push(Event::GovernanceProposalExpired {
+                                proposal_id: *proposal_id,
+                            });
+                        } else {
+                            // RE-CHECK the LIVE treasury (fail-closed): it may have
+                            // shrunk since open/resolve via a competing payout.
+                            let treasury = self
+                                .governance_instances
+                                .get(&instance_id)
+                                .ok_or(ChainError::GovernanceInstanceNotFound)?
+                                .treasury;
+                            if *amount > treasury {
+                                return Err(ChainError::GovernanceTreasuryInsufficient);
+                            }
+                            // Move native units treasury bucket -> recipient liquid
+                            // (supply-neutral).
+                            self.governance_treasury = self
+                                .governance_treasury
+                                .checked_sub(*amount)
+                                .ok_or(ChainError::ArithmeticOverflow)?;
+                            let instance = self
+                                .governance_instances
+                                .get_mut(&instance_id)
+                                .ok_or(ChainError::GovernanceInstanceNotFound)?;
+                            instance.treasury = instance
+                                .treasury
+                                .checked_sub(*amount)
+                                .ok_or(ChainError::ArithmeticOverflow)?;
+                            self.credit_native(*recipient, *amount)?;
+                            let proposal = self
+                                .governance_proposals
+                                .get_mut(proposal_id)
+                                .ok_or(ChainError::GovernanceProposalNotFound)?;
+                            proposal.status = GovProposalStatus::Executed;
+                            events.push(Event::GovernanceProposalExecuted {
+                                proposal_id: *proposal_id,
+                                instance_id,
+                            });
+                        }
+                    }
+                    GovernanceAction::Signaling => {
+                        let proposal = self
+                            .governance_proposals
+                            .get_mut(proposal_id)
+                            .ok_or(ChainError::GovernanceProposalNotFound)?;
+                        if expired {
+                            proposal.status = GovProposalStatus::Expired;
+                            events.push(Event::GovernanceProposalExpired {
+                                proposal_id: *proposal_id,
+                            });
+                        } else {
+                            proposal.status = GovProposalStatus::Executed;
+                            events.push(Event::GovernanceProposalExecuted {
+                                proposal_id: *proposal_id,
+                                instance_id,
+                            });
+                        }
+                    }
+                }
+            }
+            Operation::ReclaimVote { proposal_id } => {
+                access.read(StateKey::governance_proposal(*proposal_id))?;
+                access.write(StateKey::governance_vote(*proposal_id, tx.sender))?;
+                let (weight_token, status) = {
+                    let proposal = self
+                        .governance_proposals
+                        .get(proposal_id)
+                        .ok_or(ChainError::GovernanceProposalNotFound)?;
+                    (proposal.weight_token, proposal.status)
+                };
+                let escrow = gov_vote_escrow_address(*proposal_id);
+                access.write(StateKey::token_balance(weight_token, escrow))?;
+                access.write(StateKey::token_balance(weight_token, tx.sender))?;
+                // Reclaim only AFTER the proposal has resolved (Active is the only
+                // non-resolved status).
+                if !status.is_resolved() {
+                    return Err(ChainError::GovernanceProposalNotResolved);
+                }
+                // The voter must have a lock to reclaim.
+                let weight = self
+                    .governance_votes
+                    .get(&(*proposal_id, tx.sender))
+                    .ok_or(ChainError::GovernanceNothingToReclaim)?
+                    .weight;
+                // Move the locked units escrow -> voter (the reverse of the vote
+                // lock), preserving `sum(balances) == issued_supply`. The debit
+                // cannot underflow: the escrow holds exactly the sum of live locks.
+                self.debit_token(weight_token, escrow, weight)?;
+                self.credit_token(weight_token, tx.sender, weight)?;
+                self.governance_votes.remove(&(*proposal_id, tx.sender));
+                events.push(Event::GovernanceVoteReclaimed {
+                    proposal_id: *proposal_id,
+                    voter: tx.sender,
+                    weight,
+                });
+            }
             Operation::RegisterContract { manifest } => {
                 // Default lane only: the registration fee draws from and burns
                 // liquid (supply-neutral, like feed creation). The manifest record
@@ -6804,6 +7484,12 @@ mod tests {
             }),
             ("nft_deposits", |s| {
                 s.nft_deposits = Amount::from_units(s.nft_deposits.0 + 1)
+            }),
+            ("governance_deposits", |s| {
+                s.governance_deposits = Amount::from_units(s.governance_deposits.0 + 1)
+            }),
+            ("governance_treasury", |s| {
+                s.governance_treasury = Amount::from_units(s.governance_treasury.0 + 1)
             }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)

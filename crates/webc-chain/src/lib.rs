@@ -82,9 +82,9 @@ pub use fees::{
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
 pub use governance::{
     gov_vote_escrow_address, GovProposalStatus, GovernanceAction, GovernanceConfig,
-    GovernanceInstance, GovernanceInstanceId, Proposal as GovernanceProposal, ProposalId,
-    VoteChoice, VoteRecord, GOVERNANCE_INSTANCE_LEAF_DOMAIN, GOVERNANCE_PROPOSAL_LEAF_DOMAIN,
-    GOVERNANCE_VOTE_LEAF_DOMAIN, MAX_GOVERNANCE_BPS,
+    GovernanceInstance, GovernanceInstanceId, GovernanceParams, Proposal as GovernanceProposal,
+    ProposalId, VoteChoice, VoteRecord, GOVERNANCE_INSTANCE_LEAF_DOMAIN,
+    GOVERNANCE_PROPOSAL_LEAF_DOMAIN, GOVERNANCE_VOTE_LEAF_DOMAIN, MAX_GOVERNANCE_BPS,
 };
 pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
