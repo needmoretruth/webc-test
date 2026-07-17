@@ -563,6 +563,23 @@ impl<K: KvStore> NodeService<K> {
     }
 }
 
+impl<K: KvStore> NodeService<K> {
+    /// Submits `tx` and immediately seals a block so the transaction is final.
+    ///
+    /// A convenience for local/devnet drivers — the CLI staking subcommands and
+    /// tests — that want a submitted transaction to reach a committed block in a
+    /// single call. `now_ms` is supplied by the caller (this reads no clock), so
+    /// the flow stays deterministic. It errors if the mempool rejects the
+    /// transaction or if, unexpectedly, nothing seals (e.g. the transaction was
+    /// not runnable at selection time).
+    pub fn submit_and_seal(&self, tx: Transaction, now_ms: u64) -> Result<SealSummary, ApiError> {
+        self.submit_transaction(tx, now_ms)?;
+        self.seal_block(now_ms)?.ok_or_else(|| {
+            ApiError::Internal("submitted transaction did not seal into a block".to_owned())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,5 +903,21 @@ mod tests {
             .submit_transaction(transfer(&alice, &bob, 10, 0), NOW)
             .unwrap_err();
         assert!(matches!(err, ApiError::Rejected(_)));
+    }
+
+    #[test]
+    fn submit_and_seal_commits_in_one_call() {
+        let (service, alice, bob, _faucet) = build_service(false);
+        let summary = service
+            .submit_and_seal(transfer(&alice, &bob, 5, 0), NOW)
+            .expect("submit and seal");
+        assert_eq!(summary.height, 1);
+        assert_eq!(summary.transaction_count, 1);
+        // The block is final: bob was paid and the mempool drained.
+        assert_eq!(
+            service.account(bob.address()).unwrap().account.balance,
+            Amount::from_webc(1_005)
+        );
+        assert_eq!(service.health().mempool_size, 0);
     }
 }
