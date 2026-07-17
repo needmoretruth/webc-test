@@ -27,7 +27,7 @@
 //! `state` module owns the committed maps (`contracts`, `contract_state`), the
 //! register/invoke state transitions, the fee burn, and the
 //! state-commitment/access-list wiring; it drives the pure logic here through a
-//! [`StateAccessRecorder`] so a contract fails closed on any undeclared access
+//! `StateAccessRecorder` so a contract fails closed on any undeclared access
 //! exactly like a native operation.
 //!
 //! Determinism: no wall clock, RNG, or float on any path. Block epoch is injected
@@ -45,7 +45,7 @@
 //! footprint, registrant ownership) before it is committed; a duplicate `code_id`
 //! is rejected. At invocation the signed operation is bound to the committed
 //! manifest (namespace and declared footprint must match exactly), the declared
-//! footprint is recorded through the shared [`StateAccessRecorder`] (so an
+//! footprint is recorded through the shared `StateAccessRecorder` (so an
 //! omitted or padded access list fails closed), and the handler can reach state
 //! only through [`ContractContext`], which refuses any key outside the footprint.
 //! The only trust surface is this audited framework and its built-in handlers.
@@ -203,7 +203,7 @@ pub struct ContractManifest {
     /// The declared application key-hashes this contract may read and write,
     /// strictly ascending. Each becomes a `StateKey::application(namespace,
     /// key_hash)` in an invocation's signed access list, so the contract's whole
-    /// declared footprint is enforced by [`StateAccessRecorder`].
+    /// declared footprint is enforced by `StateAccessRecorder`.
     pub footprint: Vec<Hash256>,
     /// Account that registered (and owns) this contract record.
     pub owner: Address,
@@ -359,19 +359,24 @@ pub trait Contract {
     fn call(&self, ctx: &mut ContractContext, input: &[u8]) -> Result<Vec<u8>, ContractError>;
 }
 
+/// A contract's in-flight working set: each declared footprint key mapped to its
+/// current value (`None` if unset). Loaded from committed state before a handler
+/// runs and returned by `ContractContext::into_writes` for the caller to persist.
+pub type ContractWorkingSet = BTreeMap<Hash256, Option<Vec<u8>>>;
+
 /// The bounded execution environment a [`Contract`] handler may touch.
 ///
-/// Routes every state access through the shared [`StateAccessRecorder`] against
+/// Routes every state access through the shared `StateAccessRecorder` against
 /// the manifest's declared footprint under the contract's namespace, so a handler
 /// that reaches for an undeclared key — or whose signed access list omits a
 /// declared key — fails closed exactly like native execution. Working values are
 /// loaded from committed state before the handler runs and returned by
-/// [`ContractContext::into_writes`] afterward; the caller persists them only on
+/// `ContractContext::into_writes` afterward; the caller persists them only on
 /// success.
 pub struct ContractContext<'a> {
     namespace: Hash256,
     footprint: &'a [Hash256],
-    working: BTreeMap<Hash256, Option<Vec<u8>>>,
+    working: ContractWorkingSet,
     touched: BTreeSet<Hash256>,
     recorder: &'a mut StateAccessRecorder,
     meter: &'a mut GasMeter,
@@ -388,7 +393,7 @@ impl<'a> ContractContext<'a> {
     pub(crate) fn new(
         namespace: Hash256,
         footprint: &'a [Hash256],
-        working: BTreeMap<Hash256, Option<Vec<u8>>>,
+        working: ContractWorkingSet,
         recorder: &'a mut StateAccessRecorder,
         meter: &'a mut GasMeter,
         epoch: u64,
@@ -480,10 +485,10 @@ impl<'a> ContractContext<'a> {
     ///
     /// Recording the untouched footprint keys makes the observed access exactly
     /// equal the declared access, so the surrounding transaction's
-    /// [`StateAccessRecorder::finish`] check (every declared key must be used)
+    /// `StateAccessRecorder::finish` check (every declared key must be used)
     /// passes — the contract's declared footprint is always fully accounted, which
     /// is what keeps two invocations of the same contract serializable.
-    pub(crate) fn into_writes(mut self) -> Result<BTreeMap<Hash256, Option<Vec<u8>>>, ContractError> {
+    pub(crate) fn into_writes(mut self) -> Result<ContractWorkingSet, ContractError> {
         let untouched: Vec<Hash256> = self
             .footprint
             .iter()
@@ -776,7 +781,10 @@ mod tests {
         assert_eq!(meter.consumed(), 500);
         assert!(matches!(meter.charge(600), Err(ContractError::OutOfGas)));
         // Admission above the cap is rejected outright.
-        assert!(matches!(GasMeter::new(10, 20), Err(ContractError::OutOfGas)));
+        assert!(matches!(
+            GasMeter::new(10, 20),
+            Err(ContractError::OutOfGas)
+        ));
     }
 
     /// Drives the key/value handler directly through a context with a real
@@ -784,10 +792,10 @@ mod tests {
     /// `state` module invokes it.
     fn run_kv(
         footprint: &[Hash256],
-        working: BTreeMap<Hash256, Option<Vec<u8>>>,
+        working: ContractWorkingSet,
         input: &[u8],
         gas_limit: u64,
-    ) -> Result<(Vec<u8>, BTreeMap<Hash256, Option<Vec<u8>>>, u64), ContractError> {
+    ) -> Result<(Vec<u8>, ContractWorkingSet, u64), ContractError> {
         let namespace = key(0x11);
         let declared: Vec<StateKey> = footprint
             .iter()
@@ -800,7 +808,9 @@ mod tests {
         let output = KeyValueContract.call(&mut ctx, input)?;
         let writes = ctx.into_writes()?;
         let consumed = meter.consumed();
-        recorder.finish().expect("every declared footprint key was used");
+        recorder
+            .finish()
+            .expect("every declared footprint key was used");
         Ok((output, writes, consumed))
     }
 
@@ -833,8 +843,13 @@ mod tests {
         // Increment an existing counter.
         let mut working = BTreeMap::new();
         working.insert(k, Some(5u128.to_be_bytes().to_vec()));
-        let (out, _writes, _) =
-            run_kv(&footprint, working, &kv_command::increment(k, 37), 1_000_000).expect("inc2");
+        let (out, _writes, _) = run_kv(
+            &footprint,
+            working,
+            &kv_command::increment(k, 37),
+            1_000_000,
+        )
+        .expect("inc2");
         assert_eq!(out, 42u128.to_be_bytes().to_vec());
 
         // Delete.
@@ -897,7 +912,12 @@ mod tests {
         let footprint = vec![k];
         // A tiny gas budget cannot cover the step + read + write of a set.
         assert!(matches!(
-            run_kv(&footprint, BTreeMap::new(), &kv_command::set(k, b"hello"), 100),
+            run_kv(
+                &footprint,
+                BTreeMap::new(),
+                &kv_command::set(k, b"hello"),
+                100
+            ),
             Err(ContractError::OutOfGas)
         ));
     }
