@@ -18957,6 +18957,7 @@ mod tests {
     }
 
     /// Casts a lock-to-vote ballot.
+    #[allow(clippy::too_many_arguments)]
     fn gov_vote(
         state: &mut ChainState,
         config: &ChainConfig,
@@ -19762,10 +19763,9 @@ mod tests {
         gov_reclaim(&mut state, &config, &voter_a, 3, proposal_id, token_id).expect("reclaim");
         assert_eq!(token_balance(&state, token_id, voter_a.address()), 600);
         assert_eq!(escrow_balance(&state, token_id, proposal_id), 0);
-        assert!(state
+        assert!(!state
             .governance_votes
-            .get(&(proposal_id, voter_a.address()))
-            .is_none());
+            .contains_key(&(proposal_id, voter_a.address())));
         assert!(state.token_supply_report(token_id).unwrap().balanced);
 
         // A second reclaim finds nothing locked.
