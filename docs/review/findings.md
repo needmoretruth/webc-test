@@ -362,14 +362,22 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 ## webc-chain — supply / staking / bridge (verified findings)
 
-- **G1 — MEDIUM — genesis supply invariant is tautological; it never pins the
-  10,000,000 WEBC total.** `state.rs:486-488, 551-564`: `from_genesis` rejects
-  genesis only when `SupplyInvariantReport.balanced` is false, but `balanced` is
-  `accounted == self.minted_supply` and `minted_supply` is DEFINED as the checked
-  sum of genesis balances — a self-referential identity that always holds. A
-  genesis with the wrong total supply would still "balance." CONFIRMED. Fix: add an
-  explicit `minted_supply == Amount::from_webc(10_000_000)` check (or a
-  `ChainConfig` expected-total) in `from_genesis`.
+- **G1 — MEDIUM — RESOLVED (commit `9c77a35`) — genesis supply invariant is
+  tautological; it never pins the 10,000,000 WEBC total.** `state.rs:486-488,
+  551-564`: `from_genesis` rejects genesis only when
+  `SupplyInvariantReport.balanced` is false, but `balanced` is `accounted ==
+  self.minted_supply` and `minted_supply` is DEFINED as the checked sum of genesis
+  balances — a self-referential identity that always holds. A genesis with the
+  wrong total supply would still "balance." CONFIRMED. **Fix:** added
+  `ChainConfig::expected_total_supply: Option<Amount>` (`#[serde(default)]` →
+  `None`, so trusted in-crate test fixtures are unaffected) and a
+  `GENESIS_TOTAL_SUPPLY = Amount::from_webc(10_000_000)` const (`from_webc` is now
+  `const`); `from_genesis` rejects a mismatched total via the new
+  `ChainError::GenesisSupplyMismatch`. Devnet genesis now pins the same
+  10,000,000 WEBC as mainnet in the single valueless faucet account. Reproduced
+  first by `genesis_pins_the_declared_total_supply`,
+  `genesis_accepts_an_allocation_matching_the_declared_total`, and
+  `genesis_without_a_declared_total_skips_the_pin`.
 - **U1 — MEDIUM — `slash_locked` over-penalizes and ignores the slashable
   window.** `unbonding.rs:285-320`: it takes no `epoch` parameter and applies the
   penalty to `request.withdrawable` (principal that `mature`/`advance_epoch` has
@@ -383,12 +391,20 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
   `queued_for` re-scan them every epoch (unbounded state + growing per-epoch cost).
   Fix: prune fully-settled requests past any replay window, or move audit history to
   a separately-bounded structure.
-- **B1 — MEDIUM — unbounded bridge-recipient hex decode.** `hex_bytes.rs:32-38`:
-  `deserialize` runs `hex::decode(text)` with no length bound; it backs the
-  `recipient: Vec<u8>` of `BridgeLock`/`BridgeBurn` (`transaction.rs:266,278`),
-  unlike object payloads which use `object::bounded_hex`. PLAUSIBLE (real code gap;
-  exploitability bounded by the outer frame/body limits). Fix: a bounded-hex
-  deserializer / `MAX_BRIDGE_RECIPIENT_BYTES` cap rejecting over-length at decode.
+- **B1 — MEDIUM — RESOLVED (commit `09e6165`) — unbounded bridge-recipient hex
+  decode.** `hex_bytes.rs:32-38`: `deserialize` runs `hex::decode(text)` with no
+  length bound; it backs the `recipient: Vec<u8>` of `BridgeLock`/`BridgeBurn`
+  (`transaction.rs:266,278`), unlike object payloads which use
+  `object::bounded_hex`. PLAUSIBLE (real code gap; exploitability bounded by the
+  outer frame/body limits). **Fix:** added `bridge::bounded_recipient_hex` (checks
+  length before decode, `MAX_BRIDGE_RECIPIENT_BYTES = 128`, even-length check),
+  applied to `BridgeLock`/`BridgeBurn` recipients and `BridgeMessage`
+  sender/recipient. The shared `hex_bytes` stays unbounded for the larger
+  post-quantum key fields. Serialized bytes are unchanged, so canonical hashes and
+  the cross-language SDK fixtures still pass. Reproduced first by
+  `bridge_lock_recipient_is_bounded_before_decode`,
+  `bridge_message_rejects_oversized_address_before_decode`, and
+  `bridge_message_rejects_odd_length_address_hex`.
 
 ### Fund arithmetic (dedicated pass — completed)
 
@@ -464,12 +480,14 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 ## webc-chain — transaction wire
 
-- **T1 — LOW — `Operation` enum lacks `#[serde(deny_unknown_fields)]`.**
-  `transaction.rs:95-96`: every sibling wire type (`AccessList`, `FeeBid`,
-  `Transaction`) has it; the enum variants do not, so an externally-tagged variant
-  may accept unknown fields. CONFIRMED (low impact — the signature still binds the
-  canonical bytes, but strict decode is the project's own standard). Fix: add
-  `deny_unknown_fields` to `Operation`.
+- **T1 — LOW — RESOLVED (commit `09e6165`) — `Operation` enum lacks
+  `#[serde(deny_unknown_fields)]`.** `transaction.rs:95-96`: every sibling wire
+  type (`AccessList`, `FeeBid`, `Transaction`) has it; the enum variants do not, so
+  an externally-tagged variant may accept unknown fields. CONFIRMED (low impact —
+  the signature still binds the canonical bytes, but strict decode is the project's
+  own standard). **Fix:** added `#[serde(deny_unknown_fields)]` to `Operation`;
+  serialization is unchanged. Reproduced first by
+  `operation_rejects_unknown_variant_fields`.
 
 ## Dependency supply chain
 
