@@ -257,6 +257,9 @@ export type StateKeyKindJson =
   | { Mandate: { mandate_id: HexString } }
   // --- Service registry (Phase 9b, §15.5) ---------------------------------
   | { Service: { service_id: HexString } }
+  // --- Native oracle (Phase 7, §15.17) ------------------------------------
+  | { OracleFeed: { feed_id: HexString } }
+  | { OracleReporter: { feed_id: HexString; reporter: WebcAddress } }
   | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
@@ -508,7 +511,13 @@ export type OperationJson =
         service_id: HexString;
         amount: string;
       };
-    };
+    }
+  // --- Native oracle (Phase 7, §15.17) ------------------------------------
+  | { CreateFeed: { feed_id: HexString } }
+  | { RegisterReporter: { feed_id: HexString } }
+  | { DeregisterReporter: { feed_id: HexString } }
+  | { SubmitReport: { feed_id: HexString; value: string } }
+  | { PayFeedRead: { feed_id: HexString; amount: string } };
 
 /** Lifecycle status of a registered service, mirroring Rust `ServiceStatus`. */
 export type ServiceStatusJson = "Active" | "Paused";

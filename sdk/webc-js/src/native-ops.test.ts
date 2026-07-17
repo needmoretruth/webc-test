@@ -25,10 +25,17 @@ import {
   burnNft,
   burnToken,
   castVote,
+  createFeed,
   createGovernanceInstance,
   createNftCollection,
   createToken,
   defaultAccessList,
+  deregisterReporter,
+  oracleFeedKey,
+  oracleReporterKey,
+  payFeedRead,
+  registerReporter,
+  submitReport,
   defaultAccessListAsync,
   deriveGovernanceInstanceIdHex,
   deriveGovVoteEscrowAddress,
@@ -831,6 +838,66 @@ describe("service registry state key and access lists", () => {
       mandateKey(ID_99),
       feeAccumulatorKey(sender, DEFAULT_LANE),
       accountKey(owner),
+    ]);
+  });
+});
+
+describe("native oracle operation wire vectors", () => {
+  it("pins CreateFeed / Register / Deregister / SubmitReport / PayFeedRead JSON", () => {
+    expect(canonicalJson(createFeed(ID_88))).toBe(
+      `{"CreateFeed":{"feed_id":"${ID_88}"}}`,
+    );
+    expect(canonicalJson(registerReporter(ID_88))).toBe(
+      `{"RegisterReporter":{"feed_id":"${ID_88}"}}`,
+    );
+    expect(canonicalJson(deregisterReporter(ID_88))).toBe(
+      `{"DeregisterReporter":{"feed_id":"${ID_88}"}}`,
+    );
+    // The report value is a SIGNED decimal string, never a bare JSON number.
+    expect(canonicalJson(submitReport(ID_88, "-123456789012345"))).toBe(
+      `{"SubmitReport":{"feed_id":"${ID_88}","value":"-123456789012345"}}`,
+    );
+    expect(canonicalJson(payFeedRead(ID_88, "42"))).toBe(
+      `{"PayFeedRead":{"amount":"42","feed_id":"${ID_88}"}}`,
+    );
+  });
+
+  it("accepts i128 extremes and rejects a non-canonical signed value", () => {
+    const I128_MAX = "170141183460469231731687303715884105727";
+    const I128_MIN = "-170141183460469231731687303715884105728";
+    expect(() => submitReport(ID_88, I128_MAX)).not.toThrow();
+    expect(() => submitReport(ID_88, I128_MIN)).not.toThrow();
+    expect(() => submitReport(ID_88, "-0")).toThrow();
+    expect(() => submitReport(ID_88, "007")).toThrow();
+    expect(() =>
+      submitReport(ID_88, "170141183460469231731687303715884105728"),
+    ).toThrow(); // i128::MAX + 1
+  });
+});
+
+describe("native oracle state keys and access lists", () => {
+  it("pins OracleFeed / OracleReporter canonical JSON", async () => {
+    const reporter = await addressFromSeedByte(7);
+    expect(canonicalJson(oracleFeedKey(ID_88))).toBe(
+      `{"kind":{"OracleFeed":{"feed_id":"${ID_88}"}},"version":1}`,
+    );
+    expect(canonicalJson(oracleReporterKey(ID_88, reporter))).toBe(
+      `{"kind":{"OracleReporter":{"feed_id":"${ID_88}","reporter":"${reporter}"}},"version":1}`,
+    );
+  });
+
+  it("reads the feed and writes the reporter record on RegisterReporter", async () => {
+    const sender = await addressFromSeedByte(1);
+    const list = defaultAccessList(sender, registerReporter(ID_88));
+    expect(list.read_only).toEqual([
+      protocolKey("BaseFee"),
+      oracleFeedKey(ID_88),
+      authorizationPolicyKey(sender),
+    ]);
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      oracleReporterKey(ID_88, sender),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
     ]);
   });
 });

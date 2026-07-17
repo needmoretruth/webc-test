@@ -677,6 +677,30 @@ function requireCanonicalAmount(value: string, label: string): void {
   }
 }
 
+/** Bounds for Rust's signed `i128` oracle `FeedValue`. */
+const I128_MAX = (1n << 127n) - 1n;
+const I128_MIN = -(1n << 127n);
+
+/**
+ * Rejects any string Rust's `i128` decimal encoding (`FeedValue`) would never
+ * produce: a canonical SIGNED decimal with an optional leading `-`, no leading
+ * zeros, within the `i128` range. Signing a non-canonical value would diverge
+ * from Rust's re-serialization during verification, so fail closed here.
+ */
+function requireCanonicalSignedI128(value: string, label: string): void {
+  if (
+    typeof value !== "string" ||
+    value.length > 40 ||
+    !/^(0|-?[1-9][0-9]*)$/u.test(value)
+  ) {
+    throw new Error(`invalid canonical signed integer for ${label}`);
+  }
+  const parsed = BigInt(value);
+  if (parsed < I128_MIN || parsed > I128_MAX) {
+    throw new Error(`value for ${label} exceeds the i128 range`);
+  }
+}
+
 /** Validates a post-quantum root reveal's scheme and hex fields. */
 function requireValidReveal(reveal: PostQuantumRootRevealJson): void {
   if (reveal.scheme !== "MlDsa65") {
@@ -1304,6 +1328,47 @@ export function revokeMandate(mandateId: HexString): OperationJson {
 }
 
 // ---------------------------------------------------------------------------
+// Native oracle operations (Phase 7, §15.17).
+//
+// Field names and value encodings mirror the Rust `Operation` serde output pinned
+// by `oracle_operations_have_stable_wire_vectors`. Feed ids are 32-byte lowercase
+// hex; `amount` is an unsigned decimal string; the report `value` is a SIGNED
+// decimal string (Rust `FeedValue`, an `i128`), never a bare JSON number.
+// ---------------------------------------------------------------------------
+
+/** Creates a native oracle feed owned by the signer (flat, burned fee). */
+export function createFeed(feedId: HexString): OperationJson {
+  requireHash256Hex(feedId, "feed id");
+  return { CreateFeed: { feed_id: feedId } };
+}
+
+/** Registers the signer as a bonded reporter on an existing feed. */
+export function registerReporter(feedId: HexString): OperationJson {
+  requireHash256Hex(feedId, "feed id");
+  return { RegisterReporter: { feed_id: feedId } };
+}
+
+/** Deregisters the signer from a feed and returns its bond. */
+export function deregisterReporter(feedId: HexString): OperationJson {
+  requireHash256Hex(feedId, "feed id");
+  return { DeregisterReporter: { feed_id: feedId } };
+}
+
+/** Submits the signer's latest signed integer value for a feed. */
+export function submitReport(feedId: HexString, value: string): OperationJson {
+  requireHash256Hex(feedId, "feed id");
+  requireCanonicalSignedI128(value, "feed report value");
+  return { SubmitReport: { feed_id: feedId, value } };
+}
+
+/** Pays a read fee into a feed's revenue pool. */
+export function payFeedRead(feedId: HexString, amount: string): OperationJson {
+  requireHash256Hex(feedId, "feed id");
+  requireCanonicalAmount(amount, "pay feed read amount");
+  return { PayFeedRead: { feed_id: feedId, amount } };
+}
+
+// ---------------------------------------------------------------------------
 // Service registry operations (Phase 9b, §15.5).
 //
 // Field names and value encodings mirror the Rust `Operation` serde output pinned
@@ -1518,6 +1583,16 @@ function extraReadOnlyKeys(
   if ("SpendUnderMandateToService" in operation) {
     // The service entry is READ to resolve the pay-to owner.
     return [serviceKey(operation.SpendUnderMandateToService.service_id)];
+  }
+  // --- Native oracle ------------------------------------------------------
+  if ("RegisterReporter" in operation) {
+    return [oracleFeedKey(operation.RegisterReporter.feed_id)];
+  }
+  if ("DeregisterReporter" in operation) {
+    return [oracleFeedKey(operation.DeregisterReporter.feed_id)];
+  }
+  if ("SubmitReport" in operation) {
+    return [oracleFeedKey(operation.SubmitReport.feed_id)];
   }
   return [];
 }
@@ -2009,6 +2084,25 @@ function extraReadWriteKeys(
     const { mandate_id } = operation.SpendUnderMandateToService;
     return [accountKey(sender), mandateKey(mandate_id)];
   }
+  // --- Native oracle (Phase 7, §15.17) ------------------------------------
+  if ("CreateFeed" in operation) {
+    return [accountKey(sender), oracleFeedKey(operation.CreateFeed.feed_id)];
+  }
+  if ("RegisterReporter" in operation) {
+    const { feed_id } = operation.RegisterReporter;
+    return [accountKey(sender), oracleReporterKey(feed_id, sender)];
+  }
+  if ("DeregisterReporter" in operation) {
+    const { feed_id } = operation.DeregisterReporter;
+    return [accountKey(sender), oracleReporterKey(feed_id, sender)];
+  }
+  if ("SubmitReport" in operation) {
+    // Reporting moves no native units: only the reporter record is written.
+    return [oracleReporterKey(operation.SubmitReport.feed_id, sender)];
+  }
+  if ("PayFeedRead" in operation) {
+    return [accountKey(sender), oracleFeedKey(operation.PayFeedRead.feed_id)];
+  }
   // Incoming bridge messages need an asynchronous replay hash. Slashing also
   // needs live delegation/cooling owners, so the synchronous builder fails.
   // `CreateToken` needs an async token-id derivation, so it also lands here.
@@ -2426,6 +2520,24 @@ export function mandateKey(mandateId: HexString): StateKeyJson {
 /** Returns the registry-entry key for one service. */
 export function serviceKey(serviceId: HexString): StateKeyJson {
   return { version: 1, kind: { Service: { service_id: serviceId } } };
+}
+
+// --- Native oracle state keys (Phase 7, §15.17) ----------------------------
+
+/** Returns the feed-registry record key for one feed. */
+export function oracleFeedKey(feedId: HexString): StateKeyJson {
+  return { version: 1, kind: { OracleFeed: { feed_id: feedId } } };
+}
+
+/** Returns the per-`(feed, reporter)` bonded-reporter record key. */
+export function oracleReporterKey(
+  feedId: HexString,
+  reporter: WebcAddress,
+): StateKeyJson {
+  return {
+    version: 1,
+    kind: { OracleReporter: { feed_id: feedId, reporter } },
+  };
 }
 
 /** Returns a protocol singleton key in schema version 1. */
