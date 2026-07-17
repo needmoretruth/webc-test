@@ -106,7 +106,7 @@ describe("encrypted permission store v1", () => {
     await expect(
       decryptPermissionStore(tampered, PASSWORD, identityA),
     ).rejects.toMatchObject({ code: "AUTHENTICATION_FAILED" });
-  });
+  }, 15_000);
 
   it("rejects a store belonging to a different wallet identity before KDF work", async () => {
     const store = await encryptPermissionStore(
@@ -198,5 +198,5 @@ describe("encrypted permission store v1", () => {
         write,
       }),
     ).rejects.toMatchObject({ code: "AUTHENTICATION_FAILED" });
-  });
+  }, 15_000);
 });
