@@ -104,8 +104,14 @@ impl InflationSchedule {
     }
 
     fn validate(&self) -> Result<(), ChainError> {
+        // F2: a zero floor never converges — `rate_bps_for_year` compares the
+        // decaying numerator against `floor_rate_bps * denominator == 0`, which
+        // it never reaches, so the loop grows the denominator until it overflows
+        // at large years. WEBC always has a positive inflation floor (§7), so a
+        // zero floor is an invalid schedule and is rejected fail-closed here.
         if self.reward_periods_per_year == 0
             || self.annual_decay_denominator == 0
+            || self.floor_rate_bps == 0
             || self.annual_decay_numerator > self.annual_decay_denominator
             || self.floor_rate_bps > self.initial_rate_bps
             || self.initial_rate_bps > 10_000
@@ -134,6 +140,20 @@ mod tests {
                 expected_rate
             );
         }
+    }
+
+    #[test]
+    fn zero_floor_rate_is_rejected() {
+        // F2: a zero floor never converges and WEBC always has a positive
+        // inflation floor (§7); it must be rejected rather than overflow later.
+        let schedule = InflationSchedule {
+            floor_rate_bps: 0,
+            ..InflationSchedule::default()
+        };
+        assert!(matches!(
+            schedule.validated_periods_per_year(),
+            Err(ChainError::InvalidInflationSchedule)
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! mandatory. Batches preserve input order and use ordered sets, so local hash
 //! iteration or thread timing cannot change the proposed schedule.
 
-use crate::{StateKey, Transaction};
+use crate::{StateKeyKind, Transaction};
 use std::collections::BTreeSet;
 
 /// Builds optimistic parallel execution batches from transaction access lists.
@@ -14,18 +14,35 @@ use std::collections::BTreeSet;
 /// other, so they can be executed in parallel after signature/fee prechecks. The
 /// current prototype returns indices; a future executor can map each batch onto a
 /// worker pool.
+///
+/// **Serializability (finding SC1):** batches execute in order, so the schedule
+/// is serializable-equivalent to the original transaction order only if every
+/// conflicting pair `(i, j)` with `i < j` lands with `batch(i) <= batch(j)`. Each
+/// transaction is therefore placed in the first batch at or after every earlier
+/// batch it conflicts with — never merely the first non-conflicting batch, which
+/// could drop a later transaction into an earlier batch than an earlier
+/// transaction it conflicts with and reverse their commit order.
 pub fn parallel_batches(transactions: &[Transaction]) -> Vec<Vec<usize>> {
     let mut batches: Vec<BatchLocks> = Vec::new();
 
-    'tx_loop: for (index, tx) in transactions.iter().enumerate() {
+    for (index, tx) in transactions.iter().enumerate() {
         let tx_locks = BatchLocks::from_transaction(tx);
-        for batch in &mut batches {
-            if !batch.conflicts_with(&tx_locks) {
-                batch.merge(index, &tx_locks);
-                continue 'tx_loop;
+        // The first batch this transaction may join: one past the highest batch
+        // it conflicts with (0 if it conflicts with none). Every batch at or
+        // after that index is conflict-free with this transaction by
+        // construction, so joining the earliest such batch packs tightly while
+        // preserving order.
+        let mut earliest = 0usize;
+        for (batch_index, batch) in batches.iter().enumerate() {
+            if batch.conflicts_with(&tx_locks) {
+                earliest = batch_index + 1;
             }
         }
-        batches.push(BatchLocks::new(index, tx_locks));
+        if earliest < batches.len() {
+            batches[earliest].merge(index, &tx_locks);
+        } else {
+            batches.push(BatchLocks::new(index, tx_locks));
+        }
     }
 
     batches.into_iter().map(|batch| batch.indices).collect()
@@ -34,8 +51,8 @@ pub fn parallel_batches(transactions: &[Transaction]) -> Vec<Vec<usize>> {
 #[derive(Clone, Debug)]
 struct BatchLocks {
     indices: Vec<usize>,
-    reads: BTreeSet<StateKey>,
-    writes: BTreeSet<StateKey>,
+    reads: BTreeSet<StateKeyKind>,
+    writes: BTreeSet<StateKeyKind>,
 }
 
 impl BatchLocks {
@@ -48,10 +65,26 @@ impl BatchLocks {
     }
 
     fn from_transaction(tx: &Transaction) -> Self {
+        // Conflict detection keys on the version-independent logical identity
+        // (`StateKeyKind`), not the full versioned `StateKey` (finding SC2). Two
+        // keys with the same logical `kind` but different schema `version` refer
+        // to the same state, so they MUST conflict; keying on the whole `StateKey`
+        // (where `version` participates in `Eq`/`Ord`) would let them share a
+        // parallel batch.
         Self {
             indices: Vec::new(),
-            reads: tx.access_list.read_only.iter().cloned().collect(),
-            writes: tx.access_list.read_write.iter().cloned().collect(),
+            reads: tx
+                .access_list
+                .read_only
+                .iter()
+                .map(|key| key.kind.clone())
+                .collect(),
+            writes: tx
+                .access_list
+                .read_write
+                .iter()
+                .map(|key| key.kind.clone())
+                .collect(),
         }
     }
 
@@ -68,7 +101,7 @@ impl BatchLocks {
     }
 }
 
-fn intersects(left: &BTreeSet<StateKey>, right: &BTreeSet<StateKey>) -> bool {
+fn intersects(left: &BTreeSet<StateKeyKind>, right: &BTreeSet<StateKeyKind>) -> bool {
     left.iter().any(|item| right.contains(item))
 }
 
@@ -76,9 +109,24 @@ fn intersects(left: &BTreeSet<StateKey>, right: &BTreeSet<StateKey>) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        AccessList, Amount, AuthorizationLaneId, FeeBid, ObjectId, Operation, Transaction,
+        AccessList, Amount, AuthorizationLaneId, FeeBid, ObjectId, Operation, ProtocolVersion,
+        StateKey, StateKeyKind, Transaction, CURRENT_PROTOCOL_VERSION,
     };
     use webc_crypto::{Address, Hash256, Keypair, PublicKeyBytes};
+
+    fn tx_writing(sender: Address, writes: Vec<StateKey>) -> Transaction {
+        Transaction::new_unsigned(
+            sender,
+            PublicKeyBytes([1u8; 32]),
+            0,
+            Operation::Transfer {
+                to: sender,
+                amount: Amount::from_units(1),
+            },
+            AccessList::new(vec![], writes),
+            FeeBid::default(),
+        )
+    }
 
     fn tx(sender: Address, target: Address) -> Transaction {
         Transaction::new_unsigned(
@@ -106,6 +154,51 @@ mod tests {
         let transactions = [tx(a, b), tx(c, d)];
         let batches = parallel_batches(transactions.as_slice());
         assert_eq!(batches, vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn conflicting_pairs_keep_their_commit_order_across_batches() {
+        // SC1: tx0 touches A; tx1 touches A and C (conflicts tx0); tx2 touches C
+        // (conflicts tx1 but not tx0). Greedy first-fit would place tx2 in tx0's
+        // batch (it does not conflict there), landing the later tx2 in an earlier
+        // batch than the earlier tx1 it conflicts with — a reversed commit order.
+        // The serializable rule keeps tx1 before tx2.
+        let a = Keypair::from_seed([1u8; 32]).address();
+        let c = Keypair::from_seed([3u8; 32]).address();
+        let key_a = StateKey::account(a);
+        let key_c = StateKey::account(c);
+        let tx0 = tx_writing(a, vec![key_a.clone()]);
+        let tx1 = tx_writing(a, vec![key_a, key_c.clone()]);
+        let tx2 = tx_writing(c, vec![key_c]);
+
+        let batches = parallel_batches(&[tx0, tx1, tx2]);
+        assert_eq!(batches, vec![vec![0], vec![1], vec![2]]);
+
+        // The essential property: the conflicting pair (1, 2) does not reverse.
+        let batch_of = |index: usize| {
+            batches
+                .iter()
+                .position(|batch| batch.contains(&index))
+                .expect("scheduled")
+        };
+        assert!(batch_of(1) < batch_of(2));
+    }
+
+    #[test]
+    fn keys_conflict_on_logical_identity_regardless_of_version() {
+        // SC2: the same logical account at two schema versions refers to the same
+        // state and must conflict. Keying on the full versioned StateKey would let
+        // these share a parallel batch.
+        let account = Keypair::from_seed([1u8; 32]).address();
+        let current = StateKey::account(account);
+        let other_version = StateKey {
+            version: ProtocolVersion::new(CURRENT_PROTOCOL_VERSION.get() + 1),
+            kind: StateKeyKind::Account { address: account },
+        };
+        let tx0 = tx_writing(account, vec![current]);
+        let tx1 = tx_writing(account, vec![other_version]);
+
+        assert_eq!(parallel_batches(&[tx0, tx1]), vec![vec![0], vec![1]]);
     }
 
     #[test]
