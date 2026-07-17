@@ -20,6 +20,7 @@ pub mod genesis;
 pub mod grants;
 pub mod hex_bytes;
 pub mod inflation;
+pub mod mandate;
 pub mod namespace;
 pub mod object;
 pub mod oracle;
@@ -77,6 +78,10 @@ pub use fees::{
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
 pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
+pub use mandate::{
+    Mandate, MandateConfig, MandateCounterparty, MandateCounterpartyPolicy, MandateId,
+    MANDATE_LEAF_DOMAIN,
+};
 pub use namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_DATA_BYTES};
 pub use oracle::{
@@ -344,6 +349,32 @@ pub enum ChainError {
     NamespaceNotFound,
     #[error("only the current namespace owner may transfer this namespace")]
     NamespaceNotOwner,
+    #[error("mandate configuration is invalid (rate-limit day-window must be non-zero)")]
+    InvalidMandateConfig,
+    #[error("mandate grant parameters are invalid (budget, per-tx cap, or allowlist)")]
+    InvalidMandate,
+    #[error("a mandate already exists for this principal, agent key, and grant nonce")]
+    MandateAlreadyExists,
+    #[error("no mandate exists for this mandate id")]
+    MandateNotFound,
+    #[error("only the mandate principal may top up or revoke this mandate")]
+    MandateNotOwner,
+    #[error("this mandate management operation must use the default authorization lane")]
+    MandateRequiresDefaultLane,
+    #[error("mandate spend was not signed by the mandate's agent key")]
+    MandateAgentKeyMismatch,
+    #[error("mandate has been revoked and rejects all spends")]
+    MandateRevoked,
+    #[error("mandate has expired and rejects all spends")]
+    MandateExpired,
+    #[error("mandate spend exceeds the per-transaction maximum")]
+    MandatePerTxExceeded,
+    #[error("mandate spend exceeds the remaining escrowed budget")]
+    MandateBudgetExceeded,
+    #[error("mandate spend recipient is not permitted by the counterparty policy")]
+    MandateCounterpartyNotAllowed,
+    #[error("mandate spend exceeds the per-day rate limit")]
+    MandateRateLimited,
     #[error("a contract is already registered for this code id")]
     ContractAlreadyExists,
     #[error("no contract is registered for this code id")]
