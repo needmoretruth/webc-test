@@ -308,11 +308,13 @@ namespaces, unaffected account transfers, supply reconciliation, bincode
 crash-restart of the fee state with a stable root, and cross-run determinism.
 Full workspace gate green (fmt/clippy -D warnings/test/doc/demo).
 
-**Phase 6 remaining:** per-resource (multi-dimensional) congestion measurement
-beyond the single execution-unit dimension is still a single scalar per
-namespace today; then varint amount encoding (§15.14, a wire-version bump —
-invasive/breaking, do carefully). TPS benchmarks need real hardware (deferred
-non-finding).
+**Phase 6 remaining:** varint amount encoding (§15.14, a wire-version bump) —
+IN PROGRESS (subagent): binary/bincode `Amount` encoding switches to LEB128
+varint (rest + wire) while the canonical-JSON decimal-string path stays byte-for-
+byte unchanged (so `state_root`, signing, and the SDK are untouched). After that,
+per-resource (multi-dimensional) congestion measurement beyond the single
+execution-unit dimension is the last open metering refinement. TPS benchmarks
+need real hardware (deferred non-finding).
 
 **Note on commit signing:** this environment's ssh signing key
 (`/home/claude/.ssh/commit_signing_key.pub`) is a 0-byte placeholder, so no commit
