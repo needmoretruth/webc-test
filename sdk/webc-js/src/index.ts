@@ -11,6 +11,7 @@ export * from "./amount.js";
 export * from "./block.js";
 export * from "./canonical.js";
 export * from "./hex.js";
+export * from "./http402.js";
 export * from "./keystore.js";
 export * from "./node-client.js";
 export * from "./permission-store.js";
