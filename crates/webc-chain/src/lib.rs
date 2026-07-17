@@ -53,7 +53,10 @@ pub use consensus::{
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
     CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
-pub use fees::{split_fee, FeeBreakdown, FeePolicy};
+pub use fees::{
+    calculate_fee_summary_v1, split_fee, FeeBreakdown, FeeComputationError, FeePayerV1, FeePolicy,
+    FeeRate, FeeSummaryV1, GasUnits, FEE_SUMMARY_V1,
+};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
 pub use inflation::InflationSchedule;
 pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_DATA_BYTES};
