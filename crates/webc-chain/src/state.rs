@@ -1531,7 +1531,10 @@ impl ChainState {
             // Native oracle registry committed by its own ordered sub-roots (§15.17):
             // a feed change (including accrued revenue) or a reporter change
             // (register/report/deregister) changes these roots and the state root.
-            oracle_feed_root: ordered_value_root(ORACLE_FEED_LEAF_DOMAIN, self.oracle_feeds.iter())?,
+            oracle_feed_root: ordered_value_root(
+                ORACLE_FEED_LEAF_DOMAIN,
+                self.oracle_feeds.iter(),
+            )?,
             oracle_reporter_root: ordered_value_root(
                 ORACLE_REPORTER_LEAF_DOMAIN,
                 self.oracle_reporters.iter(),
@@ -2970,7 +2973,8 @@ impl ChainState {
                     .checked_add(creation_fee)
                     .ok_or(ChainError::ArithmeticOverflow)?;
                 let bond = config.oracle.min_reporter_bond;
-                self.oracle_feeds.insert(*feed_id, Feed::new(tx.sender, bond));
+                self.oracle_feeds
+                    .insert(*feed_id, Feed::new(tx.sender, bond));
                 events.push(Event::FeedCreated {
                     feed_id: *feed_id,
                     creator: tx.sender,
@@ -3633,11 +3637,11 @@ impl ChainState {
                 (*address, score)
             })
             .collect();
-        let total_score = scores
-            .iter()
-            .try_fold(0u128, |total, (_, score)| {
-                total.checked_add(*score).ok_or(ChainError::ArithmeticOverflow)
-            })?;
+        let total_score = scores.iter().try_fold(0u128, |total, (_, score)| {
+            total
+                .checked_add(*score)
+                .ok_or(ChainError::ArithmeticOverflow)
+        })?;
         if total_score == 0 {
             // No live reporter earned a positive weight: carry the revenue.
             return Ok(None);
@@ -4327,6 +4331,632 @@ mod tests {
                 "mutating {name} must change the state root (E8)"
             );
         }
+    }
+
+    // ----- native oracle (Phase 7, §15.17) -----
+
+    /// Oracle-tuned config with small, exact fee/bond placeholders and a fixed
+    /// settlement cadence and liveness window.
+    fn oracle_config(settlement_epochs: u64, liveness_window_epochs: u64) -> ChainConfig {
+        ChainConfig {
+            oracle: OracleConfig {
+                feed_creation_fee: Amount::from_units(1_000),
+                min_reporter_bond: Amount::from_units(10_000),
+                settlement_epochs,
+                liveness_window_epochs,
+            },
+            ..ChainConfig::default()
+        }
+    }
+
+    /// Genesis funding four accounts (no validators) under an oracle config, so
+    /// epoch advance mints nothing and every balance change is an oracle move.
+    fn oracle_fixture(config: &ChainConfig) -> (ChainState, Keypair, Keypair, Keypair, Keypair) {
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let carol = Keypair::from_seed([3u8; 32]);
+        let dave = Keypair::from_seed([4u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: alice.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: bob.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: carol.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: dave.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("oracle genesis");
+        (state, alice, bob, carol, dave)
+    }
+
+    /// Executes one oracle operation with a gas limit above any oracle op's cost
+    /// and the floor base fee (1 base unit/unit), so tx fees are exact.
+    fn oracle_exec(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        keypair: &Keypair,
+        nonce: u64,
+        operation: Operation,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_operation(
+            keypair,
+            nonce,
+            operation,
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("oracle tx signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    fn balance(state: &ChainState, address: Address) -> u128 {
+        state.accounts.get(&address).map_or(0, |a| a.balance.0)
+    }
+
+    fn find_settlement(
+        events: &[Event],
+        feed_id: FeedId,
+    ) -> Option<(Amount, Amount, Option<FeedValue>)> {
+        events.iter().find_map(|event| match event {
+            Event::FeedRevenueSettled {
+                feed_id: id,
+                distributed,
+                carried,
+                median,
+                ..
+            } if *id == feed_id => Some((*distributed, *carried, *median)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn create_feed_charges_fee_and_rejects_duplicate() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, ..) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        let before = balance(&state, alice.address());
+        let burned_before = state.burned_fees.0;
+
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+        assert!(state.oracle_feeds.contains_key(&feed));
+        assert_eq!(state.oracle_feeds[&feed].creator, alice.address());
+        assert_eq!(
+            state.oracle_feeds[&feed].bond,
+            config.oracle.min_reporter_bond
+        );
+        // The creation fee was burned (on top of the ordinary tx fee).
+        assert_eq!(
+            state.burned_fees.0,
+            burned_before + config.oracle.feed_creation_fee.0 + 15_000 / 2 // creation burn + half the tx fee
+        );
+        // Liquid dropped by at least the creation fee.
+        assert!(before - balance(&state, alice.address()) >= config.oracle.feed_creation_fee.0);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A duplicate feed id is rejected.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                Operation::CreateFeed { feed_id: feed }
+            ),
+            Err(ChainError::OracleFeedAlreadyExists)
+        ));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn register_and_deregister_reporter_locks_and_returns_bond() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, bob, ..) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        let bond = config.oracle.min_reporter_bond;
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+
+        // Registering on a missing feed fails.
+        let missing = FeedId::new(Hash256([0xee; 32]));
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                0,
+                Operation::RegisterReporter { feed_id: missing }
+            ),
+            Err(ChainError::OracleFeedNotFound)
+        ));
+
+        let bob_before = balance(&state, bob.address());
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register reporter");
+        assert_eq!(state.oracle_bonds, bond);
+        // Bond + the register tx fee (10_000 units at the floor fee) left liquid.
+        assert_eq!(bob_before - balance(&state, bob.address()), bond.0 + 10_000);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A duplicate registration is rejected.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                1,
+                Operation::RegisterReporter { feed_id: feed }
+            ),
+            Err(ChainError::OracleReporterAlreadyRegistered)
+        ));
+
+        let before = balance(&state, bob.address());
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            1,
+            Operation::DeregisterReporter { feed_id: feed },
+        )
+        .expect("deregister reporter");
+        assert_eq!(state.oracle_bonds, Amount::ZERO);
+        // The bond returned, minus the deregister tx fee (10_000 units at floor).
+        assert_eq!(balance(&state, bob.address()), before + bond.0 - 10_000);
+        assert!(!state.oracle_reporters.contains_key(&(feed, bob.address())));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Deregistering again fails.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                2,
+                Operation::DeregisterReporter { feed_id: feed }
+            ),
+            Err(ChainError::OracleReporterNotFound)
+        ));
+    }
+
+    #[test]
+    fn median_aggregation_over_single_even_and_odd_reporters() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+
+        // No feed / no reports -> None.
+        assert_eq!(state.feed_value(FeedId::new(Hash256([1u8; 32]))), None);
+        assert_eq!(state.feed_value(feed), None);
+
+        // A reporter cannot report before registering.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &bob,
+                0,
+                Operation::SubmitReport {
+                    feed_id: feed,
+                    value: FeedValue::new(42)
+                }
+            ),
+            Err(ChainError::OracleReporterNotFound)
+        ));
+
+        // Single reporter: the median is that value.
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register bob");
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(42),
+            },
+        )
+        .expect("bob reports");
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(42)));
+
+        // Even count (2): lower-mid of sorted [10, 42] is 10.
+        oracle_exec(
+            &mut state,
+            &config,
+            &carol,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register carol");
+        oracle_exec(
+            &mut state,
+            &config,
+            &carol,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(10),
+            },
+        )
+        .expect("carol reports");
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(10)));
+
+        // Odd count (3): middle of sorted [10, 42, 100] is 42.
+        oracle_exec(
+            &mut state,
+            &config,
+            &dave,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register dave");
+        oracle_exec(
+            &mut state,
+            &config,
+            &dave,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(100),
+            },
+        )
+        .expect("dave reports");
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(42)));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn read_fee_revenue_is_accuracy_weighted_with_exact_conservation() {
+        let config = oracle_config(1, 5);
+        let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+
+        // Three reporters at distances 0, 1, 10 from the median 100.
+        for (kp, value) in [(&bob, 100i128), (&carol, 101), (&dave, 90)] {
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                0,
+                Operation::RegisterReporter { feed_id: feed },
+            )
+            .expect("register");
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                1,
+                Operation::SubmitReport {
+                    feed_id: feed,
+                    value: FeedValue::new(value),
+                },
+            )
+            .expect("report");
+        }
+        assert_eq!(state.feed_value(feed), Some(FeedValue::new(100)));
+
+        // A zero read-fee is rejected; a real one accrues to the pool.
+        assert!(matches!(
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                Operation::PayFeedRead {
+                    feed_id: feed,
+                    amount: Amount::ZERO
+                }
+            ),
+            Err(ChainError::OracleReadAmountZero)
+        ));
+        let revenue = Amount::from_units(1_000_000);
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            1,
+            Operation::PayFeedRead {
+                feed_id: feed,
+                amount: revenue,
+            },
+        )
+        .expect("pay read fee");
+        assert_eq!(state.oracle_revenue, revenue);
+        assert_eq!(state.oracle_feeds[&feed].revenue, revenue);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let (bob_b, carol_b, dave_b) = (
+            balance(&state, bob.address()),
+            balance(&state, carol.address()),
+            balance(&state, dave.address()),
+        );
+        let events = state.distribute_epoch_rewards(&config).expect("settle");
+        let (distributed, carried, median_value) =
+            find_settlement(&events, feed).expect("settlement event");
+        assert_eq!(median_value, Some(FeedValue::new(100)));
+
+        let bob_share = balance(&state, bob.address()) - bob_b;
+        let carol_share = balance(&state, carol.address()) - carol_b;
+        let dave_share = balance(&state, dave.address()) - dave_b;
+        // Accuracy ordering: nearer the median earns strictly more.
+        assert!(bob_share > carol_share);
+        assert!(carol_share > dave_share);
+        assert!(dave_share > 0);
+        // Exact conservation: shares sum to the distributed total, and the
+        // integer-division remainder is carried in the feed pool (nothing lost).
+        assert_eq!(bob_share + carol_share + dave_share, distributed.0);
+        assert_eq!(distributed.0 + carried.0, revenue.0);
+        assert_eq!(state.oracle_feeds[&feed].revenue, carried);
+        assert_eq!(state.oracle_revenue, carried);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn stale_reporter_earns_no_liveness_reward() {
+        // Liveness window 1: a report is live only for the reporting epoch and the
+        // next one.
+        let config = oracle_config(1, 1);
+        let (mut state, alice, bob, carol, _dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+        for kp in [&bob, &carol] {
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                0,
+                Operation::RegisterReporter { feed_id: feed },
+            )
+            .expect("register");
+            oracle_exec(
+                &mut state,
+                &config,
+                kp,
+                1,
+                Operation::SubmitReport {
+                    feed_id: feed,
+                    value: FeedValue::new(100),
+                },
+            )
+            .expect("report at epoch 0");
+        }
+
+        // Advance to epoch 2 (both intermediate settlements have no revenue).
+        state
+            .distribute_epoch_rewards(&config)
+            .expect("advance to epoch 1");
+        state
+            .distribute_epoch_rewards(&config)
+            .expect("advance to epoch 2");
+        assert_eq!(state.current_epoch, 2);
+
+        // Bob refreshes at epoch 2 (live); carol stays stale (last report epoch 0).
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            2,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(100),
+            },
+        )
+        .expect("bob refreshes");
+        let revenue = Amount::from_units(500_000);
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            1,
+            Operation::PayFeedRead {
+                feed_id: feed,
+                amount: revenue,
+            },
+        )
+        .expect("pay read fee");
+
+        let (bob_b, carol_b) = (
+            balance(&state, bob.address()),
+            balance(&state, carol.address()),
+        );
+        let events = state
+            .distribute_epoch_rewards(&config)
+            .expect("settle epoch 2");
+        let (distributed, carried, _median) = find_settlement(&events, feed).expect("settled");
+
+        let bob_share = balance(&state, bob.address()) - bob_b;
+        let carol_share = balance(&state, carol.address()) - carol_b;
+        assert_eq!(carol_share, 0, "a stale reporter earns nothing");
+        assert!(bob_share > 0, "the live reporter earns the revenue");
+        assert_eq!(bob_share, distributed.0);
+        // Bob is the only live reporter and sits on the median, so he takes all of
+        // the revenue with no remainder.
+        assert_eq!(distributed, revenue);
+        assert_eq!(carried, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn oracle_state_survives_bincode_restart() {
+        let config = oracle_config(4, 5);
+        let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+        let feed = FeedId::new(Hash256([9u8; 32]));
+        oracle_exec(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            Operation::CreateFeed { feed_id: feed },
+        )
+        .expect("create feed");
+        // A reporter with a value, a reporter without a value, and accrued
+        // (unsettled) revenue exercise every oracle field on disk.
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register bob");
+        oracle_exec(
+            &mut state,
+            &config,
+            &bob,
+            1,
+            Operation::SubmitReport {
+                feed_id: feed,
+                value: FeedValue::new(-987_654_321),
+            },
+        )
+        .expect("bob reports");
+        oracle_exec(
+            &mut state,
+            &config,
+            &carol,
+            0,
+            Operation::RegisterReporter { feed_id: feed },
+        )
+        .expect("register carol (no report)");
+        oracle_exec(
+            &mut state,
+            &config,
+            &dave,
+            0,
+            Operation::PayFeedRead {
+                feed_id: feed,
+                amount: Amount::from_units(777),
+            },
+        )
+        .expect("dave pays a read fee");
+
+        let root = state.state_root().unwrap();
+        let restored = bincode_restart(&state);
+        assert_eq!(restored, state, "oracle state round-trips through bincode");
+        assert_eq!(
+            restored.state_root().unwrap(),
+            root,
+            "state root is preserved across a crash-restart"
+        );
+        assert_eq!(restored.feed_value(feed), state.feed_value(feed));
+        assert_eq!(restored.oracle_bonds, state.oracle_bonds);
+        assert_eq!(restored.oracle_revenue, state.oracle_revenue);
+        assert!(restored.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn oracle_settlement_is_deterministic_across_runs() {
+        fn run() -> Hash256 {
+            let config = oracle_config(1, 5);
+            let (mut state, alice, bob, carol, dave) = oracle_fixture(&config);
+            let feed = FeedId::new(Hash256([9u8; 32]));
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                0,
+                Operation::CreateFeed { feed_id: feed },
+            )
+            .unwrap();
+            for (kp, value) in [(&bob, 100i128), (&carol, 103), (&dave, 88)] {
+                oracle_exec(
+                    &mut state,
+                    &config,
+                    kp,
+                    0,
+                    Operation::RegisterReporter { feed_id: feed },
+                )
+                .unwrap();
+                oracle_exec(
+                    &mut state,
+                    &config,
+                    kp,
+                    1,
+                    Operation::SubmitReport {
+                        feed_id: feed,
+                        value: FeedValue::new(value),
+                    },
+                )
+                .unwrap();
+            }
+            oracle_exec(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                Operation::PayFeedRead {
+                    feed_id: feed,
+                    amount: Amount::from_units(999_983),
+                },
+            )
+            .unwrap();
+            state.distribute_epoch_rewards(&config).unwrap();
+            state.state_root().unwrap()
+        }
+        assert_eq!(run(), run(), "oracle settlement is deterministic");
     }
 
     // ----- session-key test helpers -----

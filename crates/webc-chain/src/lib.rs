@@ -290,7 +290,9 @@ pub enum ChainError {
     AppSponsorBudgetInsufficient { needed: Amount, available: Amount },
     #[error("fee sponsorship must use the default authorization lane")]
     SponsorshipRequiresDefaultLane,
-    #[error("oracle configuration is invalid (settlement cadence and liveness window must be non-zero)")]
+    #[error(
+        "oracle configuration is invalid (settlement cadence and liveness window must be non-zero)"
+    )]
     InvalidOracleConfig,
     #[error("oracle feed already exists for this feed id")]
     OracleFeedAlreadyExists,

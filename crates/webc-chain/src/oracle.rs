@@ -236,7 +236,7 @@ impl OracleConfig {
     pub fn report_is_live(&self, reported_epoch: u64, settlement_epoch: u64) -> bool {
         reported_epoch
             .checked_add(self.liveness_window_epochs)
-            .map_or(true, |bound| bound >= settlement_epoch)
+            .is_none_or(|bound| bound >= settlement_epoch)
     }
 }
 
@@ -415,7 +415,10 @@ mod tests {
     fn accuracy_weight_is_full_on_median_and_decays_to_zero() {
         let m = FeedValue(100);
         assert_eq!(accuracy_weight(FeedValue(100), m), ORACLE_ACCURACY_SCALE);
-        assert_eq!(accuracy_weight(FeedValue(101), m), ORACLE_ACCURACY_SCALE / 2);
+        assert_eq!(
+            accuracy_weight(FeedValue(101), m),
+            ORACLE_ACCURACY_SCALE / 2
+        );
         assert_eq!(accuracy_weight(FeedValue(99), m), ORACLE_ACCURACY_SCALE / 2);
         // Farther than the scale earns nothing — the standing-loss lever.
         assert_eq!(
@@ -423,7 +426,10 @@ mod tests {
             0
         );
         // Extreme distance never panics.
-        assert_eq!(accuracy_weight(FeedValue(i128::MIN), FeedValue(i128::MAX)), 0);
+        assert_eq!(
+            accuracy_weight(FeedValue(i128::MIN), FeedValue(i128::MAX)),
+            0
+        );
     }
 
     #[test]
@@ -445,7 +451,10 @@ mod tests {
             ..OracleConfig::default()
         };
         assert!(!bad.is_settlement_epoch(10));
-        assert!(matches!(bad.validate(), Err(ChainError::InvalidOracleConfig)));
+        assert!(matches!(
+            bad.validate(),
+            Err(ChainError::InvalidOracleConfig)
+        ));
     }
 
     #[test]
@@ -462,6 +471,9 @@ mod tests {
         reporter.value = Some(FeedValue(123_456_789_012_345));
         reporter.reported_epoch = 9;
         let text = serde_json::to_string(&reporter).expect("reporter serializes");
-        assert_eq!(serde_json::from_str::<OracleReporter>(&text).unwrap(), reporter);
+        assert_eq!(
+            serde_json::from_str::<OracleReporter>(&text).unwrap(),
+            reporter
+        );
     }
 }

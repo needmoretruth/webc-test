@@ -739,19 +739,13 @@ impl Operation {
                 // the sender's reporter record and account.
                 push_unique_key(&mut read_only, StateKey::oracle_feed(*feed_id));
                 push_unique_key(&mut read_write, StateKey::account(sender));
-                push_unique_key(
-                    &mut read_write,
-                    StateKey::oracle_reporter(*feed_id, sender),
-                );
+                push_unique_key(&mut read_write, StateKey::oracle_reporter(*feed_id, sender));
             }
             Self::SubmitReport { feed_id, .. } => {
                 // Reporting moves no native units (only the ordinary tx fee): it
                 // reads the feed for existence and writes the reporter record.
                 push_unique_key(&mut read_only, StateKey::oracle_feed(*feed_id));
-                push_unique_key(
-                    &mut read_write,
-                    StateKey::oracle_reporter(*feed_id, sender),
-                );
+                push_unique_key(&mut read_write, StateKey::oracle_reporter(*feed_id, sender));
             }
             Self::PayFeedRead { feed_id, .. } => {
                 // A read fee moves units from the payer's liquid balance into the
@@ -1684,9 +1678,7 @@ mod tests {
         };
         assert_eq!(
             crate::canonical::canonical_json_string(&report).unwrap(),
-            format!(
-                r#"{{"SubmitReport":{{"feed_id":"{id}","value":"-123456789012345"}}}}"#
-            ),
+            format!(r#"{{"SubmitReport":{{"feed_id":"{id}","value":"-123456789012345"}}}}"#),
         );
         let pay = Operation::PayFeedRead {
             feed_id,
