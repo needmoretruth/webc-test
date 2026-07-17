@@ -42,12 +42,27 @@ let previousDerivation: Promise<void> = Promise.resolve();
  * or retained here, and the caller owns clearing them. The returned key is a
  * fresh buffer the caller must clear after importing it. Uses Argon2 version
  * `0x13` (RFC 9106, decimal 19) with the supplied cost profile.
+ *
+ * `domain` is a mandatory purpose label prepended to the salt (finding S3). It
+ * domain-separates the derivation: the same `(password, salt)` yields
+ * INDEPENDENT keys for different purposes (the recovery keystore vs. the
+ * encrypted permission store), so no AES key is ever reused across two formats.
+ * Making it a required parameter means a new password-hardening consumer cannot
+ * forget to pick a distinct purpose.
  */
 export async function deriveArgon2idKey(
   password: Uint8Array,
   salt: Uint8Array,
   params: Argon2idParams,
+  domain: Uint8Array,
 ): Promise<Uint8Array> {
+  // Prepend the purpose label to the salt. Argon2 accepts a variable-length
+  // salt, and both encryption and decryption pass the same fixed label, so this
+  // is a stable, on-disk-format-neutral domain separation (the stored salt is
+  // unchanged; the label is a compile-time constant per consumer).
+  const domainSalt = new Uint8Array(domain.length + salt.length);
+  domainSalt.set(domain, 0);
+  domainSalt.set(salt, domain.length);
   const waitFor = previousDerivation;
   let release: (() => void) | undefined;
   previousDerivation = new Promise<void>((resolve) => {
@@ -55,7 +70,7 @@ export async function deriveArgon2idKey(
   });
   await waitFor;
   try {
-    return await argon2idAsync(password, salt, {
+    return await argon2idAsync(password, domainSalt, {
       m: params.memoryKib,
       t: params.iterations,
       p: params.parallelism,

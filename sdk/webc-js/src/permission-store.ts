@@ -433,19 +433,31 @@ async function decryptWithKey(
   }
 }
 
+/** Purpose label domain-separating permission-store keys from other formats (S3). */
+const PERMISSION_STORE_KDF_DOMAIN = new TextEncoder().encode(
+  "webc-permission-store-v1-encryption",
+);
+
 async function deriveStoreKey(
   passwordBytes: Uint8Array,
   salt: Uint8Array,
 ): Promise<CryptoKey> {
   let derived: Uint8Array | undefined;
   try {
-    derived = await deriveArgon2idKey(passwordBytes, salt, {
-      memoryKib: PERMISSION_STORE_ARGON2_MEMORY_KIB,
-      iterations: PERMISSION_STORE_ARGON2_ITERATIONS,
-      parallelism: PERMISSION_STORE_ARGON2_PARALLELISM,
-      dkLen: AES_KEY_BYTES,
-      maxMemoryBytes: ARGON2_MAX_MEMORY_BYTES,
-    });
+    // The permission-store purpose label domain-separates this key from the
+    // keystore's, so the same password+salt never yields one shared AES key (S3).
+    derived = await deriveArgon2idKey(
+      passwordBytes,
+      salt,
+      {
+        memoryKib: PERMISSION_STORE_ARGON2_MEMORY_KIB,
+        iterations: PERMISSION_STORE_ARGON2_ITERATIONS,
+        parallelism: PERMISSION_STORE_ARGON2_PARALLELISM,
+        dkLen: AES_KEY_BYTES,
+        maxMemoryBytes: ARGON2_MAX_MEMORY_BYTES,
+      },
+      PERMISSION_STORE_KDF_DOMAIN,
+    );
     return await crypto.subtle.importKey(
       "raw",
       toArrayBuffer(derived),

@@ -555,19 +555,29 @@ function hasUnpairedSurrogate(value: string): boolean {
   return false;
 }
 
+/** Purpose label domain-separating keystore keys from other formats (S3). */
+const KEYSTORE_KDF_DOMAIN = new TextEncoder().encode("webc-keystore-v1-encryption");
+
 async function deriveEncryptionKey(
   password: Uint8Array,
   salt: Uint8Array,
 ): Promise<Uint8Array> {
   // Serialized through the shared Argon2id gate so a concurrent keystore unlock
   // and permission-store save cannot interleave on noble's shared scratch block.
-  return deriveArgon2idKey(password, salt, {
-    memoryKib: KEYSTORE_ARGON2_MEMORY_KIB,
-    iterations: KEYSTORE_ARGON2_ITERATIONS,
-    parallelism: KEYSTORE_ARGON2_PARALLELISM,
-    dkLen: AES_KEY_BYTES,
-    maxMemoryBytes: ARGON2_MAX_MEMORY_BYTES,
-  });
+  // The keystore purpose label domain-separates this key from the permission
+  // store's, so the same password+salt never derives one shared AES key (S3).
+  return deriveArgon2idKey(
+    password,
+    salt,
+    {
+      memoryKib: KEYSTORE_ARGON2_MEMORY_KIB,
+      iterations: KEYSTORE_ARGON2_ITERATIONS,
+      parallelism: KEYSTORE_ARGON2_PARALLELISM,
+      dkLen: AES_KEY_BYTES,
+      maxMemoryBytes: ARGON2_MAX_MEMORY_BYTES,
+    },
+    KEYSTORE_KDF_DOMAIN,
+  );
 }
 
 async function importAesKey(
