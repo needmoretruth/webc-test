@@ -19,6 +19,7 @@
 //! - `GET  /fees`                       current base fee and block unit budget
 //! - `GET  /accounts/{address}`         account snapshot
 //! - `GET  /accounts/{address}/proof`   Merkle account proof
+//! - `GET  /accounts/{address}/token-balances` paginated balances held by an address
 //! - `GET  /objects/{id}`               persistent object by hex id
 //! - `GET  /tokens/{id}`                native token record by hex id
 //! - `GET  /tokens/{id}/balances/{address}` a holder's token balance
@@ -62,8 +63,8 @@ use webc_storage::KvStore;
 
 use crate::service::{
     AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NftItemsPage, NodeService,
-    ProposalsPage, SealSummary, ServicesPage, SubmitReceipt, ValidatorSummary, ValidatorsResponse,
-    API_VERSION,
+    ProposalsPage, SealSummary, ServicesPage, SubmitReceipt, TokenBalancesPage, ValidatorSummary,
+    ValidatorsResponse, API_VERSION,
 };
 
 /// Default maximum request body size (1 MiB), bounding hostile payloads.
@@ -351,6 +352,10 @@ where
         .route("/v1/fees", get(fees::<K>))
         .route("/v1/accounts/{address}", get(account::<K>))
         .route("/v1/accounts/{address}/proof", get(account_proof::<K>))
+        .route(
+            "/v1/accounts/{address}/token-balances",
+            get(account_token_balances::<K>),
+        )
         .route("/v1/validators", get(validators::<K>))
         .route("/v1/validators/{address}", get(validator::<K>))
         .route("/v1/supply", get(supply::<K>))
@@ -562,6 +567,19 @@ async fn instance_proposals<K: KvStore>(
     Ok(Json(state.service().instance_proposals(
         instance_id,
         status,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn account_token_balances<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(address): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<TokenBalancesPage>, ApiRejection> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.service().account_token_balances(
+        address,
         params.cursor.as_deref(),
         params.limit,
     )?))
@@ -1929,6 +1947,153 @@ mod tests {
             format!("/v1/governance/instances/{instance_hex}/proposals?limit=abc"),
             // Unknown query parameter.
             format!("/v1/governance/instances/{instance_hex}/proposals?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated account token-balances discovery endpoint -----
+
+    /// Builds a service where `holder` holds `count` distinct tokens (token `i`
+    /// minted `100 + i` units), plus one further token minted to a different
+    /// account. Returns the state, the holder, a stranger holding nothing, and the
+    /// holder's token ids in creation order.
+    fn token_balances_state(
+        count: u64,
+    ) -> (AppState<MemoryKvStore>, Address, Address, Vec<TokenId>) {
+        let creator = Keypair::from_seed([71u8; 32]);
+        let holder = Keypair::from_seed([72u8; 32]);
+        let other = Keypair::from_seed([73u8; 32]);
+        let stranger = Keypair::from_seed([222u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        let mint_token = |create_nonce: u64, recipient: Address| Operation::CreateToken {
+            namespace,
+            create_nonce,
+            metadata: TokenMetadata::new(
+                format!("T{create_nonce}").into_bytes(),
+                format!("TK{create_nonce}").into_bytes(),
+                6,
+                Hash256([0x1f; 32]),
+            )
+            .unwrap(),
+            mint_authority: Some(creator.address()),
+            freeze_authority: Some(creator.address()),
+            initial_supply: Amount::from_units(u128::from(100 + create_nonce)),
+            initial_recipient: recipient,
+        };
+
+        let mut token_ids = Vec::new();
+        let mut nonce = 0u64;
+        for i in 0..count {
+            seal_op(&state, &creator, nonce, mint_token(i, holder.address()));
+            token_ids.push(TokenId::derive(namespace, creator.address(), i));
+            nonce += 1;
+        }
+        // One more token minted to a different holder — must not appear for `holder`.
+        seal_op(&state, &creator, nonce, mint_token(count, other.address()));
+
+        (state, holder.address(), stranger.address(), token_ids)
+    }
+
+    /// Walks every page of an address's token balances, asserting each page is
+    /// within `limit`, and returns `(token_id, balance)` pairs in served order.
+    async fn walk_balances(app: &Router, address: &str, limit: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let base = format!("/v1/accounts/{address}/token-balances?limit={limit}");
+            let uri = match &cursor {
+                Some(c) => format!("{base}&cursor={c}"),
+                None => base,
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                out.push((
+                    item["token_id"].as_str().unwrap().to_string(),
+                    item["balance"].as_str().unwrap().to_string(),
+                ));
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(out.len() < 100_000, "pagination failed to terminate");
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn token_balances_paginate_and_exclude_other_holders() {
+        let (state, holder, stranger, token_ids) = token_balances_state(5);
+        let app = router(state);
+        // Expected token -> balance for this holder (token i holds 100 + i units).
+        let expected: std::collections::BTreeMap<String, String> = token_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (hash_hex(id.hash()), (100 + i as u64).to_string()))
+            .collect();
+
+        let walked = walk_balances(&app, &holder.to_string(), 2).await;
+        // Ascending by token id, no duplicates.
+        let ids: Vec<String> = walked.iter().map(|(id, _)| id.clone()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "ascending token-id order");
+        let got: std::collections::BTreeMap<String, String> = walked.into_iter().collect();
+        // Exactly this holder's tokens, with the right balances, and nothing from
+        // the token minted to the other account.
+        assert_eq!(got, expected);
+
+        // An address holding no tokens yields an empty, cursor-null page.
+        let body = body_value(
+            get_response(&app, format!("/v1/accounts/{}/token-balances", stranger)).await,
+        )
+        .await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn token_balances_reject_malformed_inputs() {
+        let (state, holder, _stranger, _ids) = token_balances_state(1);
+        let app = router(state);
+        let holder = holder.to_string();
+        for uri in [
+            // Malformed holder address.
+            "/v1/accounts/not-an-address/token-balances".to_string(),
+            // Cursor without the token:address separator.
+            format!("/v1/accounts/{holder}/token-balances?cursor=deadbeef"),
+            // Cursor with non-hex halves.
+            format!("/v1/accounts/{holder}/token-balances?cursor=zz:zz"),
+            // Non-numeric limit.
+            format!("/v1/accounts/{holder}/token-balances?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/accounts/{holder}/token-balances?bogus=1"),
         ] {
             let response = get_response(&app, uri.clone()).await;
             assert_eq!(

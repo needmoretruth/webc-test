@@ -770,6 +770,32 @@ fn decode_hash_cursor(raw: &str) -> Result<Hash256, ApiError> {
     Ok(Hash256(fixed))
 }
 
+/// Encodes a `(TokenId, Address)` balance key as the opaque cursor
+/// `"{token_hex}:{address_hex}"` (both 32-byte lowercase hex). The FULL key is
+/// carried so a resumed scan advances strictly past the last VISITED entry — never
+/// only the last match — guaranteeing forward progress through non-matching runs.
+fn encode_token_holder_cursor(token_id: TokenId, holder: Address) -> String {
+    format!(
+        "{}:{}",
+        token_id.hash().to_hex(),
+        hex::encode(holder.as_bytes())
+    )
+}
+
+/// Decodes a `(TokenId, Address)` balance cursor, fail-closed on any malformation.
+fn decode_token_holder_cursor(raw: &str) -> Result<(TokenId, Address), ApiError> {
+    let (token_hex, addr_hex) = raw
+        .split_once(':')
+        .ok_or_else(|| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let token_id = TokenId::new(decode_hash_cursor(token_hex)?);
+    let addr_bytes =
+        hex::decode(addr_hex).map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let addr_fixed: [u8; 32] = addr_bytes
+        .try_into()
+        .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    Ok((token_id, Address::from_bytes(addr_fixed)))
+}
+
 /// One entry in a services listing: the service's id alongside its full current
 /// `ServiceEntry` revision (the record's own serialization, flattened in).
 #[derive(Debug, serde::Serialize)]
@@ -815,6 +841,21 @@ pub struct ProposalListItem {
 #[derive(Debug, serde::Serialize)]
 pub struct ProposalsPage {
     pub items: Vec<ProposalListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in an address's token-balances listing: the token id and the held
+/// amount (the holder is fixed by the request path).
+#[derive(Debug, serde::Serialize)]
+pub struct TokenBalanceListItem {
+    pub token_id: TokenId,
+    pub balance: Amount,
+}
+
+/// A paginated token-balances page.
+#[derive(Debug, serde::Serialize)]
+pub struct TokenBalancesPage {
+    pub items: Vec<TokenBalanceListItem>,
     pub next_cursor: Option<String>,
 }
 
@@ -975,6 +1016,51 @@ impl<K: KvStore> NodeService<K> {
             }
         }
         Ok(ProposalsPage { items, next_cursor })
+    }
+
+    /// Lists the token balances held BY `address`, ascending by the `(token, holder)`
+    /// key. Balances are keyed by `(TokenId, Address)`, so one address's holdings are
+    /// scattered across the map; this is a bounded filtered scan (at most
+    /// `FILTER_SCAN_MULTIPLIER * limit` entries per page) whose cursor carries the
+    /// full last-visited key for forward progress. An address that holds nothing is a
+    /// 200 with an empty page (an absent holder is a zero balance, not an error).
+    pub fn account_token_balances(
+        &self,
+        address: Address,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<TokenBalancesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let balances = &inner.node.state().token_balances;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(decode_token_holder_cursor(raw)?),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (&(token_id, holder), amount) in balances.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            if holder == address {
+                items.push(TokenBalanceListItem {
+                    token_id,
+                    balance: *amount,
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(encode_token_holder_cursor(token_id, holder));
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(encode_token_holder_cursor(token_id, holder));
+                break;
+            }
+        }
+        Ok(TokenBalancesPage { items, next_cursor })
     }
 }
 
