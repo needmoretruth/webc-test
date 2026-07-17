@@ -1,10 +1,10 @@
 # WEBC continuation guide
 
-Last updated: 2026-07-17 (findings-backlog session: consensus C1–C7 done;
-active goal is now clearing the rest of the `docs/review/findings.md` backlog —
-see "THE ACTIVE GOAL" below). This file is the live pointer to the **exact next
-task**. Detailed "what the code implements" facts live in
-`implementation-status.md`; do not duplicate them here.
+Last updated: 2026-07-17 (findings-backlog session COMPLETE: every open finding
+in `docs/review/findings.md` is resolved — see "FINDINGS BACKLOG CLEARED" below;
+next is Phase 5 economics, which opens with owner-owned decisions). This file is
+the live pointer to the **exact next task**. Detailed "what the code implements"
+facts live in `implementation-status.md`; do not duplicate them here.
 
 ## Read first
 
@@ -124,64 +124,75 @@ finding resolved in `docs/review/findings.md` with the commit hash
 **All consensus review findings C1–C7 are now resolved**, plus the CI
 supply-chain (`cargo-deny`), JS advisory (`pnpm audit --prod`), and fuzz gates.
 
-### THE ACTIVE GOAL (owner-set 2026-07-17): clear the whole findings backlog
+### FINDINGS BACKLOG CLEARED (2026-07-17)
 
-Drive **every remaining open finding in `docs/review/findings.md` to resolved**
-— reproduce with a failing test FIRST, fix, keep the test, mark it resolved in
-`findings.md` with the commit hash (AGENTS.md pitfall 7). This is exactly what
-the Phase 5.5 core-freeze review gate requires ("resolve every open blocking
-finding first"). Run to completion autonomously; do NOT stop mid-way for status
-reports (AGENTS.md "Deciding for yourself"). Report to the owner only at true
-completion or a hard blocker.
+**Every open finding in `docs/review/findings.md` is resolved** — reproduced with
+a failing test first, fixed, tested, and marked resolved there with its commit
+hash (AGENTS.md pitfall 7). This satisfies the Phase 5.5 core-freeze gate's
+"resolve every open blocking finding first." `main` is green on the full
+workspace gate (fmt, clippy `-D warnings`, `cargo test --workspace`, rustdoc,
+`webc-node demo`, SDK `pnpm check`).
 
-**Remaining backlog (ordered; each = repro-test-first → fix → gate → commit →
-push; keep `main` green):**
+What landed this session (per-finding detail + commit hashes in `findings.md`):
 
-- **Network DoS — webc-net (HIGH):** N1 handshake timeout, N2 bound inbound
-  connections (Semaphore + per-IP cap), N3 cap peer table, N5 backoff reset,
-  N6 bincode `.with_limit()`.
-- **Node/faucet DoS — webc-node (HIGH/MED):** H1 faucet global rate-limit +
-  prune `last_drip`, H2 mempool fee-priority eviction + call `prune_expired` on
-  the seal tick, H3 cap WS subscriptions, H4 generic 5xx to client.
-- **Correctness — webc-chain / webc-storage (MED):** G1 pin genesis total
-  supply, T1 `deny_unknown_fields` on `Operation`, B1 bounded bridge-recipient
-  hex, ST1 persist+validate `ChainId` in `ChainStore::open`, U1 `slash_locked`
-  slashable-window.
-- **Latent (HIGH latent / MED):** SC1 scheduler serializable order, SC2
-  version-independent conflict keys, E2 block-timestamp validation, F1 epoch
-  reward remainder supply-conservation, E1 wire epoch advancement
-  deterministically into `apply_block`.
-- **Cross-language (MED):** X1/X2 SDK bridge/object hex lowercase validation.
-- **Docs/design:** C8 quorum-arithmetic property test + doc; plan-review §6
-  P1/P2 ADRs (node key management; committee sampling; historical-state /
-  archival; epoch/validator-set transition + weak-subjectivity; off-chain
-  contract-compilation invariant); doc hygiene (line-number → section refs).
+- **Consensus C1–C8** (C1–C7 P0/P1 plus C8 quorum-arithmetic property test).
+- **Network DoS N1–N6:** handshake timeout, bounded inbound + per-IP cap,
+  peer-table cap, per-peer rate limit, authenticated-only backoff reset, bincode
+  decode limit.
+- **Node DoS H1–H4:** faucet global rate-limit + pruned drip map, mempool
+  fee-priority eviction + seal-tick `prune_expired`, WS-subscription cap, generic
+  5xx (detail logged server-side).
+- **Chain correctness:** G1 genesis total-supply pin (devnet = mainnet = 10M),
+  T1 strict `Operation` decode, B1 bounded bridge hex, U1/U2 slashable-window +
+  settled-request pruning, F1 epoch-reward supply conservation, F2 non-zero
+  inflation floor, SC1/SC2 serializable + version-independent scheduling, E1
+  height-derived epoch advancement in `apply_block`, E2 timestamp monotonicity +
+  drift, E3 Merkle proof-length bound, E6 `verify_strict` signatures, E8
+  state-root completeness guard, X3 canonical JS-safe integer bound.
+- **Storage ST1:** chain-id bound + verified at `ChainStore::open`.
+- **SDK:** X1/X2/X4 cross-language hex/amount validation; S1–S7 wallet hardening
+  (double-click guard, popup parsing bounds, per-origin replay bound + idempotent
+  retries, reconnect spend-cap, streamed byte cap, S3 KDF purpose separation).
+- **Dependencies D3:** tokio-tungstenite aligned; remaining transitive skew
+  documented in `deny.toml`.
+- **Design ADRs (plan-review §6):** ADR-0009 node key management, ADR-0010
+  committee sampling, ADR-0011 historical state + weak-subjectivity;
+  contract-compile invariant in ADR-0006. E4/E5 direction recorded there; E7
+  phase-gated (no VM).
 
-**Deferred, NOT in this backlog (do not start):** reference-machine
-finality-timing number (needs real hardware — a cloud container cannot produce
-it honestly); the optional multi-node-over-TCP Byzantine integration test (the
-machine-level property is already tested — do only if time permits).
+### Exact next work
 
-### Working method: sequential on main (worktree-isolation caveat)
+The next phase per `development-plan.md` is **Phase 5 economics**, which opens
+with **owner-owned decisions that must be brought to the owner with a threat
+model at the freeze, not decided unilaterally**: the slashing-severity
+percentages and downtime schedule, and the §15.2 bootstrap-phase issuance
+proposal. After Phase 5 comes the **Phase 5.5 core freeze + independent security
+review**, whose per-finding prerequisite this session satisfied.
 
-Working method is in AGENTS.md ("Parallel subagents and durable work"). **CAVEAT
-discovered 2026-07-17: in this environment the Agent tool's `isolation: worktree`
-did NOT create a separate git worktree** — two launched agents collided on the
-shared main worktree (one switched the main branch, so a docs commit landed on a
-stray branch and had to be folded back). They were stopped. `claude/net-hardening`
-was never created; `claude/sdk-hex-parity` held only that docs commit and is now
-in `main` and deleted. **No finding work survived — N1–N6 and X1/X2 are still
-fully TODO in the backlog above.**
+**Owner-owned items still deferred** (do not decide alone; full list in AGENTS.md
+"User decisions still required later"): the Phase-5 economics numbers above; the
+production-bridge trust/proof model; the weak-subjectivity trust-anchor source
+(ADR-0011); mainnet governance emergency powers; renaming Weft.
 
-Before relying on any parallel worktree agent, VERIFY `git worktree list` shows a
-NEW worktree for it; if it does not, STOP and run the tracks sequentially on
-`main`. Default plan on resume: do the whole backlog SEQUENTIALLY on `main`
-(4 cores make parallel cargo builds thrash anyway), reproduce-test-first → fix →
-gate → commit+push each finding. The webc-chain/webc-node/webc-storage findings
-are coupled (shared error enums, `apply_block`/`ChainStore::open` signature
-ripple) so they must be sequential regardless. The SDK track (X1/X2, pnpm — no
-Rust build contention) is the only safe parallel candidate, and only if isolation
-is verified to work.
+**Deferred non-findings (not blockers):** the reference-machine finality-timing
+benchmark (needs real hardware, not a cloud container) and the optional
+multi-node-over-TCP Byzantine integration test (the machine-level property is
+already tested).
+
+### Parallel-subagent note (for future sessions)
+
+This session ran the `webc-net` and `sdk/webc-js` tracks as parallel background
+subagents in **manually-created git worktrees** (`git worktree add ...`, verified
+with `git worktree list` before trusting them — the Agent tool's
+`isolation: worktree` flag did NOT create a real worktree in this environment).
+Each subagent committed and pushed its own branch; the orchestrator merged both
+into `main` after the full gate, then finished the few items each subagent did
+not reach (N5; S3/S4/S7) on `main`. The coupled
+`webc-chain`/`webc-node`/`webc-storage` core was done sequentially on `main` by
+the orchestrator (shared error enums and `apply_block`/`ChainStore::open`
+signature ripples make it inherently sequential). Repeat that pattern: create the
+worktrees yourself and verify isolation, keep disjoint file sets per track, and
+integrate on `main`.
 
 ### Decisions locked this session (do not re-litigate)
 

@@ -438,16 +438,31 @@ gossips the certificate on commit). The CI supply-chain and fuzz gates are in
 `fuzz-smoke` CI job. C5 (commit `3b2b460`) attaches a `proof_of_lock` prevote
 set to re-proposals so a node that missed round `vr` follows the lock holder
 instead of stalling (wire bumped to `NET_PROTOCOL_VERSION = 2`). **All
-consensus review findings C1–C7 are now resolved.** The active Phase 4 work is
-now the rest of the `docs/review/findings.md` backlog (network DoS N1–N6, node/
-faucet DoS H1–H4, correctness G1/T1/B1/ST1/U1, latent SC1/SC2/E2/F1/E1, and
-cross-language X1/X2), each reproduced-then-fixed — see `continuation-guide.md`
-"THE ACTIVE GOAL" for the ordered list, the in-flight parallel branches to
-integrate, and the locked decisions. The only deferred non-finding items are a
-reference-machine finality-timing number (needs real hardware) and an optional
-multi-node-over-TCP Byzantine integration test (the machine-level property is
-now tested). Fork choice is covered by the finality-certificate design (a node
-follows the certified chain and commits only finalized blocks).
+consensus review findings C1–C7 are now resolved**, plus C8.
+
+**The entire `docs/review/findings.md` backlog is now cleared** (2026-07-17):
+every open finding is reproduced-then-fixed with its test and commit hash. Beyond
+consensus C1–C8 this session landed the network DoS bounds (N1–N6), node DoS
+bounds (H1–H4), chain correctness (G1 genesis-supply pin with devnet = mainnet =
+10M, T1/B1 strict decode + bounded bridge hex, U1/U2 slashable-window + pruning,
+F1/F2 reward-conservation + inflation floor, SC1/SC2 serializable scheduling,
+E1 height-derived epoch advancement in `apply_block`, E2 timestamp validation,
+E3 Merkle proof bound, E6 `verify_strict` signatures, E8 state-root completeness
+guard, X3 canonical integer bound), storage chain-id binding (ST1), the SDK
+hardening (X1/X2/X4, S1–S7), dependency alignment (D3), and the plan-review §6
+design ADRs (ADR-0009 node key management, ADR-0010 committee sampling, ADR-0011
+historical-state + weak-subjectivity; contract-compile invariant in ADR-0006).
+`main` passes the full workspace gate (fmt, strict clippy, `cargo test
+--workspace`, rustdoc, `webc-node demo`, SDK `pnpm check`). See
+`continuation-guide.md` "FINDINGS BACKLOG CLEARED" for the summary and next work.
+
+The only deferred non-finding items are a reference-machine finality-timing
+number (needs real hardware) and an optional multi-node-over-TCP Byzantine
+integration test (the machine-level property is now tested). Fork choice is
+covered by the finality-certificate design (a node follows the certified chain
+and commits only finalized blocks). E1 also makes epoch rollover (rewards,
+unbonding maturation, session-key expiry) fire deterministically inside the block
+path at each `StakingConfig.blocks_per_epoch` boundary.
 
 ## Phase 3: local restartable node, storage, and developer APIs
 
