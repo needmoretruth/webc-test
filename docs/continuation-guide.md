@@ -272,8 +272,10 @@ per-op fee, per-app daily budget; "day" = epoch window). New `sponsorship` modul
 self-pay when over-cap/ineligible/unregistered; Transfer-only). `sponsor_budgets`
 supply bucket; **state-commitment domain V8→V9**; non-sponsored txs stay
 byte-identical (manual `Transaction` Serialize keeps `sponsor` out of the JSON wire
-when absent). Follow-up (out of scope so far): TS SDK helper to construct sponsored
-transactions.
+when absent). **TS SDK support DONE** too — `signTransaction` gains an optional
+`sponsor`, byte-parity verified against the frozen `WEBC_SIGNED_TRANSACTION_V4`
+vector for both the absent (identical) and present cases. §15.35 is complete
+end-to-end (Rust + SDK).
 
 **Phase 6 remaining:** localized base/priority pricing + network-wide minimum +
 per-resource congestion measurement + fair block packing; varint amount encoding
