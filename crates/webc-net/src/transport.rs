@@ -18,16 +18,16 @@
 //! seen-frame cache drops duplicates so a message does not loop forever. Peer
 //! discovery is a static bootstrap list for A-1; richer discovery is later work.
 
-use std::collections::{HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use rand_core::{OsRng, RngCore};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use webc_chain::ChainId;
 use webc_crypto::Keypair;
@@ -61,6 +61,25 @@ const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
 /// inbound connection cap (N2) — bounds the slowloris FD-exhaustion surface.
 const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Default cap on concurrent in-flight inbound connections.
+///
+/// Why 256 (finding N2): every accepted inbound connection costs a task, a
+/// socket, and a file descriptor until it authenticates or its handshake
+/// deadline (N1) elapses. Capping the total number in flight bounds the
+/// resources an inbound flood can pin at once. 256 is far above the handful of
+/// peers a healthy devnet node keeps, so honest inbound is never refused; beyond
+/// the cap, freshly accepted connections are dropped until a slot frees.
+const DEFAULT_MAX_INBOUND_CONNECTIONS: usize = 256;
+
+/// Default cap on concurrent inbound connections from a single source IP.
+///
+/// Why 8 (finding N2): without a per-source-IP ceiling, one host can consume
+/// every global inbound slot and lock every other peer out — a trivial
+/// single-box connection-exhaustion DoS and an eclipse aid. Eight lets a
+/// legitimately multi-homed or NATed peer open a few connections while keeping
+/// any single address to a small share of accept capacity.
+const DEFAULT_MAX_INBOUND_PER_IP: usize = 8;
+
 /// A gossip message received from an authenticated peer.
 #[derive(Clone, Debug)]
 pub struct InboundMessage {
@@ -87,6 +106,15 @@ pub struct NetworkConfig {
     /// A connection that has not finished the mutual challenge/response within
     /// this window is dropped so a stalled peer cannot hold resources forever.
     pub handshake_timeout: std::time::Duration,
+    /// Maximum concurrent in-flight inbound connections (finding N2).
+    ///
+    /// Once this many inbound connections are being handled, freshly accepted
+    /// connections are dropped until a slot frees, bounding a connection flood.
+    pub max_inbound_connections: usize,
+    /// Maximum concurrent inbound connections from any single source IP (N2).
+    ///
+    /// Keeps one host from consuming every inbound slot and locking others out.
+    pub max_inbound_per_ip: usize,
 }
 
 impl NetworkConfig {
@@ -108,6 +136,72 @@ impl NetworkConfig {
             bootstrap_peers,
             inbound_capacity: 1024,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            max_inbound_connections: DEFAULT_MAX_INBOUND_CONNECTIONS,
+            max_inbound_per_ip: DEFAULT_MAX_INBOUND_PER_IP,
+        }
+    }
+}
+
+/// Caps concurrent inbound connections per source IP (finding N2).
+///
+/// The global inbound semaphore alone lets a single host consume every slot; a
+/// per-IP ceiling keeps any one address to a small share of accept capacity.
+/// Tokio has no keyed semaphore, so this is a small counted map — the standard
+/// shape for a per-key connection cap. The `std::sync::Mutex` is held only for
+/// the O(1) increment/decrement and never across an `await`, so it cannot block
+/// the runtime. A returned [`IpConnectionGuard`] decrements the count on drop,
+/// freeing the slot exactly when the connection ends. This is network glue, not
+/// consensus state, so a `HashMap` (non-deterministic iteration) is fine.
+#[derive(Clone)]
+struct IpConnectionLimiter {
+    max_per_ip: usize,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl IpConnectionLimiter {
+    /// Builds a limiter allowing at most `max_per_ip` (≥1) connections per IP.
+    fn new(max_per_ip: usize) -> Self {
+        Self {
+            max_per_ip: max_per_ip.max(1),
+            counts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Reserves a slot for `ip`, or returns `None` if it is already at its cap.
+    ///
+    /// Fails closed on a poisoned lock (returns `None`) rather than panicking on
+    /// a path reachable from network activity.
+    fn try_acquire(&self, ip: IpAddr) -> Option<IpConnectionGuard> {
+        let mut counts = self.counts.lock().ok()?;
+        let entry = counts.entry(ip).or_insert(0);
+        if *entry >= self.max_per_ip {
+            return None;
+        }
+        *entry += 1;
+        Some(IpConnectionGuard {
+            ip,
+            counts: self.counts.clone(),
+        })
+    }
+}
+
+/// Frees one per-IP inbound slot when the connection ends.
+struct IpConnectionGuard {
+    ip: IpAddr,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for IpConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.counts.lock() {
+            if let Some(count) = counts.get_mut(&self.ip) {
+                *count -= 1;
+                if *count == 0 {
+                    // Drop empty entries so the map cannot grow unbounded with
+                    // one entry per distinct attacker IP.
+                    counts.remove(&self.ip);
+                }
+            }
         }
     }
 }
@@ -215,7 +309,12 @@ pub async fn spawn_network(
             let bound = listener.local_addr().ok();
             let cfg = shared.clone();
             let ev = events_tx.clone();
-            tokio::spawn(accept_loop(listener, cfg, ev));
+            // Bound total in-flight inbound connections and per-source-IP
+            // concurrency (finding N2) so an inbound flood cannot exhaust
+            // tasks/sockets/FDs or let one host monopolize accept capacity.
+            let inbound_slots = Arc::new(Semaphore::new(config.max_inbound_connections.max(1)));
+            let ip_limiter = IpConnectionLimiter::new(config.max_inbound_per_ip);
+            tokio::spawn(accept_loop(listener, cfg, ev, inbound_slots, ip_limiter));
             bound
         }
         None => None,
@@ -243,18 +342,38 @@ pub async fn spawn_network(
     ))
 }
 
-/// Accepts inbound TCP peers and hands each to a connection task.
+/// Accepts inbound TCP peers and hands each to a connection task, subject to the
+/// global and per-IP inbound connection caps (finding N2).
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<SharedConfig>,
     events: mpsc::Sender<Event>,
+    inbound_slots: Arc<Semaphore>,
+    ip_limiter: IpConnectionLimiter,
 ) {
     // A failed accept means the listener socket itself broke; stop accepting
     // (existing peers persist through their own connection tasks).
-    while let Ok((stream, _addr)) = listener.accept().await {
+    while let Ok((stream, addr)) = listener.accept().await {
+        // Global cap: if every inbound slot is in use, drop this connection now
+        // instead of spawning an unbounded handler. The permit is held for the
+        // connection's whole lifetime and released when its task ends.
+        let Ok(permit) = inbound_slots.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        // Per-IP cap: keep one source IP from consuming every remaining slot.
+        let Some(ip_guard) = ip_limiter.try_acquire(addr.ip()) else {
+            drop(permit);
+            drop(stream);
+            continue;
+        };
         let cfg = shared.clone();
         let ev = events.clone();
         tokio::spawn(async move {
+            // Hold both guards for the connection's lifetime; dropping them when
+            // the handler returns frees the global and per-IP slots together.
+            let _permit = permit;
+            let _ip_guard = ip_guard;
             let _ = run_connection(stream, cfg, ev).await;
         });
     }
@@ -763,6 +882,79 @@ mod tests {
             closed,
             "server must drop a stalled handshake after the deadline"
         );
+    }
+
+    /// Drives the N2 caps: two raw connections occupy two inbound slots, then a
+    /// real dial-only client must be unable to authenticate until a slot frees.
+    /// With `max_conn`/`max_per_ip` chosen so one of the two caps binds at 2, the
+    /// third peer is blocked; pre-fix (no caps) it connected immediately.
+    async fn assert_inbound_cap_blocks_third(max_conn: usize, max_per_ip: usize, seed: u8) {
+        let chain = ChainId::devnet();
+        let mut server_cfg = NetworkConfig::new(
+            Keypair::from_seed([seed; 32]),
+            chain.clone(),
+            Some(loopback()),
+            Vec::new(),
+        );
+        server_cfg.max_inbound_connections = max_conn;
+        server_cfg.max_inbound_per_ip = max_per_ip;
+        // Keep the two stalled slots held for the whole test (no N1 timeout).
+        server_cfg.handshake_timeout = Duration::from_secs(30);
+        let (server, _server_rx) = spawn_network(server_cfg).await.unwrap();
+        let addr = server.local_addr().expect("listener bound");
+
+        // Occupy two inbound slots with raw connections that never authenticate.
+        let s1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let s2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Let the server accept both and take both slots.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // A real dial-only client tries to join; it must NOT authenticate while
+        // the two slots are held.
+        let (client, _client_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([seed.wrapping_add(100); 32]),
+            chain,
+            None,
+            vec![addr],
+        ))
+        .await
+        .unwrap();
+
+        // Give the client several dial attempts; all must be rejected.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(
+            server.connected_peers(),
+            0,
+            "no peer may authenticate while both inbound slots are occupied"
+        );
+
+        // Free one slot; the client must now be able to connect.
+        drop(s1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.connected_peers() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client must connect once an inbound slot frees"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(s2);
+        // Keep the client handle alive until the assertions complete.
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn global_inbound_connection_cap_is_enforced() {
+        // Global cap binds (per-IP set high): two in-flight connections fill the
+        // two-slot global budget, blocking a third.
+        assert_inbound_cap_blocks_third(2, 64, 31).await;
+    }
+
+    #[tokio::test]
+    async fn per_ip_inbound_connection_cap_is_enforced() {
+        // Per-IP cap binds (global set high): two connections from 127.0.0.1 use
+        // up the per-IP budget of 2, blocking a third from the same address.
+        assert_inbound_cap_blocks_third(64, 2, 41).await;
     }
 
     #[tokio::test]
