@@ -18,6 +18,7 @@ code depends on it. Every replacement states compatibility and migration rules.
 - [ADR-0009: node and validator key management](0009-node-key-management.md)
 - [ADR-0010: committee sampling](0010-committee-sampling.md)
 - [ADR-0011: historical state, archival, and weak-subjectivity sync](0011-historical-state-and-weak-subjectivity.md)
+- [ADR-0012: inactivity leak and slashing posture](0012-inactivity-leak-and-slashing.md)
 
 ## Planned ADRs (from the 2026-07-16 plan review)
 

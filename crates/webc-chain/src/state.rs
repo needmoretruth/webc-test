@@ -28,9 +28,10 @@ use crate::state_key::StateAccessRecorder;
 use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
 use crate::{
-    Amount, AuthorizationLaneId, BootstrapIssuance, ChainError, ChainId, Epoch, InflationSchedule,
-    ObjectId, ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, StateKey,
-    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    Amount, AuthorizationLaneId, BootstrapIssuance, ChainError, ChainId, Epoch,
+    InactivityLeakConfig, InflationSchedule, ObjectId, ObjectVersion, ProtocolStateKey,
+    ProtocolVersion, SlashingEvidence, StateKey, CURRENT_PROTOCOL_VERSION,
+    LEGACY_AUTHORIZATION_POLICY_REVISION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,6 +71,12 @@ pub struct ChainConfig {
     /// by the base per-period budget, until [`BootstrapIssuance::sunset_epoch`].
     #[serde(default)]
     pub bootstrap_issuance: Option<BootstrapIssuance>,
+    /// Opt-in inactivity leak (ADR-0012). `None` (default) keeps vanilla
+    /// Tendermint liveness (halt on >1/3 offline) plus the ADR-0011 restart
+    /// fallback; `Some` will drain offline validator weight to recover finality
+    /// once the recovery-mode consensus design is confirmed and wired.
+    #[serde(default)]
+    pub inactivity_leak: Option<InactivityLeakConfig>,
 }
 
 impl Default for ChainConfig {
@@ -86,6 +93,7 @@ impl Default for ChainConfig {
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
+            inactivity_leak: None,
         }
     }
 }

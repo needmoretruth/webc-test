@@ -71,7 +71,7 @@ pub use session_key::{
     SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
     SESSION_KEY_AUTHORIZATION_DOMAIN,
 };
-pub use slashing::{SlashingEvidence, SlashingOutcome, SlashingPolicy};
+pub use slashing::{InactivityLeakConfig, SlashingEvidence, SlashingOutcome, SlashingPolicy};
 pub use staking::{
     Delegation, StakingConfig, Validator, ValidatorStatus, SEVEN_DAY_TARGET_AT_ONE_MINUTE_EPOCHS,
 };
@@ -190,6 +190,8 @@ pub enum ChainError {
     ArithmeticOverflow,
     #[error("inflation schedule parameters are invalid")]
     InvalidInflationSchedule,
+    #[error("inactivity-leak configuration is invalid")]
+    InvalidInactivityLeakConfig,
     #[error("block chain ID does not match the active protocol configuration")]
     BlockChainIdMismatch,
     #[error("transaction chain ID does not match the active protocol configuration")]
