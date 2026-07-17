@@ -277,11 +277,28 @@ when absent). **TS SDK support DONE** too — `signTransaction` gains an optiona
 vector for both the absent (identical) and present cases. §15.35 is complete
 end-to-end (Rust + SDK).
 
+**Application namespace registry — DONE.** `RegisterNamespace`/`TransferNamespace`
+claim/transfer an app namespace to an owner (`namespaces` map, `namespace` module);
+object ops stay UNGATED (open namespaces; gating is a deferred later-phase policy);
+supply unaffected; state-commitment domain V9→V10.
+
+**Sharded examples — DONE.** `crates/webc-chain/tests/sharded_parallel_execution.rs`
+(8 tests) demonstrates namespace/account isolation at the scheduler for
+tokens/games/swaps/site-sessions (disjoint ⇒ one parallel batch + order-independent
+execution; shared resource ⇒ serialized). Swaps and shared-session contention are
+asserted at the scheduler level only (no native DEX / cross-owner object write yet
+— later phases).
+
 **Phase 6 remaining:** localized base/priority pricing + network-wide minimum +
-per-resource congestion measurement + fair block packing; varint amount encoding
-(§15.14, a wire-version bump); a first-class application namespace registry (the
-sponsorship feature already keys on app-namespace hashes); sharded examples. TPS
-benchmarks need real hardware (deferred non-finding). The **TPS benchmarks** (100/500/1000/2000 gates) need real reference
+per-resource congestion measurement + fair block packing (IN PROGRESS — subagent);
+then varint amount encoding (§15.14, a wire-version bump — invasive/breaking, do
+carefully). TPS benchmarks need real hardware (deferred non-finding).
+
+**Note on commit signing:** this environment's ssh signing key
+(`/home/claude/.ssh/commit_signing_key.pub`) is a 0-byte placeholder, so no commit
+can be signed — every branch commit is correctly authored `Claude
+<noreply@anthropic.com>` but shows "Unverified" on GitHub. Unavoidable here; not a
+code issue. The stop-hook's rebase remedy cannot add signatures without a real key. The **TPS benchmarks** (100/500/1000/2000 gates) need real reference
 hardware, not a cloud container (a known deferred non-finding) — implement the
 features here; the published-claim benchmarks run on real machines later.
 
