@@ -412,6 +412,26 @@ impl Operation {
         }
     }
 
+    /// The application namespace whose LOCALIZED base fee prices this operation.
+    ///
+    /// Only the object operations (create/mutate/transfer/delete) are
+    /// namespace-scoped and therefore priced by their namespace's own localized
+    /// base fee (Phase 6 §8 "Application isolation"): they carry object state under
+    /// a namespace, and that namespace's congestion should move only its own price.
+    /// Every other operation returns `None` and keeps the global base fee — this
+    /// includes account-scoped operations like `Transfer`/staking *and* the
+    /// sponsor- and namespace-registry management operations, which merely name a
+    /// namespace to address a record rather than transacting object state under it.
+    pub fn fee_namespace(&self) -> Option<Hash256> {
+        match self {
+            Self::CreateObject { namespace, .. }
+            | Self::MutateObject { namespace, .. }
+            | Self::TransferObject { namespace, .. }
+            | Self::DeleteObject { namespace, .. } => Some(*namespace),
+            _ => None,
+        }
+    }
+
     /// Whether this operation may have its fee paid by an application sponsor.
     ///
     /// Fee sponsorship is deliberately restricted to **simple operations** at

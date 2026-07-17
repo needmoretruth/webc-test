@@ -56,7 +56,10 @@ pub use consensus::{
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
     CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
-pub use fees::{split_fee, FeeBreakdown, FeePolicy, StoragePricing, StorageRefund};
+pub use fees::{
+    next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
+    StoragePricing, StorageRefund, NAMESPACE_FEE_LEAF_DOMAIN,
+};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
 pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
@@ -208,6 +211,14 @@ pub enum ChainError {
     TransactionChainIdMismatch,
     #[error("block execution units exceed the configured maximum of {maximum}")]
     BlockUnitsExceeded { maximum: u64 },
+    #[error(
+        "application namespace {namespace} exceeds its fair block-capacity share \
+         of {maximum} execution units"
+    )]
+    NamespaceBlockShareExceeded {
+        namespace: webc_crypto::Hash256,
+        maximum: u64,
+    },
     #[error(
         "serialized block size {actual} bytes exceeds the configured maximum of {maximum} bytes"
     )]

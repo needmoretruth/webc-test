@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, BinaryHeap};
 
 use webc_chain::{AuthorizationLaneId, ChainConfig, ChainError, ChainState, Transaction};
-use webc_crypto::Address;
+use webc_crypto::{Address, Hash256};
 
 /// Tuning knobs for mempool admission and retention.
 #[derive(Clone, Debug)]
@@ -358,8 +358,6 @@ impl Mempool {
         max_units: u64,
         now_ms: u64,
     ) -> Vec<Transaction> {
-        let base_fee = state.current_base_fee_per_unit;
-
         // Build each sender/lane's gap-free runnable run, in nonce order.
         let mut runs: BTreeMap<(Address, AuthorizationLaneId), Vec<&Entry>> = BTreeMap::new();
         for ((sender, lane, nonce), entry) in &self.entries {
@@ -409,8 +407,14 @@ impl Mempool {
         }
 
         // Effective fee ignoring an unaffordable base fee: an underpriced head
-        // disqualifies its whole run.
-        let effective = |entry: &Entry| entry.tx.fee.effective_fee_per_unit(base_fee).ok();
+        // disqualifies its whole run. Object operations are priced by their
+        // namespace's localized base fee, account-scoped ones by the global base
+        // fee (Phase 6 §8), so affordability and priority use the same per-operation
+        // base fee the state machine will charge.
+        let effective = |entry: &Entry| {
+            let base_fee = state.base_fee_per_unit_for(&entry.tx.operation, config);
+            entry.tx.fee.effective_fee_per_unit(base_fee).ok()
+        };
 
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
         for (key, run) in &runs {
@@ -426,6 +430,17 @@ impl Mempool {
             }
         }
 
+        // Fair packing (Phase 6 acceptance): defer a namespace once it reaches its
+        // per-block share cap, but keep admitting other namespaces' transactions, so
+        // one hot application cannot monopolize the block. Best-effort here — an
+        // invalid policy falls back to the whole-block limit — because `build_block`
+        // is the hard validity gate; this only shapes the proposer's selection.
+        let namespace_unit_cap = config
+            .fee_policy
+            .namespace_block_unit_cap()
+            .unwrap_or(config.fee_policy.max_block_units);
+        let mut namespace_units: BTreeMap<Hash256, u64> = BTreeMap::new();
+
         let mut selected = Vec::new();
         let mut units_used = 0u64;
         while let Some(candidate) = heap.pop() {
@@ -436,8 +451,27 @@ impl Mempool {
                 // so drop this group and keep filling from other senders.
                 continue;
             }
+            // Fair-packing cap for namespace-scoped (object) operations: if this
+            // namespace is at its share, defer this group but keep filling others.
+            let namespace_projected =
+                if let Some(namespace) = candidate.entry.tx.operation.fee_namespace() {
+                    let projected_ns = namespace_units
+                        .get(&namespace)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(required);
+                    if projected_ns > namespace_unit_cap {
+                        continue;
+                    }
+                    Some((namespace, projected_ns))
+                } else {
+                    None
+                };
             selected.push(candidate.entry.tx.clone());
             units_used = projected;
+            if let Some((namespace, projected_ns)) = namespace_projected {
+                namespace_units.insert(namespace, projected_ns);
+            }
 
             // Advance this group's run to the next contiguous transaction.
             let run = &runs[&candidate.key];
@@ -510,6 +544,107 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn create_object(
+        from: &Keypair,
+        namespace: Hash256,
+        obj_seed: &[u8],
+        nonce: u64,
+    ) -> Transaction {
+        Transaction::for_operation(
+            from,
+            nonce,
+            Operation::CreateObject {
+                object_id: webc_chain::ObjectId::new(Hash256::digest(obj_seed)),
+                namespace,
+                data: Vec::new(),
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fair_packing_defers_a_hot_namespace_but_admits_other_namespaces() {
+        // Phase 6 acceptance: when one application namespace floods the pool, the
+        // fair packer includes only up to its per-block share cap and defers the
+        // rest, while still admitting an unrelated namespace's transactions — one
+        // hot app cannot monopolize block capacity.
+        let hot = keypair(1);
+        let other = keypair(2);
+        // A small block so the cap is a couple of object operations: cap =
+        // 100_000 * 5000 / 10_000 = 50_000 units = 2 object operations (20_000 each);
+        // a third would exceed it.
+        let config = ChainConfig {
+            fee_policy: webc_chain::FeePolicy {
+                target_block_units: 50_000,
+                max_block_units: 100_000,
+                namespace_block_share_bps: 5_000,
+                ..webc_chain::FeePolicy::default()
+            },
+            ..ChainConfig::default()
+        };
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: hot.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: other.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).unwrap();
+        let ns_hot = Hash256::digest(b"hot-namespace");
+        let ns_other = Hash256::digest(b"other-namespace");
+
+        let mut pool = Mempool::new(MempoolConfig::default());
+        // Three object creates in the hot namespace (only two fit under the cap).
+        for nonce in 0..3u64 {
+            pool.insert(
+                create_object(&hot, ns_hot, format!("hot-{nonce}").as_bytes(), nonce),
+                &state,
+                &config,
+                NOW,
+            )
+            .unwrap();
+        }
+        // One object create in an unrelated namespace.
+        pool.insert(
+            create_object(&other, ns_other, b"other-0", 0),
+            &state,
+            &config,
+            NOW,
+        )
+        .unwrap();
+
+        let block = pool.select_block(&state, &config, u64::MAX, NOW);
+
+        let hot_selected = block
+            .iter()
+            .filter(|tx| tx.operation.fee_namespace() == Some(ns_hot))
+            .count();
+        let other_selected = block
+            .iter()
+            .filter(|tx| tx.operation.fee_namespace() == Some(ns_other))
+            .count();
+        assert_eq!(
+            hot_selected, 2,
+            "the hot namespace is capped at its fair per-block share (2 object ops)"
+        );
+        assert_eq!(
+            other_selected, 1,
+            "an unrelated namespace's transaction is still admitted alongside the hot one"
+        );
     }
 
     #[test]
