@@ -79,7 +79,7 @@ pub const FROZEN_TOKEN_LEAF_DOMAIN: &[u8] = b"WEBC_FROZEN_TOKEN_LEAF_V1";
 /// Maximum bytes in a token's human-readable name.
 ///
 /// Bounds the per-record name so a hostile record cannot inflate committed state
-/// or size a name allocation. Enforced on decode by [`bounded_name_hex`] and
+/// or size a name allocation. Enforced on decode by the bounded name codec and
 /// re-checked by [`TokenMetadata::validate`].
 pub const MAX_TOKEN_NAME_BYTES: usize = 32;
 
@@ -391,8 +391,13 @@ mod tests {
     }
 
     fn sample_metadata() -> TokenMetadata {
-        TokenMetadata::new(b"Acme Dollar".to_vec(), b"ACME".to_vec(), 6, Hash256([0x1f; 32]))
-            .expect("valid metadata")
+        TokenMetadata::new(
+            b"Acme Dollar".to_vec(),
+            b"ACME".to_vec(),
+            6,
+            Hash256([0x1f; 32]),
+        )
+        .expect("valid metadata")
     }
 
     #[test]
@@ -417,21 +422,36 @@ mod tests {
         // Empty name / symbol rejected.
         let mut m = sample_metadata();
         m.name.clear();
-        assert!(matches!(m.validate(), Err(ChainError::InvalidTokenMetadata)));
+        assert!(matches!(
+            m.validate(),
+            Err(ChainError::InvalidTokenMetadata)
+        ));
         let mut m = sample_metadata();
         m.symbol.clear();
-        assert!(matches!(m.validate(), Err(ChainError::InvalidTokenMetadata)));
+        assert!(matches!(
+            m.validate(),
+            Err(ChainError::InvalidTokenMetadata)
+        ));
         // Over-length name / symbol rejected.
         let mut m = sample_metadata();
         m.name = vec![0x61; MAX_TOKEN_NAME_BYTES + 1];
-        assert!(matches!(m.validate(), Err(ChainError::InvalidTokenMetadata)));
+        assert!(matches!(
+            m.validate(),
+            Err(ChainError::InvalidTokenMetadata)
+        ));
         let mut m = sample_metadata();
         m.symbol = vec![0x61; MAX_TOKEN_SYMBOL_BYTES + 1];
-        assert!(matches!(m.validate(), Err(ChainError::InvalidTokenMetadata)));
+        assert!(matches!(
+            m.validate(),
+            Err(ChainError::InvalidTokenMetadata)
+        ));
         // Out-of-range decimals rejected.
         let mut m = sample_metadata();
         m.decimals = MAX_TOKEN_DECIMALS + 1;
-        assert!(matches!(m.validate(), Err(ChainError::InvalidTokenMetadata)));
+        assert!(matches!(
+            m.validate(),
+            Err(ChainError::InvalidTokenMetadata)
+        ));
     }
 
     #[test]

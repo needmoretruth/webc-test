@@ -4347,7 +4347,10 @@ impl ChainState {
                 // A frozen recipient cannot receive. Freeze state is read directly on
                 // the value path (not via the access recorder), matching the minimal
                 // transfer access list.
-                if self.frozen_token_accounts.contains(&(*token_id, *recipient)) {
+                if self
+                    .frozen_token_accounts
+                    .contains(&(*token_id, *recipient))
+                {
                     return Err(ChainError::TokenAccountFrozen);
                 }
                 // Credit the recipient and raise issued supply by the same amount.
@@ -4420,7 +4423,9 @@ impl ChainState {
                 }
                 // Neither sender nor recipient may be frozen (read directly).
                 if self.frozen_token_accounts.contains(&(*token_id, tx.sender))
-                    || self.frozen_token_accounts.contains(&(*token_id, *recipient))
+                    || self
+                        .frozen_token_accounts
+                        .contains(&(*token_id, *recipient))
                 {
                     return Err(ChainError::TokenAccountFrozen);
                 }
@@ -5090,10 +5095,7 @@ impl ChainState {
     /// This is a SEPARATE asset from native WEBC and never enters
     /// [`Self::supply_invariant_report`]. Returns [`ChainError::TokenNotFound`] if
     /// the token does not exist. Checked addition over the held balances.
-    pub fn token_supply_report(
-        &self,
-        token_id: TokenId,
-    ) -> Result<TokenSupplyReport, ChainError> {
+    pub fn token_supply_report(&self, token_id: TokenId) -> Result<TokenSupplyReport, ChainError> {
         let issued = self
             .tokens
             .get(&token_id)
@@ -15789,5 +15791,856 @@ mod tests {
             Amount::from_units(104_500)
         );
         assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    // ----- native fungible tokens (Phase 13a, §15) -----
+
+    /// The application namespace all native-token tests create under.
+    fn token_namespace() -> Hash256 {
+        Hash256([0x77; 32])
+    }
+
+    /// A valid sample token metadata record (name "Acme Dollar", symbol "ACME").
+    fn sample_token_metadata() -> crate::TokenMetadata {
+        crate::TokenMetadata::new(
+            b"Acme Dollar".to_vec(),
+            b"ACME".to_vec(),
+            6,
+            Hash256([0x1f; 32]),
+        )
+        .expect("valid metadata")
+    }
+
+    /// Genesis funding a token creator (also the default authority holder), a
+    /// holder, and an outsider — all with room for the creation deposit + fees.
+    fn token_fixture() -> (ChainConfig, ChainState, Keypair, Keypair, Keypair) {
+        let config = ChainConfig::default();
+        let creator = Keypair::from_seed([51u8; 32]);
+        let holder = Keypair::from_seed([52u8; 32]);
+        let outsider = Keypair::from_seed([53u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: creator.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: holder.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: outsider.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("token genesis");
+        (config, state, creator, holder, outsider)
+    }
+
+    /// The token units `addr` holds of `token_id` (0 when the entry is pruned).
+    fn token_balance(state: &ChainState, token_id: TokenId, addr: Address) -> u128 {
+        state
+            .token_balances
+            .get(&(token_id, addr))
+            .map_or(0, |a| a.0)
+    }
+
+    /// Creates a token owned by `creator` and returns its derived id.
+    #[allow(clippy::too_many_arguments)]
+    fn create_token(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        creator: &Keypair,
+        nonce: u64,
+        create_nonce: u64,
+        mint_authority: Option<Address>,
+        freeze_authority: Option<Address>,
+        initial_supply: Amount,
+        initial_recipient: Address,
+    ) -> Result<TokenId, ChainError> {
+        mandate_exec(
+            state,
+            config,
+            creator,
+            nonce,
+            Operation::CreateToken {
+                namespace: token_namespace(),
+                create_nonce,
+                metadata: sample_token_metadata(),
+                mint_authority,
+                freeze_authority,
+                initial_supply,
+                initial_recipient,
+            },
+        )?;
+        Ok(TokenId::derive(
+            token_namespace(),
+            creator.address(),
+            create_nonce,
+        ))
+    }
+
+    #[test]
+    fn create_records_token_and_reads_back_with_supply_balanced() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        let creator_liquid_before = balance(&state, creator.address());
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            creator.address(),
+        )
+        .expect("create succeeds");
+
+        let record = state.tokens.get(&token_id).expect("token exists");
+        assert_eq!(record.creator, creator.address());
+        assert_eq!(record.mint_authority, Some(creator.address()));
+        assert_eq!(record.freeze_authority, Some(creator.address()));
+        assert!(!record.paused);
+        assert_eq!(record.issued_supply, Amount::from_units(1_000));
+        assert_eq!(record.metadata.symbol, b"ACME");
+        // The initial supply is credited to the recipient.
+        assert_eq!(token_balance(&state, token_id, creator.address()), 1_000);
+
+        // The deposit is locked into token_deposits; native supply still balances
+        // (only the deposit + fee left the creator's liquid balance — no WEBC minted
+        // or burned by token creation).
+        let deposit = config.token.creation_deposit;
+        assert_eq!(state.token_deposits, deposit);
+        let report = state.supply_invariant_report().unwrap();
+        assert!(report.balanced);
+        assert_eq!(report.token_deposits, deposit);
+        assert!(balance(&state, creator.address()) < creator_liquid_before);
+
+        // The per-token supply invariant holds: issued == held.
+        let tok = state.token_supply_report(token_id).unwrap();
+        assert!(tok.balanced);
+        assert_eq!(tok.issued, Amount::from_units(1_000));
+        assert_eq!(tok.held, Amount::from_units(1_000));
+    }
+
+    #[test]
+    fn duplicate_token_id_is_rejected() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("first create");
+        // Same (namespace, creator, create_nonce) derives the same id: rejected.
+        let before = state.clone();
+        let err = create_token(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            0,
+            Some(creator.address()),
+            None,
+            Amount::ZERO,
+            creator.address(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAlreadyExists));
+        assert_eq!(state, before, "rejected duplicate leaves state unchanged");
+    }
+
+    #[test]
+    fn over_length_metadata_and_bad_decimals_are_rejected_on_apply() {
+        let (config, mut state, creator, _holder, _outsider) = token_fixture();
+        let bad_create = |metadata: crate::TokenMetadata, nonce: u64| Operation::CreateToken {
+            namespace: token_namespace(),
+            create_nonce: nonce,
+            metadata,
+            mint_authority: Some(creator.address()),
+            freeze_authority: None,
+            initial_supply: Amount::ZERO,
+            initial_recipient: creator.address(),
+        };
+        // Over-length name.
+        let mut m = sample_token_metadata();
+        m.name = vec![0x61; crate::MAX_TOKEN_NAME_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 0)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidTokenMetadata));
+        // Over-length symbol.
+        let mut m = sample_token_metadata();
+        m.symbol = vec![0x61; crate::MAX_TOKEN_SYMBOL_BYTES + 1];
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 1)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidTokenMetadata));
+        // Out-of-range decimals.
+        let mut m = sample_token_metadata();
+        m.decimals = crate::MAX_TOKEN_DECIMALS + 1;
+        let err = mandate_exec(&mut state, &config, &creator, 0, bad_create(m, 2)).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidTokenMetadata));
+        // No token was recorded and no deposit was locked on any rejected create.
+        assert!(state.tokens.is_empty());
+        assert_eq!(state.token_deposits, Amount::ZERO);
+    }
+
+    #[test]
+    fn mint_requires_authority_and_raises_supply() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            None,
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("create");
+        // A non-authority cannot mint.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(500),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenMintNotAuthorized));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+        // The authority mints: recipient credited, issued_supply raised.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(500),
+            },
+        )
+        .expect("authority mint");
+        assert_eq!(token_balance(&state, token_id, holder.address()), 500);
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(500)
+        );
+        // Both invariants hold, and no native WEBC was created by the mint.
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn mint_to_frozen_account_is_rejected() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("create");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(100),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+        assert_eq!(state, before, "rejected mint leaves state unchanged");
+    }
+
+    #[test]
+    fn burn_reduces_holder_and_supply_with_guards() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        // Burning more than held is rejected.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(2_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenInsufficientBalance));
+        assert_eq!(state, before, "rejected burn leaves state unchanged");
+        // Burning while frozen is rejected.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(100),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+        // Thaw, then a burn reduces the holder AND the issued supply by the same.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::ThawTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("thaw");
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(400),
+            },
+        )
+        .expect("burn");
+        assert_eq!(token_balance(&state, token_id, holder.address()), 600);
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(600)
+        );
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn transfer_moves_balance_prunes_zero_and_guards() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        // Insufficient balance is rejected.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(2_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenInsufficientBalance));
+        assert_eq!(state, before, "rejected transfer leaves state unchanged");
+        // A full-balance transfer moves the units and PRUNES the zero sender entry.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .expect("transfer all");
+        assert_eq!(token_balance(&state, token_id, outsider.address()), 1_000);
+        assert!(
+            !state
+                .token_balances
+                .contains_key(&(token_id, holder.address())),
+            "a sender balance that reaches zero is pruned"
+        );
+        // A transfer conserves supply: issued_supply is unchanged and both invariants
+        // still hold.
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(1_000)
+        );
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        // Pausing rejects further transfers.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetTokenPaused {
+                token_id,
+                paused: true,
+            },
+        )
+        .expect("pause");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(10),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenPaused));
+        // Unpause, then a frozen RECIPIENT rejects the transfer.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetTokenPaused {
+                token_id,
+                paused: false,
+            },
+        )
+        .expect("unpause");
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze recipient");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(10),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+    }
+
+    #[test]
+    fn freeze_blocks_sending_and_thaw_restores_it() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        // Freeze the SENDER: a transfer from it is rejected.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(100),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAccountFrozen));
+        // Thaw: the transfer now succeeds.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::ThawTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("thaw");
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(100),
+            },
+        )
+        .expect("transfer after thaw");
+        assert_eq!(token_balance(&state, token_id, outsider.address()), 100);
+        assert_eq!(token_balance(&state, token_id, holder.address()), 900);
+        assert!(state.token_supply_report(token_id).unwrap().balanced);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn authority_transfer_moves_control_and_renounce_is_permanent() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::ZERO,
+            creator.address(),
+        )
+        .expect("create");
+        // Transfer the mint authority from creator to holder.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .expect("transfer mint authority");
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().mint_authority,
+            Some(holder.address())
+        );
+        // The OLD authority (creator) can no longer mint.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::MintToken {
+                token_id,
+                recipient: creator.address(),
+                amount: Amount::from_units(1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenMintNotAuthorized));
+        // The NEW authority (holder) can mint.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(50),
+            },
+        )
+        .expect("new authority mint");
+        // A non-authority cannot transfer/renounce the authority.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &outsider,
+            0,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: Some(outsider.address()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAuthorityNotAuthorized));
+        // The current authority (holder) RENOUNCES minting: Some -> None, permanent.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            1,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: None,
+            },
+        )
+        .expect("renounce mint");
+        assert_eq!(state.tokens.get(&token_id).unwrap().mint_authority, None);
+        // Minting is now impossible for anyone.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenMintNotAuthorized));
+        // The renounced authority can NEVER be restored (a Phase 13 criterion).
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            2,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Mint,
+                new_authority: Some(holder.address()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenAuthorityNotAuthorized));
+        // Renouncing the freeze authority likewise permanently disables freezing.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind: crate::TokenAuthorityKind::Freeze,
+                new_authority: None,
+            },
+        )
+        .expect("renounce freeze");
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            3,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::TokenFreezeNotAuthorized));
+    }
+
+    #[test]
+    fn both_supply_invariants_hold_after_every_step() {
+        let (config, mut state, creator, holder, outsider) = token_fixture();
+        let assert_both = |state: &ChainState, token_id: TokenId| {
+            assert!(
+                state.supply_invariant_report().unwrap().balanced,
+                "native WEBC supply must stay balanced (token ops never mint/burn WEBC)"
+            );
+            assert!(
+                state.token_supply_report(token_id).unwrap().balanced,
+                "per-token supply must equal the sum of held balances"
+            );
+        };
+        // Create with an initial mint to the creator.
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            creator.address(),
+        )
+        .expect("create");
+        assert_both(&state, token_id);
+        // Mint more to the holder.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::MintToken {
+                token_id,
+                recipient: holder.address(),
+                amount: Amount::from_units(500),
+            },
+        )
+        .expect("mint");
+        assert_both(&state, token_id);
+        // Burn part of the creator's own balance.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            2,
+            Operation::BurnToken {
+                token_id,
+                amount: Amount::from_units(200),
+            },
+        )
+        .expect("burn");
+        assert_both(&state, token_id);
+        // Transfer from the holder to the outsider.
+        mandate_exec(
+            &mut state,
+            &config,
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient: outsider.address(),
+                amount: Amount::from_units(300),
+            },
+        )
+        .expect("transfer");
+        assert_both(&state, token_id);
+        // Final tallies: issued = 1000 + 500 - 200 = 1300; held sums to 1300.
+        assert_eq!(
+            state.tokens.get(&token_id).unwrap().issued_supply,
+            Amount::from_units(1_300)
+        );
+        assert_eq!(token_balance(&state, token_id, creator.address()), 800);
+        assert_eq!(token_balance(&state, token_id, holder.address()), 200);
+        assert_eq!(token_balance(&state, token_id, outsider.address()), 300);
+        assert_eq!(
+            state.token_supply_report(token_id).unwrap().held,
+            Amount::from_units(1_300)
+        );
+    }
+
+    #[test]
+    fn token_state_is_committed_by_the_state_root() {
+        let (config, mut state, creator, holder, _outsider) = token_fixture();
+        let root_empty = state.state_root().unwrap();
+        let token_id = create_token(
+            &mut state,
+            &config,
+            &creator,
+            0,
+            0,
+            Some(creator.address()),
+            Some(creator.address()),
+            Amount::from_units(1_000),
+            holder.address(),
+        )
+        .expect("create");
+        let root_after_create = state.state_root().unwrap();
+        assert_ne!(
+            root_after_create, root_empty,
+            "creating a token moves the state root"
+        );
+        // A bincode restart preserves the token collections and the deposit scalar,
+        // so the committed state root is stable across a crash/restart.
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.tokens, state.tokens);
+        assert_eq!(restored.token_balances, state.token_balances);
+        assert_eq!(restored.frozen_token_accounts, state.frozen_token_accounts);
+        assert_eq!(restored.token_deposits, state.token_deposits);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            root_after_create,
+            "token state is committed by the state root across a restart"
+        );
+        // Freezing an account moves the frozen sub-root and thus the state root.
+        mandate_exec(
+            &mut state,
+            &config,
+            &creator,
+            1,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+        )
+        .expect("freeze");
+        assert_ne!(
+            state.state_root().unwrap(),
+            root_after_create,
+            "freezing an account moves the state root"
+        );
     }
 }

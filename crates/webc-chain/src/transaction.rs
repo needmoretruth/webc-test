@@ -1362,8 +1362,7 @@ impl Operation {
                     StateKey::token_balance(*token_id, *recipient),
                 );
             }
-            Self::SetTokenPaused { token_id, .. }
-            | Self::SetTokenAuthority { token_id, .. } => {
+            Self::SetTokenPaused { token_id, .. } | Self::SetTokenAuthority { token_id, .. } => {
                 // Pause / authority change rewrite one token record; move no native
                 // units, so they declare only the record beyond the fee lane base.
                 push_unique_key(&mut read_write, StateKey::token(*token_id));
@@ -1373,10 +1372,7 @@ impl Operation {
                 // The record is read to check the freeze authority; the freeze marker
                 // is the only write. Freezing moves no native units.
                 push_unique_key(&mut read_only, StateKey::token(*token_id));
-                push_unique_key(
-                    &mut read_write,
-                    StateKey::token_freeze(*token_id, *account),
-                );
+                push_unique_key(&mut read_write, StateKey::token_freeze(*token_id, *account));
             }
             Self::InvokeContract {
                 code_id,
@@ -2534,6 +2530,129 @@ mod tests {
         value["RegisterService"]["title"] = serde_json::Value::String(
             "61".repeat(crate::service_registry::MAX_SERVICE_TITLE_BYTES + 1),
         );
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn token_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the native token operations (Phase 13a, §15) so
+        // a browser SDK mirror must reproduce these exact field names and sorted-key
+        // order. Adding these variants leaves the frozen `every_native_operation_...`
+        // cross-language vector untouched (serde tags variants by name; existing
+        // variants are unchanged). Byte-string fields are lowercase hex; amounts are
+        // decimal STRINGS; addresses are base58; an Option is the address or null.
+        let token_id = TokenId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let recipient = Keypair::from_seed([9u8; 32]).address();
+        let rcpt = recipient.to_base58();
+        let account = Keypair::from_seed([10u8; 32]).address();
+        let acct = account.to_base58();
+
+        // CreateToken carries the nested TokenMetadata struct, so round-trip it and
+        // confirm the metadata name is lowercase hex on the wire.
+        let create = Operation::CreateToken {
+            namespace: Hash256([0x55; 32]),
+            create_nonce: 7,
+            metadata: TokenMetadata::new(
+                b"Acme Dollar".to_vec(),
+                b"ACME".to_vec(),
+                6,
+                Hash256([0x1f; 32]),
+            )
+            .expect("valid metadata"),
+            mint_authority: Some(recipient),
+            freeze_authority: None,
+            initial_supply: Amount::from_units(1_000),
+            initial_recipient: recipient,
+        };
+        let text = serde_json::to_string(&create).expect("create serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), create);
+        assert!(text.contains(&format!("\"name\":\"{}\"", hex::encode("Acme Dollar"))));
+
+        let mint = Operation::MintToken {
+            token_id,
+            recipient,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&mint).unwrap(),
+            format!(r#"{{"MintToken":{{"amount":"7","recipient":"{rcpt}","token_id":"{id}"}}}}"#),
+        );
+
+        let burn = Operation::BurnToken {
+            token_id,
+            amount: Amount::from_units(3),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&burn).unwrap(),
+            format!(r#"{{"BurnToken":{{"amount":"3","token_id":"{id}"}}}}"#),
+        );
+
+        let transfer = Operation::TransferToken {
+            token_id,
+            recipient,
+            amount: Amount::from_units(5),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&transfer).unwrap(),
+            format!(
+                r#"{{"TransferToken":{{"amount":"5","recipient":"{rcpt}","token_id":"{id}"}}}}"#
+            ),
+        );
+
+        let pause = Operation::SetTokenPaused {
+            token_id,
+            paused: true,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&pause).unwrap(),
+            format!(r#"{{"SetTokenPaused":{{"paused":true,"token_id":"{id}"}}}}"#),
+        );
+
+        let freeze = Operation::FreezeTokenAccount { token_id, account };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&freeze).unwrap(),
+            format!(r#"{{"FreezeTokenAccount":{{"account":"{acct}","token_id":"{id}"}}}}"#),
+        );
+
+        let thaw = Operation::ThawTokenAccount { token_id, account };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&thaw).unwrap(),
+            format!(r#"{{"ThawTokenAccount":{{"account":"{acct}","token_id":"{id}"}}}}"#),
+        );
+
+        // Authority transfer (Some) pins the address; renounce (None) pins null.
+        let grant_auth = Operation::SetTokenAuthority {
+            token_id,
+            authority_kind: TokenAuthorityKind::Mint,
+            new_authority: Some(recipient),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&grant_auth).unwrap(),
+            format!(
+                r#"{{"SetTokenAuthority":{{"authority_kind":"Mint","new_authority":"{rcpt}","token_id":"{id}"}}}}"#
+            ),
+        );
+        let renounce = Operation::SetTokenAuthority {
+            token_id,
+            authority_kind: TokenAuthorityKind::Freeze,
+            new_authority: None,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&renounce).unwrap(),
+            format!(
+                r#"{{"SetTokenAuthority":{{"authority_kind":"Freeze","new_authority":null,"token_id":"{id}"}}}}"#
+            ),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations,
+        // and the bounded hex codec rejects an over-length metadata name.
+        let mut value = serde_json::to_value(&mint).unwrap();
+        value["MintToken"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateToken"]["metadata"]["name"] =
+            serde_json::Value::String("61".repeat(crate::token::MAX_TOKEN_NAME_BYTES + 1));
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 
