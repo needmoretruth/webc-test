@@ -430,6 +430,22 @@ async fn accept_loop(
     }
 }
 
+/// Computes the next reconnect backoff (finding N5).
+///
+/// The backoff resets to the floor ONLY after an authenticated connection. A
+/// bare TCP accept is not enough: a host that accepts TCP but then fails or
+/// stalls the handshake would otherwise be redialed every
+/// `RECONNECT_BACKOFF_START_MS` forever, since the old code reset on connect.
+/// Resetting only on authentication makes a misbehaving host back off like any
+/// other unreachable peer.
+fn next_reconnect_backoff(previous_ms: u64, authenticated: bool) -> u64 {
+    if authenticated {
+        RECONNECT_BACKOFF_START_MS
+    } else {
+        previous_ms.saturating_mul(2).min(RECONNECT_BACKOFF_MAX_MS)
+    }
+}
+
 /// Dials a bootstrap peer and reconnects with capped exponential backoff.
 async fn dial_loop(addr: SocketAddr, shared: Arc<SharedConfig>, events: mpsc::Sender<Event>) {
     let mut backoff = RECONNECT_BACKOFF_START_MS;
@@ -439,12 +455,17 @@ async fn dial_loop(addr: SocketAddr, shared: Arc<SharedConfig>, events: mpsc::Se
         }
         match TcpStream::connect(addr).await {
             Ok(stream) => {
-                backoff = RECONNECT_BACKOFF_START_MS;
-                // Returns when the connection closes; then we reconnect.
-                let _ = run_connection(stream, shared.clone(), events.clone()).await;
+                // `run_connection` returns `Ok` only after a successful
+                // authenticated handshake (it then runs until the connection
+                // closes); a handshake failure/timeout returns `Err`. Reset the
+                // backoff only on that authenticated success (N5).
+                let authenticated = run_connection(stream, shared.clone(), events.clone())
+                    .await
+                    .is_ok();
+                backoff = next_reconnect_backoff(backoff, authenticated);
             }
             Err(_) => {
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_MS);
+                backoff = next_reconnect_backoff(backoff, false);
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
@@ -827,6 +848,27 @@ mod tests {
 
     fn loopback() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    #[test]
+    fn backoff_grows_until_authenticated_then_resets() {
+        // N5: a bare TCP accept (authenticated = false) keeps growing the
+        // backoff; only an authenticated connection resets it to the floor.
+        let mut backoff = RECONNECT_BACKOFF_START_MS;
+        backoff = next_reconnect_backoff(backoff, false);
+        assert_eq!(backoff, RECONNECT_BACKOFF_START_MS * 2);
+        backoff = next_reconnect_backoff(backoff, false);
+        assert_eq!(backoff, RECONNECT_BACKOFF_START_MS * 4);
+        // The growth is capped.
+        for _ in 0..20 {
+            backoff = next_reconnect_backoff(backoff, false);
+        }
+        assert_eq!(backoff, RECONNECT_BACKOFF_MAX_MS);
+        // An authenticated connection resets to the floor.
+        assert_eq!(
+            next_reconnect_backoff(backoff, true),
+            RECONNECT_BACKOFF_START_MS
+        );
     }
 
     fn sample_tx(seed: u8) -> Transaction {
