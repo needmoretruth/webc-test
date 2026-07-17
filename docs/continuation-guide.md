@@ -333,7 +333,28 @@ another's price" and "fair capacity bounds saturation" are already met); (2) the
 TPS benchmarks (100/500/1000/2000 gates) need real reference hardware, not a cloud
 container (a known deferred non-finding).
 
-### Next: Phase 7 — contract runtime, native oracle, then Weft
+### Phase 7 progress
+
+**Native oracle — DONE.** New `oracle` module: `CreateFeed`/`RegisterReporter`/
+`DeregisterReporter`/`SubmitReport`/`PayFeedRead`; integer median (lower-mid
+tie-break) over reporters' latest values; read-fee revenue settled every
+`settlement_epochs`, split accuracy- (inverse-distance) and liveness-weighted with
+the F1 dust-carry (supply-neutral). Locked `oracle_bonds` + `oracle_revenue`
+buckets in the supply invariant; feeds/reporters committed via new sub-roots;
+state-commitment domain **V11→V12**. Reporter slashing deferred (ADR-0012 owner
+decision) — outliers simply earn zero revenue. Deferred oracle refinements (later
+`oracle-economics.md` steps): first-party publisher class, cold-start seeding, app
+subscriptions, once-per-block pull gating, freshness-gating the displayed aggregate.
+
+**Contract runtime (Phase 7a) — NEXT, design-first.** This is a major
+architectural step (sandboxed execution, deterministic gas metering, declared-access
+integration, the interim Rust-authoring path, and how it relates to the
+compiler-emitted machine manifest of Weft §15.41 and ADR-0006's off-chain-compile
+gate). A design **ADR-0014** should land before implementation — IN PROGRESS
+(subagent). It records the sandboxing model options and the one(s) recommended; the
+implementation is a large multi-cycle effort that follows the ADR.
+
+### Original Phase 7 plan summary — contract runtime, native oracle, then Weft
 
 Per `development-plan.md` Phase 7 (sequencing owner-confirmed): **7a** a sandboxed
 contract runtime with declared-access enforcement + interim Rust authoring ships
