@@ -255,28 +255,34 @@ not deeply audited.
 
 ## webc-node — HTTP / service / mempool / secrets
 
-- **H1 — HIGH — faucet DoS via unlimited fresh addresses.** `http.rs` (~311-319)
-  + `service.rs` (~360-430): cooldown/`max_recipient_balance` are keyed per
-  recipient, so unlimited fresh addresses (1) drain the faucet, (2) grow
-  `last_drip_ms` unbounded (never pruned), and (3) each drip calls `produce_block`
-  = a full block build + durable commit per request (CPU/storage DoS). No global
-  faucet rate limit. Fix: global token-bucket on the faucet; cap/expire
-  `last_drip_ms`. (Devnet-only surface, but it is the deployed `run` path.)
-- **H2 — MEDIUM — mempool has no fee-priority eviction, and `prune_expired` is
-  never called in the `run` path.** `mempool.rs` (~228-231): when full (8192) a
-  new tx is `Full`-rejected even if it bids far above the pool — a base-fee flood
-  permanently blocks higher-fee honest txs. The single-proposer sealer
-  (`main.rs` ~176-184) calls only `remove_obsolete`, never `prune_expired`
-  (that lives in `consensus_driver.rs`), so expired txs occupy slots forever,
-  making the fill permanent. Fix: evict the lowest-effective-fee entry to admit a
-  strictly higher bidder; call `prune_expired` on the seal tick.
-- **H3 — MEDIUM — unbounded WebSocket subscriptions.** `http.rs` (~321-327):
-  `ws.on_upgrade` accepts unlimited concurrent, unauthenticated subscribers (FD/
-  memory DoS). Fix: cap concurrent subscriptions.
-- **H4 — LOW/MEDIUM — internal error strings leak to clients.** `http.rs`
-  (~179-198): 5xx bodies return `to_string()` of `Internal`/`Storage`/`Node`
-  errors (storage detail, chain internals). Fix: generic 5xx message to the
-  client, log detail server-side.
+- **H1 — HIGH — RESOLVED (commit `ec327c7`) — faucet DoS via unlimited fresh
+  addresses.** Per-recipient cooldown/`max_recipient_balance` did not bound work
+  from an attacker rotating fresh addresses (each drip builds and commits a block).
+  **Fix:** a global token bucket (`FAUCET_GLOBAL_BURST = 100`, ~1 drip/s refill)
+  checked before any block work, and `last_drip_ms` is pruned to entries within the
+  cooldown so it cannot grow without bound. Reproduced first by
+  `faucet_global_rate_limit_bounds_total_drips` and
+  `faucet_token_bucket_refills_over_time_and_caps_at_burst`.
+- **H2 — MEDIUM — RESOLVED (commit `ec327c7`) — mempool has no fee-priority
+  eviction, and `prune_expired` is never called in the `run` path.** A full pool
+  `Full`-rejected every newcomer (a base-fee flood permanently blocked higher-fee
+  honest txs), and the seal tick never pruned TTL-expired txs. **Fix:** a full pool
+  evicts the lowest-effective-fee entry for a STRICTLY higher bidder (deterministic
+  key tiebreak); `seal_block` calls `prune_expired` before selection. Reproduced
+  first by `full_pool_evicts_lowest_fee_for_a_strictly_higher_bidder` and
+  `seal_prunes_expired_transactions`.
+- **H3 — MEDIUM — RESOLVED (commit `ec327c7`) — unbounded WebSocket
+  subscriptions.** `ws.on_upgrade` accepted unlimited concurrent, unauthenticated
+  subscribers (FD/memory DoS). **Fix:** an atomic counter caps live subscriptions
+  at `MAX_WS_SUBSCRIPTIONS = 256` (503 past the cap), released by an RAII guard when
+  the connection ends or the upgrade never completes. Reproduced first by
+  `reserve_slot_bounds_concurrent_reservations`.
+- **H4 — LOW/MEDIUM — RESOLVED (commit `ec327c7`) — internal error strings leak to
+  clients.** 5xx bodies returned `to_string()` of `Internal`/`Storage`/`Node`
+  errors (storage detail, chain internals). **Fix:** a 5xx logs the detail
+  server-side and returns a generic message; 4xx client errors still return their
+  detail. Reproduced first by `internal_errors_do_not_leak_detail_to_clients` and
+  `client_errors_still_return_their_detail`.
 - **H5 — INFO/mainnet-gate — no production consensus-key provisioning exists.**
   Node identity is a fresh per-process `Keypair::generate()` (no argv/env/file
   seed — good, nothing `ps`-visible or logged). The devnet faucet uses a
