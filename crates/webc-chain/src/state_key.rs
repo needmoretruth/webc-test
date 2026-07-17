@@ -124,6 +124,24 @@ pub enum StateKeyKind {
         collection_id: crate::NftCollectionId,
         serial: u64,
     },
+    /// Native governance-instance authority/treasury record for one instance id
+    /// (Phase 13c, §15).
+    GovernanceInstance {
+        instance_id: crate::GovernanceInstanceId,
+    },
+    /// Native governance-proposal record for one proposal id (Phase 13c, §15).
+    GovernanceProposal { proposal_id: crate::ProposalId },
+    /// Native governance vote-lock record for one voter on one proposal (Phase 13c,
+    /// §15).
+    ///
+    /// The per-`(proposal, voter)` key is what makes votes on DIFFERENT proposals
+    /// parallel-schedulable while double-vote protection stays local: a vote writes
+    /// only its own lock leaf and the proposal tally, never a global per-instance
+    /// object.
+    GovernanceVote {
+        proposal_id: crate::ProposalId,
+        voter: Address,
+    },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
 }
@@ -233,6 +251,25 @@ impl StateKey {
             namespace,
             key_hash,
         })
+    }
+
+    /// Returns the current governance-instance record key for `instance_id`
+    /// (Phase 13c, §15).
+    pub const fn governance_instance(instance_id: crate::GovernanceInstanceId) -> Self {
+        Self::current(StateKeyKind::GovernanceInstance { instance_id })
+    }
+
+    /// Returns the current governance-proposal record key for `proposal_id`
+    /// (Phase 13c, §15).
+    pub const fn governance_proposal(proposal_id: crate::ProposalId) -> Self {
+        Self::current(StateKeyKind::GovernanceProposal { proposal_id })
+    }
+
+    /// Returns the current governance vote-lock key for `voter` on `proposal_id`
+    /// (Phase 13c, §15). This per-`(proposal, voter)` key keeps votes on distinct
+    /// proposals free of any global per-instance bottleneck.
+    pub const fn governance_vote(proposal_id: crate::ProposalId, voter: Address) -> Self {
+        Self::current(StateKeyKind::GovernanceVote { proposal_id, voter })
     }
 
     /// Returns a current protocol-singleton key.
@@ -596,6 +633,41 @@ mod tests {
             format!(
                 r#"{{"kind":{{"NftItem":{{"collection_id":"{id}","serial":7}}}},"version":1}}"#
             ),
+        );
+    }
+
+    #[test]
+    fn governance_state_keys_have_a_stable_cross_language_wire_vector() {
+        // The governance instance, proposal, and vote keys are new StateKeyKind
+        // variants (Phase 13c, §15). Adding variants leaves the frozen every-state-key
+        // vector untouched (serde tags variants by name), so this separate vector pins
+        // the governance keys' canonical JSON shape for a browser SDK mirror without
+        // moving the old hash. The per-(proposal, voter) vote key is what keeps votes
+        // on distinct proposals parallel-schedulable without a global per-instance
+        // bottleneck.
+        let instance_id = crate::GovernanceInstanceId::new(Hash256([0x88; 32]));
+        let proposal_id = crate::ProposalId::new(Hash256([0x99; 32]));
+        let voter = Keypair::from_seed([9u8; 32]).address();
+        let id = "88".repeat(32);
+        let pid = "99".repeat(32);
+
+        let instance_key = StateKey::governance_instance(instance_id);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&instance_key).unwrap(),
+            format!(r#"{{"kind":{{"GovernanceInstance":{{"instance_id":"{id}"}}}},"version":1}}"#),
+        );
+        let proposal_key = StateKey::governance_proposal(proposal_id);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&proposal_key).unwrap(),
+            format!(r#"{{"kind":{{"GovernanceProposal":{{"proposal_id":"{pid}"}}}},"version":1}}"#),
+        );
+        let vote_key = StateKey::governance_vote(proposal_id, voter);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&vote_key).unwrap(),
+            format!(
+                r#"{{"kind":{{"GovernanceVote":{{"proposal_id":"{pid}","voter":"{voter}"}}}},"version":1}}"#,
+                voter = voter.to_base58(),
+            )
         );
     }
 }

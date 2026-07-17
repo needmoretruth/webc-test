@@ -13,11 +13,12 @@ use crate::namespace::namespace_state_key_hash;
 use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
-    ChainId, Epoch, ExternalChain, MandateCounterpartyPolicy, MandateId, NftAuthorityKind,
-    NftCollectionId, NftMetadata, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
-    ProtocolStateKey, ProtocolVersion, ServiceId, ServicePaymentFlags, ServicePrice, ServiceStatus,
+    ChainId, Epoch, ExternalChain, GovernanceAction, GovernanceConfig, GovernanceInstanceId,
+    MandateCounterpartyPolicy, MandateId, NftAuthorityKind, NftCollectionId, NftMetadata, ObjectId,
+    ObjectVersion, PostQuantumRoot, PostQuantumRootReveal, ProposalId, ProtocolStateKey,
+    ProtocolVersion, ServiceId, ServicePaymentFlags, ServicePrice, ServiceStatus,
     SessionKeyConstraints, SessionKeyId, SlashingEvidence, StateKey, TokenAuthorityKind, TokenId,
-    TokenMetadata, UnbondingRequestId, CURRENT_PROTOCOL_VERSION,
+    TokenMetadata, UnbondingRequestId, VoteChoice, CURRENT_PROTOCOL_VERSION,
     LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
@@ -932,6 +933,119 @@ pub enum Operation {
         /// New holder, or `None` to permanently renounce.
         new_authority: Option<Address>,
     },
+    /// Creates a native application-governance instance (Phase 13c, §15).
+    ///
+    /// Creator-signed (the sender is the instance's `creator`). Derives the instance
+    /// id from `(namespace, sender, create_nonce)` and records a
+    /// [`crate::GovernanceInstance`] bound to `weight_token` under the given
+    /// [`crate::GovernanceConfig`]. It LOCKS a native WEBC creation deposit
+    /// (`ChainConfig::governance.creation_deposit`) from the creator's liquid balance
+    /// into the `governance_deposits` bucket — a NON-REFUNDABLE anti-spam price;
+    /// creation NEVER mints or burns native WEBC. Fails if the derived id already
+    /// exists (`GovernanceInstanceAlreadyExists`), the config is malformed
+    /// (`InvalidGovernanceConfig`), or `weight_token` does not exist (`TokenNotFound`).
+    /// Any authorization lane may pay the fee.
+    CreateGovernanceInstance {
+        /// Application namespace the instance lives under; bound into the id.
+        namespace: Hash256,
+        /// Creator-chosen uniquifier so one creator may create several instances
+        /// under one namespace; part of the derived instance id.
+        create_nonce: u64,
+        /// Fungible token whose per-account balance denominates voting weight.
+        weight_token: TokenId,
+        /// Immutable rule set (voting period, timelock, quorum, proposal threshold,
+        /// approval threshold).
+        config: GovernanceConfig,
+    },
+    /// Funds a governance instance's native-WEBC treasury (Phase 13c, §15).
+    ///
+    /// Anyone may deposit: moves `amount` native WEBC from the sender's liquid
+    /// balance into the instance's `treasury` (tracked by the aggregate
+    /// `governance_treasury` bucket). Supply-neutral — the units move from liquid to
+    /// the treasury bucket, never minted or burned. Fails if the instance does not
+    /// exist (`GovernanceInstanceNotFound`) or the sender cannot afford `amount`. Any
+    /// authorization lane may pay the fee.
+    FundGovernanceTreasury {
+        /// Instance whose treasury grows.
+        instance_id: GovernanceInstanceId,
+        /// Native base units moved into the treasury.
+        amount: Amount,
+    },
+    /// Opens a proposal on a governance instance (Phase 13c, §15).
+    ///
+    /// The proposer must currently hold at least the instance's
+    /// `config.proposal_threshold` of the weight token (`GovernanceProposalThresholdNotMet`).
+    /// Assigns the proposal a chain-derived [`crate::ProposalId`] from the instance's
+    /// monotonic nonce, snapshots the weight token and rule set onto the proposal,
+    /// and sets it `Active` until `created_epoch + voting_period_epochs`. A
+    /// [`crate::GovernanceAction::TreasuryTransfer`] whose amount exceeds the CURRENT
+    /// treasury is rejected at open (`GovernanceTreasuryInsufficient`) as a sanity
+    /// check; execution re-checks the live treasury. Any authorization lane may pay
+    /// the fee.
+    OpenProposal {
+        /// Instance the proposal belongs to.
+        instance_id: GovernanceInstanceId,
+        /// The single bounded typed effect the proposal carries.
+        action: GovernanceAction,
+    },
+    /// Casts a lock-to-vote ballot on a proposal (Phase 13c, §15).
+    ///
+    /// LOCKS `weight_amount` of the proposal's weight token by MOVING it from the
+    /// voter's balance into the proposal's deterministic escrow
+    /// ([`crate::gov_vote_escrow_address`]); the locked amount is the vote's weight,
+    /// added to the proposal's `choice` tally. A voter may vote only ONCE per
+    /// proposal (`GovernanceAlreadyVoted`). Rejected if the proposal is not `Active`
+    /// (`GovernanceProposalNotActive`), voting has ended (`GovernanceVotingClosed`),
+    /// the weight is zero (`GovernanceVoteWeightZero`), the voter holds less than
+    /// `weight_amount` (`TokenInsufficientBalance`), or the weight token is paused
+    /// (`TokenPaused`) or the voter/escrow is frozen (`TokenAccountFrozen`) — the same
+    /// freeze/pause rules a [`Self::TransferToken`] respects. Any authorization lane
+    /// may pay the fee.
+    CastVote {
+        /// Proposal being voted on.
+        proposal_id: ProposalId,
+        /// The voter's choice.
+        choice: VoteChoice,
+        /// Weight-token units locked as this vote's weight (must be > 0).
+        weight_amount: Amount,
+    },
+    /// Resolves a proposal after its voting period ends (Phase 13c, §15).
+    ///
+    /// Permissionless. Computes quorum against the weight token's issued supply and
+    /// approval against the decisive tally, then sets the proposal `Passed` (with
+    /// `eta_epoch = voting_ends_epoch + timelock_epochs`) or `Defeated`. Rejected
+    /// before voting ends (`GovernanceVotingOpen`), if the proposal is not `Active`
+    /// (`GovernanceProposalNotActive`), or if already resolved
+    /// (`GovernanceAlreadyResolved`). Any authorization lane may pay the fee.
+    ResolveProposal {
+        /// Proposal to resolve.
+        proposal_id: ProposalId,
+    },
+    /// Executes a passed proposal after its timelock (Phase 13c, §15).
+    ///
+    /// Permissionless. Requires the proposal to be `Passed` (`GovernanceProposalNotPassed`)
+    /// and `current_epoch >= eta_epoch` (`GovernanceTimelockNotElapsed`). For a
+    /// [`crate::GovernanceAction::TreasuryTransfer`] it RE-CHECKS the live treasury
+    /// (fail-closed with `GovernanceTreasuryInsufficient`) and, on success, pays the
+    /// recipient from the treasury and sets the proposal `Executed`. Once the
+    /// execution window (one voting period past `eta_epoch`) has lapsed, it instead
+    /// sets the proposal `Expired` (a stale approval can no longer drain the
+    /// treasury). Any authorization lane may pay the fee.
+    ExecuteProposal {
+        /// Proposal to execute.
+        proposal_id: ProposalId,
+    },
+    /// Reclaims a voter's locked weight after a proposal resolves (Phase 13c, §15).
+    ///
+    /// Moves the voter's locked weight-token units back from the proposal escrow to
+    /// their balance and clears the lock, so the units can be transferred or re-used.
+    /// Allowed only once the proposal is resolved (`Passed`/`Defeated`/`Executed`/`Expired`;
+    /// otherwise `GovernanceProposalNotResolved`) and only if the voter has a lock
+    /// (`GovernanceNothingToReclaim`). Any authorization lane may pay the fee.
+    ReclaimVote {
+        /// Proposal whose lock is reclaimed.
+        proposal_id: ProposalId,
+    },
 }
 
 impl Operation {
@@ -1008,6 +1122,19 @@ impl Operation {
             | Self::FreezeNftItem { .. }
             | Self::ThawNftItem { .. }
             | Self::SetNftAuthority { .. } => 5_000,
+            // Instance creation is permissionless-for-a-fee: it records a record and
+            // locks a native deposit — the anti-spam price is a HIGH ordinary fee
+            // (comparable to token/collection creation).
+            Self::CreateGovernanceInstance { .. } => 30_000,
+            // Fund/open move units or write one record and (for open) read a balance;
+            // vote/resolve/execute/reclaim each touch a small fixed set of records and
+            // (for vote/execute/reclaim) move token or native units — comparable to
+            // the other single-record locked-value operations.
+            Self::OpenProposal { .. } | Self::ExecuteProposal { .. } => 10_000,
+            Self::FundGovernanceTreasury { .. }
+            | Self::CastVote { .. }
+            | Self::ResolveProposal { .. }
+            | Self::ReclaimVote { .. } => 5_000,
             Self::CreateFeed { .. } => 15_000,
             Self::RegisterReporter { .. }
             | Self::DeregisterReporter { .. }
@@ -1606,6 +1733,88 @@ impl Operation {
                 push_unique_key(&mut read_only, StateKey::nft_collection(*collection_id));
                 push_unique_key(&mut read_write, StateKey::nft_item(*collection_id, *serial));
             }
+            Self::CreateGovernanceInstance {
+                namespace,
+                create_nonce,
+                weight_token,
+                ..
+            } => {
+                // Creation locks a native deposit from the creator's liquid balance
+                // and writes the new instance record; the weight token is read to
+                // confirm it exists. The instance id is derived from the signer
+                // (creator), the namespace, and the create nonce, so the access list
+                // names the exact record at signing time (mirrors CreateToken).
+                let instance_id = GovernanceInstanceId::derive(*namespace, sender, *create_nonce);
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::governance_instance(instance_id));
+                push_unique_key(&mut read_only, StateKey::token(*weight_token));
+            }
+            Self::FundGovernanceTreasury { instance_id, .. } => {
+                // Fund moves native units from the funder's liquid balance into the
+                // instance treasury, so it writes both the funder account and the
+                // instance record.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::governance_instance(*instance_id));
+            }
+            Self::OpenProposal { instance_id, .. } => {
+                // Open bumps the instance's proposal nonce (writes the instance
+                // record) and creates ONE brand-new proposal at the chain-assigned
+                // nonce. That proposal id is state-dependent and NOT known at signing
+                // time, so the new proposal key cannot be pre-declared; it is created
+                // under the instance record's WRITE scope (mirrors MintNft's fresh
+                // serial). The proposer's weight-token balance is read to check the
+                // proposal threshold — the weight token is state-derived (it lives on
+                // the instance record), so a caller adds that balance key via
+                // `Transaction::for_open_proposal`; the base list below is otherwise
+                // complete.
+                push_unique_key(&mut read_write, StateKey::governance_instance(*instance_id));
+            }
+            Self::CastVote { proposal_id, .. } => {
+                // A vote writes the proposal tally and the voter's lock record. It
+                // also LOCKS weight-token units by moving them from the voter to the
+                // proposal escrow and reads the token's paused flag and both parties'
+                // freeze markers — exactly the freeze/pause reads a TransferToken
+                // declares. Those token keys need the weight token, which is
+                // state-derived (it lives on the proposal record), so a caller adds
+                // them via `Transaction::for_cast_vote`; the base list below is
+                // otherwise complete.
+                push_unique_key(&mut read_write, StateKey::governance_proposal(*proposal_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::governance_vote(*proposal_id, sender),
+                );
+            }
+            Self::ResolveProposal { proposal_id } => {
+                // Resolve writes the proposal (status/eta) and reads the weight
+                // token's issued supply for the quorum denominator. The token key
+                // needs the weight token, which is state-derived (it lives on the
+                // proposal record), so a caller adds it via
+                // `Transaction::for_resolve_proposal`; the base list below is
+                // otherwise complete.
+                push_unique_key(&mut read_write, StateKey::governance_proposal(*proposal_id));
+            }
+            Self::ExecuteProposal { proposal_id } => {
+                // Execute writes the proposal (status). A TreasuryTransfer payout also
+                // writes the instance record (treasury) and credits the recipient
+                // account — both state-derived (they come from the stored proposal),
+                // so a caller adds them via `Transaction::for_execute_proposal`; the
+                // base list below is otherwise complete (a Signaling proposal needs no
+                // extra keys).
+                push_unique_key(&mut read_write, StateKey::governance_proposal(*proposal_id));
+            }
+            Self::ReclaimVote { proposal_id } => {
+                // Reclaim reads the proposal (resolved status) and writes the voter's
+                // lock record, and moves the locked weight-token units back from the
+                // proposal escrow to the voter. Those two token-balance keys need the
+                // weight token, which is state-derived (it lives on the proposal
+                // record), so a caller adds them via `Transaction::for_reclaim_vote`;
+                // the base list below is otherwise complete.
+                push_unique_key(&mut read_only, StateKey::governance_proposal(*proposal_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::governance_vote(*proposal_id, sender),
+                );
+            }
             Self::InvokeContract {
                 code_id,
                 namespace,
@@ -1971,6 +2180,220 @@ impl Transaction {
             fee,
         );
         tx.sign(agent_keypair)?;
+        Ok(tx)
+    }
+
+    /// Builds and signs an [`Operation::OpenProposal`] on the devnet default lane
+    /// (Phase 13c, §15).
+    ///
+    /// The proposer's weight-token balance key is state-derived (the weight token
+    /// lives on the instance record, not in the operation), so the caller resolves
+    /// `weight_token` from the on-chain instance and passes it here; this builder
+    /// adds `token_balance(weight_token, proposer)` as a read so the signed access
+    /// list exactly equals what the handler touches. A stale `weight_token` fails
+    /// closed on the access-list mismatch.
+    pub fn for_open_proposal(
+        keypair: &Keypair,
+        nonce: u64,
+        instance_id: GovernanceInstanceId,
+        action: GovernanceAction,
+        weight_token: TokenId,
+        fee: FeeBid,
+    ) -> Result<Self, ChainError> {
+        let sender = keypair.address();
+        let operation = Operation::OpenProposal {
+            instance_id,
+            action,
+        };
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(
+            &mut access_list.read_only,
+            StateKey::token_balance(weight_token, sender),
+        );
+        let mut tx = Self::new_unsigned_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            keypair.public_key(),
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign(keypair)?;
+        Ok(tx)
+    }
+
+    /// Builds and signs an [`Operation::CastVote`] on the devnet default lane
+    /// (Phase 13c, §15).
+    ///
+    /// The lock moves weight-token units from the voter to the proposal escrow, so
+    /// the signed access list must name the token record (paused read), both freeze
+    /// markers (voter + escrow), and both balance keys. The weight token is
+    /// state-derived (it lives on the proposal record), so the caller resolves it
+    /// and passes it here; a stale `weight_token` fails closed on the access-list
+    /// mismatch.
+    pub fn for_cast_vote(
+        keypair: &Keypair,
+        nonce: u64,
+        proposal_id: ProposalId,
+        choice: VoteChoice,
+        weight_amount: Amount,
+        weight_token: TokenId,
+        fee: FeeBid,
+    ) -> Result<Self, ChainError> {
+        let sender = keypair.address();
+        let escrow = crate::gov_vote_escrow_address(proposal_id);
+        let operation = Operation::CastVote {
+            proposal_id,
+            choice,
+            weight_amount,
+        };
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(&mut access_list.read_only, StateKey::token(weight_token));
+        push_unique_key(
+            &mut access_list.read_only,
+            StateKey::token_freeze(weight_token, sender),
+        );
+        push_unique_key(
+            &mut access_list.read_only,
+            StateKey::token_freeze(weight_token, escrow),
+        );
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::token_balance(weight_token, sender),
+        );
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::token_balance(weight_token, escrow),
+        );
+        let mut tx = Self::new_unsigned_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            keypair.public_key(),
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign(keypair)?;
+        Ok(tx)
+    }
+
+    /// Builds and signs an [`Operation::ResolveProposal`] on the devnet default lane
+    /// (Phase 13c, §15).
+    ///
+    /// Resolve reads the weight token's issued supply for the quorum denominator;
+    /// the token key is state-derived (the weight token lives on the proposal
+    /// record), so the caller resolves it and passes it here.
+    pub fn for_resolve_proposal(
+        keypair: &Keypair,
+        nonce: u64,
+        proposal_id: ProposalId,
+        weight_token: TokenId,
+        fee: FeeBid,
+    ) -> Result<Self, ChainError> {
+        let sender = keypair.address();
+        let operation = Operation::ResolveProposal { proposal_id };
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(&mut access_list.read_only, StateKey::token(weight_token));
+        let mut tx = Self::new_unsigned_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            keypair.public_key(),
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign(keypair)?;
+        Ok(tx)
+    }
+
+    /// Builds and signs an [`Operation::ExecuteProposal`] on the devnet default lane
+    /// (Phase 13c, §15).
+    ///
+    /// A [`GovernanceAction::TreasuryTransfer`] payout writes the instance record
+    /// (treasury) and credits the recipient — both state-derived from the stored
+    /// proposal — so the caller resolves them and passes `payout =
+    /// Some((instance_id, recipient))`; a [`GovernanceAction::Signaling`] proposal
+    /// needs no extra keys (`payout = None`). A mismatch with the stored action fails
+    /// closed on the access-list check.
+    pub fn for_execute_proposal(
+        keypair: &Keypair,
+        nonce: u64,
+        proposal_id: ProposalId,
+        payout: Option<(GovernanceInstanceId, Address)>,
+        fee: FeeBid,
+    ) -> Result<Self, ChainError> {
+        let sender = keypair.address();
+        let operation = Operation::ExecuteProposal { proposal_id };
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        if let Some((instance_id, recipient)) = payout {
+            push_unique_key(
+                &mut access_list.read_write,
+                StateKey::governance_instance(instance_id),
+            );
+            push_unique_key(&mut access_list.read_write, StateKey::account(recipient));
+        }
+        let mut tx = Self::new_unsigned_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            keypair.public_key(),
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign(keypair)?;
+        Ok(tx)
+    }
+
+    /// Builds and signs an [`Operation::ReclaimVote`] on the devnet default lane
+    /// (Phase 13c, §15).
+    ///
+    /// Reclaim moves the locked weight-token units from the proposal escrow back to
+    /// the voter, so the signed access list must name both balance keys. The weight
+    /// token is state-derived (it lives on the proposal record), so the caller
+    /// resolves it and passes it here.
+    pub fn for_reclaim_vote(
+        keypair: &Keypair,
+        nonce: u64,
+        proposal_id: ProposalId,
+        weight_token: TokenId,
+        fee: FeeBid,
+    ) -> Result<Self, ChainError> {
+        let sender = keypair.address();
+        let escrow = crate::gov_vote_escrow_address(proposal_id);
+        let operation = Operation::ReclaimVote { proposal_id };
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::token_balance(weight_token, escrow),
+        );
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::token_balance(weight_token, sender),
+        );
+        let mut tx = Self::new_unsigned_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            keypair.public_key(),
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign(keypair)?;
         Ok(tx)
     }
 
@@ -3016,6 +3439,121 @@ mod tests {
         let mut value = serde_json::to_value(&create).unwrap();
         value["CreateNftCollection"]["metadata"]["name"] =
             serde_json::Value::String("61".repeat(crate::nft::MAX_NFT_NAME_BYTES + 1));
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn governance_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the native application-governance operations
+        // (Phase 13c, §15) so a browser SDK mirror must reproduce these exact field
+        // names and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Ids/tokens are 32-byte
+        // lowercase hex; amounts are decimal strings; addresses are base58; the
+        // choice/action/status enums tag by variant name.
+        let instance_id = crate::GovernanceInstanceId::new(Hash256([0x88; 32]));
+        let proposal_id = crate::ProposalId::new(Hash256([0x99; 32]));
+        let weight_token = TokenId::new(Hash256([0x77; 32]));
+        let iid = "88".repeat(32);
+        let pid = "99".repeat(32);
+        let tid = "77".repeat(32);
+        let recipient = Keypair::from_seed([9u8; 32]).address();
+        let rcpt = recipient.to_base58();
+
+        // CreateGovernanceInstance carries the nested GovernanceConfig, so round-trip
+        // it and confirm the nested threshold fields survive.
+        let create = Operation::CreateGovernanceInstance {
+            namespace: Hash256([0x55; 32]),
+            create_nonce: 7,
+            weight_token,
+            config: GovernanceConfig {
+                voting_period_epochs: 10,
+                timelock_epochs: 3,
+                quorum_bps: 3_000,
+                proposal_threshold: Amount::from_units(10),
+                approval_threshold_bps: 5_000,
+            },
+        };
+        let text = crate::canonical::canonical_json_string(&create).unwrap();
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), create);
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"CreateGovernanceInstance":{{"config":{{"approval_threshold_bps":5000,"proposal_threshold":"10","quorum_bps":3000,"timelock_epochs":3,"voting_period_epochs":10}},"create_nonce":7,"namespace":"{ns}","weight_token":"{tid}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+
+        let fund = Operation::FundGovernanceTreasury {
+            instance_id,
+            amount: Amount::from_units(100),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&fund).unwrap(),
+            format!(r#"{{"FundGovernanceTreasury":{{"amount":"100","instance_id":"{iid}"}}}}"#),
+        );
+
+        // OpenProposal with a signaling action, and with a treasury-transfer action.
+        let open_signal = Operation::OpenProposal {
+            instance_id,
+            action: GovernanceAction::Signaling,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&open_signal).unwrap(),
+            format!(r#"{{"OpenProposal":{{"action":"Signaling","instance_id":"{iid}"}}}}"#),
+        );
+        let open_pay = Operation::OpenProposal {
+            instance_id,
+            action: GovernanceAction::TreasuryTransfer {
+                recipient,
+                amount: Amount::from_units(42),
+            },
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&open_pay).unwrap(),
+            format!(
+                r#"{{"OpenProposal":{{"action":{{"TreasuryTransfer":{{"amount":"42","recipient":"{rcpt}"}}}},"instance_id":"{iid}"}}}}"#
+            ),
+        );
+
+        let vote = Operation::CastVote {
+            proposal_id,
+            choice: VoteChoice::Yes,
+            weight_amount: Amount::from_units(5),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&vote).unwrap(),
+            format!(
+                r#"{{"CastVote":{{"choice":"Yes","proposal_id":"{pid}","weight_amount":"5"}}}}"#
+            ),
+        );
+
+        let resolve = Operation::ResolveProposal { proposal_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&resolve).unwrap(),
+            format!(r#"{{"ResolveProposal":{{"proposal_id":"{pid}"}}}}"#),
+        );
+        let execute = Operation::ExecuteProposal { proposal_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&execute).unwrap(),
+            format!(r#"{{"ExecuteProposal":{{"proposal_id":"{pid}"}}}}"#),
+        );
+        let reclaim = Operation::ReclaimVote { proposal_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&reclaim).unwrap(),
+            format!(r#"{{"ReclaimVote":{{"proposal_id":"{pid}"}}}}"#),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations,
+        // including the nested config and action structs.
+        let mut value = serde_json::to_value(&fund).unwrap();
+        value["FundGovernanceTreasury"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&vote).unwrap();
+        value["CastVote"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateGovernanceInstance"]["config"]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 
