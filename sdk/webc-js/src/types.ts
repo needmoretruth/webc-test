@@ -253,6 +253,8 @@ export type StateKeyKindJson =
   | { GovernanceInstance: { instance_id: HexString } }
   | { GovernanceProposal: { proposal_id: HexString } }
   | { GovernanceVote: { proposal_id: HexString; voter: WebcAddress } }
+  // --- Agent mandates (Phase 9a, §15.32) ----------------------------------
+  | { Mandate: { mandate_id: HexString } }
   | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
@@ -451,7 +453,47 @@ export type OperationJson =
     }
   | { ResolveProposal: { proposal_id: HexString } }
   | { ExecuteProposal: { proposal_id: HexString } }
-  | { ReclaimVote: { proposal_id: HexString } };
+  | { ReclaimVote: { proposal_id: HexString } }
+  // --- Agent mandates (Phase 9a, §15.32) ----------------------------------
+  | {
+      GrantMandate: {
+        agent_key: HexString;
+        grant_nonce: number;
+        budget_total: string;
+        expiry_epoch: number;
+        per_tx_max: string;
+        rate_limit_per_day: number;
+        counterparty_policy: MandateCounterpartyPolicyJson;
+      };
+    }
+  | { TopUpMandate: { mandate_id: HexString; amount: string } }
+  | {
+      SpendUnderMandate: {
+        mandate_id: HexString;
+        recipient: WebcAddress;
+        amount: string;
+      };
+    }
+  | { RevokeMandate: { mandate_id: HexString } };
+
+/**
+ * One allowlist entry, mirroring Rust `MandateCounterparty` (externally tagged):
+ * an opaque registry category tag (32-byte hex) or a specific recipient address.
+ */
+export type MandateCounterpartyJson =
+  | { Category: HexString }
+  | { Recipient: WebcAddress };
+
+/**
+ * Which counterparties a mandate may pay, mirroring Rust
+ * `MandateCounterpartyPolicy`. `"Open"` permits any recipient; `Allowlist`
+ * permits only the listed entries. NOTE: Rust stores the allowlist in a
+ * `BTreeSet`, so entries serialize in canonical (Category before Recipient, then
+ * byte order) order — `grantMandate` sorts and deduplicates them for you.
+ */
+export type MandateCounterpartyPolicyJson =
+  | "Open"
+  | { Allowlist: MandateCounterpartyJson[] };
 
 /** Which of a token's two authorities `SetTokenAuthority` targets. */
 export type TokenAuthorityKindJson = "Mint" | "Freeze";

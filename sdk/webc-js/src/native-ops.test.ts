@@ -32,6 +32,7 @@ import {
   defaultAccessListAsync,
   deriveGovernanceInstanceIdHex,
   deriveGovVoteEscrowAddress,
+  deriveMandateIdHex,
   deriveNftCollectionIdHex,
   deriveTokenIdHex,
   executeProposal,
@@ -42,6 +43,8 @@ import {
   governanceInstanceKey,
   governanceProposalKey,
   governanceVoteKey,
+  grantMandate,
+  mandateKey,
   mintNft,
   mintToken,
   nftCollectionKey,
@@ -50,6 +53,9 @@ import {
   protocolKey,
   reclaimVote,
   resolveProposal,
+  revokeMandate,
+  spendUnderMandate,
+  topUpMandate,
   setNftAuthority,
   setNftCollectionPaused,
   setTokenAuthority,
@@ -572,6 +578,125 @@ describe("native governance state keys and access lists", () => {
     expect(resolveList.read_write).toEqual([
       accountKey(sender),
       governanceProposalKey(ID_99),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+});
+
+describe("agent mandate operation wire vectors", () => {
+  it("pins TopUp / SpendUnderMandate / Revoke canonical JSON", async () => {
+    const recipient = await addressFromSeedByte(2);
+    expect(canonicalJson(topUpMandate(ID_88, "5"))).toBe(
+      `{"TopUpMandate":{"amount":"5","mandate_id":"${ID_88}"}}`,
+    );
+    expect(canonicalJson(spendUnderMandate(ID_88, recipient, "7"))).toBe(
+      `{"SpendUnderMandate":{"amount":"7","mandate_id":"${ID_88}","recipient":"${recipient}"}}`,
+    );
+    expect(canonicalJson(revokeMandate(ID_88))).toBe(
+      `{"RevokeMandate":{"mandate_id":"${ID_88}"}}`,
+    );
+  });
+
+  it("pins GrantMandate canonical JSON (Open policy)", async () => {
+    const agentWallet = await createWalletFromSeed(new Uint8Array(32).fill(9));
+    const agentKey = bytesToHex(agentWallet.publicKey);
+    const op = grantMandate({
+      agentKey,
+      grantNonce: 3,
+      budgetTotal: "1000",
+      expiryEpoch: 100,
+      perTxMax: "100",
+      rateLimitPerDay: 5,
+      counterpartyPolicy: "Open",
+    });
+    expect(canonicalJson(op)).toBe(
+      `{"GrantMandate":{"agent_key":"${agentKey}","budget_total":"1000","counterparty_policy":"Open",` +
+        `"expiry_epoch":100,"grant_nonce":3,"per_tx_max":"100","rate_limit_per_day":5}}`,
+    );
+  });
+
+  it("sorts a mandate allowlist into Rust BTreeSet order (Category before Recipient)", async () => {
+    const agentWallet = await createWalletFromSeed(new Uint8Array(32).fill(9));
+    const agentKey = bytesToHex(agentWallet.publicKey);
+    const recipient = await addressFromSeedByte(2);
+    const op = grantMandate({
+      agentKey,
+      grantNonce: 1,
+      budgetTotal: "1000",
+      expiryEpoch: 100,
+      perTxMax: "100",
+      rateLimitPerDay: 0,
+      // Deliberately out of order; the builder must sort Category before Recipient.
+      counterpartyPolicy: {
+        Allowlist: [{ Recipient: recipient }, { Category: "c1".repeat(32) }],
+      },
+    });
+    expect(op).toEqual({
+      GrantMandate: {
+        agent_key: agentKey,
+        grant_nonce: 1,
+        budget_total: "1000",
+        expiry_epoch: 100,
+        per_tx_max: "100",
+        rate_limit_per_day: 0,
+        counterparty_policy: {
+          Allowlist: [{ Category: "c1".repeat(32) }, { Recipient: recipient }],
+        },
+      },
+    });
+    expect(() =>
+      grantMandate({
+        agentKey,
+        grantNonce: 1,
+        budgetTotal: "1000",
+        expiryEpoch: 100,
+        perTxMax: "100",
+        rateLimitPerDay: 0,
+        counterpartyPolicy: { Allowlist: [] },
+      }),
+    ).toThrow();
+  });
+});
+
+describe("agent mandate state key and access lists", () => {
+  it("pins Mandate canonical JSON", () => {
+    expect(canonicalJson(mandateKey(ID_88))).toBe(
+      `{"kind":{"Mandate":{"mandate_id":"${ID_88}"}},"version":1}`,
+    );
+  });
+
+  it("declares the recipient account on SpendUnderMandate", async () => {
+    const sender = await addressFromSeedByte(1);
+    const recipient = await addressFromSeedByte(2);
+    const list = defaultAccessList(sender, spendUnderMandate(ID_88, recipient, "7"));
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      mandateKey(ID_88),
+      accountKey(recipient),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+
+  it("names the derived mandate record on GrantMandate", async () => {
+    const sender = await addressFromSeedByte(1);
+    const agentWallet = await createWalletFromSeed(new Uint8Array(32).fill(9));
+    const agentKey = bytesToHex(agentWallet.publicKey);
+    const mandateId = await deriveMandateIdHex(sender, agentKey, 3);
+    const list = await defaultAccessListAsync(
+      sender,
+      grantMandate({
+        agentKey,
+        grantNonce: 3,
+        budgetTotal: "1000",
+        expiryEpoch: 100,
+        perTxMax: "100",
+        rateLimitPerDay: 5,
+        counterpartyPolicy: "Open",
+      }),
+    );
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      mandateKey(mandateId),
       feeAccumulatorKey(sender, DEFAULT_LANE),
     ]);
   });

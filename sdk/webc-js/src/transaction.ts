@@ -34,6 +34,8 @@ import type {
   SessionKeyIdJson,
   GovernanceActionJson,
   GovernanceConfigJson,
+  MandateCounterpartyJson,
+  MandateCounterpartyPolicyJson,
   NftAuthorityKindJson,
   NftMetadataJson,
   SlashingEvidenceJson,
@@ -507,6 +509,69 @@ function requireGovernanceConfig(config: GovernanceConfigJson): void {
   requireBoundedU(config.quorum_bps, "quorum bps", 10_000);
   requireCanonicalAmount(config.proposal_threshold, "proposal threshold");
   requireBoundedU(config.approval_threshold_bps, "approval threshold bps", 10_000);
+}
+
+/**
+ * Canonicalizes a mandate counterparty policy: validates each entry, then sorts
+ * and deduplicates the allowlist to match Rust's `BTreeSet<MandateCounterparty>`
+ * iteration order (Category before Recipient, each by its 32 raw bytes). Rust
+ * additionally rejects an EMPTY allowlist (`Mandate::validate`), so this does too.
+ */
+function canonicalCounterpartyPolicy(
+  policy: MandateCounterpartyPolicyJson,
+): MandateCounterpartyPolicyJson {
+  if (policy === "Open") {
+    return "Open";
+  }
+  if (
+    typeof policy !== "object" ||
+    policy === null ||
+    !("Allowlist" in policy) ||
+    !Array.isArray(policy.Allowlist)
+  ) {
+    throw new Error("invalid mandate counterparty policy");
+  }
+  if (policy.Allowlist.length === 0) {
+    throw new Error("mandate allowlist must not be empty");
+  }
+  const sortable = policy.Allowlist.map((entry) => {
+    if ("Category" in entry) {
+      requireHash256Hex(entry.Category, "mandate category tag");
+      return { entry, variant: 0, bytes: hexToBytes(entry.Category) };
+    }
+    if ("Recipient" in entry) {
+      return { entry, variant: 1, bytes: addressToBytes(entry.Recipient) };
+    }
+    throw new Error("invalid mandate counterparty entry");
+  });
+  sortable.sort((a, b) => a.variant - b.variant || compareBytes(a.bytes, b.bytes));
+  const sorted: MandateCounterpartyJson[] = [];
+  for (const item of sortable) {
+    // Deduplicate structurally, matching set semantics.
+    if (!sorted.some((existing) => sameCounterparty(existing, item.entry))) {
+      sorted.push(item.entry);
+    }
+  }
+  return { Allowlist: sorted };
+}
+
+/** Lexicographic comparison of two equal-length byte arrays. */
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+  const length = Math.min(a.length, b.length);
+  for (let i = 0; i < length; i += 1) {
+    if (a[i] !== b[i]) {
+      return a[i] - b[i];
+    }
+  }
+  return a.length - b.length;
+}
+
+/** Structural equality of two counterparty entries. */
+function sameCounterparty(
+  a: MandateCounterpartyJson,
+  b: MandateCounterpartyJson,
+): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 /** Validates a governance action, mirroring Rust `GovernanceAction`. */
@@ -1106,6 +1171,75 @@ export async function accessListForReclaimVote(args: {
 }
 
 // ---------------------------------------------------------------------------
+// Agent mandate operations (Phase 9a, §15.32).
+//
+// Field names and value encodings mirror the Rust `Operation` serde output pinned
+// by `mandate_operations_have_stable_wire_vectors`. Amounts are decimal strings;
+// ids/keys are 32-byte lowercase hex; the epoch is a plain JSON number; the
+// counterparty policy tags by variant name.
+// ---------------------------------------------------------------------------
+
+/**
+ * Grants a spending mandate to `agentKey` (a 32-byte Ed25519 public key, lowercase
+ * hex). The mandate id is derived on-chain from `(principal, agentKey, grantNonce)`
+ * where the principal is the signer; use `deriveMandateIdHex` to precompute it.
+ */
+export function grantMandate(args: {
+  agentKey: HexString;
+  grantNonce: number;
+  budgetTotal: string;
+  expiryEpoch: number;
+  perTxMax: string;
+  rateLimitPerDay: number;
+  counterpartyPolicy: MandateCounterpartyPolicyJson;
+}): OperationJson {
+  requireHash256Hex(args.agentKey, "mandate agent key");
+  requireCountU64(args.grantNonce, "mandate grant nonce");
+  requireCanonicalAmount(args.budgetTotal, "mandate budget total");
+  requireCountU64(args.expiryEpoch, "mandate expiry epoch");
+  requireCanonicalAmount(args.perTxMax, "mandate per-tx max");
+  requireBoundedU(args.rateLimitPerDay, "mandate rate limit per day", 0xffffffff);
+  return {
+    GrantMandate: {
+      agent_key: args.agentKey,
+      grant_nonce: args.grantNonce,
+      budget_total: args.budgetTotal,
+      expiry_epoch: args.expiryEpoch,
+      per_tx_max: args.perTxMax,
+      rate_limit_per_day: args.rateLimitPerDay,
+      counterparty_policy: canonicalCounterpartyPolicy(args.counterpartyPolicy),
+    },
+  };
+}
+
+/** Adds native base units to an existing mandate's budget (principal-signed). */
+export function topUpMandate(
+  mandateId: HexString,
+  amount: string,
+): OperationJson {
+  requireHash256Hex(mandateId, "mandate id");
+  requireCanonicalAmount(amount, "top up mandate amount");
+  return { TopUpMandate: { mandate_id: mandateId, amount } };
+}
+
+/** Spends `amount` against a mandate to `recipient` (agent-signed). */
+export function spendUnderMandate(
+  mandateId: HexString,
+  recipient: WebcAddress,
+  amount: string,
+): OperationJson {
+  requireHash256Hex(mandateId, "mandate id");
+  requireCanonicalAmount(amount, "spend under mandate amount");
+  return { SpendUnderMandate: { mandate_id: mandateId, recipient, amount } };
+}
+
+/** Revokes a mandate and returns its unspent remainder (principal-signed). */
+export function revokeMandate(mandateId: HexString): OperationJson {
+  requireHash256Hex(mandateId, "mandate id");
+  return { RevokeMandate: { mandate_id: mandateId } };
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1283,6 +1417,16 @@ export async function defaultAccessListAsync(
       return assembleAccessList(sender, authorizationLane, [
         accountKey(sender),
         nftCollectionKey(collectionId),
+      ]);
+    }
+    if ("GrantMandate" in operation) {
+      const { agent_key, grant_nonce } = operation.GrantMandate;
+      const mandateId = await deriveMandateIdHex(sender, agent_key, grant_nonce);
+      // A grant locks the budget from the principal and writes the new mandate
+      // record.
+      return assembleAccessList(sender, authorizationLane, [
+        accountKey(sender),
+        mandateKey(mandateId),
       ]);
     }
     if ("CreateGovernanceInstance" in operation) {
@@ -1644,6 +1788,17 @@ function extraReadWriteKeys(
   if ("ReclaimVote" in operation) {
     return [governanceVoteKey(operation.ReclaimVote.proposal_id, sender)];
   }
+  // --- Agent mandates (Phase 9a, §15.32) ----------------------------------
+  if ("TopUpMandate" in operation) {
+    return [accountKey(sender), mandateKey(operation.TopUpMandate.mandate_id)];
+  }
+  if ("RevokeMandate" in operation) {
+    return [accountKey(sender), mandateKey(operation.RevokeMandate.mandate_id)];
+  }
+  if ("SpendUnderMandate" in operation) {
+    const { mandate_id, recipient } = operation.SpendUnderMandate;
+    return [accountKey(sender), mandateKey(mandate_id), accountKey(recipient)];
+  }
   // Incoming bridge messages need an asynchronous replay hash. Slashing also
   // needs live delegation/cooling owners, so the synchronous builder fails.
   // `CreateToken` needs an async token-id derivation, so it also lands here.
@@ -1820,6 +1975,25 @@ export async function deriveGovVoteEscrowAddress(
     hexToBytes(proposalId),
   ]);
   return addressFromBytes(hexToBytes(digestHex));
+}
+
+/**
+ * Derives a mandate id from `(principal, agentKey, grantNonce)`, mirroring Rust
+ * `MandateId::derive`: `SHA-256("WEBC_MANDATE_ID_V1" || principal || agent_key ||
+ * grant_nonce_be)`, lowercase hex. The principal is the granting signer.
+ */
+export async function deriveMandateIdHex(
+  principal: WebcAddress,
+  agentKey: HexString,
+  grantNonce: number,
+): Promise<string> {
+  requireHash256Hex(agentKey, "mandate agent key");
+  return digestManyHex([
+    MANDATE_ID_DOMAIN,
+    addressToBytes(principal),
+    hexToBytes(agentKey),
+    nonceBe(grantNonce, "grant nonce"),
+  ]);
 }
 
 /**
@@ -2014,6 +2188,13 @@ export function governanceVoteKey(
     version: 1,
     kind: { GovernanceVote: { proposal_id: proposalId, voter } },
   };
+}
+
+// --- Agent mandate state key (Phase 9a, §15.32) ----------------------------
+
+/** Returns the record key for one agent mandate. */
+export function mandateKey(mandateId: HexString): StateKeyJson {
+  return { version: 1, kind: { Mandate: { mandate_id: mandateId } } };
 }
 
 /** Returns a protocol singleton key in schema version 1. */
