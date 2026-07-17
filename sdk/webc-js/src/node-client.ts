@@ -24,6 +24,20 @@ export const NODE_API_VERSION = "v1";
 /** Upper bound on a single API response body, to cap hostile payloads. */
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
+/** Upper bound on a node-supplied error string surfaced into host UI. */
+const MAX_ERROR_STRING_CHARS = 256;
+
+/** Minimal streaming reader (a `ReadableStreamDefaultReader` is compatible). */
+interface ByteStreamReader {
+  read(): Promise<{ done: boolean; value?: Uint8Array }>;
+  cancel(): Promise<void>;
+}
+
+/** Minimal readable byte stream (a `fetch` `Response.body` is compatible). */
+interface ByteStream {
+  getReader(): ByteStreamReader;
+}
+
 /** Minimal `fetch` shape the client depends on (browser and Node compatible). */
 export type FetchLike = (
   input: string,
@@ -37,6 +51,12 @@ export type FetchLike = (
   ok: boolean;
   status: number;
   text(): Promise<string>;
+  /**
+   * Optional streamed body. When present (real `fetch`), the client reads it
+   * with a running byte cap and aborts early, instead of buffering the whole
+   * body before checking its size.
+   */
+  body?: ByteStream | null;
 }>;
 
 /** Minimal event-based `WebSocket` shape the client depends on. */
@@ -130,6 +150,11 @@ export interface WebcNodeClientOptions {
   readonly fetchImpl?: FetchLike;
   /** Injected `WebSocket` constructor; defaults to `globalThis.WebSocket`. */
   readonly webSocketImpl?: WebSocketConstructor;
+  /**
+   * Maximum response body size in BYTES (not UTF-16 units). Defaults to 4 MiB.
+   * A streamed body is aborted as soon as the running byte count exceeds this.
+   */
+  readonly maxResponseBytes?: number;
 }
 
 /**
@@ -142,6 +167,7 @@ export class WebcNodeClient {
   readonly #baseUrl: string;
   readonly #fetch: FetchLike;
   readonly #webSocket: WebSocketConstructor | undefined;
+  readonly #maxResponseBytes: number;
 
   constructor(baseUrl: string, options: WebcNodeClientOptions = {}) {
     // Normalize away a trailing slash so path joins are unambiguous.
@@ -154,6 +180,11 @@ export class WebcNodeClient {
     this.#webSocket =
       options.webSocketImpl ??
       (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
+    const maxBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+      throw new Error("maxResponseBytes must be a positive integer");
+    }
+    this.#maxResponseBytes = maxBytes;
   }
 
   /** Returns node health and identity. */
@@ -273,23 +304,99 @@ export class WebcNodeClient {
     ok: boolean;
     status: number;
     text(): Promise<string>;
+    body?: ByteStream | null;
   }): Promise<unknown> {
-    const text = await response.text();
-    if (text.length > MAX_RESPONSE_BYTES) {
-      throw new Error("node response exceeds the maximum allowed size");
-    }
+    const text = await this.#readBody(response);
     const value = text.length > 0 ? decodeJson(text) : null;
     if (!response.ok) {
-      // The node returns { error, kind } on failure; surface both.
-      const kind = isRecord(value) && typeof value.kind === "string" ? value.kind : "error";
+      // The node returns { error, kind } on failure; surface both, but truncate
+      // so a hostile node cannot push megabytes of controlled text into host UI.
+      const kind =
+        isRecord(value) && typeof value.kind === "string"
+          ? truncateString(value.kind, MAX_ERROR_STRING_CHARS)
+          : "error";
       const message =
         isRecord(value) && typeof value.error === "string"
-          ? value.error
+          ? truncateString(value.error, MAX_ERROR_STRING_CHARS)
           : `request failed with status ${response.status}`;
       throw new NodeApiError(response.status, kind, message);
     }
     return value;
   }
+
+  /**
+   * Reads the response body under a strict byte cap. When the transport exposes
+   * a stream (real `fetch`), the byte count is enforced WHILE reading and the
+   * reader is aborted early. Otherwise the fully-buffered text is measured by
+   * UTF-8 bytes (not UTF-16 units) before decoding.
+   */
+  async #readBody(response: {
+    text(): Promise<string>;
+    body?: ByteStream | null;
+  }): Promise<string> {
+    const body = response.body;
+    if (body && typeof body.getReader === "function") {
+      return this.#readStreamCapped(body);
+    }
+    const text = await response.text();
+    // UTF-8 byte length is always >= UTF-16 unit length, so a unit count over the
+    // cap already exceeds it; otherwise measure exact bytes (bounded work).
+    if (
+      text.length > this.#maxResponseBytes ||
+      utf8ByteLength(text) > this.#maxResponseBytes
+    ) {
+      throw new Error("node response exceeds the maximum allowed size");
+    }
+    return text;
+  }
+
+  async #readStreamCapped(body: ByteStream): Promise<string> {
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength > 0) {
+          total += value.byteLength;
+          if (total > this.#maxResponseBytes) {
+            throw new Error("node response exceeds the maximum allowed size");
+          }
+          chunks.push(value);
+        }
+      }
+    } finally {
+      // Abort any remaining body (early exit on the cap) and release resources.
+      try {
+        await reader.cancel();
+      } catch {
+        // The stream may already be closed/errored; nothing to release.
+      }
+    }
+    return new TextDecoder("utf-8").decode(concatChunks(chunks, total));
+  }
+}
+
+/** Exact UTF-8 byte length of a string. */
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/** Concatenates byte chunks into one buffer of the known total length. */
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+/** Bounds a node-controlled string to `max` characters before it reaches UI. */
+function truncateString(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max) : value;
 }
 
 /** Parses a JSON string, rejecting anything unparseable. */

@@ -145,6 +145,81 @@ describe("WebcNodeClient HTTP", () => {
     const client = new WebcNodeClient("http://node.test", { fetchImpl });
     await expect(client.health()).rejects.toThrow();
   });
+
+  it("truncates a node-supplied error string before surfacing it (S6)", async () => {
+    // A hostile node error message must not carry megabytes of node-controlled
+    // text into host UI. It is bounded to a short prefix.
+    const huge = "x".repeat(5_000);
+    const fetchImpl: FetchLike = async () => ({
+      ok: false,
+      status: 500,
+      text: async () => JSON.stringify({ error: huge, kind: "y".repeat(5_000) }),
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+    await expect(client.health()).rejects.toMatchObject({ name: "NodeApiError" });
+    try {
+      await client.health();
+      throw new Error("expected rejection");
+    } catch (error) {
+      const api = error as { message: string; kind: string };
+      expect(api.message.length).toBeLessThanOrEqual(256);
+      expect(api.kind.length).toBeLessThanOrEqual(256);
+    }
+  });
+
+  it("caps the body by bytes, not UTF-16 units, for a text response (S6)", async () => {
+    // Each "€" is one UTF-16 unit but three UTF-8 bytes; a byte cap must count
+    // bytes. With a 100-byte cap, 60 euro signs (180 bytes, 60 units) is over.
+    const body = "€".repeat(60);
+    const fetchImpl: FetchLike = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => body,
+    });
+    const client = new WebcNodeClient("http://node.test", {
+      fetchImpl,
+      maxResponseBytes: 100,
+    });
+    await expect(client.health()).rejects.toThrow(/maximum allowed size/u);
+  });
+
+  it("aborts a streamed body once the byte cap is exceeded (S6)", async () => {
+    // A ReadableStream body is capped while reading and aborted early instead of
+    // being fully buffered first.
+    let reads = 0;
+    let canceled = false;
+    const chunk = new Uint8Array(64);
+    const body = {
+      getReader() {
+        return {
+          async read() {
+            reads += 1;
+            return { done: false, value: chunk };
+          },
+          async cancel() {
+            canceled = true;
+          },
+        };
+      },
+    };
+    const fetchImpl: FetchLike = async () =>
+      ({
+        ok: true,
+        status: 200,
+        body,
+        text: async () => {
+          throw new Error("text() must not be used when a stream body exists");
+        },
+      }) as unknown as Awaited<ReturnType<FetchLike>>;
+    const client = new WebcNodeClient("http://node.test", {
+      fetchImpl,
+      maxResponseBytes: 256,
+    });
+    await expect(client.health()).rejects.toThrow(/maximum allowed size/u);
+    // 256-byte cap / 64-byte chunks: aborted after a few reads, not unbounded.
+    expect(reads).toBeLessThanOrEqual(6);
+    expect(canceled).toBe(true);
+  });
 });
 
 describe("parseBlockEvent", () => {
