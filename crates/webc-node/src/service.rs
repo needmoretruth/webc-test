@@ -79,10 +79,48 @@ pub struct FaucetConfig {
     pub max_recipient_balance: Amount,
 }
 
-/// Runtime faucet state: its config plus recent per-recipient drip times.
+/// Global faucet burst capacity, in drips (H1 token bucket).
+///
+/// Per-recipient cooldown/balance caps do not bound work from an attacker who
+/// rotates through unlimited fresh addresses — each drip builds and durably
+/// commits a full block. A global token bucket bounds the total drip rate
+/// regardless of recipient: at most this many drips may burst before the
+/// refill rate takes over.
+const FAUCET_GLOBAL_BURST: u64 = 100;
+
+/// Milliseconds to refill one global faucet token (H1) — a sustained ~1 drip/s.
+const FAUCET_GLOBAL_REFILL_MS: u64 = 1_000;
+
+/// Runtime faucet state: its config, recent per-recipient drip times, and the
+/// global rate-limit token bucket.
 struct Faucet {
     config: FaucetConfig,
     last_drip_ms: BTreeMap<Address, u64>,
+    /// Available global drip tokens (H1). Bounded by `FAUCET_GLOBAL_BURST`.
+    tokens: u64,
+    /// Timestamp the bucket was last refilled from, in Unix ms.
+    last_refill_ms: u64,
+}
+
+impl Faucet {
+    /// Refills the global token bucket for elapsed time, capped at the burst.
+    ///
+    /// Deterministic and monotonic: it only ever advances `last_refill_ms` by
+    /// whole-token intervals, so no fractional time is lost and a stalled or
+    /// non-monotonic clock cannot mint extra tokens.
+    fn refill_tokens(&mut self, now_ms: u64) {
+        let elapsed = now_ms.saturating_sub(self.last_refill_ms);
+        let refilled = elapsed / FAUCET_GLOBAL_REFILL_MS;
+        if refilled > 0 {
+            self.tokens = self
+                .tokens
+                .saturating_add(refilled)
+                .min(FAUCET_GLOBAL_BURST);
+            self.last_refill_ms = self
+                .last_refill_ms
+                .saturating_add(refilled.saturating_mul(FAUCET_GLOBAL_REFILL_MS));
+        }
+    }
 }
 
 /// Construction options for a [`NodeService`].
@@ -182,6 +220,8 @@ impl<K: KvStore> NodeService<K> {
         let faucet = options.faucet.map(|config| Faucet {
             config,
             last_drip_ms: BTreeMap::new(),
+            tokens: FAUCET_GLOBAL_BURST,
+            last_refill_ms: 0,
         });
         Self {
             inner: Mutex::new(Inner {
@@ -333,6 +373,11 @@ impl<K: KvStore> NodeService<K> {
             proposer,
             ..
         } = &mut *inner;
+        // H2: prune expired transactions every seal tick, before selection, so a
+        // pool filled with expired entries frees its slots instead of staying
+        // permanently full (only `remove_obsolete` ran here before, which drops
+        // nonce-obsolete txs but never TTL-expired ones).
+        mempool.prune_expired(now_ms);
         let max_units = node.config().fee_policy.max_block_units;
         let selected = mempool.select_block(node.state(), node.config(), max_units, now_ms);
         if selected.is_empty() {
@@ -367,6 +412,14 @@ impl<K: KvStore> NodeService<K> {
         } = &mut *inner;
         let faucet = faucet.as_mut().ok_or(ApiError::FaucetDisabled)?;
 
+        // H1: global rate limit BEFORE any per-recipient check or block work, so
+        // an attacker rotating fresh addresses cannot force unbounded block
+        // builds. Refill for elapsed time, then require and consume one token.
+        faucet.refill_tokens(now_ms);
+        if faucet.tokens == 0 {
+            return Err(ApiError::FaucetCooldown);
+        }
+
         // Per-recipient cooldown.
         if let Some(last) = faucet.last_drip_ms.get(&recipient) {
             if now_ms.saturating_sub(*last) < faucet.config.cooldown_ms {
@@ -379,6 +432,10 @@ impl<K: KvStore> NodeService<K> {
                 return Err(ApiError::FaucetRecipientFunded);
             }
         }
+
+        // Commit to the work: consume one global token now that the cheap
+        // rejections (cooldown, already-funded) have passed (H1).
+        faucet.tokens -= 1;
 
         // Build a faucet-signed transfer at the faucet account's next nonce.
         let faucet_address = faucet.config.keypair.address();
@@ -413,6 +470,13 @@ impl<K: KvStore> NodeService<K> {
         mempool.remove_obsolete(node.state());
 
         faucet.last_drip_ms.insert(recipient, now_ms);
+        // H1: bound `last_drip_ms` growth — once a recipient's cooldown has fully
+        // elapsed its entry can no longer cause a rejection, so drop it. This
+        // caps the map to recipients dripped within one cooldown window.
+        let cooldown = faucet.config.cooldown_ms;
+        faucet
+            .last_drip_ms
+            .retain(|_, last| now_ms.saturating_sub(*last) < cooldown);
         let new_balance = node
             .state()
             .accounts
@@ -498,6 +562,71 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn faucet_token_bucket_refills_over_time_and_caps_at_burst() {
+        // H1: the global bucket refills one token per interval, never above the
+        // burst, and only advances by whole intervals (no fractional loss).
+        let mut faucet = Faucet {
+            config: FaucetConfig {
+                keypair: keypair(9),
+                drip_amount: Amount::from_webc(10),
+                cooldown_ms: 60_000,
+                max_recipient_balance: Amount::from_webc(100),
+            },
+            last_drip_ms: BTreeMap::new(),
+            tokens: 0,
+            last_refill_ms: 0,
+        };
+        faucet.refill_tokens(0);
+        assert_eq!(faucet.tokens, 0);
+        faucet.refill_tokens(5 * FAUCET_GLOBAL_REFILL_MS);
+        assert_eq!(faucet.tokens, 5);
+        // A large jump caps at the burst, not beyond.
+        faucet.refill_tokens(1_000_000 * FAUCET_GLOBAL_REFILL_MS);
+        assert_eq!(faucet.tokens, FAUCET_GLOBAL_BURST);
+    }
+
+    #[test]
+    fn faucet_global_rate_limit_bounds_total_drips() {
+        // H1: with a fixed clock the global bucket never refills, so at most
+        // FAUCET_GLOBAL_BURST drips succeed no matter how many fresh addresses an
+        // attacker rotates through — each drip otherwise builds a full block.
+        let (service, ..) = build_service(true);
+        for i in 0..FAUCET_GLOBAL_BURST {
+            let recipient = keypair(100u8.wrapping_add(i as u8)).address();
+            service
+                .faucet_drip(recipient, NOW)
+                .expect("a burst drip succeeds");
+        }
+        // Bucket empty at the same instant: a fresh recipient is rate limited.
+        let extra = keypair(250).address();
+        assert!(matches!(
+            service.faucet_drip(extra, NOW),
+            Err(ApiError::FaucetCooldown)
+        ));
+        // Once a refill interval elapses, a drip succeeds again.
+        assert!(service
+            .faucet_drip(extra, NOW + FAUCET_GLOBAL_REFILL_MS)
+            .is_ok());
+    }
+
+    #[test]
+    fn seal_prunes_expired_transactions() {
+        // H2: the seal tick prunes TTL-expired transactions, so a pool filled
+        // with expired entries frees its slots instead of staying full forever.
+        let (service, alice, bob, _faucet) = build_service(false);
+        service
+            .submit_transaction(transfer(&alice, &bob, 1, 0), NOW)
+            .expect("submit");
+        assert_eq!(service.health().mempool_size, 1);
+
+        // Seal far past the mempool TTL: the expired tx is pruned, nothing seals.
+        let ttl = MempoolConfig::default().ttl_ms;
+        let sealed = service.seal_block(NOW + ttl + 1).expect("seal");
+        assert!(sealed.is_none());
+        assert_eq!(service.health().mempool_size, 0);
     }
 
     #[test]

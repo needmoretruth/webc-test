@@ -28,6 +28,7 @@
 //! - `GET  /subscribe/blocks`           WebSocket stream of new-block events
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,6 +54,12 @@ use crate::service::{
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Default broadcast buffer of recent block events for slow subscribers.
 const BLOCK_EVENT_CAPACITY: usize = 256;
+/// Maximum concurrent WebSocket block subscriptions (H3).
+///
+/// Each subscription holds a socket, a file descriptor, and a broadcast
+/// receiver. Unbounded, unauthenticated subscribers are a file-descriptor and
+/// memory DoS, so new subscriptions past this cap are refused with 503.
+const MAX_WS_SUBSCRIPTIONS: usize = 256;
 
 /// A new-block notification pushed to WebSocket subscribers.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -73,6 +80,44 @@ struct AppInner<K: KvStore> {
     /// Present when the node participates in a peer-to-peer network. Locally
     /// submitted transactions are gossiped through it; `None` runs standalone.
     network: Option<NetworkHandle>,
+    /// Live WebSocket block subscriptions, bounded by `MAX_WS_SUBSCRIPTIONS`
+    /// (H3). Held in an `Arc` so a per-connection guard can decrement it on
+    /// drop independently of the generic `K`.
+    active_subscriptions: Arc<AtomicUsize>,
+}
+
+/// Decrements the live-subscription count when a WebSocket connection ends
+/// (H3), whether it closed cleanly or the upgrade was never completed.
+struct SubscriptionGuard(Arc<AtomicUsize>);
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reserves one of `cap` slots in `counter`, returning `true` on success (H3).
+///
+/// A bounded compare-and-swap loop increments the count only while it is
+/// strictly under `cap`, so concurrent callers can never push it past the
+/// limit. On success the caller owns one slot and must release it (via
+/// [`SubscriptionGuard`]).
+fn reserve_slot(counter: &AtomicUsize, cap: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= cap {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 impl<K: KvStore> Clone for AppState<K> {
@@ -103,6 +148,7 @@ impl<K: KvStore> AppState<K> {
                 service,
                 block_events,
                 network,
+                active_subscriptions: Arc::new(AtomicUsize::new(0)),
             }),
         }
     }
@@ -189,10 +235,17 @@ impl IntoResponse for ApiRejection {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
         };
-        let body = ErrorBody {
-            error: self.0.to_string(),
-            kind,
+        // H4: never leak internal error detail (storage paths, chain internals)
+        // to the client. For a 5xx, log the real error server-side and return a
+        // generic message; 4xx errors describe the client's own request and are
+        // safe to return verbatim.
+        let error = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            eprintln!("internal API error ({kind}): {}", self.0);
+            "internal server error".to_string()
+        } else {
+            self.0.to_string()
         };
+        let body = ErrorBody { error, kind };
         (status, Json(body)).into_response()
     }
 }
@@ -322,8 +375,22 @@ async fn subscribe_blocks<K: KvStore + Send + Sync + 'static>(
     ws: WebSocketUpgrade,
     State(state): State<AppState<K>>,
 ) -> Response {
+    // H3: reserve a subscription slot before upgrading; the guard returns it
+    // when the connection ends (or the upgrade never happens).
+    if !reserve_slot(&state.inner.active_subscriptions, MAX_WS_SUBSCRIPTIONS) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subscription limit reached",
+        )
+            .into_response();
+    }
+    let guard = SubscriptionGuard(Arc::clone(&state.inner.active_subscriptions));
     let receiver = state.subscribe();
-    ws.on_upgrade(move |socket| stream_block_events(socket, receiver))
+    ws.on_upgrade(move |socket| async move {
+        // Hold the slot for the connection's lifetime; dropped when it ends.
+        let _guard = guard;
+        stream_block_events(socket, receiver).await;
+    })
 }
 
 /// Forwards each block event to one WebSocket client as JSON text until the
@@ -381,6 +448,51 @@ mod tests {
 
     use crate::mempool::MempoolConfig;
     use crate::node::Node;
+
+    #[test]
+    fn reserve_slot_bounds_concurrent_reservations() {
+        // H3: the reservation never exceeds the cap; releasing frees a slot.
+        let counter = AtomicUsize::new(0);
+        assert!(reserve_slot(&counter, 2));
+        assert!(reserve_slot(&counter, 2));
+        assert!(!reserve_slot(&counter, 2));
+        counter.fetch_sub(1, Ordering::AcqRel); // as SubscriptionGuard would
+        assert!(reserve_slot(&counter, 2));
+    }
+
+    #[tokio::test]
+    async fn internal_errors_do_not_leak_detail_to_clients() {
+        // H4: a 5xx returns a generic message; the detail never reaches the wire.
+        let rejection = ApiRejection(Box::new(ApiError::Internal(
+            "secret /var/lib/webc/chain.redb detail".into(),
+        )));
+        let response = rejection.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "internal server error");
+        assert_eq!(body["kind"], "internal");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("secret"),
+            "internal detail must not be exposed"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_errors_still_return_their_detail() {
+        // 4xx errors describe the caller's own request and remain informative.
+        let rejection = ApiRejection(Box::new(ApiError::InvalidRequest(
+            "malformed address".into(),
+        )));
+        let response = rejection.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("malformed address"));
+    }
     use crate::service::{FaucetConfig, NodeServiceOptions};
 
     fn app_state() -> (AppState<MemoryKvStore>, Keypair) {

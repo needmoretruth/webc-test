@@ -227,7 +227,33 @@ impl Mempool {
             }
             None => {
                 if self.entries.len() >= self.config.max_transactions {
-                    return Err(MempoolError::Full);
+                    // H2: the pool is full. Rejecting outright lets a base-fee
+                    // flood permanently block higher-fee honest transactions, so
+                    // instead evict the lowest-effective-fee entry — but only for
+                    // a STRICTLY higher bidder, so eviction cannot be abused to
+                    // churn the pool for free. Effective fee is computed at the
+                    // current base fee; an entry that no longer meets it ranks
+                    // lowest (fee 0) and is evicted first.
+                    let base_fee = state.current_base_fee_per_unit;
+                    let incoming_fee = tx.fee.effective_fee_per_unit(base_fee).unwrap_or(0);
+                    let lowest = self
+                        .entries
+                        .iter()
+                        .map(|(entry_key, entry)| {
+                            (
+                                *entry_key,
+                                entry.tx.fee.effective_fee_per_unit(base_fee).unwrap_or(0),
+                            )
+                        })
+                        .min_by(|left, right| {
+                            left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0))
+                        });
+                    match lowest {
+                        Some((evict_key, lowest_fee)) if incoming_fee > lowest_fee => {
+                            self.entries.remove(&evict_key);
+                        }
+                        _ => return Err(MempoolError::Full),
+                    }
                 }
                 self.entries.insert(
                     key,
@@ -462,6 +488,45 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn full_pool_evicts_lowest_fee_for_a_strictly_higher_bidder() {
+        // H2: a full pool admits a strictly higher bidder by evicting the
+        // lowest-fee entry, instead of rejecting it (which would let a low-fee
+        // flood permanently block honest higher-fee transactions). The base fee
+        // is 0 at genesis, so effective fee is the priority tip.
+        let a = keypair(1);
+        let b = keypair(2);
+        let c = keypair(3);
+        let d = keypair(4);
+        let (state, config) = funded_state(&[(&a, 1_000), (&b, 1_000), (&c, 1_000), (&d, 1_000)]);
+        let mut pool = Mempool::new(MempoolConfig {
+            max_transactions: 2,
+            ..MempoolConfig::default()
+        });
+
+        // Fill the pool with two low-priority (effective-fee 1) transactions.
+        pool.insert(transfer(&a, &b, 1, 0, 100, 1, 1_000), &state, &config, NOW)
+            .unwrap();
+        pool.insert(transfer(&b, &a, 1, 0, 100, 1, 1_000), &state, &config, NOW)
+            .unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // A strictly higher bidder (effective fee 10) evicts a lowest-fee entry.
+        let outcome = pool
+            .insert(transfer(&c, &a, 1, 0, 100, 10, 1_000), &state, &config, NOW)
+            .unwrap();
+        assert!(matches!(outcome, InsertOutcome::Added));
+        assert_eq!(pool.len(), 2);
+
+        // An equal-fee newcomer is still rejected when full — eviction is not a
+        // free churn.
+        assert!(matches!(
+            pool.insert(transfer(&d, &a, 1, 0, 100, 1, 1_000), &state, &config, NOW),
+            Err(MempoolError::Full)
+        ));
+        assert_eq!(pool.len(), 2);
     }
 
     #[test]
