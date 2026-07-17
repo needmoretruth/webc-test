@@ -314,6 +314,7 @@ export function bridgeLock(args: {
   recipient: string;
   amount: string;
 }): OperationJson {
+  requireLowercaseHex(args.recipient, "bridge recipient");
   return {
     BridgeLock: {
       asset: args.asset,
@@ -331,6 +332,7 @@ export function bridgeBurn(args: {
   recipient: string;
   amount: string;
 }): OperationJson {
+  requireLowercaseHex(args.recipient, "bridge recipient");
   return {
     BridgeBurn: {
       asset: args.asset,

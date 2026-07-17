@@ -340,6 +340,53 @@ describe("transaction signing schema", () => {
     );
   });
 
+  it("rejects non-lowercase bridge recipient hex to keep Rust parity (X1)", () => {
+    // Rust emits and re-serializes the recipient as lowercase hex, so an
+    // upper/mixed-case recipient here would sign bytes Rust never re-produces,
+    // yielding a silent signing/verification mismatch. Fail closed instead.
+    expect(() =>
+      bridgeLock({
+        asset: "NativeWebc",
+        destinationChain: "Ethereum",
+        recipient: "ABCD",
+        amount: "4",
+      }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      bridgeBurn({
+        asset: "NativeWebc",
+        destinationChain: "Solana",
+        recipient: "AbCd",
+        amount: "5",
+      }),
+    ).toThrow(/lowercase hex/u);
+    // An odd-length or non-hex recipient is likewise rejected before signing.
+    expect(() =>
+      bridgeLock({
+        asset: "NativeWebc",
+        destinationChain: "Ethereum",
+        recipient: "abc",
+        amount: "4",
+      }),
+    ).toThrow(/lowercase hex/u);
+    // A well-formed lowercase recipient still constructs successfully.
+    expect(
+      bridgeLock({
+        asset: "NativeWebc",
+        destinationChain: "Ethereum",
+        recipient: "abcd",
+        amount: "4",
+      }),
+    ).toEqual({
+      BridgeLock: {
+        asset: "NativeWebc",
+        destination_chain: "Ethereum",
+        recipient: "abcd",
+        amount: "4",
+      },
+    });
+  });
+
   it("derives the Rust session-key id for a public key", async () => {
     // Must equal Rust `SessionKeyId::derive(PublicKeyBytes([0x11; 32]))`.
     expect(await deriveSessionKeyIdHex("11".repeat(32))).toBe(
