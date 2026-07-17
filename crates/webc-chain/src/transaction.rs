@@ -205,6 +205,20 @@ pub enum Operation {
         /// New account owner.
         new_owner: Address,
     },
+    /// Deletes an owned object and settles its storage deposit (§15.22).
+    ///
+    /// Refunds the configured `refund_bps` share of the object's recorded storage
+    /// deposit to the owner's liquid balance and burns the remainder as the
+    /// occupancy fee, then removes the object. Mirrors the other owned-object
+    /// operations' owner, namespace, and expected-version authorization.
+    DeleteObject {
+        /// Existing object identity.
+        object_id: ObjectId,
+        /// Signed namespace that must match stored object metadata.
+        namespace: Hash256,
+        /// Current revision expected by the sender.
+        expected_version: ObjectVersion,
+    },
     /// Moves native base units between account records.
     Transfer {
         /// Recipient native account.
@@ -319,9 +333,10 @@ impl Operation {
             | Self::RotatePostQuantumRoot { .. } => 25_000,
             Self::InstallSessionKey { .. } | Self::RevokeSessionKey { .. } => 15_000,
             Self::OpenAuthorizationLane { .. } | Self::FundAuthorizationLane { .. } => 10_000,
-            Self::CreateObject { .. } | Self::MutateObject { .. } | Self::TransferObject { .. } => {
-                20_000
-            }
+            Self::CreateObject { .. }
+            | Self::MutateObject { .. }
+            | Self::TransferObject { .. }
+            | Self::DeleteObject { .. } => 20_000,
             Self::RegisterValidator { .. } => 25_000,
             Self::Delegate { .. }
             | Self::Undelegate { .. }
@@ -399,12 +414,27 @@ impl Operation {
                 object_id,
                 namespace,
                 ..
+            }
+            | Self::DeleteObject {
+                object_id,
+                namespace,
+                ..
             } => {
                 push_unique_key(&mut read_write, StateKey::object(*object_id));
                 push_unique_key(
                     &mut read_write,
                     StateKey::application(*namespace, object_id.hash()),
                 );
+                // Create/mutate/delete lock or release a native storage deposit
+                // from the sender's liquid balance, so they also touch the sender
+                // account. TransferObject only reassigns ownership and leaves the
+                // deposit in place, so it does not declare the account key.
+                if matches!(
+                    self,
+                    Self::CreateObject { .. } | Self::MutateObject { .. } | Self::DeleteObject { .. }
+                ) {
+                    push_unique_key(&mut read_write, StateKey::account(sender));
+                }
             }
             Self::Transfer { to, .. } => {
                 push_unique_key(&mut read_write, StateKey::account(sender));
@@ -1180,6 +1210,33 @@ mod tests {
         let mut value = serde_json::to_value(&op).expect("serializes");
         value["BridgeLock"]["recipient"] =
             serde_json::Value::String("ab".repeat(crate::bridge::MAX_BRIDGE_RECIPIENT_BYTES + 1));
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn delete_object_operation_has_a_stable_wire_vector() {
+        // Pins the canonical JSON shape of the storage-deposit DeleteObject
+        // operation (§15.22) so a browser SDK mirror must reproduce these exact
+        // field names and sorted-key order. Adding this variant leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched, because
+        // serde tags variants by name and existing variants are unchanged.
+        let operation = Operation::DeleteObject {
+            object_id: ObjectId::new(Hash256([0x33; 32])),
+            namespace: Hash256([0x55; 32]),
+            expected_version: ObjectVersion::new(4),
+        };
+        let canonical =
+            crate::canonical::canonical_json_string(&operation).expect("delete object serializes");
+        let expected = format!(
+            r#"{{"DeleteObject":{{"expected_version":4,"namespace":"{ns}","object_id":"{id}"}}}}"#,
+            ns = "55".repeat(32),
+            id = "33".repeat(32),
+        );
+        assert_eq!(canonical, expected);
+
+        // The decode is strict (deny_unknown_fields), matching its sibling ops.
+        let mut value = serde_json::to_value(&operation).expect("serializes");
+        value["DeleteObject"]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 

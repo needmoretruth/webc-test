@@ -54,7 +54,7 @@ pub use consensus::{
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
     CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
-pub use fees::{split_fee, FeeBreakdown, FeePolicy};
+pub use fees::{split_fee, FeeBreakdown, FeePolicy, StoragePricing, StorageRefund};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
 pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
@@ -252,6 +252,8 @@ pub enum ChainError {
     InsufficientLaneFeeBalance { needed: Amount, available: Amount },
     #[error("authorization lane fee deposit must be greater than zero")]
     AuthorizationLaneDepositZero,
+    #[error("storage pricing refund basis points exceed 10000")]
+    InvalidStoragePricing,
     #[error("object already exists")]
     ObjectAlreadyExists,
     #[error("object was not found")]
