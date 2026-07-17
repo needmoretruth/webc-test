@@ -1487,8 +1487,8 @@ impl Transaction {
     /// performs — and passes it here so the signed access list declares the
     /// credited account. If the owner changes on-chain before this lands, the spend
     /// fails closed on the access-list mismatch, exactly like a stale recipient in
-    /// [`Self::SpendUnderMandate`]. Signs for the devnet chain's default lane; the
-    /// signer is the mandate's agent key.
+    /// [`Operation::SpendUnderMandate`]. Signs for the devnet chain's default lane;
+    /// the signer is the mandate's agent key.
     pub fn for_service_spend(
         agent_keypair: &Keypair,
         nonce: u64,
