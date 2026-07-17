@@ -40,6 +40,11 @@ pub enum StorageError {
     /// durability bug and must stop the node.
     #[error("chain store is inconsistent: {0}")]
     Inconsistent(String),
+    /// The store was created for a different chain than the one opening it.
+    /// Refusing to proceed stops a node from resuming another network's data
+    /// under this configuration (finding ST1).
+    #[error("stored chain id {found} does not match the expected chain id {expected}")]
+    ChainIdMismatch { expected: String, found: String },
 }
 
 impl From<bincode::Error> for StorageError {

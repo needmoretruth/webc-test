@@ -27,7 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 use webc_chain::{
-    Block, BlockHeader, ChainState, ConsensusWalRecord, FinalityCertificate, ValidatorSet,
+    Block, BlockHeader, ChainId, ChainState, ConsensusWalRecord, FinalityCertificate, ValidatorSet,
 };
 use webc_crypto::Hash256;
 
@@ -44,6 +44,10 @@ pub const CHAIN_STORE_SCHEMA_VERSION: u32 = 1;
 const META_SCHEMA_VERSION: &[u8] = b"schema_version";
 /// Meta-table key holding the bincode-encoded [`ChainTip`].
 const META_TIP: &[u8] = b"tip";
+/// Meta-table key holding the bincode-encoded [`ChainId`] the store was created
+/// for (finding ST1). A schema-stamped store must carry it, and a later open
+/// must present the same chain id, or the store is rejected.
+const META_CHAIN_ID: &[u8] = b"chain_id";
 
 /// The latest committed point of the chain.
 ///
@@ -98,16 +102,22 @@ impl<K: KvStore> ChainStore<K> {
     /// value is [`StorageError::UnsupportedSchemaVersion`]. If a tip is present,
     /// its block (for height > 0) and state snapshot must exist and hash
     /// consistently, else the store is reported as inconsistent/corrupt.
-    pub fn open(mut store: K) -> Result<Self, StorageError> {
+    pub fn open(mut store: K, expected_chain_id: &ChainId) -> Result<Self, StorageError> {
         match store.get(Table::Meta, META_SCHEMA_VERSION)? {
             None => {
-                // Fresh store: stamp the schema version durably so a later open
-                // recognizes the layout.
+                // Fresh store: stamp the schema version and the chain id durably
+                // in one batch so a later open recognizes the layout (ST1: the
+                // chain id binds the store to exactly one network).
                 let mut batch = WriteBatch::new();
                 batch.put(
                     Table::Meta,
                     META_SCHEMA_VERSION,
                     CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec(),
+                );
+                batch.put(
+                    Table::Meta,
+                    META_CHAIN_ID,
+                    bincode::serialize(expected_chain_id)?,
                 );
                 store.commit(batch)?;
             }
@@ -119,6 +129,19 @@ impl<K: KvStore> ChainStore<K> {
                     return Err(StorageError::UnsupportedSchemaVersion {
                         found,
                         expected: CHAIN_STORE_SCHEMA_VERSION,
+                    });
+                }
+                // ST1: a schema-stamped store must carry the chain id it was
+                // created for, and it must equal the one opening it, so a node
+                // never resumes another network's data under this configuration.
+                let stored = store
+                    .get(Table::Meta, META_CHAIN_ID)?
+                    .ok_or_else(|| StorageError::Corruption("stored chain id is missing".into()))?;
+                let stored_chain_id: ChainId = decode(&stored)?;
+                if &stored_chain_id != expected_chain_id {
+                    return Err(StorageError::ChainIdMismatch {
+                        expected: expected_chain_id.to_string(),
+                        found: stored_chain_id.to_string(),
                     });
                 }
             }
@@ -470,7 +493,7 @@ mod tests {
     /// The core lifecycle, run against any backend: genesis, two chained blocks,
     /// tip/state/index reads, and latest-only snapshot retention.
     fn exercise_lifecycle<K: KvStore>(backend: K) {
-        let mut store = ChainStore::open(backend).unwrap();
+        let mut store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
         assert!(store.tip().unwrap().is_none());
 
         let genesis = state_at_epoch(0);
@@ -529,7 +552,7 @@ mod tests {
 
     #[test]
     fn rejects_replayed_and_gapped_heights() {
-        let mut store = ChainStore::open(MemoryKvStore::new()).unwrap();
+        let mut store = ChainStore::open(MemoryKvStore::new(), &ChainId::devnet()).unwrap();
         store.initialize_genesis(&state_at_epoch(0)).unwrap();
         let state1 = state_at_epoch(1);
         let block1 = block_for(&state1, 1, Hash256([0u8; 32]));
@@ -565,7 +588,7 @@ mod tests {
 
     #[test]
     fn rejects_broken_parent_linkage() {
-        let mut store = ChainStore::open(MemoryKvStore::new()).unwrap();
+        let mut store = ChainStore::open(MemoryKvStore::new(), &ChainId::devnet()).unwrap();
         store.initialize_genesis(&state_at_epoch(0)).unwrap();
         let state1 = state_at_epoch(1);
         let block1 = block_for(&state1, 1, Hash256([0u8; 32]));
@@ -587,7 +610,7 @@ mod tests {
 
     #[test]
     fn rejects_state_root_mismatch() {
-        let mut store = ChainStore::open(MemoryKvStore::new()).unwrap();
+        let mut store = ChainStore::open(MemoryKvStore::new(), &ChainId::devnet()).unwrap();
         store.initialize_genesis(&state_at_epoch(0)).unwrap();
         // Header commits to state epoch 1, but the provided state is epoch 2.
         let header_state = state_at_epoch(1);
@@ -610,7 +633,8 @@ mod tests {
         let path = dir.path().join("chain.redb");
         let block1_hash;
         {
-            let mut store = ChainStore::open(RedbKvStore::open(&path).unwrap()).unwrap();
+            let mut store =
+                ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
             store.initialize_genesis(&state_at_epoch(0)).unwrap();
             let state1 = state_at_epoch(1);
             let block1 = block_for(&state1, 1, Hash256([0u8; 32]));
@@ -619,7 +643,8 @@ mod tests {
         }
         // Reopen from disk: open() re-verifies tip consistency, and the committed
         // block and latest state are intact — no loss, no duplication.
-        let reopened = ChainStore::open(RedbKvStore::open(&path).unwrap()).unwrap();
+        let reopened =
+            ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
         let tip = reopened.tip().unwrap().unwrap();
         assert_eq!(tip.height, 1);
         assert_eq!(tip.block_hash, Some(block1_hash));
@@ -645,7 +670,7 @@ mod tests {
             999u32.to_be_bytes().to_vec(),
         );
         backend.commit(batch).unwrap();
-        let err = ChainStore::open(backend).unwrap_err();
+        let err = ChainStore::open(backend, &ChainId::devnet()).unwrap_err();
         assert!(matches!(
             err,
             StorageError::UnsupportedSchemaVersion {
@@ -666,6 +691,13 @@ mod tests {
             META_SCHEMA_VERSION.to_vec(),
             CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec(),
         );
+        // Stamp the matching chain id so open() reaches the tip-consistency check
+        // rather than rejecting on the ST1 chain-id guard.
+        batch.put(
+            Table::Meta,
+            META_CHAIN_ID.to_vec(),
+            bincode::serialize(&ChainId::devnet()).unwrap(),
+        );
         let tip = ChainTip {
             height: 5,
             block_hash: Some(Hash256([7u8; 32])),
@@ -677,8 +709,29 @@ mod tests {
             bincode::serialize(&tip).unwrap(),
         );
         backend.commit(batch).unwrap();
-        let err = ChainStore::open(backend).unwrap_err();
+        let err = ChainStore::open(backend, &ChainId::devnet()).unwrap_err();
         assert!(matches!(err, StorageError::Inconsistent(_)));
+    }
+
+    #[test]
+    fn open_rejects_a_store_from_a_different_chain() {
+        // ST1: a store created for one chain id cannot be resumed under another.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.redb");
+        {
+            let store =
+                ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
+            drop(store);
+        }
+        let other = ChainId::new("webc-other-net").unwrap();
+        let err = ChainStore::open(RedbKvStore::open(&path).unwrap(), &other).unwrap_err();
+        match err {
+            StorageError::ChainIdMismatch { expected, found } => {
+                assert_eq!(expected, other.to_string());
+                assert_eq!(found, ChainId::devnet().to_string());
+            }
+            other => panic!("expected ChainIdMismatch, got {other:?}"),
+        }
     }
 
     /// A minimal consensus journal for `height` (structure round-trips are what
@@ -697,7 +750,7 @@ mod tests {
 
     #[test]
     fn consensus_wal_roundtrips_overwrites_and_prunes_on_commit() {
-        let mut store = ChainStore::open(MemoryKvStore::new()).unwrap();
+        let mut store = ChainStore::open(MemoryKvStore::new(), &ChainId::devnet()).unwrap();
         store.initialize_genesis(&state_at_epoch(0)).unwrap();
 
         // Round trip.
@@ -728,19 +781,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chain.redb");
         {
-            let mut store = ChainStore::open(RedbKvStore::open(&path).unwrap()).unwrap();
+            let mut store =
+                ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
             store.initialize_genesis(&state_at_epoch(0)).unwrap();
             store.put_consensus_wal(&wal_record(1)).unwrap();
         }
         // The journal must survive a process restart — that survival is the
         // entire point of journaling before broadcast.
-        let reopened = ChainStore::open(RedbKvStore::open(&path).unwrap()).unwrap();
+        let reopened =
+            ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
         assert_eq!(reopened.consensus_wal(1).unwrap(), Some(wal_record(1)));
     }
 
     #[test]
     fn genesis_initialization_is_idempotent() {
-        let mut store = ChainStore::open(MemoryKvStore::new()).unwrap();
+        let mut store = ChainStore::open(MemoryKvStore::new(), &ChainId::devnet()).unwrap();
         store.initialize_genesis(&state_at_epoch(0)).unwrap();
         // Same genesis again is a safe no-op.
         store.initialize_genesis(&state_at_epoch(0)).unwrap();

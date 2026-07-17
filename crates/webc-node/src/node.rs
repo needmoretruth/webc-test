@@ -64,7 +64,9 @@ impl<K: KvStore> Node<K> {
     /// network's data.
     pub fn open(backend: K, genesis: &GenesisConfig) -> Result<Self, NodeError> {
         let config = genesis.chain.clone();
-        let mut store = ChainStore::open(backend)?;
+        // ST1: bind the store to this chain id at the storage layer, so a store
+        // from another network is rejected before any state is read.
+        let mut store = ChainStore::open(backend, &config.chain_id)?;
         let state = match store.latest_state()? {
             Some(existing) => {
                 if existing.chain_id != config.chain_id {
@@ -663,10 +665,15 @@ mod tests {
         {
             let _node = Node::open(RedbKvStore::open(&path).unwrap(), &genesis).unwrap();
         }
-        // Reopen with a different chain id over the same store: refused.
+        // Reopen with a different chain id over the same store: refused at the
+        // storage layer now (ST1), before any state is read — stricter and
+        // earlier than the node-level check.
         let mut other = test_genesis().0;
         other.chain.chain_id = webc_chain::ChainId::new("webc-other").unwrap();
         let err = Node::open(RedbKvStore::open(&path).unwrap(), &other).unwrap_err();
-        assert!(matches!(err, NodeError::ChainIdMismatch));
+        assert!(matches!(
+            err,
+            NodeError::Storage(StorageError::ChainIdMismatch { .. })
+        ));
     }
 }
