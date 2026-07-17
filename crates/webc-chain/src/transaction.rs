@@ -661,7 +661,14 @@ fn push_unique_key(keys: &mut Vec<StateKey>, key: StateKey) {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// `Serialize` is implemented manually (below) so the optional `sponsor` field is
+// omitted in the self-describing (JSON) encoding when absent — keeping every
+// non-sponsored transaction byte-identical to the pre-sponsorship struct — while
+// always being written in the non-self-describing binary codec (bincode), where a
+// skipped field would desynchronize positional decoding. `Deserialize` stays
+// derived: `#[serde(default)]` restores `None` from an absent JSON field, and the
+// binary codec always carries the field.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
     /// Protocol schema version that interprets every signed field.
@@ -684,6 +691,8 @@ pub struct Transaction {
     pub access_list: AccessList,
     /// Sender's execution-unit and price bounds.
     pub fee: FeeBid,
+    /// Ed25519 signature over canonical signing bytes, or `None` before signing.
+    pub signature: Option<SignatureBytes>,
     /// Optional sponsoring application namespace (fee sponsorship, §15.35).
     ///
     /// When `Some(namespace)`, the sender opts into having that application's
@@ -699,10 +708,56 @@ pub struct Transaction {
     /// (non-sponsored) transaction serializes byte-for-byte as before and the
     /// frozen `WEBC_SIGNED_TRANSACTION_V4` signing vectors are unchanged. The
     /// field is a purely additive, backward-compatible superset of V4.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// It is declared **last** so the manual [`Serialize`] impl can append it
+    /// only for the JSON encoding when present. `#[serde(default)]` restores
+    /// `None` when an absent JSON field is decoded; the binary codec always
+    /// carries the field, so positional decoding never desynchronizes.
+    #[serde(default)]
     pub sponsor: Option<Hash256>,
-    /// Ed25519 signature over canonical signing bytes, or `None` before signing.
-    pub signature: Option<SignatureBytes>,
+}
+
+impl Serialize for Transaction {
+    /// Serializes a transaction, omitting an absent `sponsor` in JSON only.
+    ///
+    /// In a self-describing encoding (JSON — the signing/hashing and cross-language
+    /// path) a `None` sponsor is omitted, so a non-sponsored transaction is
+    /// byte-identical to the pre-sponsorship struct and the frozen
+    /// `WEBC_SIGNED_TRANSACTION_V4` vectors, the transaction hash, and the browser
+    /// SDK are all unchanged. In a non-self-describing binary codec (bincode, used
+    /// to gossip transactions on the network wire) the field is ALWAYS written,
+    /// because skipping any field there would misalign every field decoded after
+    /// it. Field order matches the struct declaration so the derived
+    /// `Deserialize` reads binary fields positionally.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let omit_sponsor = serializer.is_human_readable() && self.sponsor.is_none();
+        let field_count = if omit_sponsor { 11 } else { 12 };
+        let mut state = serializer.serialize_struct("Transaction", field_count)?;
+        state.serialize_field("protocol_version", &self.protocol_version)?;
+        state.serialize_field("chain_id", &self.chain_id)?;
+        state.serialize_field("sender", &self.sender)?;
+        state.serialize_field("public_key", &self.public_key)?;
+        state.serialize_field("authorization_lane", &self.authorization_lane)?;
+        state.serialize_field(
+            "authorization_policy_revision",
+            &self.authorization_policy_revision,
+        )?;
+        state.serialize_field("nonce", &self.nonce)?;
+        state.serialize_field("operation", &self.operation)?;
+        state.serialize_field("access_list", &self.access_list)?;
+        state.serialize_field("fee", &self.fee)?;
+        state.serialize_field("signature", &self.signature)?;
+        if omit_sponsor {
+            state.skip_field("sponsor")?;
+        } else {
+            state.serialize_field("sponsor", &self.sponsor)?;
+        }
+        state.end()
+    }
 }
 
 impl Transaction {
@@ -1466,7 +1521,8 @@ mod tests {
         .unwrap();
         assert_eq!(sponsored.sponsor, Some(namespace));
         assert!(
-            canonical_signing_text(&sponsored).contains(&format!(r#""sponsor":"{}""#, "ab".repeat(32))),
+            canonical_signing_text(&sponsored)
+                .contains(&format!(r#""sponsor":"{}""#, "ab".repeat(32))),
             "a present sponsor is part of the signed payload"
         );
         // The signed payload binds the sponsor: the signature verifies, and the

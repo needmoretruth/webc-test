@@ -8268,7 +8268,13 @@ mod tests {
             validators: Vec::new(),
         };
         let state = ChainState::from_genesis(&genesis).expect("genesis builds");
-        (config, state, alice, bob, Hash256::digest(b"demo-app-namespace"))
+        (
+            config,
+            state,
+            alice,
+            bob,
+            Hash256::digest(b"demo-app-namespace"),
+        )
     }
 
     /// Fee bid whose effective per-unit price is exactly 1, so a `Transfer`'s fee
@@ -8381,7 +8387,10 @@ mod tests {
         )
         .expect("fund signs");
         let receipt = state.execute_transaction(&fund, &config).expect("funded");
-        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(150_000));
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(150_000)
+        );
         assert_eq!(state.sponsor_budgets, Amount::from_units(150_000));
         assert!(receipt.events.iter().any(|e| matches!(
             e,
@@ -8414,7 +8423,9 @@ mod tests {
     #[test]
     fn sponsored_transfer_draws_fee_from_sponsor_leaving_sender_fee_untouched() {
         let (config, mut state, alice, bob, namespace) = sponsored_setup();
-        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 200_000, 0);
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 200_000, 0,
+        );
 
         // Fund Bob with EXACTLY one transfer principal and no fee headroom: a
         // self-paid transfer would fail, so success proves the sponsor paid.
@@ -8437,12 +8448,24 @@ mod tests {
 
         // Bob's balance fell by the principal only — the 500 fee never touched it.
         assert_eq!(state.accounts[&bob.address()].balance, Amount::ZERO);
-        assert_eq!(state.accounts[&carol].balance, Amount::from_units(principal));
+        assert_eq!(
+            state.accounts[&carol].balance,
+            Amount::from_units(principal)
+        );
         // The fee came out of the sponsor budget and split into burn + reward.
-        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(199_500));
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(199_500)
+        );
         assert_eq!(state.sponsor_budgets, Amount::from_units(199_500));
-        assert_eq!(state.sponsors[&namespace].spent_in_window, Amount::from_units(500));
-        assert_eq!(state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0), 1);
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            1
+        );
         assert_eq!(
             state.burned_fees,
             burned_before.checked_add(Amount::from_units(250)).unwrap()
@@ -8456,7 +8479,10 @@ mod tests {
             Event::FeeSponsored { application, beneficiary, .. }
                 if *application == namespace && *beneficiary == bob.address()
         )));
-        assert_eq!(state.minted_supply, issued, "a sponsored fee mints no supply");
+        assert_eq!(
+            state.minted_supply, issued,
+            "a sponsored fee mints no supply"
+        );
         assert!(state.supply_invariant_report().unwrap().balanced);
     }
 
@@ -8464,7 +8490,9 @@ mod tests {
     fn per_user_daily_cap_exhausts_then_falls_back_to_self_pay() {
         let (config, mut state, alice, bob, namespace) = sponsored_setup();
         // per-user cap is 2. Fund Bob for 3 principals + exactly one self-paid fee.
-        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 100_000, 0);
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
         seed_balance(&mut state, &config, &alice, bob.address(), 3 * 10 + 500, 1);
         let carol = Keypair::from_seed([3u8; 32]).address();
 
@@ -8477,8 +8505,14 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::FeeSponsored { .. })));
         }
-        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(99_000));
-        assert_eq!(state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0), 2);
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_000)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
 
         // The third exceeds the per-user daily cap and falls back to self-pay.
         let bob_before = state.accounts[&bob.address()].balance;
@@ -8496,16 +8530,17 @@ mod tests {
         // Bob paid the 500 fee himself plus the 10 principal; sponsor unchanged.
         assert_eq!(
             state.accounts[&bob.address()].balance,
-            bob_before
-                .checked_sub(Amount::from_units(510))
-                .unwrap()
+            bob_before.checked_sub(Amount::from_units(510)).unwrap()
         );
         assert_eq!(
             state.sponsors[&namespace].budget,
             Amount::from_units(99_000),
             "the sponsor budget did not move for the self-paid op"
         );
-        assert_eq!(state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0), 2);
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
         assert!(state.supply_invariant_report().unwrap().balanced);
     }
 
@@ -8560,7 +8595,10 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, Event::FeeSponsored { .. })));
-        assert_eq!(state.sponsors[&namespace].spent_in_window, Amount::from_units(500));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
 
         // 500 + 500 > 700 day cap -> self-pay; the daily spend counter stays put.
         let second = sponsored_transfer(&bob, carol, 10, 1, namespace);
@@ -8570,15 +8608,23 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, Event::FeeSponsored { .. })));
-        assert_eq!(state.sponsors[&namespace].spent_in_window, Amount::from_units(500));
-        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(99_500));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_500)
+        );
         assert!(state.supply_invariant_report().unwrap().balanced);
     }
 
     #[test]
     fn a_non_simple_operation_is_never_sponsored() {
         let (config, mut state, alice, bob, namespace) = sponsored_setup();
-        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 100_000, 0);
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
         // CreateObject costs a 20,000 fee + a 1,000 storage deposit (1 byte).
         seed_balance(&mut state, &config, &alice, bob.address(), 21_000, 1);
         let sponsor_before = state.sponsors[&namespace].clone();
@@ -8620,14 +8666,18 @@ mod tests {
     #[test]
     fn day_window_counter_resets_deterministically_across_windows() {
         let (config, mut state, alice, bob, namespace) = sponsored_setup();
-        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 100_000, 0);
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
         // window 0: two sponsored + one self-paid (per-user cap 2); window 1: one more.
         seed_balance(&mut state, &config, &alice, bob.address(), 4 * 10 + 500, 1);
         let carol = Keypair::from_seed([3u8; 32]).address();
 
         for nonce in 0..2 {
             let tx = sponsored_transfer(&bob, carol, 10, nonce, namespace);
-            state.execute_transaction(&tx, &config).expect("window-0 sponsored");
+            state
+                .execute_transaction(&tx, &config)
+                .expect("window-0 sponsored");
         }
         // Third in window 0 hits the per-user cap and self-pays.
         let capped = sponsored_transfer(&bob, carol, 10, 2, namespace);
@@ -8637,7 +8687,10 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, Event::FeeSponsored { .. })));
-        assert_eq!(state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0), 2);
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
         let budget_after_window0 = state.sponsors[&namespace].budget;
         assert_eq!(budget_after_window0, Amount::from_units(99_000));
 
@@ -8653,8 +8706,14 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::FeeSponsored { .. })));
         assert_eq!(state.sponsors[&namespace].window_index, 1);
-        assert_eq!(state.sponsors[&namespace].spent_in_window, Amount::from_units(500));
-        assert_eq!(state.sponsors[&namespace].user_ops_in_window(&bob.address(), 1), 1);
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 1),
+            1
+        );
         assert_eq!(
             state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
             0,
@@ -8662,7 +8721,9 @@ mod tests {
         );
         assert_eq!(
             state.sponsors[&namespace].budget,
-            budget_after_window0.checked_sub(Amount::from_units(500)).unwrap()
+            budget_after_window0
+                .checked_sub(Amount::from_units(500))
+                .unwrap()
         );
         assert!(state.supply_invariant_report().unwrap().balanced);
     }
@@ -8670,7 +8731,9 @@ mod tests {
     #[test]
     fn withdraw_returns_unspent_budget_and_conserves_supply() {
         let (config, mut state, alice, _bob, namespace) = sponsored_setup();
-        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 100_000, 0);
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
         let liquid_before = state.accounts[&alice.address()].balance;
 
         let withdraw = Transaction::for_operation(
@@ -8684,9 +8747,14 @@ mod tests {
         )
         .expect("withdraw signs");
         let withdraw_fee = Amount::from_units(u128::from(withdraw.required_units()));
-        state.execute_transaction(&withdraw, &config).expect("withdrew");
+        state
+            .execute_transaction(&withdraw, &config)
+            .expect("withdrew");
 
-        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(60_000));
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(60_000)
+        );
         assert_eq!(state.sponsor_budgets, Amount::from_units(60_000));
         // Alice regained the withdrawal minus the withdrawal transaction's own fee.
         assert_eq!(
@@ -8720,7 +8788,9 @@ mod tests {
     #[test]
     fn sponsorship_on_a_non_default_lane_is_rejected() {
         let (config, mut state, alice, _bob, namespace) = sponsored_setup();
-        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 100_000, 0);
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
         // Hand-craft a transfer that names a sponsor but selects a non-default lane.
         let carol = Keypair::from_seed([3u8; 32]).address();
         let lane = AuthorizationLaneId::new(Hash256([0x42; 32]));
@@ -8756,14 +8826,19 @@ mod tests {
         // and the committed state root, so a node cannot silently diverge on the
         // new sponsorship state after reloading from disk.
         let (config, mut state, alice, bob, namespace) = sponsored_setup();
-        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 100_000, 0);
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
         seed_balance(&mut state, &config, &alice, bob.address(), 100, 1);
         let carol = Keypair::from_seed([3u8; 32]).address();
         let tx = sponsored_transfer(&bob, carol, 100, 0, namespace);
         state
             .execute_transaction(&tx, &config)
             .expect("sponsored transfer");
-        assert_eq!(state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0), 1);
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            1
+        );
         assert!(!state.sponsor_budgets.is_zero());
 
         let bytes = bincode::serialize(&state).expect("state serializes");
