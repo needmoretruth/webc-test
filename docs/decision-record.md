@@ -98,39 +98,49 @@ here (do not re-litigate; plan within them — §16 rules of engagement):
 - No zero-collateral block-producing validator path.
 - Splitting the same stake across identities must not increase voting power.
 
-#### Slashing severity — owner-decided at the 2026-07-17 economics freeze
+#### Slashing severity + liveness — DIRECTION set 2026-07-17, exact numbers DEFERRED
 
-The owner selected the **aggressive** severity posture (strong deterrence,
-accepting higher operator risk). Concrete parameters below are the chosen
-defaults for this posture; exact figures remain **config-tunable up to the
-configuration freeze**, but the posture (severe = large slash + permanent
-tombstone; downtime = small slash + jail; coordinated = correlated slash) is
-fixed.
+The owner directed (2026-07-17) that the slashing **severity numbers are NOT
+finalized**: they live in a **flexible config structure** (`SlashingPolicy` plus
+the forthcoming inactivity-leak config) with provisional defaults, and the exact
+values will be **decided carefully later by referencing Ethereum, Solana, Sui,
+Polkadot, and Cardano** (comparison + proposed WEBC design captured in
+**ADR-0012**). What is fixed is the *design direction* below; what is deferred is
+every percentage/curve constant. Code MUST keep these parameterized (no hardcoded
+final magnitudes) until the owner confirms them.
 
-- **Severe faults** (conflicting signed votes/blocks — equivocation/double-sign,
-  objectively invalid signed transitions, fraudulent signed bridge messages):
-  slash **25%** of the offender's **whole pool** (operator self-stake plus
-  delegated stake, pro-rata — delegators share the operator's risk, which is
-  what makes delegation a security signal rather than free leverage) and
-  **Tombstone** the pool (permanent exclusion; the consensus key is banned so a
-  re-registration with the same key cannot rejoin).
+Design direction (intent, not final numbers):
+
+- **Severe faults** (conflicting signed votes/blocks — equivocation/double-sign;
+  later, objectively invalid signed transitions and fraudulent signed bridge
+  messages once their evidence artifacts exist): a large slash of the offender's
+  **whole pool** (operator self-stake plus delegated stake, pro-rata —
+  delegators share operator risk, which is what makes delegation a security
+  signal rather than free leverage) and a permanent **Tombstone** (consensus key
+  banned). Leaning aggressive, but the exact fraction is deferred.
 - **Correlated slashing** for coordinated provable attacks: the severe fraction
   ramps with the share of total active stake that committed the same fault in
-  the same evidence window — `slash_fraction = min(100%, max(25%,
-  CORRELATION_MULTIPLIER × correlated_fraction))` with `CORRELATION_MULTIPLIER =
-  3` (Ethereum-style): an isolated fault costs the 25% floor, while a
-  near-majority coordinated equivocation approaches a 100% slash. The multiplier
-  and floor are config values.
-- **Downtime / liveness faults** (missed signatures beyond a tolerance window):
-  a small **0.1%** (10 bps) slash of the whole pool plus **Jail** (temporary
-  exclusion, re-bondable after a jail cooldown of a few epochs). Ordinary
-  operational mistakes stay in the "lost rewards + soft, proportionate penalty"
-  band per the principle above; only sustained downtime past the tolerance
-  triggers the slash.
-- All slashing still requires **objective signed evidence**; nothing here
-  changes the evidence rule. Slashed units are burned (removed from
-  circulating/minted accounting via `slashed_units`), never redistributed to the
-  reporter, to avoid a bounty incentive to manufacture faults.
+  the same window (Ethereum-style, e.g. `min(100%, max(base, k ×
+  correlated_fraction))`) so an isolated fault is bounded while a near-majority
+  coordinated equivocation approaches a full slash. `base` and `k` are config,
+  deferred.
+- **Liveness / mass-offline — inactivity leak (owner-directed 2026-07-17).**
+  WEBC is Tendermint-style and today HALTS if >1/3 of stake is offline (no 2/3
+  quorum). The owner directed adopting an **Ethereum-style inactivity leak** so
+  the network does **not** halt permanently: when the online voting power cannot
+  reach the finality quorum, offline validators' effective stake is progressively
+  drained (a growing, e.g. quadratic, leak while finality is stalled) until the
+  online set regains >2/3 and finality resumes. Ordinary *isolated* downtime
+  stays in the soft "lost rewards + jail (re-bondable)" band; the heavy leak is
+  reserved for the correlated mass-offline case. Activation threshold, leak
+  curve/rate, quorum target, and exit conditions are config, deferred to ADR-0012
+  finalization. This is a consensus-layer change (a recovery mode that can update
+  weights without 2/3) and must be designed carefully before implementation.
+- All slashing still requires **objective signed evidence** (unchanged). Slashed
+  and leaked units are **burned** — moved to the `slashed_units` sink already
+  reconciled by the supply invariant, never redistributed to a reporter (no
+  bounty incentive to manufacture faults). This burn treatment is already the
+  code's behavior and is fixed.
 
 #### Bootstrap-phase issuance (§15.2) — owner-decided at the 2026-07-17 economics freeze
 

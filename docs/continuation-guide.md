@@ -186,29 +186,36 @@ fast-forwarded to include all of them and is the branch to keep developing on).
 
 ### Exact next work
 
-**Phase 5 economics is UNBLOCKED (owner decisions taken 2026-07-17).** The two
-freeze-gated owner decisions are made and recorded in `docs/decision-record.md`
-(§ "Consensus and slashing" → the two 2026-07-17 subsections):
+**Phase 5 economics is UNBLOCKED (owner direction taken 2026-07-17).** Recorded
+in `docs/decision-record.md` (§ "Consensus and slashing" → the 2026-07-17
+subsections):
 
-- **Slashing severity = aggressive posture.** Severe faults (equivocation /
-  double-sign / invalid transition / fraudulent bridge): 25% whole-pool slash +
-  permanent Tombstone; correlated slash ramps `min(100%, max(25%, 3 ×
-  correlated_fraction))`; downtime past tolerance: 0.1% slash + Jail
-  (re-bondable). Slashed units burned. Figures config-tunable to the config
-  freeze; posture fixed.
-- **Bootstrap issuance = stake-keyed with a supply-% cap + published sunset
-  criteria** (base 10%→1% schedule unchanged, resumes on bootstrap exit).
+- **Slashing severity = DIRECTION only; exact numbers DEFERRED.** The owner
+  directed keeping severity in a **flexible config** with provisional defaults
+  and finalizing the numbers later by referencing Ethereum/Solana/Sui/Polkadot/
+  Cardano (design → **ADR-0012**). Direction: severe = large whole-pool slash +
+  Tombstone; correlated ramp for coordinated attacks; **liveness handled by an
+  Ethereum-style inactivity leak** so a >1/3-offline event does NOT permanently
+  halt the (Tendermint-style) chain — offline stake is drained until the online
+  set regains >2/3. Burn (not redistribute) is fixed. **Do NOT hardcode final
+  magnitudes**; keep everything parameterized until the owner confirms.
+- **Bootstrap issuance = DECIDED: stake-keyed with a supply-% cap + published
+  sunset criteria** (base 10%→1% schedule unchanged, resumes on bootstrap exit).
+  This one is not deferred.
 
-Remaining Phase 5 work is standard economic implementation (much already built —
-delegation, epoch snapshots, commission/reward accounting, inflation curve,
-unbonding/slashable window). The freeze-gated core to build now is **slashing
-execution** (apply the decided severe/correlated/downtime penalties to state
-with objective evidence, Tombstone/Jail lifecycle) and **bootstrap issuance**
-(stake-keyed capped budget + sunset), each reproduce-then-fix with the full
-gate. Then the lighter tasks: public validator perf/reward/slash data, faucet
-devnet staking UX, and the stake-locked-grant / vest-by-operation primitives for
-Phase 16. After Phase 5 comes the **Phase 5.5 core freeze + independent security
-review**, whose per-finding prerequisite this session satisfied.
+The slashing EXECUTION mechanism (evidence→slash→burn→tombstone, replay-guarded)
+is already built and test-covered; the current 80/90/100% defaults are
+**un-approved placeholders** to keep as flexible provisional values (do not
+present as final). Remaining Phase 5 work: (1) **ADR-0012** — inactivity-leak +
+slashing-posture design comparing the 5 reference chains, with the tunable
+parameters and the owner-decision points flagged; (2) **inactivity-leak
+scaffolding** — config struct + participation/finality-gap tracking (design-
+independent parts), consensus recovery-mode gated on the ADR being confirmed;
+(3) **bootstrap issuance** (decided; stake-keyed capped budget + sunset); then
+the lighter tasks — compounding, public validator perf/reward/slash endpoints,
+faucet devnet staking UX, stake-locked-grant / vest-by-operation primitives
+(Phase 16). After Phase 5 comes the **Phase 5.5 core freeze + independent
+security review**, whose per-finding prerequisite this session satisfied.
 
 **Owner-owned items still deferred** (do not decide alone; full list in AGENTS.md
 "User decisions still required later"): the Phase-5 economics numbers above; the
