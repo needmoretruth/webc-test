@@ -13,6 +13,11 @@ use crate::authorization_policy::{
     active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
 };
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
+use crate::contract::{
+    builtin_contract, BuiltinContract, ContractContext, ContractManifest, ContractRuntimeConfig,
+    ContractStateValue, GasMeter, CONTRACT_LEAF_DOMAIN, CONTRACT_STATE_LEAF_DOMAIN,
+    MAX_CONTRACT_INPUT_BYTES,
+};
 use crate::fees::{
     next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
     StoragePricing, NAMESPACE_FEE_LEAF_DOMAIN,
@@ -85,6 +90,13 @@ pub struct ChainConfig {
     /// the launch values are measurement-tuned placeholders (§15.35 method).
     #[serde(default)]
     pub oracle: OracleConfig,
+    /// Interim contract runtime parameters (Phase 7a, ADR-0014): the flat, burned
+    /// contract-registration fee.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before the contract runtime
+    /// decodable; the launch value is a measurement-tuned placeholder.
+    #[serde(default)]
+    pub contracts: ContractRuntimeConfig,
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
@@ -125,6 +137,7 @@ impl Default for ChainConfig {
             storage_pricing: StoragePricing::default(),
             sponsorship: SponsorshipConfig::default(),
             oracle: OracleConfig::default(),
+            contracts: ContractRuntimeConfig::default(),
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
@@ -260,6 +273,33 @@ pub enum Event {
         distributed: Amount,
         /// Native base units carried forward in the pool (division remainder).
         carried: Amount,
+    },
+    /// An interim Rust-authored contract was registered (Phase 7a, ADR-0014).
+    ContractRegistered {
+        /// Registered contract identity (the manifest / module key).
+        code_id: Hash256,
+        /// Application namespace the contract's state is isolated under.
+        namespace: Hash256,
+        /// Account that registered and owns the contract.
+        owner: Address,
+        /// Audited built-in handler the contract runs.
+        builtin: BuiltinContract,
+        /// Registration fee burned from the owner's liquid balance.
+        fee_burned: Amount,
+    },
+    /// A registered contract's handler was invoked (Phase 7a, ADR-0014).
+    ContractInvoked {
+        /// Registered contract identity that ran.
+        code_id: Hash256,
+        /// Application namespace whose state the call touched.
+        namespace: Hash256,
+        /// Account that invoked the contract.
+        caller: Address,
+        /// Total execution units the call consumed (admission plus metered
+        /// per-host-op consumption), within the sender's authorized `gas_limit`.
+        gas_consumed: u64,
+        /// Length in bytes of the handler's returned output.
+        output_len: u64,
     },
     ValidatorRegistered {
         operator: Address,
@@ -560,6 +600,30 @@ pub struct ChainState {
     /// committed by the state root as a scalar.
     #[serde(default)]
     pub oracle_revenue: Amount,
+    /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
+    ///
+    /// Each [`ContractManifest`] describes one registered contract (its identity,
+    /// application namespace, declared footprint, ABI/gas-schedule versions, and
+    /// audited built-in handler). Addressed for declared access by
+    /// `StateKey::module(code_id)`. Committed by the state root through a dedicated
+    /// Merkle sub-root (`CONTRACT_LEAF_DOMAIN`), so registering a contract changes
+    /// the state root. Holds no native units — the registration fee is burned — so
+    /// it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub contracts: BTreeMap<Hash256, ContractManifest>,
+    /// Interim contract application state, keyed by `(namespace, key_hash)` (Phase
+    /// 7a, ADR-0014).
+    ///
+    /// A contract's state lives under `StateKey::application(namespace, key_hash)`
+    /// for each `key_hash` in its manifest footprint; this map is the physical
+    /// backing store. Committed by the state root through a dedicated Merkle
+    /// sub-root (`CONTRACT_STATE_LEAF_DOMAIN`), so any contract write changes the
+    /// state root. Holds only opaque contract-owned bytes, never native units, so
+    /// it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub contract_state: BTreeMap<(Hash256, Hash256), ContractStateValue>,
     /// Localized (per-application-namespace) base-fee state (Phase 6, §8 isolation).
     ///
     /// Maps a currently-congested application namespace to its [`NamespaceFeeState`]
@@ -701,6 +765,8 @@ impl Default for ChainState {
             oracle_reporters: BTreeMap::new(),
             oracle_bonds: Amount::ZERO,
             oracle_revenue: Amount::ZERO,
+            contracts: BTreeMap::new(),
+            contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
@@ -1438,6 +1504,8 @@ impl ChainState {
             namespace_root: Hash256,
             oracle_feed_root: Hash256,
             oracle_reporter_root: Hash256,
+            contract_root: Hash256,
+            contract_state_root: Hash256,
             namespace_fee_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
@@ -1455,6 +1523,15 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V13 adds the interim contract runtime (Phase 7a, ADR-0014): the
+            // `contract_root` sub-root commits every registered contract manifest
+            // (identity, namespace, footprint, ABI/gas-schedule versions, handler)
+            // and the `contract_state_root` sub-root commits every contract state
+            // value, so a register or any contract write always changes the state
+            // root. It adds no new scalar and locks no native units (the
+            // registration fee is burned into the existing `burned_fees` scalar).
+            // The domain bump is a deliberate consensus-format change; no external
+            // fixture pins a prior root.
             // V12 adds the native oracle (Phase 7, §15.17): the `oracle_feed_root`
             // and `oracle_reporter_root` sub-roots commit every feed record
             // (creator, bond class, accrued revenue) and every bonded-reporter
@@ -1479,7 +1556,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V12",
+            domain: "WEBC_STATE_COMMITMENT_V13",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1538,6 +1615,15 @@ impl ChainState {
             oracle_reporter_root: ordered_value_root(
                 ORACLE_REPORTER_LEAF_DOMAIN,
                 self.oracle_reporters.iter(),
+            )?,
+            // Interim contract runtime committed by its own ordered sub-roots (Phase
+            // 7a, ADR-0014): registering a contract changes `contract_root`; any
+            // contract state write changes `contract_state_root`; either changes the
+            // state root.
+            contract_root: ordered_value_root(CONTRACT_LEAF_DOMAIN, self.contracts.iter())?,
+            contract_state_root: ordered_value_root(
+                CONTRACT_STATE_LEAF_DOMAIN,
+                self.contract_state.iter(),
             )?,
             // Localized per-namespace fee state committed by its own ordered sub-root
             // (Phase 6, §8 isolation): a change to any namespace's localized base fee
@@ -3101,6 +3187,113 @@ impl ChainState {
                     amount: *amount,
                 });
             }
+            Operation::RegisterContract { manifest } => {
+                // Default lane only: the registration fee draws from and burns
+                // liquid (supply-neutral, like feed creation). The manifest record
+                // is committed under the reserved module key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::ContractRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::module(manifest.code_id))?;
+                // Validate the hostile manifest before touching supply or state.
+                manifest.validate(tx.sender)?;
+                if self.contracts.contains_key(&manifest.code_id) {
+                    return Err(ChainError::ContractAlreadyExists);
+                }
+                let fee = config.contracts.registration_fee;
+                self.debit_native(tx.sender, fee)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(fee)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.contracts.insert(manifest.code_id, manifest.clone());
+                events.push(Event::ContractRegistered {
+                    code_id: manifest.code_id,
+                    namespace: manifest.namespace,
+                    owner: tx.sender,
+                    builtin: manifest.builtin,
+                    fee_burned: fee,
+                });
+            }
+            Operation::InvokeContract {
+                code_id,
+                namespace,
+                declared_keys,
+                input,
+            } => {
+                // Bound the hostile input before any work.
+                if input.len() > MAX_CONTRACT_INPUT_BYTES {
+                    return Err(ChainError::ContractInputTooLarge {
+                        actual: input.len(),
+                        maximum: MAX_CONTRACT_INPUT_BYTES,
+                    });
+                }
+                // Resolve the manifest through the declared (read-only) module key.
+                access.read(StateKey::module(*code_id))?;
+                let manifest = self
+                    .contracts
+                    .get(code_id)
+                    .ok_or(ChainError::ContractNotFound)?
+                    .clone();
+                // Bind the signed operation to the committed manifest so the access
+                // list and the scheduler agree with the manifest and a call cannot
+                // under- or mis-declare what it touches.
+                if *namespace != manifest.namespace {
+                    return Err(ChainError::ContractNamespaceMismatch);
+                }
+                if declared_keys.as_slice() != manifest.footprint.as_slice() {
+                    return Err(ChainError::ContractFootprintMismatch);
+                }
+                // Seed the meter with the admission cost already priced into the fee
+                // (`units`), and cap it at the sender's authorized `gas_limit`; the
+                // handler's per-host-op consumption is metered on top and hard-stops
+                // on over-gas (fail-closed atomic rollback of the whole transaction).
+                let mut meter = GasMeter::new(tx.fee.gas_limit, units)?;
+                // Load the contract's whole declared footprint from committed state
+                // into a working set. Every footprint key is recorded/enforced
+                // through the shared recorder by `ContractContext`, so an omitted or
+                // padded access list fails closed exactly like a native op.
+                let mut working = BTreeMap::new();
+                for key_hash in &manifest.footprint {
+                    let current = self
+                        .contract_state
+                        .get(&(manifest.namespace, *key_hash))
+                        .map(|value| value.0.clone());
+                    working.insert(*key_hash, current);
+                }
+                let mut ctx = ContractContext::new(
+                    manifest.namespace,
+                    &manifest.footprint,
+                    working,
+                    &mut access,
+                    &mut meter,
+                    self.current_epoch,
+                );
+                let handler = builtin_contract(manifest.builtin);
+                let output = handler.call(&mut ctx, input)?;
+                let writes = ctx.into_writes()?;
+                let gas_consumed = meter.consumed();
+                // Commit the contract's declared writes back to committed state.
+                for (key_hash, value) in writes {
+                    let key = (manifest.namespace, key_hash);
+                    match value {
+                        Some(bytes) => {
+                            self.contract_state.insert(key, ContractStateValue(bytes));
+                        }
+                        None => {
+                            self.contract_state.remove(&key);
+                        }
+                    }
+                }
+                events.push(Event::ContractInvoked {
+                    code_id: *code_id,
+                    namespace: *namespace,
+                    caller: tx.sender,
+                    gas_consumed,
+                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
+                });
+            }
         }
 
         access.finish()?;
@@ -3828,6 +4021,7 @@ fn leaf_hash<T: Serialize + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::kv_command;
     use crate::{
         AuthorizationPolicyRevision, DoubleVoteEvidence, FeeBid, GenesisAccount, GenesisValidator,
         Nonce, Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
@@ -10702,6 +10896,459 @@ mod tests {
             changed.state_root().unwrap(),
             inserted.state_root().unwrap(),
             "changing a localized fee must change the state root (E8)"
+        );
+    }
+
+    // ----- interim contract runtime (Phase 7a, ADR-0014) -----
+
+    /// Genesis funding three accounts (no validators) so epoch advance mints
+    /// nothing and every balance change is a contract move (fee/burn only).
+    fn contract_fixture() -> (ChainConfig, ChainState, Keypair, Keypair, Keypair) {
+        let config = ChainConfig::default();
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let carol = Keypair::from_seed([3u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: alice.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: bob.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: carol.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("contract genesis");
+        (config, state, alice, bob, carol)
+    }
+
+    fn kv_manifest(code_id: Hash256, namespace: Hash256, owner: Address) -> ContractManifest {
+        ContractManifest::new(
+            code_id,
+            namespace,
+            BuiltinContract::KeyValue,
+            [Hash256([0xa1; 32])],
+            owner,
+        )
+    }
+
+    /// Registers a key/value contract; returns the receipt.
+    fn register_kv(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        keypair: &Keypair,
+        nonce: u64,
+        manifest: ContractManifest,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::RegisterContract { manifest },
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("register tx signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    /// Builds a signed contract-invocation transaction with an explicit gas limit.
+    fn invoke_tx(
+        keypair: &Keypair,
+        nonce: u64,
+        manifest: &ContractManifest,
+        input: Vec<u8>,
+        gas_limit: u64,
+    ) -> Transaction {
+        Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::InvokeContract {
+                code_id: manifest.code_id,
+                namespace: manifest.namespace,
+                declared_keys: manifest.footprint.clone(),
+                input,
+            },
+            FeeBid {
+                gas_limit,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("invoke tx signs")
+    }
+
+    #[test]
+    fn register_contract_charges_fee_and_rejects_duplicate() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let before = balance(&state, alice.address());
+        let burned_before = state.burned_fees.0;
+
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        assert_eq!(state.contracts.get(&code_id), Some(&manifest));
+        // The registration fee was burned (plus half the ordinary tx fee).
+        assert_eq!(
+            state.burned_fees.0,
+            burned_before + config.contracts.registration_fee.0 + 30_000 / 2
+        );
+        assert!(before - balance(&state, alice.address()) >= config.contracts.registration_fee.0);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A duplicate code id is rejected and leaves state unchanged.
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_kv(&mut state, &config, &alice, 1, manifest),
+            Err(ChainError::ContractAlreadyExists)
+        ));
+        assert_eq!(state, snapshot, "rejected duplicate leaves state unchanged");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn register_contract_rejects_malformed_manifest() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        // A manifest whose owner is not the registrant fails closed.
+        let bob = Keypair::from_seed([2u8; 32]);
+        let mut manifest = kv_manifest(code_id, namespace, bob.address());
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_kv(&mut state, &config, &alice, 0, manifest.clone()),
+            Err(ChainError::InvalidContractManifest)
+        ));
+        assert_eq!(state, snapshot);
+        // An empty footprint fails closed.
+        manifest.owner = alice.address();
+        manifest.footprint = Vec::new();
+        assert!(matches!(
+            register_kv(&mut state, &config, &alice, 0, manifest),
+            Err(ChainError::InvalidContractManifest)
+        ));
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn invoke_contract_mutates_declared_state_and_conserves_supply() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Increment the counter from zero to 5.
+        let tx = invoke_tx(&alice, 1, &manifest, kv_command::increment(key, 5), 100_000);
+        let receipt = state.execute_transaction(&tx, &config).expect("invoke");
+        assert_eq!(
+            state.contract_state.get(&(namespace, key)),
+            Some(&ContractStateValue(5u128.to_be_bytes().to_vec()))
+        );
+        // The invocation moved no native value beyond the ordinary tx fee.
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::ContractInvoked { code_id: c, .. } if *c == code_id
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A second increment accumulates: 5 + 37 = 42.
+        let tx = invoke_tx(
+            &alice,
+            2,
+            &manifest,
+            kv_command::increment(key, 37),
+            100_000,
+        );
+        state.execute_transaction(&tx, &config).expect("invoke2");
+        assert_eq!(
+            state.contract_state.get(&(namespace, key)),
+            Some(&ContractStateValue(42u128.to_be_bytes().to_vec()))
+        );
+
+        // Set then delete round-trips the value out of state.
+        let tx = invoke_tx(&alice, 3, &manifest, kv_command::set(key, b"data"), 100_000);
+        state.execute_transaction(&tx, &config).expect("set");
+        assert_eq!(
+            state.contract_state.get(&(namespace, key)),
+            Some(&ContractStateValue(b"data".to_vec()))
+        );
+        let tx = invoke_tx(&alice, 4, &manifest, kv_command::delete(key), 100_000);
+        state.execute_transaction(&tx, &config).expect("delete");
+        assert!(!state.contract_state.contains_key(&(namespace, key)));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn invoke_contract_fails_closed_on_undeclared_key() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+
+        // The handler references a key OUTSIDE the declared footprint: the
+        // ContractContext rejects it (via the shared recorder discipline) and the
+        // whole transaction rolls back atomically.
+        let stranger = Hash256([0x99; 32]);
+        let tx = invoke_tx(
+            &alice,
+            1,
+            &manifest,
+            kv_command::increment(stranger, 1),
+            100_000,
+        );
+        let snapshot = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractUndeclaredKey)
+        ));
+        assert_eq!(state, snapshot, "undeclared access leaves state unchanged");
+    }
+
+    #[test]
+    fn invoke_contract_fails_closed_when_access_list_omits_a_footprint_key() {
+        // Directly exercises the StateAccessRecorder reuse: a signed access list
+        // that omits a declared footprint key fails closed when the runtime records
+        // the whole footprint through the recorder.
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        // A two-key footprint so one key can be dropped from the access list.
+        let manifest = ContractManifest::new(
+            code_id,
+            namespace,
+            BuiltinContract::KeyValue,
+            [Hash256([0x21; 32]), Hash256([0x22; 32])],
+            alice.address(),
+        );
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+
+        let dropped = StateKey::application(namespace, manifest.footprint[1]);
+        let mut tx = invoke_tx(
+            &alice,
+            1,
+            &manifest,
+            kv_command::set(manifest.footprint[0], b"x"),
+            100_000,
+        );
+        tx.access_list.read_write.retain(|key| key != &dropped);
+        tx.sign(&alice).expect("re-sign truncated access list");
+        let snapshot = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractUndeclaredKey)
+        ));
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn invoke_contract_over_gas_rolls_back_atomically() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+
+        // Seed a value so the state is non-trivially present before the over-gas call.
+        let tx = invoke_tx(&alice, 1, &manifest, kv_command::set(key, b"seed"), 100_000);
+        state.execute_transaction(&tx, &config).expect("seed set");
+        let snapshot = state.clone();
+
+        // A gas limit just above the admission cost cannot cover the metered
+        // per-host-op consumption, so the call aborts with ContractOutOfGas and the
+        // whole transaction (including its fee) rolls back — state is unchanged.
+        let op = Operation::InvokeContract {
+            code_id,
+            namespace,
+            declared_keys: manifest.footprint.clone(),
+            input: kv_command::increment(key, 1),
+        };
+        let admission = op.required_units();
+        let tx = invoke_tx(
+            &alice,
+            2,
+            &manifest,
+            kv_command::increment(key, 1),
+            admission + 100,
+        );
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractOutOfGas)
+        ));
+        assert_eq!(state, snapshot, "over-gas call leaves state unchanged");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn contracts_in_different_namespaces_parallelize_while_same_serializes() {
+        let (config, mut state, alice, bob, carol) = contract_fixture();
+        let ns_a = Hash256([0x11; 32]);
+        let ns_b = Hash256([0x22; 32]);
+        let manifest_a = kv_manifest(Hash256([0xaa; 32]), ns_a, alice.address());
+        let manifest_b = kv_manifest(Hash256([0xbb; 32]), ns_b, alice.address());
+        register_kv(&mut state, &config, &alice, 0, manifest_a.clone()).expect("register A");
+        register_kv(&mut state, &config, &alice, 1, manifest_b.clone()).expect("register B");
+        let key_a = manifest_a.footprint[0];
+        let key_b = manifest_b.footprint[0];
+
+        // Two invocations of DIFFERENT contracts in different namespaces, from
+        // different senders, share no read_write key -> one parallel batch.
+        let inv_a = invoke_tx(
+            &bob,
+            0,
+            &manifest_a,
+            kv_command::increment(key_a, 1),
+            100_000,
+        );
+        let inv_b = invoke_tx(
+            &carol,
+            0,
+            &manifest_b,
+            kv_command::increment(key_b, 1),
+            100_000,
+        );
+        let batches = crate::parallel_batches(&[inv_a.clone(), inv_b]);
+        assert_eq!(batches.len(), 1, "disjoint-namespace contracts parallelize");
+
+        // Two invocations of the SAME contract, from different senders, both write
+        // its application state key -> they must serialize into two batches.
+        let inv_a2 = invoke_tx(
+            &carol,
+            0,
+            &manifest_a,
+            kv_command::increment(key_a, 1),
+            100_000,
+        );
+        let batches = crate::parallel_batches(&[inv_a, inv_a2]);
+        assert_eq!(
+            batches.len(),
+            2,
+            "same-contract invocations serialize on the shared footprint key"
+        );
+    }
+
+    #[test]
+    fn supply_reconciles_across_register_and_invoke() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+        for (nonce, input) in [
+            (1, kv_command::increment(key, 3)),
+            (2, kv_command::set(key, b"hello world")),
+            (3, kv_command::delete(key)),
+        ] {
+            let tx = invoke_tx(&alice, nonce, &manifest, input, 100_000);
+            state.execute_transaction(&tx, &config).expect("invoke");
+            assert!(state.supply_invariant_report().unwrap().balanced);
+        }
+    }
+
+    #[test]
+    fn bincode_restart_preserves_contract_registry_and_state_root() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let manifest = kv_manifest(code_id, namespace, alice.address());
+        let key = manifest.footprint[0];
+        register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+        let tx = invoke_tx(&alice, 1, &manifest, kv_command::increment(key, 9), 100_000);
+        state.execute_transaction(&tx, &config).expect("invoke");
+
+        let restored = bincode_restart(&state);
+        assert_eq!(
+            restored.contracts, state.contracts,
+            "restart preserves the contract registry"
+        );
+        assert_eq!(
+            restored.contract_state, state.contract_state,
+            "restart preserves contract state"
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "the contract registry and state are committed by the state root across a restart"
+        );
+    }
+
+    #[test]
+    fn contract_registry_and_state_are_committed_by_the_state_root() {
+        // E8 extension: the contract registry and contract state maps are committed
+        // consensus fields (via the contract_root / contract_state_root sub-roots),
+        // so registering a contract or writing contract state must change the state
+        // root. Otherwise two nodes could diverge on contract state yet share a root.
+        let (_config, base, alice, ..) = contract_fixture();
+        let root = base.state_root().unwrap();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let key = Hash256([0xa1; 32]);
+
+        let mut with_contract = base.clone();
+        with_contract
+            .contracts
+            .insert(code_id, kv_manifest(code_id, namespace, alice.address()));
+        assert_ne!(
+            with_contract.state_root().unwrap(),
+            root,
+            "registering a contract must change the state root (E8)"
+        );
+
+        let mut with_state = with_contract.clone();
+        with_state
+            .contract_state
+            .insert((namespace, key), ContractStateValue(vec![1, 2, 3]));
+        assert_ne!(
+            with_state.state_root().unwrap(),
+            with_contract.state_root().unwrap(),
+            "writing contract state must change the state root (E8)"
+        );
+    }
+
+    #[test]
+    fn contract_execution_is_deterministic_across_runs() {
+        let build = || {
+            let (config, mut state, alice, ..) = contract_fixture();
+            let code_id = Hash256([0xc0; 32]);
+            let namespace = Hash256([0x11; 32]);
+            let manifest = kv_manifest(code_id, namespace, alice.address());
+            let key = manifest.footprint[0];
+            register_kv(&mut state, &config, &alice, 0, manifest.clone()).expect("register");
+            for (nonce, delta) in [(1u64, 7u128), (2, 35)] {
+                let tx = invoke_tx(
+                    &alice,
+                    nonce,
+                    &manifest,
+                    kv_command::increment(key, delta),
+                    100_000,
+                );
+                state.execute_transaction(&tx, &config).expect("invoke");
+            }
+            state.state_root().expect("root")
+        };
+        assert_eq!(
+            build(),
+            build(),
+            "identical inputs produce an identical root"
         );
     }
 }

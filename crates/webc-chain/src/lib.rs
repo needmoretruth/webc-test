@@ -13,6 +13,7 @@ pub mod block_builder;
 pub mod bridge;
 pub mod canonical;
 pub mod consensus;
+pub mod contract;
 pub mod fees;
 pub mod genesis;
 pub mod grants;
@@ -56,6 +57,13 @@ pub use consensus::{
     detect_double_votes, DoubleVoteEvidence, FinalityCertificate, Proposal, SignedProposal,
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
     CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
+};
+pub use contract::{
+    builtin_contract, kv_command, BuiltinContract, Contract, ContractContext, ContractError,
+    ContractManifest, ContractRuntimeConfig, ContractStateValue, GasMeter, KeyValueContract,
+    CONTRACT_ABI_VERSION, CONTRACT_GAS_SCHEDULE_VERSION, CONTRACT_LEAF_DOMAIN,
+    CONTRACT_STATE_LEAF_DOMAIN, MAX_CONTRACT_FOOTPRINT_KEYS, MAX_CONTRACT_INPUT_BYTES,
+    MAX_CONTRACT_STATE_VALUE_BYTES,
 };
 pub use fees::{
     next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
@@ -312,6 +320,30 @@ pub enum ChainError {
     NamespaceNotFound,
     #[error("only the current namespace owner may transfer this namespace")]
     NamespaceNotOwner,
+    #[error("a contract is already registered for this code id")]
+    ContractAlreadyExists,
+    #[error("no contract is registered for this code id")]
+    ContractNotFound,
+    #[error("contract manifest is invalid (footprint, versions, or owner)")]
+    InvalidContractManifest,
+    #[error("unsupported contract ABI/manifest version: {actual}")]
+    UnsupportedContractAbiVersion { actual: u16 },
+    #[error("contract invocation namespace does not match the registered manifest")]
+    ContractNamespaceMismatch,
+    #[error("contract invocation declared footprint does not match the registered manifest")]
+    ContractFootprintMismatch,
+    #[error("contract invocation input has {actual} bytes, above the maximum of {maximum}")]
+    ContractInputTooLarge { actual: usize, maximum: usize },
+    #[error("contract runtime operation must use the default authorization lane")]
+    ContractRequiresDefaultLane,
+    #[error("contract call exceeded its gas limit")]
+    ContractOutOfGas,
+    #[error("contract touched an undeclared state key")]
+    ContractUndeclaredKey,
+    #[error("contract state value has {actual} bytes, above the maximum of {maximum}")]
+    ContractStateValueTooLarge { actual: usize, maximum: usize },
+    #[error("contract input is malformed")]
+    ContractInvalidInput,
     #[error("object already exists")]
     ObjectAlreadyExists,
     #[error("object was not found")]

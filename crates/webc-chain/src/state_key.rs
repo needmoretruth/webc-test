@@ -183,6 +183,14 @@ impl StateKey {
         Self::current(StateKeyKind::Object { object_id })
     }
 
+    /// Returns the current module key that addresses a contract's code/manifest
+    /// record (ADR-0014): a registered contract's [`crate::ContractManifest`] is
+    /// addressed by `StateKey::module(code_id)`, so two registrations of the same
+    /// code id deterministically share (and therefore serialize on) this key.
+    pub const fn module(module_id: Hash256) -> Self {
+        Self::current(StateKeyKind::Module { module_id })
+    }
+
     /// Returns a future application state key with fixed-size namespace isolation.
     pub const fn application(namespace: Hash256, key_hash: Hash256) -> Self {
         Self::current(StateKeyKind::Application {
