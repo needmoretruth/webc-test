@@ -91,6 +91,26 @@ describe("wallet request parser", () => {
     ).toThrow("invalid");
   });
 
+  it("bounds recipient and amount length before any O(n^2) decode (S2)", () => {
+    // A megabyte recipient/amount must be rejected by a cheap length check, not
+    // after an O(n^2) base58 decode or an O(n^2) BigInt parse that would freeze
+    // the trusted popup mid-confirmation. Pre-fix these fields reach the decode
+    // before any bound, so the parse takes seconds; post-fix it is instant.
+    const hugeRecipient = "webc1" + "z".repeat(100_000);
+    const startRecipient = performance.now();
+    expect(() =>
+      parseWalletRequest(request({ ...transferParams(), recipient: hugeRecipient })),
+    ).toThrow("invalid");
+    expect(performance.now() - startRecipient).toBeLessThan(1_000);
+
+    const hugeAmount = "9".repeat(100_000);
+    const startAmount = performance.now();
+    expect(() =>
+      parseWalletRequest(request({ ...transferParams(), amount: hugeAmount })),
+    ).toThrow("invalid");
+    expect(performance.now() - startAmount).toBeLessThan(1_000);
+  }, 30_000);
+
   it("accepts HTTPS and localhost but rejects opaque and insecure web origins", () => {
     expect(isSecureWalletHostOrigin("https://shop.example")).toBe(true);
     expect(isSecureWalletHostOrigin("http://localhost:5173")).toBe(true);
