@@ -1688,7 +1688,9 @@ impl ChainState {
                 // deterministic stored byte count. `debit_native` fails closed
                 // (rolling the whole transaction back) if the creator cannot
                 // afford it, so an object can never exist without its deposit.
-                let deposit = config.storage_pricing.deposit_for_bytes(object.data.len())?;
+                let deposit = config
+                    .storage_pricing
+                    .deposit_for_bytes(object.data.len())?;
                 self.debit_native(tx.sender, deposit)?;
                 object.deposit = deposit;
                 self.storage_deposits = self
@@ -1799,7 +1801,10 @@ impl ChainState {
                 // Validate ownership/version and read the recorded deposit, then
                 // release the borrow before settling balances.
                 let deposit = {
-                    let object = self.objects.get(object_id).ok_or(ChainError::ObjectNotFound)?;
+                    let object = self
+                        .objects
+                        .get(object_id)
+                        .ok_or(ChainError::ObjectNotFound)?;
                     validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
                     object.deposit
                 };
@@ -6352,7 +6357,10 @@ mod tests {
             split.refund.checked_add(split.burned).unwrap(),
             deposit_for(5)
         );
-        assert!(!split.burned.is_zero(), "occupancy fee must burn a remainder");
+        assert!(
+            !split.burned.is_zero(),
+            "occupancy fee must burn a remainder"
+        );
         let delete = Transaction::for_operation(
             &alice,
             3,
@@ -6365,7 +6373,9 @@ mod tests {
         )
         .expect("delete signs");
         let delete_fee = Amount::from_units(u128::from(delete.required_units()));
-        let receipt = state.execute_transaction(&delete, &config).expect("deleted");
+        let receipt = state
+            .execute_transaction(&delete, &config)
+            .expect("deleted");
         assert!(!state.objects.contains_key(&object_id), "object removed");
         assert_eq!(state.storage_deposits, Amount::ZERO);
         assert!(receipt.events.iter().any(|event| matches!(
@@ -6415,7 +6425,9 @@ mod tests {
             },
         )
         .expect("seed signs");
-        state.execute_transaction(&seed, &config).expect("bob funded");
+        state
+            .execute_transaction(&seed, &config)
+            .expect("bob funded");
 
         let namespace = Hash256::digest(b"poor-ns");
         let object_id = ObjectId::new(Hash256::digest(b"poor-obj"));
@@ -6469,7 +6481,9 @@ mod tests {
             },
         )
         .expect("create signs");
-        state.execute_transaction(&create, &config).expect("created");
+        state
+            .execute_transaction(&create, &config)
+            .expect("created");
         assert!(!state.storage_deposits.is_zero());
 
         let bytes = bincode::serialize(&state).expect("state serializes");

@@ -219,10 +219,7 @@ mod tests {
             refund_bps: 9_000,
         };
         // Deposit is exactly byte_len * deposit_per_byte.
-        assert_eq!(
-            pricing.deposit_for_bytes(0).unwrap(),
-            Amount::from_units(0)
-        );
+        assert_eq!(pricing.deposit_for_bytes(0).unwrap(), Amount::from_units(0));
         let deposit = pricing.deposit_for_bytes(64).unwrap();
         assert_eq!(deposit, Amount::from_units(64_000));
 
@@ -266,7 +263,10 @@ mod tests {
             invalid.refund_split(Amount::from_units(1)),
             Err(ChainError::InvalidStoragePricing)
         ));
-        assert!(matches!(invalid.validate(), Err(ChainError::InvalidStoragePricing)));
+        assert!(matches!(
+            invalid.validate(),
+            Err(ChainError::InvalidStoragePricing)
+        ));
 
         // A zero per-byte price disables deposits.
         let disabled = StoragePricing {

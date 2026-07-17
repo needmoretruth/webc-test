@@ -431,7 +431,9 @@ impl Operation {
                 // deposit in place, so it does not declare the account key.
                 if matches!(
                     self,
-                    Self::CreateObject { .. } | Self::MutateObject { .. } | Self::DeleteObject { .. }
+                    Self::CreateObject { .. }
+                        | Self::MutateObject { .. }
+                        | Self::DeleteObject { .. }
                 ) {
                     push_unique_key(&mut read_write, StateKey::account(sender));
                 }
