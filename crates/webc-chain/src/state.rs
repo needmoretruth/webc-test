@@ -888,8 +888,8 @@ impl ChainState {
     /// Object operations are priced by their namespace's localized base fee (Phase 6
     /// §8); every other operation keeps the global `current_base_fee_per_unit`. Both
     /// are read as block-constant values (localized fees are only adjusted by
-    /// [`finish_block`] after every transaction has executed), so all transactions
-    /// in a block observe a single stable price.
+    /// [`ChainState::finish_block`] after every transaction has executed), so all
+    /// transactions in a block observe a single stable price.
     pub fn base_fee_per_unit_for(&self, operation: &Operation, config: &ChainConfig) -> u64 {
         match operation.fee_namespace() {
             Some(namespace) => self.localized_base_fee_per_unit(&namespace, config),
@@ -964,8 +964,12 @@ impl ChainState {
                 // it to keep the committed map bounded to congested namespaces.
                 self.namespace_fees.remove(&namespace);
             } else {
-                self.namespace_fees
-                    .insert(namespace, NamespaceFeeState { base_fee_per_unit: next });
+                self.namespace_fees.insert(
+                    namespace,
+                    NamespaceFeeState {
+                        base_fee_per_unit: next,
+                    },
+                );
             }
         }
         Ok(())
@@ -9333,11 +9337,14 @@ mod tests {
         }
 
         let a_fee = state.namespace_fees[&ns_a].base_fee_per_unit;
-        assert!(a_fee > min, "namespace A congestion must raise A's localized fee");
+        assert!(
+            a_fee > min,
+            "namespace A congestion must raise A's localized fee"
+        );
 
         // Namespace B never appeared in any usage map: it carries no record and is
         // priced at exactly the network minimum, unaffected by A's congestion.
-        assert!(state.namespace_fees.get(&ns_b).is_none());
+        assert!(!state.namespace_fees.contains_key(&ns_b));
         assert_eq!(
             state.base_fee_per_unit_for(&create_in(ns_b, b"b-obj"), &config),
             min,
@@ -9389,12 +9396,18 @@ mod tests {
                 .get(&ns)
                 .map(|s| s.base_fee_per_unit)
                 .unwrap_or(min);
-            assert!(now <= previous, "localized fee decays monotonically while idle");
-            assert!(now >= min, "localized fee never drops below the network minimum");
+            assert!(
+                now <= previous,
+                "localized fee decays monotonically while idle"
+            );
+            assert!(
+                now >= min,
+                "localized fee never drops below the network minimum"
+            );
             previous = now;
         }
         assert!(
-            state.namespace_fees.get(&ns).is_none(),
+            !state.namespace_fees.contains_key(&ns),
             "a namespace back at the floor carries no committed record"
         );
     }
@@ -9445,13 +9458,8 @@ mod tests {
 
         // An object op in the congested namespace priced with a floor max-fee is now
         // rejected (its localized base fee is above the floor)...
-        let cheap = Transaction::for_operation(
-            &alice,
-            1,
-            create_in(ns, b"o1"),
-            unit_fee(30_000),
-        )
-        .expect("create signs");
+        let cheap = Transaction::for_operation(&alice, 1, create_in(ns, b"o1"), unit_fee(30_000))
+            .expect("create signs");
         assert!(matches!(
             state.execute_transaction(&cheap, &config),
             Err(ChainError::FeeTooLow)
@@ -9474,7 +9482,8 @@ mod tests {
         state
             .execute_transaction(&create, &config)
             .expect("object op clears at the localized fee");
-        let fee_charged = (state.burned_fees.0 - burned_before) + (state.validator_fee_pool.0 - pool_before);
+        let fee_charged =
+            (state.burned_fees.0 - burned_before) + (state.validator_fee_pool.0 - pool_before);
         assert_eq!(
             fee_charged,
             20_000 * u128::from(localized),
@@ -9494,13 +9503,25 @@ mod tests {
             let (_c, mut state, _a, _b) = funded_state();
             for round in 0..15u64 {
                 let mut usage = BTreeMap::new();
-                usage.insert(ns1, config.fee_policy.per_namespace_target_units * 2 + round);
+                usage.insert(
+                    ns1,
+                    config.fee_policy.per_namespace_target_units * 2 + round,
+                );
                 usage.insert(ns2, config.fee_policy.per_namespace_target_units / 2);
-                state.finish_block(round + 1, &usage, &config).expect("finish");
+                state
+                    .finish_block(round + 1, &usage, &config)
+                    .expect("finish");
             }
-            (state.namespace_fees.clone(), state.state_root().expect("root"))
+            (
+                state.namespace_fees.clone(),
+                state.state_root().expect("root"),
+            )
         };
-        assert_eq!(run(), run(), "localized fees are a deterministic function of usage");
+        assert_eq!(
+            run(),
+            run(),
+            "localized fees are a deterministic function of usage"
+        );
     }
 
     #[test]
@@ -9518,7 +9539,9 @@ mod tests {
                 config.fee_policy.per_namespace_target_units * 3,
             );
         }
-        assert!(state.namespace_fees[&ns].base_fee_per_unit > config.fee_policy.min_base_fee_per_unit);
+        assert!(
+            state.namespace_fees[&ns].base_fee_per_unit > config.fee_policy.min_base_fee_per_unit
+        );
 
         let bytes = bincode::serialize(&state).expect("state serializes");
         let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
@@ -9545,9 +9568,12 @@ mod tests {
         let ns = Hash256::digest(b"fee-commit-ns");
 
         let mut inserted = base.clone();
-        inserted
-            .namespace_fees
-            .insert(ns, NamespaceFeeState { base_fee_per_unit: 7 });
+        inserted.namespace_fees.insert(
+            ns,
+            NamespaceFeeState {
+                base_fee_per_unit: 7,
+            },
+        );
         assert_ne!(
             inserted.state_root().unwrap(),
             root,
@@ -9555,7 +9581,11 @@ mod tests {
         );
 
         let mut changed = inserted.clone();
-        changed.namespace_fees.get_mut(&ns).unwrap().base_fee_per_unit = 8;
+        changed
+            .namespace_fees
+            .get_mut(&ns)
+            .unwrap()
+            .base_fee_per_unit = 8;
         assert_ne!(
             changed.state_root().unwrap(),
             inserted.state_root().unwrap(),

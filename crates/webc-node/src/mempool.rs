@@ -358,7 +358,6 @@ impl Mempool {
         max_units: u64,
         now_ms: u64,
     ) -> Vec<Transaction> {
-
         // Build each sender/lane's gap-free runnable run, in nonce order.
         let mut runs: BTreeMap<(Address, AuthorizationLaneId), Vec<&Entry>> = BTreeMap::new();
         for ((sender, lane, nonce), entry) in &self.entries {
@@ -547,7 +546,12 @@ mod tests {
         .unwrap()
     }
 
-    fn create_object(from: &Keypair, namespace: Hash256, obj_seed: &[u8], nonce: u64) -> Transaction {
+    fn create_object(
+        from: &Keypair,
+        namespace: Hash256,
+        obj_seed: &[u8],
+        nonce: u64,
+    ) -> Transaction {
         Transaction::for_operation(
             from,
             nonce,

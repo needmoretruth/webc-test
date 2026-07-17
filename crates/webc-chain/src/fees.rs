@@ -461,7 +461,10 @@ mod tests {
         for _ in 0..10_000 {
             fee = next_localized_base_fee(fee, 0, &policy).expect("valid policy");
         }
-        assert_eq!(fee, policy.min_base_fee_per_unit, "idle localized fee reaches the floor");
+        assert_eq!(
+            fee, policy.min_base_fee_per_unit,
+            "idle localized fee reaches the floor"
+        );
     }
 
     #[test]
@@ -476,7 +479,11 @@ mod tests {
         ));
         // Usage above the whole-block hard limit is rejected before any math.
         assert!(matches!(
-            next_localized_base_fee(10, FeePolicy::default().max_block_units + 1, &FeePolicy::default()),
+            next_localized_base_fee(
+                10,
+                FeePolicy::default().max_block_units + 1,
+                &FeePolicy::default()
+            ),
             Err(ChainError::InvalidFeePolicy)
         ));
         let overflow = FeePolicy {

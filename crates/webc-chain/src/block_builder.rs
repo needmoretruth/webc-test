@@ -774,7 +774,10 @@ mod tests {
                 vec![object_op(0), object_op(1), object_op(2)],
                 Vec::new(),
             ),
-            Err(ChainError::NamespaceBlockShareExceeded { maximum: 50_000, .. })
+            Err(ChainError::NamespaceBlockShareExceeded {
+                maximum: 50_000,
+                ..
+            })
         ));
         assert_eq!(state, before);
     }
