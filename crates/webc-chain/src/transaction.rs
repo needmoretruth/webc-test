@@ -1353,13 +1353,21 @@ impl Operation {
                 // The token record is READ-ONLY (only its paused flag is consulted);
                 // the two per-account balance keys are the ONLY writes, so an
                 // ordinary transfer never writes a global per-token object (a Phase
-                // 13 acceptance criterion). Freeze state is read directly on the
-                // value path and is not declared here.
+                // 13 acceptance criterion). Both parties' freeze markers are declared
+                // READS so the parallel scheduler serializes this transfer against a
+                // FreezeTokenAccount/ThawTokenAccount of either party — otherwise a
+                // transfer and a concurrent freeze of the same account could race
+                // (freeze bypass + nondeterministic state root under parallel exec).
                 push_unique_key(&mut read_only, StateKey::token(*token_id));
                 push_unique_key(&mut read_write, StateKey::token_balance(*token_id, sender));
                 push_unique_key(
                     &mut read_write,
                     StateKey::token_balance(*token_id, *recipient),
+                );
+                push_unique_key(&mut read_only, StateKey::token_freeze(*token_id, sender));
+                push_unique_key(
+                    &mut read_only,
+                    StateKey::token_freeze(*token_id, *recipient),
                 );
             }
             Self::SetTokenPaused { token_id, .. } | Self::SetTokenAuthority { token_id, .. } => {

@@ -403,6 +403,28 @@ correctly reachable only cumulatively (the over-budget tests exercise two
 within-cap spends). Everything else in the mandate path (supply conservation,
 agent-key binding, replay, determinism, panic-safety) verified clean.
 
+**T1 — P2 — RESOLVED (Phase 13a tokens) — TransferToken under-declared its freeze
+read.** A read-only adversarial review of the native fungible-token system found
+that `TransferToken` consulted `frozen_token_accounts` directly on the value path
+but did NOT declare the two `(token, party)` `TokenFreeze` keys in its signed
+access list. Execution is sequential today (`build_block` loops `execute_transaction`
+in order; `parallel_batches` is exported/tested but wired into no executor), so it
+is latent — but the moment the declared-access parallel scheduler is enabled, a
+`TransferToken` and a concurrent `FreezeTokenAccount`/`ThawTokenAccount` of the
+same account would land in one batch and race (freeze bypass + nondeterministic
+state root), exactly the failure the declared-access model exists to prevent.
+**Fix:** the transfer path now declares both parties' `TokenFreeze` markers as
+reads (in the `transaction.rs` access-list builder) and records them
+unconditionally in the handler (before the short-circuiting frozen check), so the
+scheduler serializes a transfer against a freeze/thaw of either party. Regression:
+`scheduler::tests::token_transfer_serializes_against_a_freeze_of_either_party`
+(asserts the pair splits into two batches via the real access-list builder).
+Everything else in the token path (per-token supply conservation, native-WEBC
+neutrality, authority binding + permanent renounce, freeze/pause enforcement,
+checked arithmetic, determinism, bounds) verified clean. A second finding (a
+token's own freeze authority can freeze arbitrarily many accounts) is within that
+token's trust model and fee-cost-bounded — noted, no change.
+
 ## webc-chain — supply / staking / bridge (verified findings)
 
 - **G1 — MEDIUM — RESOLVED (commit `9c77a35`) — genesis supply invariant is

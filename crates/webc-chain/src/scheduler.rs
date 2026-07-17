@@ -157,6 +157,63 @@ mod tests {
     }
 
     #[test]
+    fn token_transfer_serializes_against_a_freeze_of_either_party() {
+        // Regression (token review Finding 1): a TransferToken must declare both
+        // parties' freeze markers as reads so the scheduler serializes it against a
+        // concurrent FreezeTokenAccount of either party. Before the fix the transfer
+        // touched no freeze key and shared a batch with the freeze, so under the
+        // parallel executor the two would race (freeze bypass + nondeterministic
+        // state root). This exercises the real access-list builder via `for_operation`.
+        let holder = Keypair::from_seed([1u8; 32]);
+        let recipient = Keypair::from_seed([2u8; 32]).address();
+        let freeze_authority = Keypair::from_seed([3u8; 32]);
+        let token_id = crate::TokenId::new(Hash256([7u8; 32]));
+
+        let transfer = Transaction::for_operation(
+            &holder,
+            0,
+            Operation::TransferToken {
+                token_id,
+                recipient,
+                amount: Amount::from_units(1),
+            },
+            FeeBid::default(),
+        )
+        .expect("transfer signs");
+        // Freezing the SENDER conflicts with the transfer's read of that marker.
+        let freeze_sender = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: holder.address(),
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer.clone(), freeze_sender]),
+            vec![vec![0], vec![1]]
+        );
+
+        // Freezing the RECIPIENT is likewise serialized.
+        let freeze_recipient = Transaction::for_operation(
+            &freeze_authority,
+            0,
+            Operation::FreezeTokenAccount {
+                token_id,
+                account: recipient,
+            },
+            FeeBid::default(),
+        )
+        .expect("freeze signs");
+        assert_eq!(
+            parallel_batches(&[transfer, freeze_recipient]),
+            vec![vec![0], vec![1]]
+        );
+    }
+
+    #[test]
     fn conflicting_pairs_keep_their_commit_order_across_batches() {
         // SC1: tx0 touches A; tx1 touches A and C (conflicts tx0); tx2 touches C
         // (conflicts tx1 but not tx0). Greedy first-fit would place tx2 in tx0's

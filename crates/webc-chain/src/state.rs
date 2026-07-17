@@ -4413,6 +4413,13 @@ impl ChainState {
                 access.read(StateKey::token(*token_id))?;
                 access.write(StateKey::token_balance(*token_id, tx.sender))?;
                 access.write(StateKey::token_balance(*token_id, *recipient))?;
+                // Both freeze markers are declared reads (see the matching access
+                // list in `transaction.rs`), recorded UNCONDITIONALLY here — before
+                // the short-circuiting frozen check — so the observed access always
+                // equals the declaration and the parallel scheduler serializes this
+                // transfer against a freeze/thaw of either party.
+                access.read(StateKey::token_freeze(*token_id, tx.sender))?;
+                access.read(StateKey::token_freeze(*token_id, *recipient))?;
                 let paused = self
                     .tokens
                     .get(token_id)
@@ -4421,7 +4428,7 @@ impl ChainState {
                 if paused {
                     return Err(ChainError::TokenPaused);
                 }
-                // Neither sender nor recipient may be frozen (read directly).
+                // Neither sender nor recipient may be frozen.
                 if self.frozen_token_accounts.contains(&(*token_id, tx.sender))
                     || self
                         .frozen_token_accounts

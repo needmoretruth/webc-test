@@ -427,7 +427,37 @@ client, service challenge/verify middleware) are SDK/integration-level. The
 docs-as-data registry snapshot and the flagship agent-marketplace showcase ride
 on the primitives above.
 
-### Autonomous continuation: Phase 13 — native tokens / NFTs / app governance
+### Phase 13 — native tokens / NFTs / app governance
+
+**Fungible tokens — DONE (13a).** A SELF-CONTAINED native token space
+(`token.rs`), deliberately separate from the bridge `AssetId`/`asset_balances`
+to avoid entangling with the production-bridge trust model and the SDK codec:
+own `TokenId` (namespace/creator/nonce-derived), own zero-pruned
+`token_balances`, own `frozen_token_accounts`. Ops CreateToken / MintToken /
+BurnToken / TransferToken / SetTokenPaused / FreezeTokenAccount / ThawTokenAccount
+/ SetTokenAuthority. Authorities are `Option<Address>` — renounce (`Some→None`) is
+PERMANENT. TWO invariants both enforced+tested: native WEBC supply stays balanced
+(non-refundable creation deposit locked into a new `token_deposits` bucket; mint/
+burn never touch WEBC) and per-token `sum(balances)==issued_supply`. Transfers
+write only the two `(token,addr)` balance keys — no global mint bottleneck. Domain
+V16→V17. Merged 4cc47ca. **Post-merge adversarial review** confirmed supply/
+authority/native-WEBC/arithmetic/determinism clean and found one latent defect
+(**T1**): `TransferToken` read freeze state without declaring the `TokenFreeze`
+keys, so under the (not-yet-wired) parallel executor a transfer could share a
+batch with a concurrent freeze and race. Fixed by declaring both parties' freeze
+markers as reads on the transfer path (+ scheduler regression test
+`token_transfer_serializes_against_a_freeze_of_either_party`). Finding 2 (a token's
+own freeze authority can freeze many accounts) is within that token's trust model
+and cost-bounded — informational, no change.
+
+**Next: Phase 13b — NFTs**, then **13c — application governance** (snapshots/
+quorum/timelocks/delegation/execution policy). NFTs are closer to the existing
+`object` model (per-item identity + owner + metadata) than to fungible balances;
+build a native NFT/collection registry (mint unique items, owner transfer,
+freeze/pause, royalty/metadata commitments) with the same determinism + deposit +
+domain-bump + adversarial-review discipline. Governance instances follow.
+
+### Original Phase 13 rationale — native tokens / NFTs / app governance
 
 Chosen next because it is the cleanest FULLY-AUTONOMOUS native block: spec-decided
 (§15, development-plan Phase 13), builds directly on the existing multi-asset
