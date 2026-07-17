@@ -5,6 +5,7 @@
 //! keys each native operation is expected to touch. Runtime enforcement lives in
 //! `state` and fails atomically if execution diverges from that signed list.
 
+use crate::namespace::namespace_state_key_hash;
 use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
@@ -354,6 +355,27 @@ pub enum Operation {
         /// Native base units returned to the owner's liquid balance.
         amount: Amount,
     },
+    /// Claims an unclaimed application namespace for the sender (§8 isolation).
+    ///
+    /// Records the sender as the owner of `namespace` in the namespace registry.
+    /// Fails if the namespace is already registered. Locks no native units — it is
+    /// purely an ownership record, so only the ordinary transaction fee moves.
+    /// Ownership is **not** required to create objects under a namespace today;
+    /// gating object creation on ownership is a later-phase policy decision.
+    RegisterNamespace {
+        /// Application namespace the sender claims.
+        namespace: Hash256,
+    },
+    /// Transfers a registered application namespace to a new owner (§8 isolation).
+    ///
+    /// Only the current owner may transfer. Fails if the namespace is not
+    /// registered or the sender is not its owner. Moves no native units.
+    TransferNamespace {
+        /// Registered application namespace being transferred.
+        namespace: Hash256,
+        /// Account that becomes the new owner.
+        new_owner: Address,
+    },
 }
 
 impl Operation {
@@ -386,6 +408,7 @@ impl Operation {
             Self::RegisterAppSponsor { .. }
             | Self::FundAppSponsor { .. }
             | Self::WithdrawAppSponsor { .. } => 10_000,
+            Self::RegisterNamespace { .. } | Self::TransferNamespace { .. } => 10_000,
         }
     }
 
@@ -618,6 +641,18 @@ impl Operation {
                 push_unique_key(
                     &mut read_write,
                     StateKey::application(*namespace, sponsor_state_key_hash()),
+                );
+            }
+            Self::RegisterNamespace { namespace }
+            | Self::TransferNamespace { namespace, .. } => {
+                // The registry claim/transfer only reads and writes the namespace's
+                // registry record; it moves no native units, so it does not declare
+                // the sender account beyond what the fee lane already covers. The
+                // record is domain-separated from object and sponsor state under the
+                // same namespace by `namespace_state_key_hash()`.
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::application(*namespace, namespace_state_key_hash()),
                 );
             }
         }
@@ -1475,6 +1510,42 @@ mod tests {
         // The decode is strict (deny_unknown_fields), matching sibling operations.
         let mut value = serde_json::to_value(&register).unwrap();
         value["RegisterAppSponsor"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn namespace_registry_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the two namespace-registry operations (§8
+        // application isolation) so a browser SDK mirror must reproduce these exact
+        // field names and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged).
+        let namespace = Hash256([0x55; 32]);
+        let new_owner = Keypair::from_seed([2u8; 32]).address();
+        let register = Operation::RegisterNamespace { namespace };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&register).unwrap(),
+            format!(
+                r#"{{"RegisterNamespace":{{"namespace":"{ns}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+        let transfer = Operation::TransferNamespace {
+            namespace,
+            new_owner,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&transfer).unwrap(),
+            format!(
+                r#"{{"TransferNamespace":{{"namespace":"{ns}","new_owner":"{owner}"}}}}"#,
+                ns = "55".repeat(32),
+                owner = new_owner.to_base58(),
+            )
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        let mut value = serde_json::to_value(&register).unwrap();
+        value["RegisterNamespace"]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 

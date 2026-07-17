@@ -18,6 +18,7 @@ pub mod genesis;
 pub mod grants;
 pub mod hex_bytes;
 pub mod inflation;
+pub mod namespace;
 pub mod object;
 pub mod protocol;
 pub mod round;
@@ -59,6 +60,7 @@ pub use fees::{split_fee, FeeBreakdown, FeePolicy, StoragePricing, StorageRefund
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
 pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
+pub use namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_DATA_BYTES};
 pub use protocol::{
     AuthorizationLaneId, BaseUnits, BlockHeight, ChainId, ChainIdError, Epoch, Nonce,
@@ -272,6 +274,12 @@ pub enum ChainError {
     AppSponsorBudgetInsufficient { needed: Amount, available: Amount },
     #[error("fee sponsorship must use the default authorization lane")]
     SponsorshipRequiresDefaultLane,
+    #[error("application namespace is already registered")]
+    NamespaceAlreadyRegistered,
+    #[error("application namespace is not registered")]
+    NamespaceNotFound,
+    #[error("only the current namespace owner may transfer this namespace")]
+    NamespaceNotOwner,
     #[error("object already exists")]
     ObjectAlreadyExists,
     #[error("object was not found")]
