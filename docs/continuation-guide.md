@@ -1,8 +1,10 @@
 # WEBC continuation guide
 
-Last updated: 2026-07-17 (findings backlog complete; the first incomplete global
-`main` item is Phase 5 economics). Separately assigned feature goals use their
-own branches and task documents and do not replace this pointer until merged.
+Last updated: 2026-07-17 (Phases 5–13 complete and integrated into `main`; the
+app-facing surface is complete end-to-end — see "Boundary reached" below — and
+the remaining roadmap is owner-gated). Separately assigned feature goals use
+their own branches and task documents and do not replace this pointer until
+merged.
 This file is the live pointer to the **exact next task**. Detailed "what the code
 implements" facts live in `implementation-status.md`; do not duplicate them
 here.
@@ -88,12 +90,30 @@ preserved, 8–19 new); AGENTS.md facts updated. Committed and pushed through
 
 ## Exact next work
 
-The first incomplete global `main` item is **Phase 5 economics** in
-`development-plan.md`. It begins with the slashing-severity/downtime schedule
-and the §15.2 bootstrap-issuance proposal, which must be presented to the owner
-with threat models at the Phase 5 freeze. Continue the remaining technical work
-inside Phase 5 autonomously; do not substitute a separately scoped feature goal
-for this global pointer.
+**Phases 5–13 are DONE and integrated into `main`** (economics, localized fees /
+sponsorship / namespaces / compression, interim contract runtime + oracle, DEX,
+agent mandate + service registry, tokens, NFTs, application governance), together
+with the TypeScript SDK for all 38 native operations, the HTTP-402 agent-payment
+flow, node read + query endpoints, and a proptest invariant-stress suite. Each
+feature was adversarially reviewed (fixing real bugs M1 and T1) and gated. The
+detailed per-phase record is deeper in this file; the current status and the
+owner-gated remainder are in the **"Boundary reached — app-facing surface
+complete; remainder is owner-gated"** section below.
+
+The one actionable autonomous item still open is **node discovery/list endpoints**
+(paginated, DoS-bounded: services by category per agent-commerce §3.3, collection
+items, proposals by status, an address's token balances / mandates). Everything
+past that needs the owner or external resources — do NOT decide those
+autonomously (slashing numbers, weak-subjectivity anchor, WASM engine, bridge
+trust model, mainnet gates, independent audit). A separately assigned
+transaction-system goal runs on its own `codex/transaction-system` branch and is
+not merged here.
+
+NOTE ON THE EPHEMERAL ENVIRONMENT: the container can be reclaimed mid-run, which
+kills in-flight background subagents WITHOUT a completion notification and drops
+any un-pushed worktree. Subagents must commit+push after their first unit of work
+and frequently thereafter; if a subagent runs unusually long with no completion,
+check for a restart (worktree/branch gone) rather than waiting.
 
 ## Completed Phase 4 findings checkpoint (historical)
 
