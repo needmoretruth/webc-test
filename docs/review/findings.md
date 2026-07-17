@@ -221,28 +221,28 @@ not deeply audited.
 
 ## webc-net — transport / handshake / wire
 
-- **N1 — HIGH — no handshake timeout (slowloris).** `transport.rs` (~258-289):
+- **N1 — HIGH — RESOLVED (commit `52b87a4`) — no handshake timeout (slowloris).** `transport.rs` (~258-289):
   the four-step handshake awaits frames with no deadline; a peer that connects and
   stalls holds a task + socket + FD forever. Fix: wrap the whole handshake in
   `tokio::time::timeout`.
-- **N2 — HIGH — inbound connections are unbounded.** `transport.rs` (~209-223):
+- **N2 — HIGH — RESOLVED (commit `478ebed`) — inbound connections are unbounded.** `transport.rs` (~209-223):
   every `accept()` spawns a handler with no concurrency cap, per-IP limit, or
   accept rate limit. With N1, unlimited half-open handshakes. Fix: bound in-flight
   inbound connections with a `Semaphore`; add a per-IP cap.
-- **N3 — HIGH — peer table has no size cap.** `transport.rs` (~354, 374-379):
+- **N3 — HIGH — RESOLVED (commit `5b0955f`) — peer table has no size cap.** `transport.rs` (~354, 374-379):
   `peers` grows one entry per successful handshake; identity keys are unauthenticated
   names anyone can mint, so a Sybil inflates the table without bound (memory +
   gossip amplification via `flood()`). Fix: cap peer count; reject/evict beyond a
   limit (with peer scoring later).
-- **N4 — MEDIUM — no per-peer inbound rate limiting.** `transport.rs` (~384-395):
+- **N4 — MEDIUM — RESOLVED (commit `8f08257`) — no per-peer inbound rate limiting.** `transport.rs` (~384-395):
   one fast peer can monopolize the shared worker (hash/decode/re-flood) and crowd
   out honest peers. `try_send` avoids a hard stall, so this is fairness/throughput.
   Fix: per-peer token bucket before re-flood.
-- **N5 — LOW — dial backoff resets on TCP connect, not on authenticated success.**
+- **N5 — LOW — RESOLVED (commit `647e472`) — dial backoff resets on TCP connect, not on authenticated success.**
   `transport.rs` (~226-244): a host that accepts TCP but fails the handshake is
   redialed every 500 ms forever. Fix: reset backoff only after a successful
   authenticated connection.
-- **N6 — LOW — bincode has no explicit `.with_limit()`.** `codec.rs` (13-17): a
+- **N6 — LOW — RESOLVED (commit `123e528`) — bincode has no explicit `.with_limit()`.** `codec.rs` (13-17): a
   hostile 4 MiB frame can embed a length prefix claiming billions of elements;
   mitigated in practice by the 4 MiB frame bound + serde cautious capacity, but
   that is defense-by-accident. Fix: add `.with_limit(MAX_FRAME_BYTES)`.
@@ -301,38 +301,38 @@ not deeply audited.
 No critical key-exfiltration path found. WeakMap isolation, exact-origin
 postMessage, keystore AAD binding, and bigint accounting are fundamentally sound.
 
-- **S1 — MEDIUM — confirmation double-click can approve two transfers.**
+- **S1 — MEDIUM — RESOLVED (commit `e71a842`) — confirmation double-click can approve two transfers.**
   `wallet-confirmation-ui.ts` (~131-144): the next queued request's Approve button
   mounts in the same position the instant the previous resolves; a hostile host
   queues two `sign_native_transfer` and a double-click on tx1 lands on tx2. Fix:
   disable Approve ~500 ms–1 s after render; require pointerdown+pointerup both
   after render.
-- **S2 — LOW/MEDIUM — unbounded hostile strings hang the trusted popup.**
+- **S2 — LOW/MEDIUM — RESOLVED (commit `f01b47d`) — unbounded hostile strings hang the trusted popup.**
   `wallet-request.ts` (~391-458): `recipient` (O(n²) base58 decode) and `amount`
   (`BigInt()` on an arbitrarily long string) are parsed before length bounds; a
   megabyte payload freezes the popup main thread mid-confirmation. Fix: bound
   `recipient` (~64) and `amount` (≤39) before any decode.
-- **S3 — LOW — no KDF purpose separation between keystore and permission store.**
+- **S3 — LOW — RESOLVED (commit `3215e1e`) — no KDF purpose separation between keystore and permission store.**
   Both derive AES-256 from (password, salt) with identical Argon2id params and no
   domain/info; same password+salt ⇒ same key across formats. AAD domains differ so
   ciphertext swapping fails, but key reuse across contexts erodes the GCM margin.
   Fix: mix a purpose string (HKDF-expand with distinct `info`, or domain-prefixed
   salt).
-- **S4 — LOW — replay-ID FIFO eviction is attacker-pumpable.** `wallet-service.ts`
+- **S4 — LOW — RESOLVED (commit `e177545`) — replay-ID FIFO eviction is attacker-pumpable.** `wallet-service.ts`
   (~401-407): 2049 cheap messages evict any prior `request_id`. Transfers stay
   protected by session/sequence; exposure is connect/revoke replay. Fix: per-origin
   quotas or hard-reject when full.
-- **S5 — LOW — reconnect can create a grant whose carried `spentAmount` exceeds
+- **S5 — LOW — RESOLVED (commit `d1a7aed`) — reconnect can create a grant whose carried `spentAmount` exceeds
   the new `max_total_amount`.** `wallet-service.ts` (~277-285): fail-safe (never
   widens spend) but with persistence throws an opaque INTERNAL_ERROR after the user
   approved. Fix: reject/surface when `previous.spentAmount > newLimits.maxTotalAmount`
   at connect.
-- **S6 — LOW — response size cap enforced after full buffering, in UTF-16 units.**
+- **S6 — LOW — RESOLVED (commit `08c47e7`) — response size cap enforced after full buffering, in UTF-16 units.**
   `node-client.ts` (~277-289): `response.text()` buffers the whole body before the
   `.length > MAX` check and counts code units, not bytes; error messages carry up
   to 4 MiB of node-controlled text into host UI. Fix: stream with a byte cap;
   truncate server error strings to ~256.
-- **S7/S8 — LOW — retry vs. replay-detection and sequence desync.**
+- **S7/S8 — LOW — RESOLVED (commit `e177545`; S8 sequence-resync residual noted) — retry vs. replay-detection and sequence desync.**
   `wallet-client.ts`/`wallet-service.ts`: client re-posts the same request_id on
   backoff while the service treats duplicates as `REQUEST_REPLAY`; concurrent
   signs or a client timeout-after-user-approval desync the sequence counter
@@ -548,14 +548,14 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 ## Cross-language byte parity (Rust canonical.rs vs TS canonical.ts / transaction.ts)
 
-- **X1 — MEDIUM — bridge recipient hex not lowercase-validated in the SDK.**
+- **X1 — MEDIUM — RESOLVED (commit `9dfd761`) — bridge recipient hex not lowercase-validated in the SDK.**
   `transaction.ts:311-342`: `bridgeLock`/`bridgeBurn` copy `recipient` verbatim
   while `installSessionKey`/rotations call `requireLowercaseHex`; Rust emits
   lowercase and re-serializes during `verify`, so an upper/mixed-case recipient
   produces a silent signing/verification MISMATCH (fail-closed, not a forgery).
   CONFIRMED. Fix: `requireLowercaseHex` in the bridge constructors (or make Rust
   reject non-lowercase so both sides share one norm).
-- **X2 — MEDIUM — object id/namespace/data hex not validated in the SDK.**
+- **X2 — MEDIUM — RESOLVED (commit `1ef080d`) — object id/namespace/data hex not validated in the SDK.**
   `transaction.ts:202-248`: `createObject`/`mutateObject`/`transferObject` pass hex
   through unvalidated → same silent mismatch class as X1. CONFIRMED. Fix:
   lowercase-validate these fields in the TS constructors.
@@ -568,7 +568,7 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
   already use decimal strings; the authorization-policy revision bound is exactly
   2^53-1, so the same rule is now enforced one layer earlier for every field.
   Reproduced first by `integers_beyond_the_js_safe_range_are_rejected`.
-- **X4 — LOW — amount-string parity.** Amounts are decimal strings both sides
+- **X4 — LOW — RESOLVED (commit `598cd16`) — amount-string parity.** Amounts are decimal strings both sides
   (parity holds for well-formed input), but the TS constructors don't validate the
   amount-string shape; a value Rust's u128 decimal form would not produce could be
   signed. Fix: validate `^(0|[1-9][0-9]*)$` in the TS helpers.
