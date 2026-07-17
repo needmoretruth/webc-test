@@ -11,7 +11,7 @@
 //! pinning client CPU on an inflated step list.
 //!
 //! Second-preimage separation. Internal nodes are hashed with the explicit
-//! `WEBC_MERKLE_V1` domain (`hash_pair`), a domain no caller uses for a leaf:
+//! `WEBC_MERKLE_V1` domain ([`merkle_parent`]), a domain no caller uses for a leaf:
 //! every leaf handed to [`merkle_root`] is already a digest under its own
 //! distinct domain (e.g. `WEBC_ACCOUNT_LEAF_V1`) or a plain payload digest.
 //! Because an internal-node hash is computed over `WEBC_MERKLE_V1 || l || r`
@@ -72,7 +72,7 @@ pub fn merkle_root(leaves: &[Hash256]) -> Hash256 {
         for pair in layer.chunks(2) {
             let left = pair[0];
             let right = pair.get(1).copied().unwrap_or(left);
-            next.push(hash_pair(left, right));
+            next.push(merkle_parent(left, right));
         }
         layer = next;
     }
@@ -113,7 +113,7 @@ pub fn merkle_proof(leaves: &[Hash256], index: usize) -> Option<MerkleProof> {
         for pair in layer.chunks(2) {
             let left = pair[0];
             let right = pair.get(1).copied().unwrap_or(left);
-            next.push(hash_pair(left, right));
+            next.push(merkle_parent(left, right));
         }
         layer = next;
         current_index /= 2;
@@ -132,14 +132,21 @@ pub fn verify_merkle_proof(root: Hash256, proof: &MerkleProof) -> bool {
     let mut current = proof.leaf;
     for step in &proof.steps {
         current = match step.direction {
-            MerkleDirection::Left => hash_pair(step.sibling, current),
-            MerkleDirection::Right => hash_pair(current, step.sibling),
+            MerkleDirection::Left => merkle_parent(step.sibling, current),
+            MerkleDirection::Right => merkle_parent(current, step.sibling),
         };
     }
     current == root
 }
 
-fn hash_pair(left: Hash256, right: Hash256) -> Hash256 {
+/// Hashes two ordered child nodes into one `WEBC_MERKLE_V1` parent.
+///
+/// Both inputs must already be 32-byte node digests. The function performs no
+/// tree-shape validation; callers such as indexed-proof verifiers must first
+/// validate the leaf index, leaf count, and path length. Keeping this helper in
+/// `webc-crypto` ensures every current and future proof format computes exactly
+/// the same parent bytes as [`merkle_root`].
+pub fn merkle_parent(left: Hash256, right: Hash256) -> Hash256 {
     let parts: [&[u8]; 3] = [
         b"WEBC_MERKLE_V1".as_slice(),
         left.as_bytes().as_slice(),
