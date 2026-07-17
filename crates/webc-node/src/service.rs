@@ -17,13 +17,15 @@
 //! top up already-funded accounts, and labels its drips as valueless test units.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Mutex;
 
 use webc_chain::{
-    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, GovernanceInstance,
-    GovernanceInstanceId, GovernanceProposal, Mandate, MandateId, NftCollection, NftCollectionId,
-    NftId, NftItem, ObjectId, Operation, ProposalId, ServiceEntry, ServiceId, StateObject,
-    SupplyInvariantReport, TokenId, TokenRecord, TokenSupplyReport, Transaction, Validator,
+    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, GovProposalStatus,
+    GovernanceInstance, GovernanceInstanceId, GovernanceProposal, Mandate, MandateId,
+    NftCollection, NftCollectionId, NftId, NftItem, ObjectId, Operation, ProposalId, ServiceEntry,
+    ServiceId, StateObject, SupplyInvariantReport, TokenId, TokenRecord, TokenSupplyReport,
+    Transaction, Validator,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_storage::{KvStore, StorageError};
@@ -729,6 +731,396 @@ impl<K: KvStore> NodeService<K> {
             .get(&mandate_id)
             .cloned()
             .ok_or(ApiError::NotFound)
+    }
+}
+
+// ----- paginated discovery / list accessors (Phase 9/13 native state) -----
+
+/// Default page size when a caller supplies no `limit`.
+pub const DEFAULT_PAGE_LIMIT: usize = 50;
+
+/// Hard upper bound on a page size. A larger requested `limit` is clamped to this,
+/// so an unauthenticated caller can never force an unbounded response out of a map
+/// that grows without limit.
+pub const MAX_PAGE_LIMIT: usize = 200;
+
+/// Per-request scan multiplier for FILTERED list pages (e.g. services-by-category).
+/// Such a page examines at most `FILTER_SCAN_MULTIPLIER * limit` map entries even if
+/// fewer (or none) match, then returns a `next_cursor` so the client continues —
+/// this bounds the work one request can cost over a sparse filter regardless of map
+/// size.
+const FILTER_SCAN_MULTIPLIER: usize = 4;
+
+/// Clamps a requested page limit into `1..=MAX_PAGE_LIMIT`, applying
+/// `DEFAULT_PAGE_LIMIT` when unset. A `0` clamps up to `1` so a page always makes
+/// forward progress (a zero-size page with a cursor could never advance).
+fn clamp_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .clamp(1, MAX_PAGE_LIMIT)
+}
+
+/// Decodes an opaque hash-shaped cursor (32-byte lowercase hex) into a `Hash256`,
+/// mapping any malformed input to a fail-closed `InvalidRequest`.
+fn decode_hash_cursor(raw: &str) -> Result<Hash256, ApiError> {
+    let bytes = hex::decode(raw).map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let fixed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    Ok(Hash256(fixed))
+}
+
+/// Encodes a `(TokenId, Address)` balance key as the opaque cursor
+/// `"{token_hex}:{address_hex}"` (both 32-byte lowercase hex). The FULL key is
+/// carried so a resumed scan advances strictly past the last VISITED entry — never
+/// only the last match — guaranteeing forward progress through non-matching runs.
+fn encode_token_holder_cursor(token_id: TokenId, holder: Address) -> String {
+    format!(
+        "{}:{}",
+        token_id.hash().to_hex(),
+        hex::encode(holder.as_bytes())
+    )
+}
+
+/// Decodes a `(TokenId, Address)` balance cursor, fail-closed on any malformation.
+fn decode_token_holder_cursor(raw: &str) -> Result<(TokenId, Address), ApiError> {
+    let (token_hex, addr_hex) = raw
+        .split_once(':')
+        .ok_or_else(|| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let token_id = TokenId::new(decode_hash_cursor(token_hex)?);
+    let addr_bytes =
+        hex::decode(addr_hex).map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let addr_fixed: [u8; 32] = addr_bytes
+        .try_into()
+        .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    Ok((token_id, Address::from_bytes(addr_fixed)))
+}
+
+/// One entry in a services listing: the service's id alongside its full current
+/// `ServiceEntry` revision (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct ServiceListItem {
+    pub service_id: ServiceId,
+    #[serde(flatten)]
+    pub entry: ServiceEntry,
+}
+
+/// A paginated services page: `next_cursor` is non-null iff more may remain.
+#[derive(Debug, serde::Serialize)]
+pub struct ServicesPage {
+    pub items: Vec<ServiceListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in a collection's items listing: the item's serial alongside its
+/// full `NftItem` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct NftItemListItem {
+    pub serial: u64,
+    #[serde(flatten)]
+    pub item: NftItem,
+}
+
+/// A paginated NFT-collection-items page.
+#[derive(Debug, serde::Serialize)]
+pub struct NftItemsPage {
+    pub items: Vec<NftItemListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in an instance's proposals listing: the proposal's id alongside its
+/// full `GovernanceProposal` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct ProposalListItem {
+    pub proposal_id: ProposalId,
+    #[serde(flatten)]
+    pub proposal: GovernanceProposal,
+}
+
+/// A paginated governance-proposals page.
+#[derive(Debug, serde::Serialize)]
+pub struct ProposalsPage {
+    pub items: Vec<ProposalListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in an address's token-balances listing: the token id and the held
+/// amount (the holder is fixed by the request path).
+#[derive(Debug, serde::Serialize)]
+pub struct TokenBalanceListItem {
+    pub token_id: TokenId,
+    pub balance: Amount,
+}
+
+/// A paginated token-balances page.
+#[derive(Debug, serde::Serialize)]
+pub struct TokenBalancesPage {
+    pub items: Vec<TokenBalanceListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in an address's mandates listing: the mandate's id alongside its full
+/// `Mandate` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct MandateListItem {
+    pub mandate_id: MandateId,
+    #[serde(flatten)]
+    pub mandate: Mandate,
+}
+
+/// A paginated mandates page.
+#[derive(Debug, serde::Serialize)]
+pub struct MandatesPage {
+    pub items: Vec<MandateListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// Bounded, cursor-paginated DISCOVERY reads over the Phase 9/13 native-state maps.
+///
+/// Every accessor here is a pure, deterministic ASCENDING walk of a committed
+/// `webc_chain::ChainState` `BTreeMap`, taken under the single service lock, that
+/// clones out at most `limit` records and returns an opaque `next_cursor` (the last
+/// key it visited) so the client can resume. A FILTERED walk additionally caps the
+/// scan at `FILTER_SCAN_MULTIPLIER * limit` VISITED entries, matching or not, then
+/// hands back a cursor — this bounds the per-request work over a sparse filter so a
+/// hostile query can never force a whole-map scan.
+///
+/// A malformed cursor/limit/id maps to `ApiError::InvalidRequest`. Nothing here
+/// reads a clock, network, or randomness, and nothing panics on hostile input.
+impl<K: KvStore> NodeService<K> {
+    /// Lists registered services in ascending `ServiceId` order. With `category`,
+    /// returns only entries whose `categories` set contains that tag (a bounded
+    /// filtered scan); without it, lists every service (a bounded range).
+    pub fn services(
+        &self,
+        category: Option<Hash256>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ServicesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let services = &inner.node.state().services;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(ServiceId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, entry) in services.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            let matched = match &category {
+                Some(tag) => entry.categories.contains(tag),
+                None => true,
+            };
+            if matched {
+                items.push(ServiceListItem {
+                    service_id: *id,
+                    entry: entry.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(ServicesPage { items, next_cursor })
+    }
+
+    /// Lists a collection's live items ascending by serial. This is a contiguous
+    /// range over `nft_items` (keyed by `(collection, serial)`, ordered by that
+    /// pair), so it needs no filter scan bound — every visited key is an item of the
+    /// collection, and the page is bounded by `limit` alone. The collection must
+    /// exist, else `NotFound` (mirroring the item point-read). The cursor is the
+    /// last serial returned; the next page starts strictly after it.
+    pub fn nft_collection_items(
+        &self,
+        collection_id: NftCollectionId,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<NftItemsPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.nft_collections.contains_key(&collection_id) {
+            return Err(ApiError::NotFound);
+        }
+
+        let start = match cursor {
+            Some(raw) => {
+                let serial: u64 = raw
+                    .parse()
+                    .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+                Bound::Excluded(NftId::new(collection_id, serial))
+            }
+            None => Bound::Included(NftId::new(collection_id, 0)),
+        };
+        // Bound the range to this collection's key space so the walk never crosses
+        // into the next collection's items.
+        let end = Bound::Included(NftId::new(collection_id, u64::MAX));
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        for (nft_id, item) in state.nft_items.range((start, end)) {
+            items.push(NftItemListItem {
+                serial: nft_id.serial,
+                item: item.clone(),
+            });
+            if items.len() >= limit {
+                next_cursor = Some(nft_id.serial.to_string());
+                break;
+            }
+        }
+        Ok(NftItemsPage { items, next_cursor })
+    }
+
+    /// Lists an instance's proposals in ascending `ProposalId` order, optionally
+    /// filtered by `status`. Proposals are keyed by their opaque `ProposalId`, not
+    /// grouped by instance, so this is a bounded filtered scan (at most
+    /// `FILTER_SCAN_MULTIPLIER * limit` entries per page); the cursor carries the
+    /// last-visited id for forward progress. The instance must exist, else
+    /// `NotFound`.
+    pub fn instance_proposals(
+        &self,
+        instance_id: GovernanceInstanceId,
+        status: Option<GovProposalStatus>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ProposalsPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.governance_instances.contains_key(&instance_id) {
+            return Err(ApiError::NotFound);
+        }
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(ProposalId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, proposal) in state.governance_proposals.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            let status_ok = match status {
+                Some(want) => proposal.status == want,
+                None => true,
+            };
+            if proposal.instance_id == instance_id && status_ok {
+                items.push(ProposalListItem {
+                    proposal_id: *id,
+                    proposal: proposal.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(ProposalsPage { items, next_cursor })
+    }
+
+    /// Lists the token balances held BY `address`, ascending by the `(token, holder)`
+    /// key. Balances are keyed by `(TokenId, Address)`, so one address's holdings are
+    /// scattered across the map; this is a bounded filtered scan (at most
+    /// `FILTER_SCAN_MULTIPLIER * limit` entries per page) whose cursor carries the
+    /// full last-visited key for forward progress. An address that holds nothing is a
+    /// 200 with an empty page (an absent holder is a zero balance, not an error).
+    pub fn account_token_balances(
+        &self,
+        address: Address,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<TokenBalancesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let balances = &inner.node.state().token_balances;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(decode_token_holder_cursor(raw)?),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (&(token_id, holder), amount) in balances.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            if holder == address {
+                items.push(TokenBalanceListItem {
+                    token_id,
+                    balance: *amount,
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(encode_token_holder_cursor(token_id, holder));
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(encode_token_holder_cursor(token_id, holder));
+                break;
+            }
+        }
+        Ok(TokenBalancesPage { items, next_cursor })
+    }
+
+    /// Lists the mandates whose `principal == address`, ascending by `MandateId`.
+    /// Mandates are keyed by their opaque `MandateId`, so this is a bounded filtered
+    /// scan (at most `FILTER_SCAN_MULTIPLIER * limit` entries per page); the cursor
+    /// carries the last-visited id for forward progress. An address that is the
+    /// principal of no mandate is a 200 with an empty page.
+    pub fn account_mandates(
+        &self,
+        address: Address,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<MandatesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let mandates = &inner.node.state().mandates;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(MandateId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, mandate) in mandates.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            if mandate.principal == address {
+                items.push(MandateListItem {
+                    mandate_id: *id,
+                    mandate: mandate.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(MandatesPage { items, next_cursor })
     }
 }
 
