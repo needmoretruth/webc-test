@@ -29,6 +29,7 @@
 //! - `GET  /services`                   paginated services (optional `category`)
 //! - `GET  /services/{id}`              service-registry entry by hex id
 //! - `GET  /governance/instances/{id}`  governance instance by hex id
+//! - `GET  /governance/instances/{id}/proposals` paginated proposals (optional `status`)
 //! - `GET  /governance/proposals/{id}`  governance proposal by hex id
 //! - `GET  /mandates/{id}`              agent-payment mandate by hex id
 //! - `GET  /blocks/height/{height}`     finalized block by height
@@ -53,15 +54,16 @@ use tokio::sync::broadcast;
 use webc_net::{NetMessage, NetworkHandle};
 
 use webc_chain::{
-    Amount, Block, GovernanceInstanceId, MandateId, NftCollectionId, NftId, ObjectId, ProposalId,
-    ServiceId, TokenId, Transaction,
+    Amount, Block, GovProposalStatus, GovernanceInstanceId, MandateId, NftCollectionId, NftId,
+    ObjectId, ProposalId, ServiceId, TokenId, Transaction,
 };
 use webc_crypto::{Address, Hash256};
 use webc_storage::KvStore;
 
 use crate::service::{
     AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NftItemsPage, NodeService,
-    SealSummary, ServicesPage, SubmitReceipt, ValidatorSummary, ValidatorsResponse, API_VERSION,
+    ProposalsPage, SealSummary, ServicesPage, SubmitReceipt, ValidatorSummary, ValidatorsResponse,
+    API_VERSION,
 };
 
 /// Default maximum request body size (1 MiB), bounding hostile payloads.
@@ -311,6 +313,34 @@ struct ServiceListParams {
     limit: Option<usize>,
 }
 
+/// Query parameters for the proposals listing: an optional `status` filter plus
+/// pagination.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalListParams {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Parses a governance proposal status filter, or a 400-mapped error. Mirrors the
+/// `GovProposalStatus` variant names exactly so the query value is self-describing.
+fn parse_proposal_status(raw: &str) -> Result<GovProposalStatus, ApiRejection> {
+    match raw {
+        "Active" => Ok(GovProposalStatus::Active),
+        "Passed" => Ok(GovProposalStatus::Passed),
+        "Defeated" => Ok(GovProposalStatus::Defeated),
+        "Executed" => Ok(GovProposalStatus::Executed),
+        "Expired" => Ok(GovProposalStatus::Expired),
+        _ => Err(ApiRejection(Box::new(ApiError::InvalidRequest(
+            "invalid proposal status".into(),
+        )))),
+    }
+}
+
 /// Builds the versioned API router with a request-body size limit.
 pub fn router<K>(state: AppState<K>) -> Router
 where
@@ -345,6 +375,10 @@ where
         .route(
             "/v1/governance/instances/{id}",
             get(governance_instance::<K>),
+        )
+        .route(
+            "/v1/governance/instances/{id}/proposals",
+            get(instance_proposals::<K>),
         )
         .route(
             "/v1/governance/proposals/{id}",
@@ -510,6 +544,24 @@ async fn nft_collection_items<K: KvStore>(
     let collection_id = NftCollectionId::new(parse_hash(&id)?);
     Ok(Json(state.service().nft_collection_items(
         collection_id,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn instance_proposals<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+    Query(params): Query<ProposalListParams>,
+) -> Result<Json<ProposalsPage>, ApiRejection> {
+    let instance_id = GovernanceInstanceId::new(parse_hash(&id)?);
+    let status = match params.status.as_deref() {
+        Some(raw) => Some(parse_proposal_status(raw)?),
+        None => None,
+    };
+    Ok(Json(state.service().instance_proposals(
+        instance_id,
+        status,
         params.cursor.as_deref(),
         params.limit,
     )?))
@@ -1625,6 +1677,258 @@ mod tests {
             format!("/v1/nft/collections/{collection_hex}/items?limit=abc"),
             // Unknown query parameter.
             format!("/v1/nft/collections/{collection_hex}/items?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated governance-proposals discovery endpoint -----
+
+    /// Builds a service with one governance instance holding `count` open
+    /// (signaling, Active) proposals, plus a second empty instance. Returns the
+    /// state, the populated instance id, the empty instance id, the proposal ids in
+    /// open order, and the proposer (creator) address.
+    fn proposals_state(
+        count: u64,
+    ) -> (
+        AppState<MemoryKvStore>,
+        GovernanceInstanceId,
+        GovernanceInstanceId,
+        Vec<ProposalId>,
+        Address,
+    ) {
+        let creator = Keypair::from_seed([61u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        // A weight token (held by the creator) the instance votes on.
+        seal_op(
+            &state,
+            &creator,
+            0,
+            Operation::CreateToken {
+                namespace,
+                create_nonce: 0,
+                metadata: TokenMetadata::new(
+                    b"Gov".to_vec(),
+                    b"GOV".to_vec(),
+                    6,
+                    Hash256([0x1f; 32]),
+                )
+                .unwrap(),
+                mint_authority: Some(creator.address()),
+                freeze_authority: Some(creator.address()),
+                initial_supply: Amount::from_units(1_000),
+                initial_recipient: creator.address(),
+            },
+        );
+        let token_id = TokenId::derive(namespace, creator.address(), 0);
+
+        // A zero-threshold config so the creator can open proposals freely.
+        let config = GovernanceConfig {
+            voting_period_epochs: 1_000,
+            timelock_epochs: 0,
+            quorum_bps: 0,
+            proposal_threshold: Amount::ZERO,
+            approval_threshold_bps: 5_000,
+        };
+        seal_op(
+            &state,
+            &creator,
+            1,
+            Operation::CreateGovernanceInstance {
+                namespace,
+                create_nonce: 0,
+                weight_token: token_id,
+                config,
+            },
+        );
+        let instance_id = GovernanceInstanceId::derive(namespace, creator.address(), 0);
+
+        let mut nonce = 2u64;
+        let mut proposal_ids = Vec::new();
+        for i in 0..count {
+            let open = Transaction::for_open_proposal(
+                &creator,
+                nonce,
+                instance_id,
+                GovernanceAction::Signaling,
+                token_id,
+                seed_fee(),
+            )
+            .expect("open-proposal transaction signs");
+            seal_tx(&state, open);
+            proposal_ids.push(ProposalId::derive(instance_id, i));
+            nonce += 1;
+        }
+
+        // A second instance with no proposals.
+        seal_op(
+            &state,
+            &creator,
+            nonce,
+            Operation::CreateGovernanceInstance {
+                namespace,
+                create_nonce: 1,
+                weight_token: token_id,
+                config,
+            },
+        );
+        let empty_instance = GovernanceInstanceId::derive(namespace, creator.address(), 1);
+
+        (
+            state,
+            instance_id,
+            empty_instance,
+            proposal_ids,
+            creator.address(),
+        )
+    }
+
+    /// Walks every page of an instance's proposals for the given query (without a
+    /// leading `?` or `cursor`), asserting each page is within `limit`, and returns
+    /// the proposal ids in served order.
+    async fn walk_proposals(
+        app: &Router,
+        instance_hex: &str,
+        query: &str,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let base = format!("/v1/governance/instances/{instance_hex}/proposals?{query}");
+            let uri = match &cursor {
+                Some(c) => format!("{base}&cursor={c}"),
+                None => base,
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                ids.push(item["proposal_id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(ids.len() < 100_000, "pagination failed to terminate");
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn proposals_paginate_and_filter_by_status() {
+        let (state, instance_id, empty_instance, proposal_ids, creator) = proposals_state(6);
+        let app = router(state);
+        let instance_hex = hash_hex(instance_id.hash());
+        let expected: BTreeSet<String> =
+            proposal_ids.iter().map(|id| hash_hex(id.hash())).collect();
+
+        // Unfiltered walk visits every proposal once, ascending by proposal id.
+        let walked = walk_proposals(&app, &instance_hex, "limit=2", 2).await;
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(walked, sorted, "ascending proposal-id order");
+        let got: BTreeSet<String> = walked.iter().cloned().collect();
+        assert_eq!(got.len(), walked.len(), "no proposal repeats");
+        assert_eq!(got, expected);
+
+        // The status filter returns only matches: every seeded proposal is Active,
+        // so status=Active returns them all and a terminal status returns none.
+        let active = walk_proposals(&app, &instance_hex, "status=Active&limit=2", 2).await;
+        assert_eq!(
+            active.iter().cloned().collect::<BTreeSet<_>>(),
+            expected,
+            "status=Active matches every open proposal"
+        );
+        let executed = body_value(
+            get_response(
+                &app,
+                format!("/v1/governance/instances/{instance_hex}/proposals?status=Executed"),
+            )
+            .await,
+        )
+        .await;
+        assert!(executed["items"].as_array().unwrap().is_empty());
+        assert!(executed["next_cursor"].is_null());
+
+        // The first page flattens the GovernanceProposal record.
+        let first = body_value(
+            get_response(
+                &app,
+                format!("/v1/governance/instances/{instance_hex}/proposals?limit=2"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["status"], "Active");
+        assert_eq!(first["items"][0]["instance_id"], instance_hex);
+        assert_eq!(first["items"][0]["proposer"], creator.to_string());
+
+        // An instance with no proposals is an empty, cursor-null page.
+        let empty_hex = hash_hex(empty_instance.hash());
+        let empty = body_value(
+            get_response(
+                &app,
+                format!("/v1/governance/instances/{empty_hex}/proposals"),
+            )
+            .await,
+        )
+        .await;
+        assert!(empty["items"].as_array().unwrap().is_empty());
+        assert!(empty["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn proposals_reject_unknown_instance_and_malformed_inputs() {
+        let (state, instance_id, _empty, _ids, _creator) = proposals_state(1);
+        let app = router(state);
+        let instance_hex = hash_hex(instance_id.hash());
+
+        // A well-formed id naming no instance is a 404.
+        let missing = "ab".repeat(32);
+        let response = get_response(
+            &app,
+            format!("/v1/governance/instances/{missing}/proposals"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        for uri in [
+            // Malformed instance id.
+            "/v1/governance/instances/zz/proposals".to_string(),
+            // Non-hex cursor.
+            format!("/v1/governance/instances/{instance_hex}/proposals?cursor=zz"),
+            // Unknown status filter value.
+            format!("/v1/governance/instances/{instance_hex}/proposals?status=Nope"),
+            // Non-numeric limit.
+            format!("/v1/governance/instances/{instance_hex}/proposals?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/governance/instances/{instance_hex}/proposals?bogus=1"),
         ] {
             let response = get_response(&app, uri.clone()).await;
             assert_eq!(

@@ -21,10 +21,11 @@ use std::ops::Bound;
 use std::sync::Mutex;
 
 use webc_chain::{
-    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, GovernanceInstance,
-    GovernanceInstanceId, GovernanceProposal, Mandate, MandateId, NftCollection, NftCollectionId,
-    NftId, NftItem, ObjectId, Operation, ProposalId, ServiceEntry, ServiceId, StateObject,
-    SupplyInvariantReport, TokenId, TokenRecord, TokenSupplyReport, Transaction, Validator,
+    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, GovProposalStatus,
+    GovernanceInstance, GovernanceInstanceId, GovernanceProposal, Mandate, MandateId,
+    NftCollection, NftCollectionId, NftId, NftItem, ObjectId, Operation, ProposalId, ServiceEntry,
+    ServiceId, StateObject, SupplyInvariantReport, TokenId, TokenRecord, TokenSupplyReport,
+    Transaction, Validator,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_storage::{KvStore, StorageError};
@@ -801,6 +802,22 @@ pub struct NftItemsPage {
     pub next_cursor: Option<String>,
 }
 
+/// One entry in an instance's proposals listing: the proposal's id alongside its
+/// full `GovernanceProposal` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct ProposalListItem {
+    pub proposal_id: ProposalId,
+    #[serde(flatten)]
+    pub proposal: GovernanceProposal,
+}
+
+/// A paginated governance-proposals page.
+#[derive(Debug, serde::Serialize)]
+pub struct ProposalsPage {
+    pub items: Vec<ProposalListItem>,
+    pub next_cursor: Option<String>,
+}
+
 /// Bounded, cursor-paginated DISCOVERY reads over the Phase 9/13 native-state maps.
 ///
 /// Every accessor here is a pure, deterministic ASCENDING walk of a committed
@@ -905,6 +922,59 @@ impl<K: KvStore> NodeService<K> {
             }
         }
         Ok(NftItemsPage { items, next_cursor })
+    }
+
+    /// Lists an instance's proposals in ascending `ProposalId` order, optionally
+    /// filtered by `status`. Proposals are keyed by their opaque `ProposalId`, not
+    /// grouped by instance, so this is a bounded filtered scan (at most
+    /// `FILTER_SCAN_MULTIPLIER * limit` entries per page); the cursor carries the
+    /// last-visited id for forward progress. The instance must exist, else
+    /// `NotFound`.
+    pub fn instance_proposals(
+        &self,
+        instance_id: GovernanceInstanceId,
+        status: Option<GovProposalStatus>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ProposalsPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.governance_instances.contains_key(&instance_id) {
+            return Err(ApiError::NotFound);
+        }
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(ProposalId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, proposal) in state.governance_proposals.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            let status_ok = match status {
+                Some(want) => proposal.status == want,
+                None => true,
+            };
+            if proposal.instance_id == instance_id && status_ok {
+                items.push(ProposalListItem {
+                    proposal_id: *id,
+                    proposal: proposal.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(ProposalsPage { items, next_cursor })
     }
 }
 
