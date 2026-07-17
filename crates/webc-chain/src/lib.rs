@@ -27,6 +27,7 @@ pub mod oracle;
 pub mod protocol;
 pub mod round;
 pub mod scheduler;
+pub mod service_registry;
 pub mod session_key;
 pub mod slashing;
 pub mod sponsorship;
@@ -97,6 +98,12 @@ pub use round::{
     TimeoutKind, ValidatorIdentity, MAX_FUTURE_ROUNDS, MAX_PAST_ROUNDS,
 };
 pub use scheduler::parallel_batches;
+pub use service_registry::{
+    ServiceEntry, ServiceId, ServicePaymentFlags, ServicePrice, ServiceStatus,
+    INITIAL_SERVICE_REVISION, MAX_SERVICE_CATEGORIES, MAX_SERVICE_ENDPOINT_BYTES,
+    MAX_SERVICE_PRICE_UNIT_BYTES, MAX_SERVICE_PRICING_ENTRIES, MAX_SERVICE_TITLE_BYTES,
+    SERVICE_REGISTRY_LEAF_DOMAIN,
+};
 pub use session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
     SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
@@ -375,6 +382,19 @@ pub enum ChainError {
     MandateCounterpartyNotAllowed,
     #[error("mandate spend exceeds the per-day rate limit")]
     MandateRateLimited,
+    #[error("a service is already registered for this namespace, owner, and create nonce")]
+    ServiceAlreadyExists,
+    #[error("no service is registered for this service id")]
+    ServiceNotFound,
+    #[error("only the service owner may update or set the status of this service")]
+    ServiceNotOwner,
+    #[error("the service is not active and cannot be paid")]
+    ServiceNotActive,
+    #[error(
+        "service entry is invalid (empty required field, over-length field, or over-count \
+         categories/pricing)"
+    )]
+    InvalidServiceEntry,
     #[error("a contract is already registered for this code id")]
     ContractAlreadyExists,
     #[error("no contract is registered for this code id")]

@@ -14,11 +14,13 @@ use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
     ChainId, Epoch, ExternalChain, MandateCounterpartyPolicy, MandateId, ObjectId, ObjectVersion,
-    PostQuantumRoot, PostQuantumRootReveal, ProtocolStateKey, ProtocolVersion,
-    SessionKeyConstraints, SessionKeyId, SlashingEvidence, StateKey, UnbondingRequestId,
-    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
+    PostQuantumRoot, PostQuantumRootReveal, ProtocolStateKey, ProtocolVersion, ServiceId,
+    ServicePaymentFlags, ServicePrice, ServiceStatus, SessionKeyConstraints, SessionKeyId,
+    SlashingEvidence, StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION,
+    LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, SignatureBytes};
 
 /// Signed transaction access list used for enforcement and parallel scheduling.
@@ -571,6 +573,101 @@ pub enum Operation {
         /// The mandate to revoke and reclaim.
         mandate_id: MandateId,
     },
+    /// Registers a service in the native registry (Phase 9b, §15.5).
+    ///
+    /// Owner-signed (the sender is the entry's `owner` and pay-to account).
+    /// Derives the service id from `(namespace, sender, create_nonce)` and records
+    /// a [`crate::ServiceEntry`] at revision [`crate::INITIAL_SERVICE_REVISION`]
+    /// with status [`crate::ServiceStatus::Active`]. It records data only and locks
+    /// NO native units; the spam price is this operation's HIGH `required_units`,
+    /// so the ordinary transaction fee (which flows through the normal burn / fee-
+    /// pool split) makes registration permissionless-for-a-fee. Fails if the derived
+    /// id already exists or the entry is malformed (over-length/over-count/empty
+    /// required field). Any authorization lane may pay the fee.
+    RegisterService {
+        /// Application namespace the entry lives under; bound into the service id.
+        namespace: Hash256,
+        /// Owner-chosen uniquifier so one owner may register several services under
+        /// one namespace; part of the derived service id.
+        create_nonce: u64,
+        /// Taxonomy tags a mandate allowlist may reference (bounded count).
+        categories: BTreeSet<Hash256>,
+        /// Short human/machine label, lowercase hex on the wire (bounded length).
+        #[serde(with = "crate::service_registry::bounded_title_hex")]
+        title: Vec<u8>,
+        /// HTTPS URL or on-chain entrypoint reference, lowercase hex (bounded).
+        #[serde(with = "crate::service_registry::bounded_endpoint_hex")]
+        endpoint: Vec<u8>,
+        /// Manifest reference hash for the machine-readable interface description.
+        interface: Hash256,
+        /// Priced operations the service exposes (bounded count).
+        pricing: Vec<ServicePrice>,
+        /// Accepted payment flows.
+        payment_flags: ServicePaymentFlags,
+    },
+    /// Updates a registered service's mutable fields (Phase 9b, §15.5).
+    ///
+    /// Owner-only. Replaces the entry's categories, title, endpoint, interface,
+    /// pricing, and payment flows, keeping its owner, namespace, and status, and
+    /// bumps `revision`. Only the CURRENT revision lives in committed active state.
+    /// Fails if the service does not exist (`ServiceNotFound`), the sender is not
+    /// its owner (`ServiceNotOwner`), or the resulting entry is malformed
+    /// (`InvalidServiceEntry`). Any authorization lane may pay the fee.
+    UpdateService {
+        /// Identity of the service to update.
+        service_id: ServiceId,
+        /// Replacement taxonomy tags (bounded count).
+        categories: BTreeSet<Hash256>,
+        /// Replacement label, lowercase hex on the wire (bounded length).
+        #[serde(with = "crate::service_registry::bounded_title_hex")]
+        title: Vec<u8>,
+        /// Replacement endpoint reference, lowercase hex (bounded length).
+        #[serde(with = "crate::service_registry::bounded_endpoint_hex")]
+        endpoint: Vec<u8>,
+        /// Replacement manifest reference hash.
+        interface: Hash256,
+        /// Replacement priced operations (bounded count).
+        pricing: Vec<ServicePrice>,
+        /// Replacement accepted payment flows.
+        payment_flags: ServicePaymentFlags,
+    },
+    /// Pauses, retires, or reactivates a registered service (Phase 9b, §15.5).
+    ///
+    /// Owner-only. Sets the entry's lifecycle `status` and bumps `revision`. A
+    /// Paused or Retired service rejects service-scoped spends. Fails if the
+    /// service does not exist (`ServiceNotFound`) or the sender is not its owner
+    /// (`ServiceNotOwner`). Any authorization lane may pay the fee.
+    SetServiceStatus {
+        /// Identity of the service whose status changes.
+        service_id: ServiceId,
+        /// The new lifecycle status.
+        status: ServiceStatus,
+    },
+    /// Spends against a mandate to pay a registered service (Phase 9b, §15.5).
+    ///
+    /// Signed by the mandate's `agent_key` (same auth model as
+    /// [`Self::SpendUnderMandate`]). Pays the SERVICE's `owner` account from the
+    /// mandate escrow, enforcing — O(1), no registry scan — every Phase 9a mandate
+    /// check (exists, not revoked, not expired, `amount <= per_tx_max`, `spent +
+    /// amount + fee <= budget_total`, daily rate limit) PLUS the counterparty policy
+    /// resolved against the registry ([`MandateCounterpartyPolicy::permits_service`]:
+    /// the service owner satisfies a recipient allowlist, and an active service's
+    /// categories resolve a category allowlist), and additionally requires the
+    /// service to be [`crate::ServiceStatus::Active`] (`ServiceNotActive`). On
+    /// success it credits `amount` to the service owner and routes the fee exactly
+    /// as [`Self::SpendUnderMandate`], both drawn from the mandate escrow. The
+    /// service owner (the registry pay-to) is state-derived, so a caller must
+    /// additionally declare its account in the signed access list — the runtime
+    /// resolves it from the entry, exactly the HTTP-402 pay-to check
+    /// ([`Transaction::for_service_spend`] builds this list). Default lane only.
+    SpendUnderMandateToService {
+        /// The mandate authorizing (and funding) this spend.
+        mandate_id: MandateId,
+        /// The service whose owner is credited the spent principal.
+        service_id: ServiceId,
+        /// Native principal moved to the service owner (excludes the fee).
+        amount: Amount,
+    },
 }
 
 impl Operation {
@@ -611,6 +708,16 @@ impl Operation {
             | Self::TopUpMandate { .. }
             | Self::SpendUnderMandate { .. }
             | Self::RevokeMandate { .. } => 10_000,
+            // Registration is permissionless-for-a-fee: it records data and locks
+            // no native units, so the anti-spam price is a HIGH ordinary fee (the
+            // fee flows through the normal burn / fee-pool split, no new bucket).
+            Self::RegisterService { .. } => 20_000,
+            // Update / status-change rewrite one existing record; a service-scoped
+            // spend moves units and writes one record — comparable to the other
+            // single-record management / locked-value operations.
+            Self::UpdateService { .. }
+            | Self::SetServiceStatus { .. }
+            | Self::SpendUnderMandateToService { .. } => 10_000,
             Self::CreateFeed { .. } => 15_000,
             Self::RegisterReporter { .. }
             | Self::DeregisterReporter { .. }
@@ -1012,6 +1119,45 @@ impl Operation {
                 push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
                 push_unique_key(&mut read_write, StateKey::account(*recipient));
             }
+            Self::RegisterService {
+                namespace,
+                create_nonce,
+                ..
+            } => {
+                // Registration records only the service-registry entry and moves no
+                // native units (the ordinary, spam-priced fee is drawn from the
+                // fee lane, already covered by the default-lane base). The service
+                // id is derived from the signer (owner), the namespace, and the
+                // create nonce, so the access list names the exact record at signing
+                // time (mirroring GrantMandate's derived id).
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::service(ServiceId::derive(*namespace, sender, *create_nonce)),
+                );
+            }
+            Self::UpdateService { service_id, .. } | Self::SetServiceStatus { service_id, .. } => {
+                // Update / status change only reads and writes the entry's record;
+                // it moves no native units, so it does not declare the sender account
+                // beyond the fee lane already covered by the default-lane base.
+                push_unique_key(&mut read_write, StateKey::service(*service_id));
+            }
+            Self::SpendUnderMandateToService {
+                mandate_id,
+                service_id,
+                ..
+            } => {
+                // The sender is the agent; the mandate escrow funds both the
+                // principal moved and the fee. The agent account (default-lane base)
+                // carries the spend's nonce/replay state; the mandate record is
+                // written and the service entry is read to resolve the pay-to owner.
+                // The service OWNER (the registry pay-to) account is state-derived —
+                // it is not in the operation — so a caller adds it here via
+                // `Transaction::for_service_spend`; the base list below is otherwise
+                // complete.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
+                push_unique_key(&mut read_only, StateKey::service(*service_id));
+            }
             Self::InvokeContract {
                 code_id,
                 namespace,
@@ -1329,6 +1475,54 @@ impl Transaction {
         );
         tx.sponsor = Some(sponsor_namespace);
         tx.sign(keypair)?;
+        Ok(tx)
+    }
+
+    /// Builds and signs a mandate spend that pays a registered service's owner
+    /// (Phase 9b, §15.5).
+    ///
+    /// The service `owner` (the registry pay-to account) is state-derived, so the
+    /// pure default access list cannot name it; the agent resolves it by reading
+    /// the on-chain service entry — the same pay-to check the HTTP-402 flow
+    /// performs — and passes it here so the signed access list declares the
+    /// credited account. If the owner changes on-chain before this lands, the spend
+    /// fails closed on the access-list mismatch, exactly like a stale recipient in
+    /// [`Operation::SpendUnderMandate`]. Signs for the devnet chain's default lane;
+    /// the signer is the mandate's agent key.
+    pub fn for_service_spend(
+        agent_keypair: &Keypair,
+        nonce: u64,
+        mandate_id: MandateId,
+        service_id: ServiceId,
+        amount: Amount,
+        service_owner: Address,
+        fee: FeeBid,
+    ) -> Result<Self, ChainError> {
+        let operation = Operation::SpendUnderMandateToService {
+            mandate_id,
+            service_id,
+            amount,
+        };
+        let sender = agent_keypair.address();
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::account(service_owner),
+        );
+        let mut tx = Self::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            agent_keypair.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            LEGACY_AUTHORIZATION_POLICY_REVISION,
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sign(agent_keypair)?;
         Ok(tx)
     }
 
@@ -2030,6 +2224,96 @@ mod tests {
         // The decode is strict (deny_unknown_fields), matching sibling operations.
         let mut value = serde_json::to_value(&revoke).unwrap();
         value["RevokeMandate"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
+    fn service_registry_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the four service-registry operations (Phase 9b,
+        // §15.5) so a browser SDK mirror must reproduce these exact field names and
+        // sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Byte-string fields are
+        // lowercase hex (like bridge addresses); amounts are decimal STRINGS.
+        use std::collections::BTreeSet;
+        let namespace = Hash256([0x55; 32]);
+        let interface = Hash256([0x1f; 32]);
+        let service_id = ServiceId::new(Hash256([0x88; 32]));
+        let id = "88".repeat(32);
+        let mut categories = BTreeSet::new();
+        categories.insert(Hash256([0xc1; 32]));
+        let pricing = vec![ServicePrice {
+            operation: Hash256([0x0b; 32]),
+            price: Amount::from_units(1_000),
+            unit: b"call".to_vec(),
+        }];
+        let payment_flags = ServicePaymentFlags {
+            on_chain_direct: true,
+            http_402: false,
+            subscription: false,
+        };
+
+        // RegisterService / UpdateService carry sets, lists, and bounded byte
+        // strings, so round-trip them rather than pin a large fixed string; the two
+        // simpler ops are pinned exactly below.
+        let register = Operation::RegisterService {
+            namespace,
+            create_nonce: 7,
+            categories: categories.clone(),
+            title: b"inference".to_vec(),
+            endpoint: b"https://api.example/infer".to_vec(),
+            interface,
+            pricing: pricing.clone(),
+            payment_flags,
+        };
+        let text = serde_json::to_string(&register).expect("register serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), register);
+        // The title field is lowercase hex on the wire ("inference" = 696e...).
+        assert!(text.contains(&format!("\"title\":\"{}\"", hex::encode("inference"))));
+
+        let update = Operation::UpdateService {
+            service_id,
+            categories,
+            title: b"inference-v2".to_vec(),
+            endpoint: b"https://api.example/infer".to_vec(),
+            interface,
+            pricing,
+            payment_flags,
+        };
+        let text = serde_json::to_string(&update).expect("update serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), update);
+
+        let set_status = Operation::SetServiceStatus {
+            service_id,
+            status: ServiceStatus::Paused,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&set_status).unwrap(),
+            format!(r#"{{"SetServiceStatus":{{"service_id":"{id}","status":"Paused"}}}}"#),
+        );
+
+        let spend = Operation::SpendUnderMandateToService {
+            mandate_id: MandateId::new(Hash256([0x99; 32])),
+            service_id,
+            amount: Amount::from_units(7),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&spend).unwrap(),
+            format!(
+                r#"{{"SpendUnderMandateToService":{{"amount":"7","mandate_id":"{mid}","service_id":"{id}"}}}}"#,
+                mid = "99".repeat(32),
+            )
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations.
+        // The bounded hex codec additionally rejects an over-length title.
+        let mut value = serde_json::to_value(&set_status).unwrap();
+        value["SetServiceStatus"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&register).unwrap();
+        value["RegisterService"]["title"] = serde_json::Value::String(
+            "61".repeat(crate::service_registry::MAX_SERVICE_TITLE_BYTES + 1),
+        );
         assert!(serde_json::from_value::<Operation>(value).is_err());
     }
 
