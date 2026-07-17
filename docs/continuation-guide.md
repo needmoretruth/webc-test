@@ -240,6 +240,34 @@ gate green incl. SDK):
   `InactivityLeakConfig` (opt-in, disabled) with tested per-epoch leak math;
   `SlashingPolicy` marked provisional.
 
+### Phase 6 progress (2026-07-17)
+
+Started Phase 6 (parallel execution / localized fees / storage deposits). The
+scheduler (deterministic parallel batches + serializable order, SC1/SC2), the
+end-to-end signed access-list declarations, and namespace-keyed object state
+were already implemented. Landed this session:
+
+- **Storage deposit + deletion rebate (§15.22) — DONE, wired:** `StoragePricing`
+  config; `CreateObject` locks a byte-proportional deposit, `MutateObject`
+  adjusts on resize, new `Operation::DeleteObject` refunds `refund_bps` and burns
+  the remainder; `storage_deposits` supply bucket reconciles the invariant;
+  per-object `StateObject.deposit`. **State-commitment domain bumped V7→V8** and
+  the object leaf V1→V2 (committed shapes changed). Full workspace gate green.
+- **ADR-0013 hot/cold tiering boundary** — the archive-node interface + proof /
+  restore-on-demand design (builds on ADR-0011).
+- **Fixed the long-standing `consensus_import_failure` flake** (a harness
+  broadcast/peer-registration race — now waits for both connection directions;
+  8/8 green where it was ~2/3).
+
+**Phase 6 remaining (mostly not started):** sponsor/paymaster accounts (§15.35,
+per-user/app/op/day caps); localized base/priority pricing + network-wide minimum
++ per-resource congestion measurement + fair block packing; varint amount
+encoding (§15.14, a wire-version bump) and **zstd wire/storage compression**
+(§15.19/15.24, on by default); an application namespace registry; sharded
+examples. The **TPS benchmarks** (100/500/1000/2000 gates) need real reference
+hardware, not a cloud container (a known deferred non-finding) — implement the
+features here; the published-claim benchmarks run on real machines later.
+
 **Deferred within Phase 5 (owner-gated / consensus-safety, tracked in ADR-0012):**
 the slashing severity numbers, correlated-slashing behavior, the downtime→jail
 path, and the inactivity-leak consensus wiring (recovery mode) all await the
