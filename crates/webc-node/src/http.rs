@@ -25,6 +25,7 @@
 //! - `GET  /tokens/{id}/supply`         per-token supply reconciliation
 //! - `GET  /nft/collections/{id}`       NFT collection record by hex id
 //! - `GET  /nft/collections/{id}/items/{serial}` one NFT item
+//! - `GET  /nft/collections/{id}/items` paginated items in a collection
 //! - `GET  /services`                   paginated services (optional `category`)
 //! - `GET  /services/{id}`              service-registry entry by hex id
 //! - `GET  /governance/instances/{id}`  governance instance by hex id
@@ -59,8 +60,8 @@ use webc_crypto::{Address, Hash256};
 use webc_storage::KvStore;
 
 use crate::service::{
-    AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NodeService, SealSummary,
-    ServicesPage, SubmitReceipt, ValidatorSummary, ValidatorsResponse, API_VERSION,
+    AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NftItemsPage, NodeService,
+    SealSummary, ServicesPage, SubmitReceipt, ValidatorSummary, ValidatorsResponse, API_VERSION,
 };
 
 /// Default maximum request body size (1 MiB), bounding hostile payloads.
@@ -284,6 +285,18 @@ fn parse_hash(raw: &str) -> Result<Hash256, ApiRejection> {
     Ok(Hash256(fixed))
 }
 
+/// Query parameters shared by the simple paginated list endpoints (cursor + limit).
+/// `deny_unknown_fields` rejects any stray parameter with a 400 (via the `Query`
+/// extractor).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageParams {
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 /// Query parameters for the services listing: an optional hex `category` tag plus
 /// pagination. `deny_unknown_fields` rejects any stray parameter with a 400 (via the
 /// `Query` extractor).
@@ -322,6 +335,10 @@ where
         .route(
             "/v1/nft/collections/{id}/items/{serial}",
             get(nft_item::<K>),
+        )
+        .route(
+            "/v1/nft/collections/{id}/items",
+            get(nft_collection_items::<K>),
         )
         .route("/v1/services", get(list_services::<K>))
         .route("/v1/services/{id}", get(service_entry::<K>))
@@ -480,6 +497,19 @@ async fn list_services<K: KvStore>(
     };
     Ok(Json(state.service().services(
         category,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn nft_collection_items<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<NftItemsPage>, ApiRejection> {
+    let collection_id = NftCollectionId::new(parse_hash(&id)?);
+    Ok(Json(state.service().nft_collection_items(
+        collection_id,
         params.cursor.as_deref(),
         params.limit,
     )?))
@@ -1435,6 +1465,168 @@ mod tests {
             "/v1/services?bogus=1",
         ] {
             let response = get_response(&app, uri.to_string()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated NFT-collection-items discovery endpoint -----
+
+    /// Builds a service with one collection that has `count` items minted to a
+    /// holder (serials `0..count`), plus a second, empty collection. Returns the
+    /// state, the populated collection id, the empty collection id, and the holder.
+    fn nft_items_state(
+        count: u64,
+    ) -> (
+        AppState<MemoryKvStore>,
+        NftCollectionId,
+        NftCollectionId,
+        Address,
+    ) {
+        let creator = Keypair::from_seed([51u8; 32]);
+        let holder = Keypair::from_seed([52u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        let new_collection =
+            |create_nonce: u64, name: &[u8], symbol: &[u8]| Operation::CreateNftCollection {
+                namespace,
+                create_nonce,
+                metadata: NftMetadata::new(name.to_vec(), symbol.to_vec(), Hash256([0x2f; 32]))
+                    .unwrap(),
+                mint_authority: Some(creator.address()),
+                freeze_authority: Some(creator.address()),
+                max_supply: None,
+                royalty_bps: 0,
+            };
+
+        // Populated collection (create nonce 0).
+        seal_op(&state, &creator, 0, new_collection(0, b"Acme Apes", b"APE"));
+        let collection_id = NftCollectionId::derive(namespace, creator.address(), 0);
+        let mut nonce = 1u64;
+        for _ in 0..count {
+            seal_op(
+                &state,
+                &creator,
+                nonce,
+                Operation::MintNft {
+                    collection_id,
+                    recipient: holder.address(),
+                    item_metadata_hash: Hash256([0x3f; 32]),
+                },
+            );
+            nonce += 1;
+        }
+
+        // Second, empty collection (create nonce 1).
+        seal_op(&state, &creator, nonce, new_collection(1, b"Empty", b"EMP"));
+        let empty_id = NftCollectionId::derive(namespace, creator.address(), 1);
+
+        (state, collection_id, empty_id, holder.address())
+    }
+
+    /// Walks every page of a collection's items, asserting each page is within
+    /// `limit`, and returns the serials in served order.
+    async fn walk_items(app: &Router, collection_hex: &str, limit: usize) -> Vec<u64> {
+        let mut serials = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => {
+                    format!("/v1/nft/collections/{collection_hex}/items?limit={limit}&cursor={c}")
+                }
+                None => format!("/v1/nft/collections/{collection_hex}/items?limit={limit}"),
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                serials.push(item["serial"].as_u64().unwrap());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(serials.len() < 100_000, "pagination failed to terminate");
+        }
+        serials
+    }
+
+    #[tokio::test]
+    async fn nft_items_paginate_ascending_by_serial() {
+        let (state, collection_id, empty_id, holder) = nft_items_state(7);
+        let app = router(state);
+        let collection_hex = hash_hex(collection_id.hash());
+
+        let serials = walk_items(&app, &collection_hex, 3).await;
+        // Every serial exactly once, contiguous and ascending.
+        assert_eq!(serials, (0..7).collect::<Vec<_>>());
+
+        // The first page carries the flattened NftItem record (owner, frozen).
+        let first = body_value(
+            get_response(
+                &app,
+                format!("/v1/nft/collections/{collection_hex}/items?limit=3"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["serial"], 0);
+        assert_eq!(first["items"][0]["owner"], holder.to_string());
+        assert_eq!(first["items"][0]["frozen"], false);
+
+        // An existing collection with no items is an empty, cursor-null page.
+        let empty_hex = hash_hex(empty_id.hash());
+        let body =
+            body_value(get_response(&app, format!("/v1/nft/collections/{empty_hex}/items")).await)
+                .await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn nft_items_reject_unknown_collection_and_malformed_inputs() {
+        let (state, collection_id, _empty, _holder) = nft_items_state(1);
+        let app = router(state);
+        let collection_hex = hash_hex(collection_id.hash());
+
+        // A well-formed id that names no collection is a 404 (mirrors the point-read).
+        let missing = "ab".repeat(32);
+        let response = get_response(&app, format!("/v1/nft/collections/{missing}/items")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        for uri in [
+            // Malformed collection id.
+            "/v1/nft/collections/zz/items".to_string(),
+            // Non-numeric cursor.
+            format!("/v1/nft/collections/{collection_hex}/items?cursor=notaserial"),
+            // Non-numeric limit.
+            format!("/v1/nft/collections/{collection_hex}/items?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/nft/collections/{collection_hex}/items?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
             assert_eq!(
                 response.status(),
                 StatusCode::BAD_REQUEST,

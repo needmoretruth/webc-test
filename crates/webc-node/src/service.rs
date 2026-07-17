@@ -785,6 +785,22 @@ pub struct ServicesPage {
     pub next_cursor: Option<String>,
 }
 
+/// One entry in a collection's items listing: the item's serial alongside its
+/// full `NftItem` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct NftItemListItem {
+    pub serial: u64,
+    #[serde(flatten)]
+    pub item: NftItem,
+}
+
+/// A paginated NFT-collection-items page.
+#[derive(Debug, serde::Serialize)]
+pub struct NftItemsPage {
+    pub items: Vec<NftItemListItem>,
+    pub next_cursor: Option<String>,
+}
+
 /// Bounded, cursor-paginated DISCOVERY reads over the Phase 9/13 native-state maps.
 ///
 /// Every accessor here is a pure, deterministic ASCENDING walk of a committed
@@ -842,6 +858,53 @@ impl<K: KvStore> NodeService<K> {
             }
         }
         Ok(ServicesPage { items, next_cursor })
+    }
+
+    /// Lists a collection's live items ascending by serial. This is a contiguous
+    /// range over `nft_items` (keyed by `(collection, serial)`, ordered by that
+    /// pair), so it needs no filter scan bound — every visited key is an item of the
+    /// collection, and the page is bounded by `limit` alone. The collection must
+    /// exist, else `NotFound` (mirroring the item point-read). The cursor is the
+    /// last serial returned; the next page starts strictly after it.
+    pub fn nft_collection_items(
+        &self,
+        collection_id: NftCollectionId,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<NftItemsPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.nft_collections.contains_key(&collection_id) {
+            return Err(ApiError::NotFound);
+        }
+
+        let start = match cursor {
+            Some(raw) => {
+                let serial: u64 = raw
+                    .parse()
+                    .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+                Bound::Excluded(NftId::new(collection_id, serial))
+            }
+            None => Bound::Included(NftId::new(collection_id, 0)),
+        };
+        // Bound the range to this collection's key space so the walk never crosses
+        // into the next collection's items.
+        let end = Bound::Included(NftId::new(collection_id, u64::MAX));
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        for (nft_id, item) in state.nft_items.range((start, end)) {
+            items.push(NftItemListItem {
+                serial: nft_id.serial,
+                item: item.clone(),
+            });
+            if items.len() >= limit {
+                next_cursor = Some(nft_id.serial.to_string());
+                break;
+            }
+        }
+        Ok(NftItemsPage { items, next_cursor })
     }
 }
 
