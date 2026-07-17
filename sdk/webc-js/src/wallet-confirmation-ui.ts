@@ -21,12 +21,25 @@ import {
 } from "./wallet-service.js";
 import type { WebcWallet } from "./wallet.js";
 
+/**
+ * Milliseconds the Approve button stays inert after each render, so a
+ * double-click aimed at one request cannot carry over to the next request that
+ * mounts in the same position. OWASP-style "guard delay" against click-through.
+ */
+export const DEFAULT_APPROVE_DELAY_MS = 700;
+
 /** Options for labels in one trusted wallet confirmation surface. */
 export interface WalletConfirmationUiOptions {
   readonly root: HTMLElement;
   readonly title?: string;
   readonly approveLabel?: string;
   readonly rejectLabel?: string;
+  /**
+   * How long Approve is disabled after render before it can be activated, in
+   * milliseconds. Defaults to {@link DEFAULT_APPROVE_DELAY_MS}. Exposed mainly so
+   * tests can drive the guard deterministically.
+   */
+  readonly approveDelayMs?: number;
 }
 
 /** Inputs for a top-level trusted wallet popup service. */
@@ -130,16 +143,55 @@ function renderConfirmation(
   panel.append(actions);
   root.append(panel);
 
+  // Double-click guard. The next queued request's Approve button mounts in the
+  // exact spot the previous one just occupied, so a fast double-click on request
+  // N could otherwise land its second click on request N+1. Two defenses:
+  //   1. Approve is disabled for a short delay after every render, so the second
+  //      click of a double-click (tens of ms later) hits an inert button.
+  //   2. Approval requires a fresh pointer press — pointerdown AND pointerup both
+  //      after the delay — so a stray mouseup or a click whose press began on the
+  //      previous request cannot approve this one. Keyboard activation (a
+  //      deliberate, separate action) is honored once enabled. Reject is always
+  //      immediate; rejecting is never dangerous.
+  const approveDelayMs = options.approveDelayMs ?? DEFAULT_APPROVE_DELAY_MS;
   let completed = false;
+  let approveEnabled = false;
+  let pressArmed = false;
+  approve.disabled = true;
+
+  const enableTimer = setTimeout(() => {
+    approveEnabled = true;
+    approve.disabled = false;
+  }, approveDelayMs);
+
   const finish = (approved: boolean) => {
     if (completed) return;
     completed = true;
+    clearTimeout(enableTimer);
     approve.disabled = true;
     reject.disabled = true;
     resolve(approved);
   };
+
+  const disarm = () => {
+    pressArmed = false;
+  };
+  approve.addEventListener("pointerdown", () => {
+    // Only a press that begins after the guard delay can arm approval.
+    if (approveEnabled) pressArmed = true;
+  });
+  approve.addEventListener("pointerup", () => {
+    if (approveEnabled && pressArmed) finish(true);
+  });
+  approve.addEventListener("pointercancel", disarm);
+  approve.addEventListener("pointerleave", disarm);
+  approve.addEventListener("keydown", (event) => {
+    if (approveEnabled && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      finish(true);
+    }
+  });
   reject.addEventListener("click", () => finish(false), { once: true });
-  approve.addEventListener("click", () => finish(true), { once: true });
   reject.focus();
 }
 

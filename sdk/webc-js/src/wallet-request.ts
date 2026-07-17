@@ -26,6 +26,20 @@ export const WALLET_MESSAGE_VERSION = 1 as const;
 /** Maximum requests retained for replay detection by one service instance. */
 export const MAX_WALLET_REPLAY_IDS = 2_048;
 
+/**
+ * Upper bound on a transfer recipient string, checked before base58 decode.
+ * A `webc1...` address is ~49 characters; 64 leaves margin without letting an
+ * unbounded string reach the O(n^2) base58 decoder and freeze the popup.
+ */
+const MAX_TRANSFER_RECIPIENT_CHARS = 64;
+
+/**
+ * Upper bound on a transfer amount string, checked before `BigInt` parsing.
+ * `u128::MAX` is 39 decimal digits, so anything longer is out of range anyway
+ * and must never reach the O(n^2) decimal `BigInt` parse.
+ */
+const MAX_TRANSFER_AMOUNT_CHARS = 39;
+
 /** Only permission currently safe for automatic wire construction. */
 export type WalletPermissionScope = "sign_native_transfer";
 
@@ -388,7 +402,9 @@ function parseNativeTransferParams(input: unknown): WalletNativeTransferParams {
     !Number.isSafeInteger(params.authorization_policy_revision) ||
     params.authorization_policy_revision < 0 ||
     typeof params.recipient !== "string" ||
-    typeof params.amount !== "string"
+    params.recipient.length > MAX_TRANSFER_RECIPIENT_CHARS ||
+    typeof params.amount !== "string" ||
+    params.amount.length > MAX_TRANSFER_AMOUNT_CHARS
   ) {
     invalidRequest();
   }

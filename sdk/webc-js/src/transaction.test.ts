@@ -340,6 +340,133 @@ describe("transaction signing schema", () => {
     );
   });
 
+  it("rejects non-canonical amount strings to keep Rust u128 parity (X4)", () => {
+    // Rust's Amount serializes as a canonical unsigned decimal (no leading zero,
+    // no sign, within u128). A value Rust would never re-produce must not be
+    // signable, or the signed bytes silently diverge from verification.
+    const validator = "webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem";
+    const overU128 = (2n ** 128n).toString(10);
+    for (const bad of ["01", "-5", "abc", "", " 5", "5 ", "1_000", overU128]) {
+      expect(() => transfer(validator, bad)).toThrow(/amount/u);
+      expect(() => delegate(validator, bad)).toThrow(/amount/u);
+      expect(() => undelegate(validator, bad)).toThrow(/amount/u);
+      expect(() => unstakeValidator(bad)).toThrow(/amount/u);
+      expect(() => registerValidator({
+        consensusKey: "aa".repeat(32),
+        selfStake: bad,
+        commissionBps: 500,
+        bootstrap: false,
+      })).toThrow(/amount/u);
+      expect(() =>
+        bridgeLock({
+          asset: "NativeWebc",
+          destinationChain: "Ethereum",
+          recipient: "abcd",
+          amount: bad,
+        }),
+      ).toThrow(/amount/u);
+      expect(() => openAuthorizationLane("99".repeat(32), bad)).toThrow(/amount/u);
+    }
+    // Session-key constraint amounts are validated too (same parity class).
+    expect(() =>
+      installSessionKey({
+        sessionPublicKey: "11".repeat(32),
+        constraints: { ...sessionConstraints, max_amount_per_use: "05" },
+        postQuantumRootReveal: sessionReveal,
+      }),
+    ).toThrow(/amount/u);
+    // Canonical values still construct.
+    expect(transfer(validator, "0")).toEqual({
+      Transfer: { to: validator, amount: "0" },
+    });
+    expect(transfer(validator, "123456")).toEqual({
+      Transfer: { to: validator, amount: "123456" },
+    });
+  });
+
+  it("rejects non-lowercase object id/namespace/data hex to keep Rust parity (X2)", () => {
+    // object_id and namespace are Hash256 and data is bounded lowercase hex in
+    // Rust; a mixed-case field re-serializes lowercase there, so signing it here
+    // produces a silent mismatch. Validate each hex field in the constructor.
+    const id = "ab".repeat(32);
+    const namespace = "cd".repeat(32);
+    expect(() =>
+      createObject({ objectId: id.toUpperCase(), namespace, data: "ab" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      createObject({ objectId: id, namespace: namespace.toUpperCase(), data: "ab" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      createObject({ objectId: id, namespace, data: "AB" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      mutateObject({ objectId: id, namespace, expectedVersion: 1, data: "Cd" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      transferObject({
+        objectId: id.toUpperCase(),
+        namespace,
+        expectedVersion: 2,
+        newOwner: "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3",
+      }),
+    ).toThrow(/lowercase hex/u);
+    // Odd-length (non-byte-aligned) hex is also rejected before signing.
+    expect(() =>
+      createObject({ objectId: id, namespace, data: "abc" }),
+    ).toThrow(/lowercase hex/u);
+    // Well-formed lowercase fields still construct.
+    expect(
+      createObject({ objectId: id, namespace, data: "ab" }),
+    ).toEqual({ CreateObject: { object_id: id, namespace, data: "ab" } });
+  });
+
+  it("rejects non-lowercase bridge recipient hex to keep Rust parity (X1)", () => {
+    // Rust emits and re-serializes the recipient as lowercase hex, so an
+    // upper/mixed-case recipient here would sign bytes Rust never re-produces,
+    // yielding a silent signing/verification mismatch. Fail closed instead.
+    expect(() =>
+      bridgeLock({
+        asset: "NativeWebc",
+        destinationChain: "Ethereum",
+        recipient: "ABCD",
+        amount: "4",
+      }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      bridgeBurn({
+        asset: "NativeWebc",
+        destinationChain: "Solana",
+        recipient: "AbCd",
+        amount: "5",
+      }),
+    ).toThrow(/lowercase hex/u);
+    // An odd-length or non-hex recipient is likewise rejected before signing.
+    expect(() =>
+      bridgeLock({
+        asset: "NativeWebc",
+        destinationChain: "Ethereum",
+        recipient: "abc",
+        amount: "4",
+      }),
+    ).toThrow(/lowercase hex/u);
+    // A well-formed lowercase recipient still constructs successfully.
+    expect(
+      bridgeLock({
+        asset: "NativeWebc",
+        destinationChain: "Ethereum",
+        recipient: "abcd",
+        amount: "4",
+      }),
+    ).toEqual({
+      BridgeLock: {
+        asset: "NativeWebc",
+        destination_chain: "Ethereum",
+        recipient: "abcd",
+        amount: "4",
+      },
+    });
+  });
+
   it("derives the Rust session-key id for a public key", async () => {
     // Must equal Rust `SessionKeyId::derive(PublicKeyBytes([0x11; 32]))`.
     expect(await deriveSessionKeyIdHex("11".repeat(32))).toBe(
