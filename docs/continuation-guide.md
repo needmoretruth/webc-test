@@ -477,16 +477,33 @@ review returned CLEAN** — the subagent had applied the token-T1 lesson
 authority renounce permanence, freeze/pause gating, and supply neutrality all
 verified.
 
-**Next: Phase 13c — application governance** (development-plan Phase 13:
-"governance instances — snapshots, quorum, timelocks, delegation, execution
-policy"). Native, autonomous. Design: a governance-instance registry (proposal +
-voting with a stake- or token-weighted snapshot taken at proposal time to prevent
-double-voting / after-snapshot manipulation — a Phase 13 acceptance criterion),
-quorum + timelock before execution, vote delegation, and a bounded execution
-policy. Decide the weight source (native stake vs a governance token) as
-design-within-scope. Same determinism + domain-bump + E8 + adversarial-review
-discipline. This completes Phase 13; the deferred cross-phase tail (SDK toolkit,
-HTTP-402, benchmarks, bridges, mainnet) remains owner-gated/external.
+**Application governance — DONE (13c).** Token-weighted, LOCK-TO-VOTE governance
+(`governance.rs`): an instance is bound to a `weight_token` and holds a native-WEBC
+`treasury`. Ops CreateGovernanceInstance / FundGovernanceTreasury / OpenProposal /
+CastVote / ResolveProposal / ExecuteProposal / ReclaimVote. Voting LOCKS weight
+tokens by moving them to a synthetic per-proposal escrow **within** `token_balances`
+— this satisfies the "prevent double-voting / after-snapshot manipulation"
+acceptance criterion WITHOUT historical state and keeps `sum(token_balances)==
+issued_supply` intact automatically. Integer quorum/approval (`u128 checked_mul`,
+no float); timelock + Compound-style execution/expiry window; `TreasuryTransfer`
+pays once, re-checking the live treasury. Two supply buckets (`governance_deposits`,
+`governance_treasury`); domain V18→V19. Delegation DEFERRED (does not compose
+cleanly with lock-to-vote; documented). Merged into main f5a4ad8. **Post-merge
+adversarial review returned CLEAN** — native-supply conservation, no treasury
+double-spend/overspend/timelock-bypass, per-token invariant, declared==actual
+access (no T1-style bug, verified line-by-line + scheduler serialization), integer
+math, and determinism all confirmed; two by-design informational notes only (live
+quorum denominator = mint-authority grief, documented; ReclaimVote intentionally
+skips pause/freeze to avoid stranding a voter's escrow).
+
+**Phase 13 (tokens, NFTs, governance) is COMPLETE and integrated into `main`.**
+The deferred cross-phase tail — SDK agent/token/governance toolkits, HTTP-402
+flows, Phase 10 succinct proofs / PQ, Phase 11 fast-path + real-hardware
+benchmarks, Phase 12 web platform, Phase 14/18 bridges, Phase 16 testnet, Phase
+17 mainnet gates — remains owner-gated (trust anchors, slashing numbers, bridge
+trust model, mainnet governance) or needs external resources (benchmarks, audits,
+live bridges). Surface those to the owner rather than deciding alone. A separate
+**transaction-system** goal runs independently on `codex/transaction-system`.
 
 ### Original Phase 13 rationale — native tokens / NFTs / app governance
 
