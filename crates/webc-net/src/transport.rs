@@ -50,6 +50,17 @@ const PEER_SEND_CAPACITY: usize = 256;
 const RECONNECT_BACKOFF_START_MS: u64 = 500;
 const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
 
+/// Default deadline for completing the full authentication handshake.
+///
+/// Why 10s (finding N1): the four-step challenge/response is a few small frames
+/// over one round trip; even a slow, distant, loaded peer completes it well
+/// under a second. Ten seconds is generous enough never to reject an honest
+/// peer, yet short enough that a stalled or malicious peer cannot pin a task,
+/// socket, and file descriptor for long. A peer that has not authenticated
+/// within this window is dropped and its slot freed, which — together with the
+/// inbound connection cap (N2) — bounds the slowloris FD-exhaustion surface.
+const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A gossip message received from an authenticated peer.
 #[derive(Clone, Debug)]
 pub struct InboundMessage {
@@ -71,10 +82,19 @@ pub struct NetworkConfig {
     pub bootstrap_peers: Vec<SocketAddr>,
     /// Inbound message queue depth delivered to the node.
     pub inbound_capacity: usize,
+    /// Deadline for completing the authentication handshake (finding N1).
+    ///
+    /// A connection that has not finished the mutual challenge/response within
+    /// this window is dropped so a stalled peer cannot hold resources forever.
+    pub handshake_timeout: std::time::Duration,
 }
 
 impl NetworkConfig {
-    /// Builds a config with a sensible default inbound queue depth.
+    /// Builds a config with sensible defaults for the DoS-hardening limits.
+    ///
+    /// The public constructor keeps a stable four-argument signature so
+    /// downstream callers (`webc-node`) are unaffected; the hardening limits use
+    /// documented defaults and can be overridden on the returned value in tests.
     pub fn new(
         identity: Keypair,
         chain_id: ChainId,
@@ -87,6 +107,7 @@ impl NetworkConfig {
             listen_addr,
             bootstrap_peers,
             inbound_capacity: 1024,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 }
@@ -95,6 +116,8 @@ impl NetworkConfig {
 struct SharedConfig {
     identity: Keypair,
     chain_id: ChainId,
+    /// Deadline bounding the authentication handshake (finding N1).
+    handshake_timeout: std::time::Duration,
 }
 
 /// Cloneable control handle to a running network worker.
@@ -178,6 +201,7 @@ pub async fn spawn_network(
     let shared = Arc::new(SharedConfig {
         identity: config.identity,
         chain_id: config.chain_id,
+        handshake_timeout: config.handshake_timeout,
     });
 
     let (events_tx, events_rx) = mpsc::channel::<Event>(1024);
@@ -279,28 +303,23 @@ async fn run_connection(
         .max_frame_length(MAX_FRAME_BYTES)
         .new_framed(stream);
 
-    // 1. Announce ourselves with a fresh challenge.
-    let our_challenge = random_challenge();
-    let hello = build_hello(&shared.identity, &shared.chain_id, our_challenge);
-    framed.send(Bytes::from(codec::encode(&hello)?)).await?;
-
-    // 2. Receive and validate the peer's hello.
-    let peer_hello_bytes = next_frame(&mut framed).await?;
-    let peer_hello: HandshakeHello = codec::decode(&peer_hello_bytes)?;
-    let peer_id = accept_hello(&peer_hello, &shared.chain_id)?;
-    if peer_id == PeerId(shared.identity.public_key()) {
-        // Refuse to peer with ourselves (e.g. a bootstrap list naming us).
-        return Err(NetError::MalformedHandshake);
-    }
-
-    // 3. Prove possession of our key over the peer's challenge.
-    let proof = build_proof(&shared.identity, &shared.chain_id, &peer_hello.challenge);
-    framed.send(Bytes::from(codec::encode(&proof)?)).await?;
-
-    // 4. Receive and verify the peer's proof over our challenge.
-    let peer_proof_bytes = next_frame(&mut framed).await?;
-    let peer_proof: HandshakeProof = codec::decode(&peer_proof_bytes)?;
-    verify_peer_proof(peer_id, &shared.chain_id, &our_challenge, &peer_proof)?;
+    // Bound the entire authentication handshake with a deadline (finding N1).
+    // Without it, a peer that connects and then stalls — never sending its hello
+    // or its proof — blocks forever at `next_frame`, pinning this task plus the
+    // socket and its file descriptor. Many such half-open connections exhaust the
+    // file-descriptor table (a slowloris DoS). `tokio::time::timeout` drops the
+    // connection on elapse and frees the slot. The deadline covers only the
+    // handshake; once authenticated, the steady-state read loop intentionally has
+    // no such deadline, because a healthy peer may sit idle between gossip frames.
+    let peer_id = match tokio::time::timeout(
+        shared.handshake_timeout,
+        perform_handshake(&mut framed, &shared),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => return Err(NetError::HandshakeTimedOut),
+    };
 
     // Authenticated. Register an outbound queue and start pumping frames.
     let (out_tx, mut out_rx) = mpsc::channel::<Arc<Vec<u8>>>(PEER_SEND_CAPACITY);
@@ -345,6 +364,42 @@ async fn run_connection(
     writer.abort();
     let _ = events.send(Event::Disconnected { peer: peer_id }).await;
     Ok(())
+}
+
+/// Runs the four-step mutual challenge/response, returning the authenticated peer.
+///
+/// This is the exact sequence factored out of [`run_connection`] so the whole of
+/// it can be wrapped in a single deadline (finding N1). It performs no
+/// registration or pumping; on success the returned [`PeerId`] is authenticated
+/// (the peer proved possession of its identity key over our fresh challenge).
+async fn perform_handshake(
+    framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
+    shared: &SharedConfig,
+) -> Result<PeerId, NetError> {
+    // 1. Announce ourselves with a fresh challenge.
+    let our_challenge = random_challenge();
+    let hello = build_hello(&shared.identity, &shared.chain_id, our_challenge);
+    framed.send(Bytes::from(codec::encode(&hello)?)).await?;
+
+    // 2. Receive and validate the peer's hello.
+    let peer_hello_bytes = next_frame(framed).await?;
+    let peer_hello: HandshakeHello = codec::decode(&peer_hello_bytes)?;
+    let peer_id = accept_hello(&peer_hello, &shared.chain_id)?;
+    if peer_id == PeerId(shared.identity.public_key()) {
+        // Refuse to peer with ourselves (e.g. a bootstrap list naming us).
+        return Err(NetError::MalformedHandshake);
+    }
+
+    // 3. Prove possession of our key over the peer's challenge.
+    let proof = build_proof(&shared.identity, &shared.chain_id, &peer_hello.challenge);
+    framed.send(Bytes::from(codec::encode(&proof)?)).await?;
+
+    // 4. Receive and verify the peer's proof over our challenge.
+    let peer_proof_bytes = next_frame(framed).await?;
+    let peer_proof: HandshakeProof = codec::decode(&peer_proof_bytes)?;
+    verify_peer_proof(peer_id, &shared.chain_id, &our_challenge, &peer_proof)?;
+
+    Ok(peer_id)
 }
 
 /// Reads the next length-delimited frame, mapping closure/short-read to typed errors.
@@ -668,6 +723,45 @@ mod tests {
         assert!(
             c_got.is_err(),
             "a directed send must not reach a non-target peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_handshake_is_dropped_after_the_timeout() {
+        use tokio::io::AsyncReadExt;
+        // N1 reproduce: a peer that connects and then stalls (never sends its
+        // hello or proof) must be dropped once the handshake deadline elapses,
+        // freeing the task/socket/FD. Pre-fix the handshake had no deadline, so
+        // the server held the half-open connection forever.
+        let chain = ChainId::devnet();
+        let mut cfg = NetworkConfig::new(
+            Keypair::from_seed([21u8; 32]),
+            chain,
+            Some(loopback()),
+            Vec::new(),
+        );
+        cfg.handshake_timeout = Duration::from_millis(300);
+        let (handle, _rx) = spawn_network(cfg).await.unwrap();
+        let addr = handle.local_addr().expect("listener bound");
+
+        // Raw client: connect, then never send a hello or proof (a slowloris).
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // The server must close the connection once the deadline elapses; we see
+        // that as EOF (read returns 0) or a reset. A per-read timeout keeps the
+        // test from hanging if the server (pre-fix) holds the connection open.
+        let mut buf = [0u8; 1024];
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await {
+                Ok(Ok(0)) => break true,  // EOF: server dropped the stalled peer
+                Ok(Ok(_)) => continue,    // server's own hello bytes; keep reading
+                Ok(Err(_)) => break true, // connection reset also means dropped
+                Err(_) => break false,    // no close within 2s → still held open
+            }
+        };
+        assert!(
+            closed,
+            "server must drop a stalled handshake after the deadline"
         );
     }
 
