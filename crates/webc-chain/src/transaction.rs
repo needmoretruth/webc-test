@@ -3443,6 +3443,121 @@ mod tests {
     }
 
     #[test]
+    fn governance_operations_have_stable_wire_vectors() {
+        // Pins the canonical JSON of the native application-governance operations
+        // (Phase 13c, §15) so a browser SDK mirror must reproduce these exact field
+        // names and sorted-key order. Adding these variants leaves the frozen
+        // `every_native_operation_...` cross-language vector untouched (serde tags
+        // variants by name; existing variants are unchanged). Ids/tokens are 32-byte
+        // lowercase hex; amounts are decimal strings; addresses are base58; the
+        // choice/action/status enums tag by variant name.
+        let instance_id = crate::GovernanceInstanceId::new(Hash256([0x88; 32]));
+        let proposal_id = crate::ProposalId::new(Hash256([0x99; 32]));
+        let weight_token = TokenId::new(Hash256([0x77; 32]));
+        let iid = "88".repeat(32);
+        let pid = "99".repeat(32);
+        let tid = "77".repeat(32);
+        let recipient = Keypair::from_seed([9u8; 32]).address();
+        let rcpt = recipient.to_base58();
+
+        // CreateGovernanceInstance carries the nested GovernanceConfig, so round-trip
+        // it and confirm the nested threshold fields survive.
+        let create = Operation::CreateGovernanceInstance {
+            namespace: Hash256([0x55; 32]),
+            create_nonce: 7,
+            weight_token,
+            config: GovernanceConfig {
+                voting_period_epochs: 10,
+                timelock_epochs: 3,
+                quorum_bps: 3_000,
+                proposal_threshold: Amount::from_units(10),
+                approval_threshold_bps: 5_000,
+            },
+        };
+        let text = crate::canonical::canonical_json_string(&create).unwrap();
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), create);
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"CreateGovernanceInstance":{{"config":{{"approval_threshold_bps":5000,"proposal_threshold":"10","quorum_bps":3000,"timelock_epochs":3,"voting_period_epochs":10}},"create_nonce":7,"namespace":"{ns}","weight_token":"{tid}"}}}}"#,
+                ns = "55".repeat(32),
+            )
+        );
+
+        let fund = Operation::FundGovernanceTreasury {
+            instance_id,
+            amount: Amount::from_units(100),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&fund).unwrap(),
+            format!(r#"{{"FundGovernanceTreasury":{{"amount":"100","instance_id":"{iid}"}}}}"#),
+        );
+
+        // OpenProposal with a signaling action, and with a treasury-transfer action.
+        let open_signal = Operation::OpenProposal {
+            instance_id,
+            action: GovernanceAction::Signaling,
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&open_signal).unwrap(),
+            format!(r#"{{"OpenProposal":{{"action":"Signaling","instance_id":"{iid}"}}}}"#),
+        );
+        let open_pay = Operation::OpenProposal {
+            instance_id,
+            action: GovernanceAction::TreasuryTransfer {
+                recipient,
+                amount: Amount::from_units(42),
+            },
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&open_pay).unwrap(),
+            format!(
+                r#"{{"OpenProposal":{{"action":{{"TreasuryTransfer":{{"amount":"42","recipient":"{rcpt}"}}}},"instance_id":"{iid}"}}}}"#
+            ),
+        );
+
+        let vote = Operation::CastVote {
+            proposal_id,
+            choice: VoteChoice::Yes,
+            weight_amount: Amount::from_units(5),
+        };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&vote).unwrap(),
+            format!(
+                r#"{{"CastVote":{{"choice":"Yes","proposal_id":"{pid}","weight_amount":"5"}}}}"#
+            ),
+        );
+
+        let resolve = Operation::ResolveProposal { proposal_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&resolve).unwrap(),
+            format!(r#"{{"ResolveProposal":{{"proposal_id":"{pid}"}}}}"#),
+        );
+        let execute = Operation::ExecuteProposal { proposal_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&execute).unwrap(),
+            format!(r#"{{"ExecuteProposal":{{"proposal_id":"{pid}"}}}}"#),
+        );
+        let reclaim = Operation::ReclaimVote { proposal_id };
+        assert_eq!(
+            crate::canonical::canonical_json_string(&reclaim).unwrap(),
+            format!(r#"{{"ReclaimVote":{{"proposal_id":"{pid}"}}}}"#),
+        );
+
+        // The decode is strict (deny_unknown_fields), matching sibling operations,
+        // including the nested config and action structs.
+        let mut value = serde_json::to_value(&fund).unwrap();
+        value["FundGovernanceTreasury"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&vote).unwrap();
+        value["CastVote"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+        let mut value = serde_json::to_value(&create).unwrap();
+        value["CreateGovernanceInstance"]["config"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Operation>(value).is_err());
+    }
+
+    #[test]
     fn sponsor_field_is_omitted_when_absent_and_signed_when_present() {
         // A non-sponsored transaction must serialize without a `sponsor` key, so
         // the frozen V4 vectors and the TS SDK stay valid; a sponsored one signs
