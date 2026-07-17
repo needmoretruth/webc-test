@@ -15,6 +15,7 @@ pub mod canonical;
 pub mod consensus;
 pub mod fees;
 pub mod genesis;
+pub mod grants;
 pub mod hex_bytes;
 pub mod inflation;
 pub mod object;
@@ -55,6 +56,7 @@ pub use consensus::{
 };
 pub use fees::{split_fee, FeeBreakdown, FeePolicy};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
+pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
 pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_DATA_BYTES};
 pub use protocol::{
@@ -192,6 +194,8 @@ pub enum ChainError {
     InvalidInflationSchedule,
     #[error("inactivity-leak configuration is invalid")]
     InvalidInactivityLeakConfig,
+    #[error("stake grant parameters are invalid")]
+    InvalidStakeGrant,
     #[error("block chain ID does not match the active protocol configuration")]
     BlockChainIdMismatch,
     #[error("transaction chain ID does not match the active protocol configuration")]
