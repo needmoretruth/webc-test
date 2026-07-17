@@ -364,19 +364,27 @@ and independent external review before production use.
 
 ## Goal progress checkpoint
 
-Checkpoint on 2026-07-18: the isolated branch is pushed through `d25eb57`.
-Baseline fixes removed a Rust 1.96 clippy type-complexity failure and gave the
-browser permission-store KDF tests their existing 15-second cryptographic test
-budget. A fresh-target Rust full gate passed (`fmt`, strict workspace clippy,
-workspace tests, rustdoc, and node demo), and exact pnpm 11.7.0 `pnpm check`
-passed. Three read-only audits completed in verified worktrees; ADR-0012 and
-`4d54170` freeze their shared interfaces. `d25eb57` adds the versioned
-`FeeSummaryV1` accounting boundary with checked conservation, exact decimal JSON
-values, payer metadata, and focused tests while leaving legacy V4 execution
-unchanged. V5 wire/SDK, bounded storage codec, and indexed transparent Merkle
-proof foundations are active on their verified isolated branches. Exact next
-item: integrate and test the V5 wire/SDK foundation, then the storage and proof
-foundations, before wiring V5 execution and durable lifecycle consumers.
+Checkpoint on 2026-07-18: the isolated branch is pushed through `528ef4d`.
+ADR-0012 and `4d54170` freeze the shared interfaces. `d25eb57` adds the
+versioned `FeeSummaryV1` accounting boundary without changing V4 execution.
+`ee09e61` routes every schema-1 `ChainStore` record through a bounded,
+trailing-rejecting codec while preserving its legacy bytes. `b405e6b` adds the
+pure `webc-proof` crate and bounded `IndexedMerkleProofV1`; `528ef4d` integrates
+the Rust/browser V5 multi-action, cancellation, transaction-ID, exact-decimal,
+and scoped-sponsor wire foundation without activating protocol version 2.
+
+The integrated gate passed: `webc-storage` 32 tests, `webc-proof` 10 tests, V5
+7 tests, strict clippy for the changed protocol/proof crates, Rust formatting,
+and exact pnpm 11.7.0 `pnpm check` (81 SDK and 3 widget tests plus builds and
+documentation links). Remaining limitations are material: the frozen
+cross-language V5 vector, typed receipt/event roots, two-level V5 execution and
+fee/nonce rollback semantics, lifecycle schema 2/migration, mempool/runtime/API
+integration, finalized checkpoint proofs and browser verifier, fuzz/dependency
+gates, restart/three-validator acceptance, and the final full workspace/main
+integration gates are not yet implemented. The real STARK backend remains
+correctly deferred until the Phase 5.5 gate. Exact next item: add and freeze the
+Rust/TypeScript V5 canonical/signature/ID fixture, then implement typed receipts
+and the two-level V5 execution overlay before any node lifecycle consumer.
 
 While the goal runs, update this branch-local section after each integrated
 milestone with the last pushed commit, passed tests, remaining limitation, and
