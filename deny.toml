@@ -55,10 +55,13 @@ confidence-threshold = 0.9
 unused-allowed-license = "allow"
 
 [bans]
-# Duplicate major versions are a known, tracked state (findings D3:
-# getrandom/rand_core/thiserror/tokio-tungstenite). Warn so they stay visible
-# and get aligned over time, without blocking the merge gate on transitive
-# version skew we do not fully control yet.
+# Duplicate major versions (finding D3). The one duplicate we directly
+# controlled — a webc-node dev-dependency on tokio-tungstenite 0.24 while axum
+# pulls 0.29 — is now aligned to 0.29, so the WebSocket stack is single-version.
+# The remaining duplicates (getrandom, rand/rand_core, thiserror 1/2) are purely
+# transitive through crypto and error-handling crates we do not control; they
+# will collapse as those ecosystems finish moving to the new majors. Warn so
+# they stay visible without blocking the merge gate on skew we cannot yet fix.
 multiple-versions = "warn"
 # A wildcard ("*") version requirement pins nothing and lets an unexpected
 # release in silently; forbid it in shipped crates.
