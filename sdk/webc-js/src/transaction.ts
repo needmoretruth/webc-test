@@ -48,6 +48,15 @@ import { bridgeMessageHashHex } from "./protocol-hash.js";
 /** Domain for session-key id derivation — must match Rust `SESSION_KEY_ID_DOMAIN`. */
 const SESSION_KEY_ID_DOMAIN = new TextEncoder().encode("WEBC_SESSION_KEY_ID_V1");
 
+/**
+ * Fixed application-key discriminant that addresses an app's sponsor record —
+ * must match Rust `sponsorship::SPONSOR_STATE_KEY_DISCRIMINANT`. The sponsor
+ * state key is `Application { namespace, key_hash: SHA-256(discriminant) }`.
+ */
+const SPONSOR_STATE_KEY_DISCRIMINANT = new TextEncoder().encode(
+  "WEBC_SPONSOR_STATE_KEY_V1",
+);
+
 /** Stable signing domain — must match Rust `crate::SIGNING_DOMAIN`. */
 export const TRANSACTION_SIGNING_DOMAIN = "WEBC_SIGNED_TRANSACTION_V4";
 
@@ -75,12 +84,27 @@ export async function signTransaction(
   authorizationLane: AuthorizationLaneIdJson = DEFAULT_AUTHORIZATION_LANE,
   protocolVersion: number = CURRENT_TRANSACTION_PROTOCOL_VERSION,
   authorizationPolicyRevision = 0,
+  sponsor?: HexString,
 ): Promise<SignedTransactionJson> {
   validateTransactionContext(protocolVersion, chainId);
   validateAuthorizationPolicyRevision(authorizationPolicyRevision);
+  if (sponsor !== undefined) {
+    validateSponsor(sponsor);
+  }
+  // When opting into sponsorship without an explicit access list, mirror Rust
+  // `Transaction::for_sponsored_operation`: build the operation's default list
+  // and append the app's sponsor state key so execution covers both the
+  // sponsored and the self-pay (fail-open) paths.
   const resolvedAccessList =
     accessList ??
-    (await defaultAccessListAsync(wallet.address, operation, authorizationLane));
+    (sponsor !== undefined
+      ? await sponsoredAccessListAsync(
+          wallet.address,
+          operation,
+          sponsor,
+          authorizationLane,
+        )
+      : await defaultAccessListAsync(wallet.address, operation, authorizationLane));
   const publicKey = bytesToHex(wallet.publicKey);
   const wireFee = feeWireJson(fee);
   const payload = transactionSigningPayload(
@@ -94,6 +118,7 @@ export async function signTransaction(
     fee,
     authorizationLane,
     authorizationPolicyRevision,
+    sponsor,
   );
   const signingBytes = canonicalJsonBytes(payload);
   const signature = await signWithWallet(wallet, signingBytes);
@@ -109,6 +134,10 @@ export async function signTransaction(
     access_list: resolvedAccessList,
     fee: wireFee,
     signature: bytesToHex(signature),
+    // `sponsor` is additive and omitted entirely when absent, so a non-sponsored
+    // transaction's wire form and hash are byte-identical to the pre-sponsorship
+    // encoding (matching Rust's manual `Serialize` impl for `Transaction`).
+    ...(sponsor !== undefined ? { sponsor } : {}),
   };
 }
 
@@ -122,6 +151,9 @@ export async function verifySignedTransaction(
 ): Promise<boolean> {
   validateTransactionContext(tx.protocol_version, tx.chain_id);
   validateAuthorizationPolicyRevision(tx.authorization_policy_revision);
+  if (tx.sponsor !== undefined) {
+    validateSponsor(tx.sponsor);
+  }
   // Import lazily via dynamic require-style access to keep this module
   // dependency-light. `verifyEd25519` is in `wallet.ts`.
   const { verifyEd25519 } = await import("./wallet.js");
@@ -137,6 +169,7 @@ export async function verifySignedTransaction(
     tx.operation,
     tx.access_list,
     tx.fee,
+    tx.sponsor,
   );
   const signingBytes = canonicalJsonBytes(payload);
   return verifyEd25519(pubkeyBytes, signingBytes, hexToBytes(tx.signature));
@@ -618,9 +651,13 @@ export function transactionSigningPayload(
   fee: FeeBid,
   authorizationLane: AuthorizationLaneIdJson = DEFAULT_AUTHORIZATION_LANE,
   authorizationPolicyRevision = 0,
+  sponsor?: HexString,
 ): Record<string, unknown> {
   validateTransactionContext(protocolVersion, chainId);
   validateAuthorizationPolicyRevision(authorizationPolicyRevision);
+  if (sponsor !== undefined) {
+    validateSponsor(sponsor);
+  }
   return transactionSigningPayloadWire(
     protocolVersion,
     chainId,
@@ -632,6 +669,7 @@ export function transactionSigningPayload(
     operation,
     accessList,
     feeWireJson(fee),
+    sponsor,
   );
 }
 
@@ -646,6 +684,7 @@ function transactionSigningPayloadWire(
   operation: OperationJson,
   accessList: StateAccessListJson,
   fee: FeeBidJson,
+  sponsor?: HexString,
 ): Record<string, unknown> {
   return {
     domain: TRANSACTION_SIGNING_DOMAIN,
@@ -659,6 +698,10 @@ function transactionSigningPayloadWire(
     operation,
     access_list: accessList,
     fee,
+    // Included only when set. Canonical JSON sorts keys, so it lands last (after
+    // `sender`), exactly where Rust's `#[serde(skip_serializing_if)]` sponsor
+    // field sorts. Omitted when absent → byte-identical to the frozen V4 vectors.
+    ...(sponsor !== undefined ? { sponsor } : {}),
   };
 }
 
@@ -683,6 +726,19 @@ export function validateTransactionContext(
 export function validateAuthorizationPolicyRevision(revision: number): void {
   if (!Number.isSafeInteger(revision) || revision < 0) {
     throw new Error("invalid authorization policy revision");
+  }
+}
+
+/**
+ * Rejects a sponsor namespace that Rust's `Hash256` JSON encoding would never
+ * reproduce. A sponsor is a 32-byte app-namespace hash, serialized by Rust as a
+ * lowercase 64-char hex string (`hex::encode`). A mixed-case, wrong-length, or
+ * non-hex value would sign bytes the node never re-derives, so fail closed here
+ * exactly like the other Hash256-typed fields.
+ */
+export function validateSponsor(sponsor: HexString): void {
+  if (typeof sponsor !== "string" || !/^[0-9a-f]{64}$/u.test(sponsor)) {
+    throw new Error("invalid sponsor namespace (expected 32-byte lowercase hex)");
   }
 }
 
@@ -854,6 +910,59 @@ export async function deriveSessionKeyIdHex(
     await crypto.subtle.digest("SHA-256", toArrayBuffer(payload)),
   );
   return bytesToHex(digest);
+}
+
+/**
+ * Derives the fixed `key_hash` addressing an application's sponsor record:
+ * `SHA-256("WEBC_SPONSOR_STATE_KEY_V1")`, lowercase hex. Must match Rust
+ * `sponsorship::sponsor_state_key_hash`, so the sponsor state key agrees across
+ * languages. The full key is `applicationKey(namespace, <this hash>)`.
+ */
+export async function sponsorStateKeyHashHex(): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      toArrayBuffer(SPONSOR_STATE_KEY_DISCRIMINANT),
+    ),
+  );
+  return bytesToHex(digest);
+}
+
+/** Returns the application state key holding one app namespace's sponsor record. */
+export async function sponsorStateKey(
+  namespace: HexString,
+): Promise<StateKeyJson> {
+  validateSponsor(namespace);
+  return applicationKey(namespace, await sponsorStateKeyHashHex());
+}
+
+/**
+ * Builds the access list for a sponsored transaction, mirroring Rust
+ * `Transaction::for_sponsored_operation`: the operation's default access list
+ * plus the app's sponsor state key appended (deduplicated) to `read_write`. The
+ * result is a superset covering both the sponsored and the self-pay fail-open
+ * paths, so neither can trigger an undeclared-key failure.
+ */
+export async function sponsoredAccessListAsync(
+  sender: WebcAddress,
+  operation: OperationJson,
+  sponsorNamespace: HexString,
+  authorizationLane: AuthorizationLaneIdJson = DEFAULT_AUTHORIZATION_LANE,
+): Promise<StateAccessListJson> {
+  validateSponsor(sponsorNamespace);
+  const base = await defaultAccessListAsync(sender, operation, authorizationLane);
+  const sponsorKey = applicationKey(
+    sponsorNamespace,
+    await sponsorStateKeyHashHex(),
+  );
+  if (
+    !base.read_write.some(
+      (candidate) => canonicalKey(candidate) === canonicalKey(sponsorKey),
+    )
+  ) {
+    base.read_write.push(sponsorKey);
+  }
+  return base;
 }
 
 /** Returns the current state key for one validator pool. */

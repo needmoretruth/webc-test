@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { addressToBytes } from "./address";
 import { canonicalJson, canonicalJsonHashHex } from "./canonical";
 import { bytesToHex } from "./hex";
+import { createWalletFromSeed } from "./wallet";
 import {
   bridgeBurn,
   bridgeLock,
@@ -27,6 +28,10 @@ import {
   rotateActiveTransactionKey,
   rotatePostQuantumRoot,
   sessionKeyKey,
+  signTransaction,
+  sponsorStateKey,
+  sponsorStateKeyHashHex,
+  sponsoredAccessListAsync,
   submitSlashingEvidence,
   transactionHashHex,
   transactionSigningPayload,
@@ -34,6 +39,7 @@ import {
   transferObject,
   undelegate,
   unstakeValidator,
+  validateSponsor,
   verifySignedTransaction,
 } from "./transaction";
 import type {
@@ -591,5 +597,153 @@ describe("transaction signing schema", () => {
         authorization_policy_revision: Number.MAX_SAFE_INTEGER + 1,
       }),
     ).rejects.toThrow("policy revision");
+  });
+});
+
+describe("fee sponsorship signing (§15.35)", () => {
+  const defaultLane = "00".repeat(32);
+  const sender = "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3";
+  const recipient = "webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem";
+  const publicKey =
+    "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
+  const sponsor = "ab".repeat(32);
+  const fee = { gasLimit: 1_000, maxFeePerUnit: 5, priorityFeePerUnit: 1 };
+
+  // The exact canonical signing payload for the shared transfer fixture, WITHOUT
+  // a sponsor. Byte-identical to the frozen `WEBC_SIGNED_TRANSACTION_V4` vector
+  // asserted above and in the Rust `transfer_canonical_signing_payload_is_stable`.
+  const baseSigningJson =
+    `{"access_list":{"read_only":[{"kind":{"Protocol":{"field":"BaseFee"}},"version":1},{"kind":{"AuthorizationPolicy":{"owner":"${sender}"}},"version":1}],"read_write":[{"kind":{"Account":{"address":"${sender}"}},"version":1},{"kind":{"Account":{"address":"${recipient}"}},"version":1},{"kind":{"FeeAccumulator":{"lane":"${defaultLane}","payer":"${sender}"}},"version":1}]},"authorization_lane":"${defaultLane}","authorization_policy_revision":0,"chain_id":"webc-devnet-1","domain":"WEBC_SIGNED_TRANSACTION_V4","fee":{"gas_limit":1000,"max_fee_per_unit":5,"priority_fee_per_unit":1},"nonce":7,"operation":{"Transfer":{"amount":"123456","to":"${recipient}"}},"protocol_version":1,"public_key":"${publicKey}","sender":"${sender}"}`;
+
+  function payloadFor(sponsorArg?: string) {
+    const operation = transfer(recipient, "123456");
+    return transactionSigningPayload(
+      1,
+      "webc-devnet-1",
+      sender,
+      publicKey,
+      7,
+      operation,
+      defaultAccessList(sender, operation),
+      fee,
+      defaultLane,
+      0,
+      sponsorArg,
+    );
+  }
+
+  it("omits sponsor when absent, byte-identical to the frozen V4 payload", () => {
+    // Regression: with no sponsor the signing bytes must not change at all, so
+    // every existing hash/signature/vector stays valid.
+    const json = canonicalJson(payloadFor(undefined));
+    expect(json).toBe(baseSigningJson);
+    expect(json).not.toContain("sponsor");
+  });
+
+  it("appends the sponsor field last, matching the Rust canonical form", () => {
+    // Canonical JSON sorts keys, so `sponsor` lands after `sender` — exactly
+    // where Rust's `Option<Hash256>` sponsor field sorts. The only difference
+    // from the frozen payload is the single appended key.
+    const expected = baseSigningJson.replace(
+      `"sender":"${sender}"}`,
+      `"sender":"${sender}","sponsor":"${sponsor}"}`,
+    );
+    expect(canonicalJson(payloadFor(sponsor))).toBe(expected);
+    // And this equals the Rust test's `"sponsor":"abab…ab"` (namespace [0xab;32]).
+    expect(canonicalJson(payloadFor(sponsor))).toContain(
+      `"sponsor":"${"ab".repeat(32)}"`,
+    );
+  });
+
+  it("derives the Rust sponsor state-key hash for an application namespace", async () => {
+    // Cross-language vector: SHA-256("WEBC_SPONSOR_STATE_KEY_V1"), matching Rust
+    // `sponsorship::sponsor_state_key_hash()`.
+    expect(await sponsorStateKeyHashHex()).toBe(
+      "dc9618d08738c7e00d00fb7393c53d8323b90a9ad8a88e578e4608dbb3b4ee9c",
+    );
+    expect(await sponsorStateKey(sponsor)).toEqual({
+      version: 1,
+      kind: {
+        Application: {
+          namespace: sponsor,
+          key_hash:
+            "dc9618d08738c7e00d00fb7393c53d8323b90a9ad8a88e578e4608dbb3b4ee9c",
+        },
+      },
+    });
+  });
+
+  it("builds a sponsored access list that appends the sponsor state key", async () => {
+    const operation = transfer(recipient, "123456");
+    const list = await sponsoredAccessListAsync(sender, operation, sponsor);
+    const base = await defaultAccessListAsync(sender, operation);
+    const sponsorKey = await sponsorStateKey(sponsor);
+    // Superset of the default list: same read_only, and read_write with the
+    // sponsor state key appended last (mirrors Rust `for_sponsored_operation`).
+    expect(list.read_only).toEqual(base.read_only);
+    expect(list.read_write).toEqual([...base.read_write, sponsorKey]);
+  });
+
+  it("signs, verifies, and hashes a full sponsored transaction end to end", async () => {
+    const wallet = await createWalletFromSeed(new Uint8Array(32).fill(9));
+    const operation = transfer(recipient, "123456");
+    const sponsored = await signTransaction(
+      wallet,
+      "webc-devnet-1",
+      7,
+      operation,
+      fee,
+      undefined,
+      defaultLane,
+      1,
+      0,
+      sponsor,
+    );
+    // The sponsor is carried on the wire and its state key is declared.
+    expect(sponsored.sponsor).toBe(sponsor);
+    expect(sponsored.access_list.read_write).toContainEqual(
+      await sponsorStateKey(sponsor),
+    );
+    expect(await verifySignedTransaction(sponsored)).toBe(true);
+
+    // The identical transaction WITHOUT a sponsor produces a different hash and
+    // omits the field entirely — proving the signature binds the sponsor choice.
+    const plain = await signTransaction(
+      wallet,
+      "webc-devnet-1",
+      7,
+      operation,
+      fee,
+    );
+    expect(plain.sponsor).toBeUndefined();
+    expect(await transactionHashHex(plain)).not.toBe(
+      await transactionHashHex(sponsored),
+    );
+
+    // Tampering the sponsor after signing breaks verification.
+    expect(
+      await verifySignedTransaction({ ...sponsored, sponsor: "cd".repeat(32) }),
+    ).toBe(false);
+    // Stripping the signed sponsor likewise fails to verify.
+    const stripped = { ...sponsored };
+    delete stripped.sponsor;
+    expect(await verifySignedTransaction(stripped)).toBe(false);
+  });
+
+  it("rejects a non-canonical sponsor namespace to keep Rust Hash256 parity", () => {
+    // Rust serializes the sponsor as a lowercase 64-char hex Hash256; a value it
+    // would never re-produce must not be signable or the bytes silently diverge.
+    for (const bad of [
+      "ab".repeat(31), // too short
+      "ab".repeat(33), // too long
+      "AB".repeat(32), // upper-case
+      `${"ab".repeat(31)}gg`, // non-hex
+      "",
+    ]) {
+      expect(() => validateSponsor(bad)).toThrow(/sponsor/u);
+      expect(() => payloadFor(bad)).toThrow(/sponsor/u);
+    }
+    // A well-formed lowercase 32-byte hex namespace is accepted.
+    expect(() => validateSponsor(sponsor)).not.toThrow();
   });
 });
