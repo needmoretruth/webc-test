@@ -681,8 +681,8 @@ pub struct ChainState {
     /// Each [`Order`] holds its owner, oriented pair, side, original and remaining
     /// size, limit price, deadline, and flags. An order exists only between a
     /// [`Operation::SubmitOrder`] and the batch/cancel/expiry that closes it. The
-    /// per-block batch pass ([`ChainState::settle_dex_batch`]) settles all orders on
-    /// a pair at one uniform clearing price. Committed by the state root through a
+    /// per-block batch pass (`settle_dex_batch`) settles all orders on a pair at one
+    /// uniform clearing price. Committed by the state root through a
     /// dedicated Merkle sub-root (`DEX_ORDER_LEAF_DOMAIN`), so any submit/fill/
     /// cancel/expire changes the state root. A `BTreeMap` keeps iteration
     /// deterministic in the hashed/consensus path.
