@@ -1,9 +1,10 @@
 # WEBC continuation guide
 
-Last updated: 2026-07-17 (after the definition-alignment documentation
-overhaul). This file is the live pointer to the **exact next task**. Detailed
-"what the code implements" facts live in `implementation-status.md`; do not
-duplicate them here.
+Last updated: 2026-07-17 (findings-backlog session: consensus C1–C7 done;
+active goal is now clearing the rest of the `docs/review/findings.md` backlog —
+see "THE ACTIVE GOAL" below). This file is the live pointer to the **exact next
+task**. Detailed "what the code implements" facts live in
+`implementation-status.md`; do not duplicate them here.
 
 ## Read first
 
@@ -122,20 +123,83 @@ finding resolved in `docs/review/findings.md` with the commit hash
 
 **All consensus review findings C1–C7 are now resolved**, plus the CI
 supply-chain (`cargo-deny`), JS advisory (`pnpm audit --prod`), and fuzz gates.
-The **next work** is the remaining Phase 4 acceptance items that are not code
-findings: a reference-machine finality-timing number (needs real hardware —
-this cloud container cannot produce it honestly) and, optionally, a
-multi-node-over-TCP Byzantine integration test (the machine-level property is
-already tested). C8 is a LOW documentation/property-test item on the quorum
-arithmetic. After those, Phase 4 can be declared done and the path is Phase 5
-economics.
 
-Full context: `docs/review/findings.md` (C1–C8) and
-`docs/review/2026-07-16-plan-review.md` §6. The session decides autonomously
-within this list and the development plan; do not stop to ask permission
-between items (AGENTS.md). Do not jump ahead to Phase 5+ features, the
-contract runtime, Weft, the DEX, the oracle, ZK, or bridges before their
-phase gates.
+### THE ACTIVE GOAL (owner-set 2026-07-17): clear the whole findings backlog
+
+Drive **every remaining open finding in `docs/review/findings.md` to resolved**
+— reproduce with a failing test FIRST, fix, keep the test, mark it resolved in
+`findings.md` with the commit hash (AGENTS.md pitfall 7). This is exactly what
+the Phase 5.5 core-freeze review gate requires ("resolve every open blocking
+finding first"). Run to completion autonomously; do NOT stop mid-way for status
+reports (AGENTS.md "Deciding for yourself"). Report to the owner only at true
+completion or a hard blocker.
+
+**Remaining backlog (ordered; each = repro-test-first → fix → gate → commit →
+push; keep `main` green):**
+
+- **Network DoS — webc-net (HIGH):** N1 handshake timeout, N2 bound inbound
+  connections (Semaphore + per-IP cap), N3 cap peer table, N5 backoff reset,
+  N6 bincode `.with_limit()`.
+- **Node/faucet DoS — webc-node (HIGH/MED):** H1 faucet global rate-limit +
+  prune `last_drip`, H2 mempool fee-priority eviction + call `prune_expired` on
+  the seal tick, H3 cap WS subscriptions, H4 generic 5xx to client.
+- **Correctness — webc-chain / webc-storage (MED):** G1 pin genesis total
+  supply, T1 `deny_unknown_fields` on `Operation`, B1 bounded bridge-recipient
+  hex, ST1 persist+validate `ChainId` in `ChainStore::open`, U1 `slash_locked`
+  slashable-window.
+- **Latent (HIGH latent / MED):** SC1 scheduler serializable order, SC2
+  version-independent conflict keys, E2 block-timestamp validation, F1 epoch
+  reward remainder supply-conservation, E1 wire epoch advancement
+  deterministically into `apply_block`.
+- **Cross-language (MED):** X1/X2 SDK bridge/object hex lowercase validation.
+- **Docs/design:** C8 quorum-arithmetic property test + doc; plan-review §6
+  P1/P2 ADRs (node key management; committee sampling; historical-state /
+  archival; epoch/validator-set transition + weak-subjectivity; off-chain
+  contract-compilation invariant); doc hygiene (line-number → section refs).
+
+**Deferred, NOT in this backlog (do not start):** reference-machine
+finality-timing number (needs real hardware — a cloud container cannot produce
+it honestly); the optional multi-node-over-TCP Byzantine integration test (the
+machine-level property is already tested — do only if time permits).
+
+### In-flight parallel work — INTEGRATE THESE BRANCHES INTO main
+
+Working method is now in AGENTS.md ("Parallel subagents and durable work"): use
+parallel subagents scaled to host performance (this host = 4 cores → keep ~2–3
+concurrent cargo builds; split by crate/language); each subagent commits+pushes
+its own branch; the orchestrator merges each branch into `main`, runs the full
+gate, and pushes. As of the 2026-07-17 session two worktree subagents were
+launched and push to their own branches — **on resume, run `git branch -a` /
+`git fetch`, and if these branches exist, review and merge each into `main`
+(disjoint files → clean merge), gate, and push, then mark the findings resolved
+in `findings.md`:**
+
+- `claude/net-hardening` — webc-net N1/N2/N3/N5/N6 (kept webc-net public API
+  backward-compatible for webc-node).
+- `claude/sdk-hex-parity` — SDK X1/X2 (TypeScript; independent of Rust).
+
+Do the webc-chain + webc-node + webc-storage findings on `main` yourself
+(they are coupled: shared error enums and `apply_block`/`ChainStore::open`
+signature ripple), sequentially, since parallel cargo builds thrash 4 cores.
+
+### Decisions locked this session (do not re-litigate)
+
+- **Devnet initializes 10,000,000 WEBC** (same as mainnet), one valueless faucet
+  account; real distribution buckets are Phase 5. Change devnet `main.rs` genesis
+  faucet balance 1M → 10M.
+- **G1 mechanism:** add `pub const GENESIS_TOTAL_SUPPLY = Amount::from_webc(
+  10_000_000)` (make `Amount::from_webc` a `const fn` via a lossless u64→u128
+  widening cast), add `#[serde(default)] expected_total_supply: Option<Amount>`
+  to `GenesisConfig`, and have `from_genesis` reject `minted_supply != Some(v)`.
+  Production genesis (devnet/mainnet) sets `Some(GENESIS_TOTAL_SUPPLY)`; in-crate
+  test fixtures pass `None` (trusted inputs). This requires adding the field to
+  every `GenesisConfig` literal (webc-chain block_builder.rs/state.rs tests +
+  webc-node src/tests) — mechanical.
+
+Full context: `docs/review/findings.md` (per-finding detail + recommended fixes)
+and `docs/review/2026-07-16-plan-review.md` §6. Do not jump ahead to Phase 5+
+features, the contract runtime, Weft, the DEX, the oracle, ZK, or bridges before
+their phase gates.
 
 After Phase 4's P0/P1 items are done, the path is: Phase 5 economics (bring
 the owner the slashing-severity numbers and the §15.2 bootstrap-issuance

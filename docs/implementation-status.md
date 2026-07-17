@@ -438,9 +438,13 @@ gossips the certificate on commit). The CI supply-chain and fuzz gates are in
 `fuzz-smoke` CI job. C5 (commit `3b2b460`) attaches a `proof_of_lock` prevote
 set to re-proposals so a node that missed round `vr` follows the lock holder
 instead of stalling (wire bumped to `NET_PROTOCOL_VERSION = 2`). **All
-consensus review findings C1–C7 are now resolved.** Genuinely remaining Phase 4
-items are no longer code findings: a reference-machine finality-timing number
-(this cloud container cannot produce it honestly) and, optionally, a
+consensus review findings C1–C7 are now resolved.** The active Phase 4 work is
+now the rest of the `docs/review/findings.md` backlog (network DoS N1–N6, node/
+faucet DoS H1–H4, correctness G1/T1/B1/ST1/U1, latent SC1/SC2/E2/F1/E1, and
+cross-language X1/X2), each reproduced-then-fixed — see `continuation-guide.md`
+"THE ACTIVE GOAL" for the ordered list, the in-flight parallel branches to
+integrate, and the locked decisions. The only deferred non-finding items are a
+reference-machine finality-timing number (needs real hardware) and an optional
 multi-node-over-TCP Byzantine integration test (the machine-level property is
 now tested). Fork choice is covered by the finality-certificate design (a node
 follows the certified chain and commits only finalized blocks).
