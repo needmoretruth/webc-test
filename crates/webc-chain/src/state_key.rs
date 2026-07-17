@@ -90,6 +90,8 @@ pub enum StateKeyKind {
     },
     /// Native DEX order-intent record for one order id.
     DexOrder { order_id: crate::OrderId },
+    /// Native agent-mandate record for one mandate id (Phase 9a, §15.32).
+    Mandate { mandate_id: crate::MandateId },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
 }
@@ -219,6 +221,11 @@ impl StateKey {
     /// Returns the current DEX order-intent key for `order_id`.
     pub const fn dex_order(order_id: crate::OrderId) -> Self {
         Self::current(StateKeyKind::DexOrder { order_id })
+    }
+
+    /// Returns the current agent-mandate key for `mandate_id` (Phase 9a, §15.32).
+    pub const fn mandate(mandate_id: crate::MandateId) -> Self {
+        Self::current(StateKeyKind::Mandate { mandate_id })
     }
 
     /// Rejects keys whose schema is not supported by this executable.
@@ -419,6 +426,23 @@ mod tests {
                 r#"{{"kind":{{"OracleReporter":{{"feed_id":"{id}","reporter":"{rep}"}}}},"version":1}}"#,
                 id = "88".repeat(32),
                 rep = reporter.to_base58(),
+            )
+        );
+    }
+
+    #[test]
+    fn mandate_state_key_has_a_stable_cross_language_wire_vector() {
+        // The mandate key is a new StateKeyKind variant (Phase 9a, §15.32). Adding a
+        // variant leaves the frozen every-state-key vector untouched (serde tags
+        // variants by name), so this separate vector pins the mandate key's
+        // canonical JSON shape for a browser SDK mirror without moving the old hash.
+        let mandate_id = crate::MandateId::new(Hash256([0x88; 32]));
+        let key = StateKey::mandate(mandate_id);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&key).unwrap(),
+            format!(
+                r#"{{"kind":{{"Mandate":{{"mandate_id":"{id}"}}}},"version":1}}"#,
+                id = "88".repeat(32),
             )
         );
     }

@@ -27,6 +27,7 @@ use crate::fees::{
     StoragePricing, NAMESPACE_FEE_LEAF_DOMAIN,
 };
 use crate::genesis::GenesisConfig;
+use crate::mandate::{Mandate, MandateConfig, MandateId, MANDATE_LEAF_DOMAIN};
 use crate::namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
 use crate::oracle::{
@@ -111,6 +112,13 @@ pub struct ChainConfig {
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
+    /// Agent-mandate parameters (Phase 9a, §15.32): the deterministic per-day
+    /// rate-limit window.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before mandates decodable; the
+    /// launch value is a measurement-tuned placeholder (§15.35 method).
+    #[serde(default)]
+    pub mandate: MandateConfig,
     /// Total native supply, in base units, that the genesis allocation must sum
     /// to. `Some` on production genesis — mainnet and devnet both pin
     /// [`GENESIS_TOTAL_SUPPLY`] — so `ChainState::from_genesis` rejects any
@@ -151,6 +159,7 @@ impl Default for ChainConfig {
             dex: DexConfig::default(),
             contracts: ContractRuntimeConfig::default(),
             session_keys: SessionKeyConfig::default(),
+            mandate: MandateConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
             inactivity_leak: None,
@@ -528,6 +537,50 @@ pub enum Event {
         /// Native base units burned as the storage occupancy fee.
         burned: Amount,
     },
+    /// An agent mandate was granted and its budget escrowed (§15.32).
+    MandateGranted {
+        /// New mandate identity.
+        mandate_id: MandateId,
+        /// Account that granted and funds the mandate.
+        principal: Address,
+        /// Agent key authorized to spend under the mandate.
+        agent_key: webc_crypto::PublicKeyBytes,
+        /// Native base units escrowed as the mandate's total budget.
+        budget_total: Amount,
+        /// Last epoch (inclusive) the mandate may be spent.
+        expiry_epoch: Epoch,
+    },
+    /// An agent mandate's budget was topped up (§15.32).
+    MandateToppedUp {
+        /// Mandate whose budget grew.
+        mandate_id: MandateId,
+        /// Native base units added to the escrowed budget.
+        amount: Amount,
+        /// The mandate's total budget after the top-up.
+        budget_total: Amount,
+    },
+    /// An agent spent against a mandate (§15.32) — the audit-trail record.
+    MandateSpent {
+        /// Mandate that authorized and funded the spend.
+        mandate_id: MandateId,
+        /// Agent key that signed the spend.
+        agent_key: webc_crypto::PublicKeyBytes,
+        /// Recipient credited the spent principal.
+        recipient: Address,
+        /// Native principal moved to the recipient.
+        amount: Amount,
+        /// Native fee drawn from the mandate escrow for this spend.
+        fee: Amount,
+    },
+    /// An agent mandate was revoked and its remainder reclaimed (§15.32).
+    MandateRevoked {
+        /// Mandate that was revoked.
+        mandate_id: MandateId,
+        /// Principal that revoked it and received the remainder.
+        principal: Address,
+        /// Native base units returned from escrow to the principal.
+        refunded: Amount,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,6 +752,29 @@ pub struct ChainState {
     /// the state root as a scalar (mirroring `oracle_bonds`/`sponsor_budgets`).
     #[serde(default)]
     pub dex_escrow: Amount,
+    /// Native agent mandates, keyed by [`MandateId`] (Phase 9a, §15.32).
+    ///
+    /// Each [`Mandate`] holds its principal, agent key, escrowed budget and spend,
+    /// expiry, per-transaction cap, counterparty policy, revocation flag, and
+    /// per-day rate-limit counters. A mandate exists only between a
+    /// [`Operation::GrantMandate`] and the [`Operation::RevokeMandate`] that marks
+    /// it revoked (which also reclaims its remainder). Committed by the state root
+    /// through a dedicated Merkle sub-root (`MANDATE_LEAF_DOMAIN`), so a grant,
+    /// top-up, spend, or revocation changes the state root. A `BTreeMap` keeps
+    /// iteration deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub mandates: BTreeMap<MandateId, Mandate>,
+    /// Refundable native units locked across every live agent mandate (Phase 9a,
+    /// §15.32).
+    ///
+    /// Sum of every mandate's unspent remainder (`budget_total - spent`).
+    /// `GrantMandate`/`TopUpMandate` move units here from the principal's liquid
+    /// balance; `SpendUnderMandate` moves them out to the recipient plus the fee
+    /// split; `RevokeMandate` returns the remainder to the principal. Reconciled by
+    /// [`SupplyInvariantReport`] as a locked bucket and committed by the state root
+    /// as a scalar (mirroring `dex_escrow`/`oracle_bonds`/`sponsor_budgets`).
+    #[serde(default)]
+    pub mandate_escrow: Amount,
     /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
     ///
     /// Each [`ContractManifest`] describes one registered contract (its identity,
@@ -796,6 +872,8 @@ pub struct SupplyInvariantReport {
     pub oracle_revenue: Amount,
     /// Native units locked across every live DEX order (§15.37).
     pub dex_escrow: Amount,
+    /// Native units locked across every live agent mandate (§15.32).
+    pub mandate_escrow: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -875,6 +953,8 @@ impl Default for ChainState {
             oracle_revenue: Amount::ZERO,
             dex_orders: BTreeMap::new(),
             dex_escrow: Amount::ZERO,
+            mandates: BTreeMap::new(),
+            mandate_escrow: Amount::ZERO,
             contracts: BTreeMap::new(),
             contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
@@ -926,6 +1006,9 @@ impl ChainState {
         // Reject a malformed DEX config (per-fill fee above 100%) so settlement can
         // never carve more than the proceeds and underflow.
         genesis.chain.dex.validate()?;
+        // Reject a malformed mandate config (zero rate-limit window) so the per-day
+        // rate limit has a well-defined, non-divide-by-zero window boundary.
+        genesis.chain.mandate.validate()?;
 
         for account in &genesis.accounts {
             if state.accounts.contains_key(&account.address) {
@@ -1069,6 +1152,7 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(self.oracle_bonds))
             .and_then(|amount| amount.checked_add(self.oracle_revenue))
             .and_then(|amount| amount.checked_add(self.dex_escrow))
+            .and_then(|amount| amount.checked_add(self.mandate_escrow))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -1087,6 +1171,7 @@ impl ChainState {
             oracle_bonds: self.oracle_bonds,
             oracle_revenue: self.oracle_revenue,
             dex_escrow: self.dex_escrow,
+            mandate_escrow: self.mandate_escrow,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -1621,6 +1706,7 @@ impl ChainState {
             oracle_feed_root: Hash256,
             oracle_reporter_root: Hash256,
             dex_order_root: Hash256,
+            mandate_root: Hash256,
             contract_root: Hash256,
             contract_state_root: Hash256,
             namespace_fee_root: Hash256,
@@ -1631,6 +1717,7 @@ impl ChainState {
             oracle_bonds: Amount,
             oracle_revenue: Amount,
             dex_escrow: Amount,
+            mandate_escrow: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
@@ -1642,6 +1729,15 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V15 adds the native agent-mandate primitive (Phase 9a, §15.32): the
+            // `mandate_root` sub-root commits every live mandate record (principal,
+            // agent key, escrowed budget/spend, expiry, per-tx cap, counterparty
+            // policy, revocation flag, per-day rate-limit counters), and the
+            // `mandate_escrow` scalar commits the aggregate locked native bucket
+            // (mirroring how `dex_escrow`/`oracle_bonds`/`sponsor_budgets` pair with
+            // their sub-roots). So a grant / top-up / spend / revoke always changes
+            // the state root. The domain bump is a deliberate consensus-format
+            // change; no external fixture pins a prior root.
             // V14 adds the native DEX (Phase 8, §15.13/§15.18/§15.37): the
             // `dex_order_root` sub-root commits every live order intent (owner, pair,
             // side, amount/remaining, limit price, deadline, flags), and the
@@ -1685,7 +1781,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V14",
+            domain: "WEBC_STATE_COMMITMENT_V15",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1750,6 +1846,10 @@ impl ChainState {
             // this root and therefore the state root, binding the per-block batch pass
             // to consensus.
             dex_order_root: ordered_value_root(DEX_ORDER_LEAF_DOMAIN, self.dex_orders.iter())?,
+            // Native agent-mandate registry committed by its own ordered sub-root
+            // (§15.32): a grant, top-up, spend, or revocation changes this root and
+            // therefore the state root.
+            mandate_root: ordered_value_root(MANDATE_LEAF_DOMAIN, self.mandates.iter())?,
             // Interim contract runtime committed by its own ordered sub-roots (Phase
             // 7a, ADR-0014): registering a contract changes `contract_root`; any
             // contract state write changes `contract_state_root`; either changes the
@@ -1773,6 +1873,7 @@ impl ChainState {
             oracle_bonds: self.oracle_bonds,
             oracle_revenue: self.oracle_revenue,
             dex_escrow: self.dex_escrow,
+            mandate_escrow: self.mandate_escrow,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
@@ -1874,6 +1975,15 @@ impl ChainState {
         if tx.sponsor.is_some() && !tx.authorization_lane.is_default() {
             return Err(ChainError::SponsorshipRequiresDefaultLane);
         }
+        // A mandate spend is authorized by the agent key's signature; the agent
+        // holds no balance of its own (the mandate escrow funds both the principal
+        // moved and the fee). Ensure the agent account exists before the nonce
+        // lookup, so default-lane replay protection applies even to an agent that
+        // was never separately funded. This runs on the cloned overlay, so it
+        // persists only if the whole spend succeeds.
+        if matches!(tx.operation, Operation::SpendUnderMandate { .. }) {
+            self.accounts.entry(tx.sender).or_default();
+        }
         let mut access =
             StateAccessRecorder::new(&tx.access_list.read_only, &tx.access_list.read_write)?;
         // Authorization policy is consensus state even though it is consulted
@@ -1946,6 +2056,12 @@ impl ChainState {
         // authorized. The burn + validator-reward split below is identical
         // whichever source pays, so supply is conserved either way.
         let mut sponsored_by: Option<Hash256> = None;
+        // A mandate spend pays its fee out of the mandate escrow, not the agent's
+        // balance (the prepaid-card model). The escrow debit happens atomically in
+        // the `SpendUnderMandate` arm after the mandate's budget check; the burn +
+        // validator-reward split below is applied here identically to any other fee,
+        // so supply is conserved whichever source pays.
+        let fee_from_mandate = matches!(&tx.operation, Operation::SpendUnderMandate { .. });
         if tx.authorization_lane.is_default() {
             let mut paid_by_sponsor = false;
             if let Some(namespace) = tx.sponsor {
@@ -1960,7 +2076,7 @@ impl ChainState {
                     sponsored_by = Some(namespace);
                 }
             }
-            if !paid_by_sponsor {
+            if !paid_by_sponsor && !fee_from_mandate {
                 self.debit_native(tx.sender, total_fee)?;
             }
         } else {
@@ -3419,6 +3535,234 @@ impl ChainState {
                     return Err(ChainError::DexOrderNotOwner);
                 }
                 order.cancel_requested = true;
+            }
+            Operation::GrantMandate {
+                agent_key,
+                grant_nonce,
+                budget_total,
+                expiry_epoch,
+                per_tx_max,
+                rate_limit_per_day,
+                counterparty_policy,
+            } => {
+                // Principal-signed financial action: default lane only (the budget
+                // is escrowed from the sender's liquid balance). Supply-neutral:
+                // liquid -> mandate_escrow.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                let mandate_id = MandateId::derive(tx.sender, agent_key, *grant_nonce);
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(mandate_id))?;
+                // Validate the grant parameters before touching any supply.
+                let mandate = Mandate::new(
+                    tx.sender,
+                    *agent_key,
+                    *budget_total,
+                    *expiry_epoch,
+                    *per_tx_max,
+                    *rate_limit_per_day,
+                    counterparty_policy.clone(),
+                )?;
+                if self.mandates.contains_key(&mandate_id) {
+                    return Err(ChainError::MandateAlreadyExists);
+                }
+                // Escrow the budget. `debit_native` fails closed if the principal
+                // cannot afford it (after the fee was already charged above), so the
+                // whole transaction rolls back and no mandate is created.
+                self.debit_native(tx.sender, *budget_total)?;
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_add(*budget_total)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.mandates.insert(mandate_id, mandate);
+                events.push(Event::MandateGranted {
+                    mandate_id,
+                    principal: tx.sender,
+                    agent_key: *agent_key,
+                    budget_total: *budget_total,
+                    expiry_epoch: *expiry_epoch,
+                });
+            }
+            Operation::TopUpMandate { mandate_id, amount } => {
+                // Principal-signed: default lane only (liquid -> mandate_escrow).
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                if amount.is_zero() {
+                    return Err(ChainError::InvalidMandate);
+                }
+                // Validate existence, ownership, and liveness before moving units.
+                {
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    if mandate.principal != tx.sender {
+                        return Err(ChainError::MandateNotOwner);
+                    }
+                    if mandate.revoked {
+                        return Err(ChainError::MandateRevoked);
+                    }
+                }
+                self.debit_native(tx.sender, *amount)?;
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.budget_total = mandate
+                    .budget_total
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::MandateToppedUp {
+                    mandate_id: *mandate_id,
+                    amount: *amount,
+                    budget_total: mandate.budget_total,
+                });
+            }
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient,
+                amount,
+            } => {
+                // Agent-signed spend: default lane only. The agent account (its
+                // nonce/replay state and the default-lane base key) was ensured to
+                // exist above; the mandate escrow — not the agent's balance — funds
+                // both the principal moved and the fee. Every rejection path is a
+                // distinct typed error, checked in the spec's fixed order.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                access.write(StateKey::account(*recipient))?;
+                // Validate the whole spend against an immutable borrow, then drop it
+                // before mutating balances and the record.
+                let (charge, next_spent, next_window, next_count) = {
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    // Bind the agent key: only the mandate's own agent key may
+                    // spend. The envelope already proved the signer controls
+                    // `tx.public_key`; this ties that key to this mandate.
+                    if tx.public_key != mandate.agent_key {
+                        return Err(ChainError::MandateAgentKeyMismatch);
+                    }
+                    if mandate.revoked {
+                        return Err(ChainError::MandateRevoked);
+                    }
+                    if self.current_epoch > mandate.expiry_epoch.get() {
+                        return Err(ChainError::MandateExpired);
+                    }
+                    if *amount > mandate.per_tx_max {
+                        return Err(ChainError::MandatePerTxExceeded);
+                    }
+                    // The budget covers BOTH the principal and the fee.
+                    let charge = amount
+                        .checked_add(total_fee)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    let next_spent = mandate
+                        .spent
+                        .checked_add(charge)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    if next_spent > mandate.budget_total {
+                        return Err(ChainError::MandateBudgetExceeded);
+                    }
+                    if !mandate.counterparty_policy.permits(recipient) {
+                        return Err(ChainError::MandateCounterpartyNotAllowed);
+                    }
+                    // Per-day rate limit, in a deterministic epoch window. A window
+                    // roll resets the counter; `0` means unlimited.
+                    let window = config.mandate.window_index(self.current_epoch);
+                    let current_count = if mandate.window_index == window {
+                        mandate.spends_in_window
+                    } else {
+                        0
+                    };
+                    if mandate.rate_limit_per_day != 0
+                        && current_count >= mandate.rate_limit_per_day
+                    {
+                        return Err(ChainError::MandateRateLimited);
+                    }
+                    let next_count = current_count
+                        .checked_add(1)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    (charge, next_spent, window, next_count)
+                };
+                // Commit: escrow -> recipient (principal) + fee split (already added
+                // to burned/pool above). Supply-neutral: mandate_escrow decreases by
+                // exactly `amount + fee`, matching the recipient credit plus the
+                // burn + validator-reward split.
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_sub(charge)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(*recipient, *amount)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.spent = next_spent;
+                mandate.window_index = next_window;
+                mandate.spends_in_window = next_count;
+                events.push(Event::MandateSpent {
+                    mandate_id: *mandate_id,
+                    agent_key: tx.public_key,
+                    recipient: *recipient,
+                    amount: *amount,
+                    fee: total_fee,
+                });
+            }
+            Operation::RevokeMandate { mandate_id } => {
+                // Principal-signed: default lane only. Returns the unspent remainder
+                // (mandate_escrow -> principal liquid) and marks the mandate revoked
+                // so no further spend succeeds. Also the reclaim path for an expired
+                // mandate. Supply-neutral.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::MandateRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::mandate(*mandate_id))?;
+                let remainder = {
+                    let mandate = self
+                        .mandates
+                        .get(mandate_id)
+                        .ok_or(ChainError::MandateNotFound)?;
+                    if mandate.principal != tx.sender {
+                        return Err(ChainError::MandateNotOwner);
+                    }
+                    if mandate.revoked {
+                        // Already revoked: nothing left to reclaim.
+                        return Err(ChainError::MandateRevoked);
+                    }
+                    mandate.remaining()?
+                };
+                self.mandate_escrow = self
+                    .mandate_escrow
+                    .checked_sub(remainder)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(tx.sender, remainder)?;
+                let mandate = self
+                    .mandates
+                    .get_mut(mandate_id)
+                    .ok_or(ChainError::MandateNotFound)?;
+                mandate.revoked = true;
+                // The remainder is now returned, so this mandate contributes zero to
+                // `mandate_escrow`: set `spent` to the full budget to keep the
+                // per-record `budget_total - spent` invariant in lockstep.
+                mandate.spent = mandate.budget_total;
+                events.push(Event::MandateRevoked {
+                    mandate_id: *mandate_id,
+                    principal: tx.sender,
+                    refunded: remainder,
+                });
             }
             Operation::RegisterContract { manifest } => {
                 // Default lane only: the registration fee draws from and burns
@@ -5085,6 +5429,9 @@ mod tests {
             ("dex_escrow", |s| {
                 s.dex_escrow = Amount::from_units(s.dex_escrow.0 + 1)
             }),
+            ("mandate_escrow", |s| {
+                s.mandate_escrow = Amount::from_units(s.mandate_escrow.0 + 1)
+            }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
             }),
@@ -5114,6 +5461,758 @@ mod tests {
                 "mutating {name} must change the state root (E8)"
             );
         }
+    }
+
+    // ----- native agent mandate (Phase 9a, §15.32) -----
+
+    use crate::mandate::{MandateCounterparty, MandateCounterpartyPolicy};
+
+    /// Mandate-tuned config with an explicit per-day rate-limit window.
+    fn mandate_config(day_window_epochs: u64) -> ChainConfig {
+        ChainConfig {
+            mandate: MandateConfig { day_window_epochs },
+            ..ChainConfig::default()
+        }
+    }
+
+    /// Genesis funding only the principal (no validators, so epoch advance mints
+    /// nothing). The agent is deliberately UNFUNDED: it must be able to spend with
+    /// no balance of its own, and recipients are created lazily on credit.
+    fn mandate_fixture(config: &ChainConfig) -> (ChainState, Keypair, Keypair, Keypair, Keypair) {
+        let principal = Keypair::from_seed([11u8; 32]);
+        let agent = Keypair::from_seed([12u8; 32]);
+        let recipient = Keypair::from_seed([13u8; 32]);
+        let stranger = Keypair::from_seed([14u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: principal.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("mandate genesis");
+        (state, principal, agent, recipient, stranger)
+    }
+
+    /// Executes one mandate operation at the floor base fee (1 base unit/unit) and
+    /// a gas limit above any mandate op's cost, so the fee is exactly 10_000 units.
+    fn mandate_exec(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        signer: &Keypair,
+        nonce: u64,
+        operation: Operation,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_operation(
+            signer,
+            nonce,
+            operation,
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("mandate tx signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    /// Grants a mandate from `principal` to `agent` and returns its derived id.
+    #[allow(clippy::too_many_arguments)]
+    fn grant_mandate(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        principal: &Keypair,
+        agent: &Keypair,
+        nonce: u64,
+        grant_nonce: u64,
+        budget_total: Amount,
+        expiry_epoch: Epoch,
+        per_tx_max: Amount,
+        rate_limit_per_day: u32,
+        counterparty_policy: MandateCounterpartyPolicy,
+    ) -> Result<MandateId, ChainError> {
+        mandate_exec(
+            state,
+            config,
+            principal,
+            nonce,
+            Operation::GrantMandate {
+                agent_key: agent.public_key(),
+                grant_nonce,
+                budget_total,
+                expiry_epoch,
+                per_tx_max,
+                rate_limit_per_day,
+                counterparty_policy,
+            },
+        )?;
+        Ok(MandateId::derive(
+            principal.address(),
+            &agent.public_key(),
+            grant_nonce,
+        ))
+    }
+
+    #[test]
+    fn grant_escrows_budget_and_supply_stays_balanced() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, _stranger) = mandate_fixture(&config);
+        let before = balance(&state, principal.address());
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            5,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("grant succeeds");
+        // Budget is escrowed; the fee (10_000) is additionally debited.
+        assert_eq!(state.mandate_escrow, budget);
+        assert_eq!(
+            balance(&state, principal.address()),
+            before - 500_000 - 10_000
+        );
+        let mandate = state.mandates.get(&mandate_id).expect("mandate exists");
+        assert_eq!(mandate.principal, principal.address());
+        assert_eq!(mandate.agent_key, agent.public_key());
+        assert_eq!(mandate.spent, Amount::ZERO);
+        assert!(!mandate.revoked);
+        // Most important: escrow keeps the supply invariant balanced.
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn spend_moves_principal_and_fee_from_escrow_agent_needs_no_balance() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            5,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let burned_before = state.burned_fees.0;
+        let pool_before = state.validator_fee_pool.0;
+        let mandate_count = state.mandates.len();
+
+        let amount = Amount::from_units(100_000);
+        let receipt = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount,
+            },
+        )
+        .expect("spend succeeds");
+
+        // Recipient credited exactly the principal; the fee left escrow too.
+        assert_eq!(balance(&state, recipient.address()), 100_000);
+        // The agent holds no balance of its own — it never was funded.
+        assert_eq!(balance(&state, agent.address()), 0);
+        // Escrow fell by amount + fee; the mandate's spent grew by the same.
+        assert_eq!(state.mandate_escrow, Amount::from_units(500_000 - 110_000));
+        let mandate = state.mandates.get(&mandate_id).unwrap();
+        assert_eq!(mandate.spent, Amount::from_units(110_000));
+        // The fee was split into burn + validator reward exactly as any tx.
+        assert_eq!(
+            state.burned_fees.0 + state.validator_fee_pool.0,
+            burned_before + pool_before + 10_000
+        );
+        // No re-delegation: a spend never mints or removes a mandate.
+        assert_eq!(state.mandates.len(), mandate_count);
+        // The receipt carries the mandate id — the complete audit trail.
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::MandateSpent { mandate_id: id, .. } if *id == mandate_id
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn spend_over_budget_is_rejected() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        // Budget only just covers one small spend + fee; a large spend overflows it.
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(50_000),
+            Epoch::new(100),
+            Amount::from_units(50_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let before = state.clone();
+        // 45_000 + 10_000 fee = 55_000 > 50_000 budget.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(45_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateBudgetExceeded));
+        assert_eq!(state, before, "rejected spend leaves state unchanged");
+    }
+
+    #[test]
+    fn spend_exceeding_per_tx_max_is_rejected() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(10_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(10_001),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandatePerTxExceeded));
+    }
+
+    #[test]
+    fn spend_on_expired_mandate_is_rejected_but_reclaimable() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(10),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // Advance past expiry (inclusive at epoch 10).
+        state.current_epoch = 11;
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateExpired));
+        // The principal reclaims the full remainder from an expired mandate.
+        let before = balance(&state, principal.address());
+        mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::RevokeMandate { mandate_id },
+        )
+        .expect("reclaim on expired mandate");
+        // Remainder = full budget (nothing spent); the fee is separately debited.
+        assert_eq!(
+            balance(&state, principal.address()),
+            before + 500_000 - 10_000
+        );
+        assert_eq!(state.mandate_escrow, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn revoked_mid_flight_refunds_remainder_and_rejects_further_spend() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(500_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // One spend goes through.
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(100_000),
+            },
+        )
+        .expect("first spend");
+        let spent = state.mandates.get(&mandate_id).unwrap().spent;
+        assert_eq!(spent, Amount::from_units(110_000));
+
+        // Principal revokes; the unspent remainder returns.
+        let principal_before = balance(&state, principal.address());
+        let receipt = mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::RevokeMandate { mandate_id },
+        )
+        .expect("revoke");
+        let remainder: u128 = 500_000 - 110_000;
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::MandateRevoked { refunded, .. } if refunded.0 == remainder
+        )));
+        assert_eq!(
+            balance(&state, principal.address()),
+            principal_before + remainder - 10_000
+        );
+        assert_eq!(state.mandate_escrow, Amount::ZERO);
+        assert!(state.mandates.get(&mandate_id).unwrap().revoked);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A further spend against the revoked mandate fails.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateRevoked));
+    }
+
+    #[test]
+    fn rate_limit_binds_within_a_day_then_resets_next_window() {
+        // A tight day window so a single epoch advance crosses it.
+        let config = mandate_config(10);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(1_000_000),
+            Epoch::new(1_000),
+            Amount::from_units(1_000_000),
+            2, // at most two spends per window
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let spend = |state: &mut ChainState, nonce: u64| {
+            mandate_exec(
+                state,
+                &config,
+                &agent,
+                nonce,
+                Operation::SpendUnderMandate {
+                    mandate_id,
+                    recipient: recipient.address(),
+                    amount: Amount::from_units(1_000),
+                },
+            )
+        };
+        // Two spends in window 0 (epoch 0) succeed; the third is rate-limited.
+        spend(&mut state, 0).expect("first spend");
+        spend(&mut state, 1).expect("second spend");
+        assert!(matches!(
+            spend(&mut state, 2).unwrap_err(),
+            ChainError::MandateRateLimited
+        ));
+        // Cross into the next window (epoch 10 -> window 1); the counter resets.
+        state.current_epoch = 10;
+        spend(&mut state, 2).expect("spend in the next window");
+        let mandate = state.mandates.get(&mandate_id).unwrap();
+        assert_eq!(mandate.window_index, 1);
+        assert_eq!(mandate.spends_in_window, 1);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn counterparty_allowlist_admits_only_listed_recipients() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, stranger) = mandate_fixture(&config);
+        let mut entries = BTreeSet::new();
+        entries.insert(MandateCounterparty::Recipient(recipient.address()));
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Allowlist(entries),
+        )
+        .unwrap();
+        // A spend to a non-listed recipient is rejected.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: stranger.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateCounterpartyNotAllowed));
+        // A spend to the listed recipient succeeds.
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .expect("allowlisted spend");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn spend_signed_by_wrong_key_is_rejected() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // `stranger` signs a spend against the agent's mandate. The envelope is
+        // valid for the stranger's own address, but the mandate binds `agent_key`.
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &stranger,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateAgentKeyMismatch));
+        assert_eq!(state, before, "a wrong-key spend must not mutate state");
+    }
+
+    #[test]
+    fn agent_cannot_re_delegate_the_principals_escrow() {
+        // No-re-delegation: an agent-signed grant funds a sub-mandate from the
+        // AGENT's own liquid balance, never from the principal's escrow. With no
+        // balance, the agent cannot mint a sub-mandate, and the original escrow is
+        // untouched. There is likewise no operation by which a spend mints a mandate.
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, sub_agent) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        // Fund the agent just enough to pay a grant fee (10_000) but far less than
+        // a sub-budget, so a grant draws from the agent's OWN balance and cannot
+        // reach the principal's escrow.
+        mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::Transfer {
+                to: agent.address(),
+                amount: Amount::from_units(20_000),
+            },
+        )
+        .expect("fund agent minimally");
+        let escrow_before = state.mandate_escrow;
+        let mandate_count = state.mandates.len();
+        // The agent tries to grant a 100_000 sub-mandate to `sub_agent`: the fee is
+        // affordable, but the sub-budget exceeds the agent's own balance.
+        let err = grant_mandate(
+            &mut state,
+            &config,
+            &agent,
+            &sub_agent,
+            0,
+            0,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap_err();
+        // The grant draws from the agent's own balance, not any mandate escrow.
+        assert!(matches!(err, ChainError::InsufficientBalance { .. }));
+        assert_eq!(state.mandate_escrow, escrow_before, "escrow untouched");
+        assert_eq!(state.mandates.len(), mandate_count, "no sub-mandate minted");
+        assert!(state.mandates.contains_key(&mandate_id));
+    }
+
+    #[test]
+    fn double_grant_same_nonce_collides_and_distinct_nonce_coexists() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, _stranger) = mandate_fixture(&config);
+        grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            7,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("first grant");
+        // Same (principal, agent_key, grant_nonce) derives the same id -> rejected.
+        let err = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            1,
+            7,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateAlreadyExists));
+        // A different grant nonce derives a distinct id -> both coexist.
+        grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            1,
+            8,
+            Amount::from_units(100_000),
+            Epoch::new(100),
+            Amount::from_units(100_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .expect("distinct-nonce grant");
+        assert_eq!(state.mandates.len(), 2);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn top_up_raises_budget_and_keeps_supply_balanced() {
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        // Original budget is exactly one 40_000 spend (+10_000 fee = 50_000).
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(50_000),
+            Epoch::new(100),
+            Amount::from_units(50_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        mandate_exec(
+            &mut state,
+            &config,
+            &principal,
+            1,
+            Operation::TopUpMandate {
+                mandate_id,
+                amount: Amount::from_units(200_000),
+            },
+        )
+        .expect("top up");
+        assert_eq!(
+            state.mandates.get(&mandate_id).unwrap().budget_total,
+            Amount::from_units(250_000)
+        );
+        assert_eq!(state.mandate_escrow, Amount::from_units(250_000));
+        // Two 40_000 spends (charge 50_000 each) need 100_000 total — impossible
+        // under the original 50_000 budget, now comfortably within the raised one.
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(40_000),
+            },
+        )
+        .expect("first spend under raised budget");
+        mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(40_000),
+            },
+        )
+        .expect("second spend under raised budget");
+        assert_eq!(
+            state.mandates.get(&mandate_id).unwrap().spent,
+            Amount::from_units(100_000)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn mandate_ops_reject_non_default_lane() {
+        // All four mandate ops require the default lane, like the oracle/DEX
+        // financial operations. Open a funded non-default lane first so its
+        // nonce/fee lookup succeeds and the default-lane guard is the check that
+        // actually fires (rather than an incidental lane-not-found).
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, _recipient, _stranger) = mandate_fixture(&config);
+        let lane = AuthorizationLaneId::new(Hash256([0x5a; 32]));
+        let fee = FeeBid {
+            gas_limit: 100_000,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        };
+        let open = Transaction::for_operation(
+            &principal,
+            0,
+            Operation::OpenAuthorizationLane {
+                lane,
+                fee_deposit: Amount::from_webc(1),
+            },
+            fee,
+        )
+        .expect("open lane signs");
+        state
+            .execute_transaction(&open, &config)
+            .expect("lane opens");
+
+        let grant = Transaction::for_operation_in_lane(
+            &principal,
+            lane,
+            0,
+            Operation::GrantMandate {
+                agent_key: agent.public_key(),
+                grant_nonce: 0,
+                budget_total: Amount::from_units(100_000),
+                expiry_epoch: Epoch::new(100),
+                per_tx_max: Amount::from_units(100_000),
+                rate_limit_per_day: 0,
+                counterparty_policy: MandateCounterpartyPolicy::Open,
+            },
+            fee,
+        )
+        .expect("grant signs");
+        assert!(matches!(
+            state.execute_transaction(&grant, &config),
+            Err(ChainError::MandateRequiresDefaultLane)
+        ));
+        assert!(state.mandates.is_empty());
     }
 
     // ----- native oracle (Phase 7, §15.17) -----
