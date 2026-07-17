@@ -17,24 +17,35 @@ import { createWalletFromSeed } from "./wallet";
 import {
   accountKey,
   authorizationPolicyKey,
+  burnNft,
   burnToken,
+  createNftCollection,
   createToken,
   defaultAccessList,
   defaultAccessListAsync,
+  deriveNftCollectionIdHex,
   deriveTokenIdHex,
   feeAccumulatorKey,
+  freezeNftItem,
   freezeTokenAccount,
+  mintNft,
   mintToken,
+  nftCollectionKey,
+  nftItemKey,
   protocolKey,
+  setNftAuthority,
+  setNftCollectionPaused,
   setTokenAuthority,
   setTokenPaused,
+  thawNftItem,
   thawTokenAccount,
   tokenBalanceKey,
   tokenFreezeKey,
   tokenKey,
+  transferNft,
   transferToken,
 } from "./transaction";
-import type { TokenMetadataJson } from "./types";
+import type { NftMetadataJson, TokenMetadataJson } from "./types";
 
 const DEFAULT_LANE = "00".repeat(32);
 
@@ -204,5 +215,120 @@ describe("native token state-key wire vectors", () => {
     expect(canonicalJson(tokenFreezeKey(ID_88, holder))).toBe(
       `{"kind":{"TokenFreeze":{"account":"${holder}","token_id":"${ID_88}"}},"version":1}`,
     );
+  });
+});
+
+describe("native NFT operation wire vectors", () => {
+  const ITEM_HEX = "3a".repeat(32);
+
+  it("pins CreateNftCollection canonical JSON (Some/None authorities, Some cap)", async () => {
+    const recipient = await addressFromSeedByte(9);
+    const metadata: NftMetadataJson = {
+      name: hexOfText("Acme Apes"),
+      symbol: hexOfText("APE"),
+      metadata_hash: "1f".repeat(32),
+    };
+    const op = createNftCollection({
+      namespace: "55".repeat(32),
+      createNonce: 7,
+      metadata,
+      mintAuthority: recipient,
+      freezeAuthority: null,
+      maxSupply: 10_000,
+      royaltyBps: 500,
+    });
+    expect(canonicalJson(op)).toBe(
+      `{"CreateNftCollection":{"create_nonce":7,"freeze_authority":null,"max_supply":10000,` +
+        `"metadata":{"metadata_hash":"${"1f".repeat(32)}","name":"${hexOfText("Acme Apes")}",` +
+        `"symbol":"${hexOfText("APE")}"},"mint_authority":"${recipient}","namespace":"${"55".repeat(32)}",` +
+        `"royalty_bps":500}}`,
+    );
+  });
+
+  it("pins MintNft / TransferNft / BurnNft canonical JSON", async () => {
+    const recipient = await addressFromSeedByte(9);
+    expect(canonicalJson(mintNft(ID_88, recipient, ITEM_HEX))).toBe(
+      `{"MintNft":{"collection_id":"${ID_88}","item_metadata_hash":"${ITEM_HEX}","recipient":"${recipient}"}}`,
+    );
+    expect(canonicalJson(transferNft(ID_88, 3, recipient))).toBe(
+      `{"TransferNft":{"collection_id":"${ID_88}","recipient":"${recipient}","serial":3}}`,
+    );
+    expect(canonicalJson(burnNft(ID_88, 3))).toBe(
+      `{"BurnNft":{"collection_id":"${ID_88}","serial":3}}`,
+    );
+  });
+
+  it("pins pause / freeze / thaw / authority canonical JSON", async () => {
+    const recipient = await addressFromSeedByte(9);
+    expect(canonicalJson(setNftCollectionPaused(ID_88, true))).toBe(
+      `{"SetNftCollectionPaused":{"collection_id":"${ID_88}","paused":true}}`,
+    );
+    expect(canonicalJson(freezeNftItem(ID_88, 3))).toBe(
+      `{"FreezeNftItem":{"collection_id":"${ID_88}","serial":3}}`,
+    );
+    expect(canonicalJson(thawNftItem(ID_88, 3))).toBe(
+      `{"ThawNftItem":{"collection_id":"${ID_88}","serial":3}}`,
+    );
+    expect(canonicalJson(setNftAuthority(ID_88, "Mint", recipient))).toBe(
+      `{"SetNftAuthority":{"authority_kind":"Mint","collection_id":"${ID_88}","new_authority":"${recipient}"}}`,
+    );
+    expect(canonicalJson(setNftAuthority(ID_88, "Freeze", null))).toBe(
+      `{"SetNftAuthority":{"authority_kind":"Freeze","collection_id":"${ID_88}","new_authority":null}}`,
+    );
+  });
+});
+
+describe("native NFT state keys and access lists", () => {
+  it("pins NftCollection / NftItem canonical JSON", () => {
+    expect(canonicalJson(nftCollectionKey(ID_88))).toBe(
+      `{"kind":{"NftCollection":{"collection_id":"${ID_88}"}},"version":1}`,
+    );
+    expect(canonicalJson(nftItemKey(ID_88, 7))).toBe(
+      `{"kind":{"NftItem":{"collection_id":"${ID_88}","serial":7}},"version":1}`,
+    );
+  });
+
+  it("declares the collection read-only and the item read-write on TransferNft", async () => {
+    const sender = await addressFromSeedByte(1);
+    const recipient = await addressFromSeedByte(9);
+    const list = defaultAccessList(sender, transferNft(ID_88, 3, recipient));
+    expect(list.read_only).toEqual([
+      protocolKey("BaseFee"),
+      nftCollectionKey(ID_88),
+      authorizationPolicyKey(sender),
+    ]);
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      nftItemKey(ID_88, 3),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+
+  it("names the derived collection record on CreateNftCollection", async () => {
+    const sender = await addressFromSeedByte(1);
+    const recipient = await addressFromSeedByte(9);
+    const metadata: NftMetadataJson = {
+      name: hexOfText("Acme Apes"),
+      symbol: hexOfText("APE"),
+      metadata_hash: "1f".repeat(32),
+    };
+    const collectionId = await deriveNftCollectionIdHex("55".repeat(32), sender, 7);
+    const list = await defaultAccessListAsync(
+      sender,
+      createNftCollection({
+        namespace: "55".repeat(32),
+        createNonce: 7,
+        metadata,
+        mintAuthority: recipient,
+        freezeAuthority: null,
+        maxSupply: null,
+        royaltyBps: 500,
+      }),
+    );
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      nftCollectionKey(collectionId),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
   });
 });

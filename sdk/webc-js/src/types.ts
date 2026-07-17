@@ -246,6 +246,9 @@ export type StateKeyKindJson =
   | { Token: { token_id: HexString } }
   | { TokenBalance: { token_id: HexString; owner: WebcAddress } }
   | { TokenFreeze: { token_id: HexString; account: WebcAddress } }
+  // --- Native NFTs (Phase 13b, §15) ---------------------------------------
+  | { NftCollection: { collection_id: HexString } }
+  | { NftItem: { collection_id: HexString; serial: number } }
   | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
@@ -386,10 +389,64 @@ export type OperationJson =
         authority_kind: TokenAuthorityKindJson;
         new_authority: WebcAddress | null;
       };
+    }
+  // --- Native NFTs (Phase 13b, §15) ---------------------------------------
+  | {
+      CreateNftCollection: {
+        namespace: HexString;
+        create_nonce: number;
+        metadata: NftMetadataJson;
+        mint_authority: WebcAddress | null;
+        freeze_authority: WebcAddress | null;
+        max_supply: number | null;
+        royalty_bps: number;
+      };
+    }
+  | {
+      MintNft: {
+        collection_id: HexString;
+        recipient: WebcAddress;
+        item_metadata_hash: HexString;
+      };
+    }
+  | {
+      TransferNft: {
+        collection_id: HexString;
+        serial: number;
+        recipient: WebcAddress;
+      };
+    }
+  | { BurnNft: { collection_id: HexString; serial: number } }
+  | { SetNftCollectionPaused: { collection_id: HexString; paused: boolean } }
+  | { FreezeNftItem: { collection_id: HexString; serial: number } }
+  | { ThawNftItem: { collection_id: HexString; serial: number } }
+  | {
+      SetNftAuthority: {
+        collection_id: HexString;
+        authority_kind: NftAuthorityKindJson;
+        new_authority: WebcAddress | null;
+      };
     };
 
 /** Which of a token's two authorities `SetTokenAuthority` targets. */
 export type TokenAuthorityKindJson = "Mint" | "Freeze";
+
+/** Which of a collection's two authorities `SetNftAuthority` targets. */
+export type NftAuthorityKindJson = "Mint" | "Freeze";
+
+/**
+ * Bounded NFT collection metadata mirroring Rust `NftMetadata`. `name`/`symbol`
+ * are LOWERCASE HEX of their UTF-8 bytes; `metadata_hash` is a 32-byte hex
+ * commitment. (Unlike tokens, there is no `decimals` field.)
+ */
+export interface NftMetadataJson {
+  /** Lowercase hex of the UTF-8 name bytes (non-empty, ≤ 32 bytes). */
+  name: HexString;
+  /** Lowercase hex of the UTF-8 symbol bytes (non-empty, ≤ 12 bytes). */
+  symbol: HexString;
+  /** 32-byte lowercase-hex commitment to off-chain metadata. */
+  metadata_hash: HexString;
+}
 
 /**
  * Bounded token metadata mirroring Rust `TokenMetadata`. `name` and `symbol` are

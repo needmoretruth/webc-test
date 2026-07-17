@@ -32,6 +32,8 @@ import type {
   PostQuantumRootRevealJson,
   SessionKeyConstraintsJson,
   SessionKeyIdJson,
+  NftAuthorityKindJson,
+  NftMetadataJson,
   SlashingEvidenceJson,
   SignedTransactionJson,
   StateAccessListJson,
@@ -477,6 +479,17 @@ function requireTokenMetadata(metadata: TokenMetadataJson): void {
   requireHash256Hex(metadata.metadata_hash, "token metadata hash");
 }
 
+/**
+ * Validates bounded NFT metadata, mirroring Rust `NftMetadata::validate` plus its
+ * `bounded_*_hex` codec: name ≤ 32 bytes (non-empty), symbol ≤ 12 bytes
+ * (non-empty), 32-byte hex commitment. There is no `decimals` field.
+ */
+function requireNftMetadata(metadata: NftMetadataJson): void {
+  requireBoundedHex(metadata.name, "nft name", 32, true);
+  requireBoundedHex(metadata.symbol, "nft symbol", 12, true);
+  requireHash256Hex(metadata.metadata_hash, "nft metadata hash");
+}
+
 /** Largest value Rust's `u128` amount encoding can represent. */
 const AMOUNT_U128_MAX = (1n << 128n) - 1n;
 
@@ -722,6 +735,133 @@ export function setTokenAuthority(
 }
 
 // ---------------------------------------------------------------------------
+// Native NFT operations (Phase 13b, §15).
+//
+// Field names and value encodings mirror the Rust `Operation` serde output pinned
+// by `nft_operations_have_stable_wire_vectors`. Serials are plain JSON numbers
+// (u64); ids/hashes are 32-byte lowercase hex; an absent authority/cap is `null`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates an NFT collection. `metadata.name`/`metadata.symbol` are LOWERCASE HEX
+ * of their UTF-8 bytes. `maxSupply` is an optional hard cap (`null` = no cap);
+ * `royaltyBps` is a recorded-only royalty commitment (≤ 10000). The collection id
+ * is derived on-chain from `(namespace, creator, createNonce)`; use
+ * `deriveNftCollectionIdHex` to precompute it.
+ */
+export function createNftCollection(args: {
+  namespace: HexString;
+  createNonce: number;
+  metadata: NftMetadataJson;
+  mintAuthority: WebcAddress | null;
+  freezeAuthority: WebcAddress | null;
+  maxSupply: number | null;
+  royaltyBps: number;
+}): OperationJson {
+  requireHash256Hex(args.namespace, "nft namespace");
+  requireCountU64(args.createNonce, "nft create nonce");
+  requireNftMetadata(args.metadata);
+  if (args.maxSupply !== null) {
+    requireCountU64(args.maxSupply, "nft max supply");
+  }
+  requireBoundedU(args.royaltyBps, "nft royalty bps", 10_000);
+  return {
+    CreateNftCollection: {
+      namespace: args.namespace,
+      create_nonce: args.createNonce,
+      metadata: args.metadata,
+      mint_authority: args.mintAuthority,
+      freeze_authority: args.freezeAuthority,
+      max_supply: args.maxSupply,
+      royalty_bps: args.royaltyBps,
+    },
+  };
+}
+
+/** Mints a new item of a collection to `recipient`. */
+export function mintNft(
+  collectionId: HexString,
+  recipient: WebcAddress,
+  itemMetadataHash: HexString,
+): OperationJson {
+  requireHash256Hex(collectionId, "collection id");
+  requireHash256Hex(itemMetadataHash, "nft item metadata hash");
+  return {
+    MintNft: {
+      collection_id: collectionId,
+      recipient,
+      item_metadata_hash: itemMetadataHash,
+    },
+  };
+}
+
+/** Transfers one NFT item (by serial) to `recipient`. */
+export function transferNft(
+  collectionId: HexString,
+  serial: number,
+  recipient: WebcAddress,
+): OperationJson {
+  requireHash256Hex(collectionId, "collection id");
+  requireCountU64(serial, "nft serial");
+  return { TransferNft: { collection_id: collectionId, serial, recipient } };
+}
+
+/** Burns one NFT item (by serial) held by the signer. */
+export function burnNft(collectionId: HexString, serial: number): OperationJson {
+  requireHash256Hex(collectionId, "collection id");
+  requireCountU64(serial, "nft serial");
+  return { BurnNft: { collection_id: collectionId, serial } };
+}
+
+/** Pauses or unpauses minting of a collection (mint-authority controlled). */
+export function setNftCollectionPaused(
+  collectionId: HexString,
+  paused: boolean,
+): OperationJson {
+  requireHash256Hex(collectionId, "collection id");
+  return { SetNftCollectionPaused: { collection_id: collectionId, paused } };
+}
+
+/** Freezes one NFT item (freeze-authority controlled). */
+export function freezeNftItem(
+  collectionId: HexString,
+  serial: number,
+): OperationJson {
+  requireHash256Hex(collectionId, "collection id");
+  requireCountU64(serial, "nft serial");
+  return { FreezeNftItem: { collection_id: collectionId, serial } };
+}
+
+/** Thaws (unfreezes) one NFT item. */
+export function thawNftItem(
+  collectionId: HexString,
+  serial: number,
+): OperationJson {
+  requireHash256Hex(collectionId, "collection id");
+  requireCountU64(serial, "nft serial");
+  return { ThawNftItem: { collection_id: collectionId, serial } };
+}
+
+/**
+ * Transfers (`newAuthority` = address) or permanently renounces (`newAuthority`
+ * = `null`) one of a collection's authorities.
+ */
+export function setNftAuthority(
+  collectionId: HexString,
+  authorityKind: NftAuthorityKindJson,
+  newAuthority: WebcAddress | null,
+): OperationJson {
+  requireHash256Hex(collectionId, "collection id");
+  return {
+    SetNftAuthority: {
+      collection_id: collectionId,
+      authority_kind: authorityKind,
+      new_authority: newAuthority,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -794,6 +934,18 @@ function extraReadOnlyKeys(
   }
   if ("ThawTokenAccount" in operation) {
     return [tokenKey(operation.ThawTokenAccount.token_id)];
+  }
+  // --- Native NFTs --------------------------------------------------------
+  if ("TransferNft" in operation) {
+    // The collection record is read-only (paused flag); the item key carries the
+    // owner/frozen reads and the ownership write.
+    return [nftCollectionKey(operation.TransferNft.collection_id)];
+  }
+  if ("FreezeNftItem" in operation) {
+    return [nftCollectionKey(operation.FreezeNftItem.collection_id)];
+  }
+  if ("ThawNftItem" in operation) {
+    return [nftCollectionKey(operation.ThawNftItem.collection_id)];
   }
   return [];
 }
@@ -869,6 +1021,20 @@ export async function defaultAccessListAsync(
         extra.push(tokenBalanceKey(tokenId, initial_recipient));
       }
       return assembleAccessList(sender, authorizationLane, extra);
+    }
+    if ("CreateNftCollection" in operation) {
+      const { namespace, create_nonce } = operation.CreateNftCollection;
+      const collectionId = await deriveNftCollectionIdHex(
+        namespace,
+        sender,
+        create_nonce,
+      );
+      // Creation writes only the account and the new collection record; it mints
+      // no item, so no item key is declared.
+      return assembleAccessList(sender, authorizationLane, [
+        accountKey(sender),
+        nftCollectionKey(collectionId),
+      ]);
     }
     if (STATE_DERIVED_ACCESS_LIST_OPS.some((variant) => variant in operation)) {
       throw new Error(
@@ -1156,6 +1322,34 @@ function extraReadWriteKeys(
     const { token_id, account } = operation.ThawTokenAccount;
     return [tokenFreezeKey(token_id, account)];
   }
+  // --- Native NFTs (Phase 13b, §15) ---------------------------------------
+  if ("MintNft" in operation) {
+    // Only the collection record is written; the fresh item's serial is chain
+    // assigned (unknown at signing) and created under the collection's write scope.
+    return [nftCollectionKey(operation.MintNft.collection_id)];
+  }
+  if ("TransferNft" in operation) {
+    const { collection_id, serial } = operation.TransferNft;
+    return [nftItemKey(collection_id, serial)];
+  }
+  if ("BurnNft" in operation) {
+    const { collection_id, serial } = operation.BurnNft;
+    return [nftCollectionKey(collection_id), nftItemKey(collection_id, serial)];
+  }
+  if ("SetNftCollectionPaused" in operation) {
+    return [nftCollectionKey(operation.SetNftCollectionPaused.collection_id)];
+  }
+  if ("SetNftAuthority" in operation) {
+    return [nftCollectionKey(operation.SetNftAuthority.collection_id)];
+  }
+  if ("FreezeNftItem" in operation) {
+    const { collection_id, serial } = operation.FreezeNftItem;
+    return [nftItemKey(collection_id, serial)];
+  }
+  if ("ThawNftItem" in operation) {
+    const { collection_id, serial } = operation.ThawNftItem;
+    return [nftItemKey(collection_id, serial)];
+  }
   // Incoming bridge messages need an asynchronous replay hash. Slashing also
   // needs live delegation/cooling owners, so the synchronous builder fails.
   // `CreateToken` needs an async token-id derivation, so it also lands here.
@@ -1279,6 +1473,20 @@ export function deriveTokenIdHex(
 ): Promise<string> {
   return deriveNamespaceCreatorId(
     TOKEN_ID_DOMAIN,
+    namespace,
+    creator,
+    createNonce,
+  );
+}
+
+/** Derives an NFT collection id from `(namespace, creator, createNonce)`. */
+export function deriveNftCollectionIdHex(
+  namespace: HexString,
+  creator: WebcAddress,
+  createNonce: number,
+): Promise<string> {
+  return deriveNamespaceCreatorId(
+    NFT_COLLECTION_ID_DOMAIN,
     namespace,
     creator,
     createNonce,
@@ -1427,6 +1635,27 @@ export function tokenFreezeKey(
   account: WebcAddress,
 ): StateKeyJson {
   return { version: 1, kind: { TokenFreeze: { token_id: tokenId, account } } };
+}
+
+// --- Native NFT state keys (Phase 13b, §15) --------------------------------
+
+/** Returns the authority/supply record key for one collection. */
+export function nftCollectionKey(collectionId: HexString): StateKeyJson {
+  return {
+    version: 1,
+    kind: { NftCollection: { collection_id: collectionId } },
+  };
+}
+
+/** Returns the per-`(collection, serial)` item key. */
+export function nftItemKey(
+  collectionId: HexString,
+  serial: number,
+): StateKeyJson {
+  return {
+    version: 1,
+    kind: { NftItem: { collection_id: collectionId, serial } },
+  };
 }
 
 /** Returns a protocol singleton key in schema version 1. */
