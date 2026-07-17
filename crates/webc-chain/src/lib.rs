@@ -102,6 +102,8 @@ pub enum ChainError {
     Serialization(String),
     #[error("canonical protocol JSON cannot contain floating-point numbers")]
     NonIntegerCanonicalNumber,
+    #[error("canonical protocol JSON integer is outside the JS safe range (±(2^53-1))")]
+    CanonicalIntegerOutOfSafeRange,
     #[error("account not found: {0}")]
     AccountNotFound(webc_crypto::Address),
     #[error("nonce mismatch for {address}: expected {expected}, got {actual}")]

@@ -3919,7 +3919,13 @@ mod tests {
         ));
         assert_eq!(state, before_root);
 
-        let mut inexact = Transaction::for_operation(
+        // An authorization revision beyond the JS-safe wire bound (which equals
+        // MAX_AUTHORIZATION_POLICY_REVISION = 2^53-1) can no longer even be
+        // signed: the canonical encoder rejects the out-of-range integer (X3), a
+        // stricter and earlier guard than the execution-time range check. The
+        // transaction therefore never becomes a valid signed payload and cannot
+        // reach a state commit.
+        let mut over_range = Transaction::for_operation(
             &alice,
             0,
             Operation::Transfer {
@@ -3929,15 +3935,12 @@ mod tests {
             FeeBid::default(),
         )
         .unwrap();
-        inexact.authorization_policy_revision =
+        over_range.authorization_policy_revision =
             AuthorizationPolicyRevision::new(MAX_AUTHORIZATION_POLICY_REVISION + 1);
-        inexact.sign(&alice).unwrap();
-        let before_revision = state.clone();
         assert!(matches!(
-            state.execute_transaction(&inexact, &config),
-            Err(ChainError::InvalidAuthorizationPolicyRevision)
+            over_range.sign(&alice),
+            Err(ChainError::CanonicalIntegerOutOfSafeRange)
         ));
-        assert_eq!(state, before_revision);
     }
 
     fn double_vote_evidence(

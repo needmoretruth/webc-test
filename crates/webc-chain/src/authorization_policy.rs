@@ -475,6 +475,22 @@ mod tests {
     }
 
     #[test]
+    fn revision_range_check_is_defense_in_depth_for_the_js_safe_bound() {
+        // The maximum revision is exactly the JS-safe integer bound; `validate`
+        // rejects anything above it independent of the canonical encoder (X3),
+        // which enforces the same bound one layer earlier for every field.
+        assert!(
+            AuthorizationPolicyRevision::new(MAX_AUTHORIZATION_POLICY_REVISION)
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            AuthorizationPolicyRevision::new(MAX_AUTHORIZATION_POLICY_REVISION + 1).validate(),
+            Err(ChainError::InvalidAuthorizationPolicyRevision)
+        ));
+    }
+
+    #[test]
     fn installed_policy_starts_at_revision_one() {
         let key = PublicKeyBytes([7; 32]);
         let root = PostQuantumRoot::new(

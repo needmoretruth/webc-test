@@ -166,15 +166,14 @@ impl ValidatorSet {
     /// Returns true when `power` is strictly greater than 2/3 of total power.
     ///
     /// BFT finality generally requires more than two thirds, not merely equal to
-    /// two thirds, to preserve safety under Byzantine faults.
+    /// two thirds, to preserve safety under Byzantine faults. A zero-power set
+    /// can never reach quorum. See [`strictly_exceeds_fraction`] for the
+    /// overflow-safe threshold arithmetic (finding C8).
     pub fn has_two_thirds_power(&self, power: Amount) -> bool {
         if self.total_power.is_zero() {
             return false;
         }
-        let whole = self.total_power.0 / 3;
-        let remainder = self.total_power.0 % 3;
-        let threshold = whole * 2 + (remainder * 2) / 3;
-        power.0 > threshold
+        strictly_exceeds_fraction(power.0, self.total_power.0, 2, 3)
     }
 
     /// Returns true when `power` is strictly greater than 1/3 of total power.
@@ -187,8 +186,7 @@ impl ValidatorSet {
         if self.total_power.is_zero() {
             return false;
         }
-        let threshold = self.total_power.0 / 3;
-        power.0 > threshold
+        strictly_exceeds_fraction(power.0, self.total_power.0, 1, 3)
     }
 
     /// Checks whether unique matching votes represent strictly over two thirds.
@@ -679,11 +677,70 @@ impl FinalityCertificate {
     }
 }
 
+/// Returns whether `power` is strictly greater than `numerator/denominator` of
+/// `total`, using overflow-safe integer arithmetic (finding C8).
+///
+/// The naive form `power * denominator > total * numerator` overflows `u128`
+/// when `total` is near `u128::MAX` (for the 2/3 quorum, `total * 2`). This
+/// instead computes `floor(total * numerator / denominator)` via the split
+/// `(total / d) * n + ((total % d) * n) / d`. With `numerator < denominator`
+/// (true for the 1/3 and 2/3 quorums) `(total / d) * n < total`, so no
+/// intermediate exceeds `total` and nothing overflows. `power` strictly
+/// exceeding that floor is exactly `power * d > total * n`, the intended strict
+/// fraction test.
+///
+/// Precondition: `0 < numerator < denominator` and `denominator > 0`. Callers
+/// pass only `(2, 3)` and `(1, 3)`.
+fn strictly_exceeds_fraction(power: u128, total: u128, numerator: u128, denominator: u128) -> bool {
+    let whole = total / denominator;
+    let remainder = total % denominator;
+    let threshold = whole * numerator + (remainder * numerator) / denominator;
+    power > threshold
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Amount, Validator};
+    use proptest::prelude::*;
     use webc_crypto::{Keypair, PublicKeyBytes};
+
+    proptest! {
+        // C8: the overflow-safe threshold matches the naive reference across the
+        // range where the reference itself does not overflow.
+        #[test]
+        fn two_thirds_threshold_matches_reference(
+            total in 0u128..=(u128::MAX / 3),
+            power in 0u128..=(u128::MAX / 3),
+        ) {
+            prop_assert_eq!(
+                strictly_exceeds_fraction(power, total, 2, 3),
+                3 * power > 2 * total
+            );
+        }
+
+        #[test]
+        fn one_third_threshold_matches_reference(
+            total in 0u128..=(u128::MAX / 3),
+            power in 0u128..=(u128::MAX / 3),
+        ) {
+            prop_assert_eq!(
+                strictly_exceeds_fraction(power, total, 1, 3),
+                3 * power > total
+            );
+        }
+    }
+
+    #[test]
+    fn two_thirds_threshold_does_not_overflow_near_u128_max() {
+        // The naive `total * 2` would overflow here; the split form must not.
+        let total = u128::MAX;
+        // Exactly half the power is below the 2/3 line.
+        assert!(!strictly_exceeds_fraction(total / 2, total, 2, 3));
+        // All of it, and one below all of it, are above the 2/3 line.
+        assert!(strictly_exceeds_fraction(total, total, 2, 3));
+        assert!(strictly_exceeds_fraction(total - 1, total, 2, 3));
+    }
 
     fn vote(validator: &Keypair, block_hash: Hash256) -> SignedVote {
         SignedVote::sign(

@@ -71,7 +71,21 @@ fn canonicalize_value(value: Value) -> Result<Value, ChainError> {
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         Value::Number(number) => {
-            if number.is_u64() || number.is_i64() {
+            // X3: parity with the TypeScript canonical encoder, which rejects any
+            // integer outside the JS safe-integer range. A JSON number beyond
+            // 2^53-1 cannot round-trip identically in a browser, so it must never
+            // enter a signed payload; large integer fields carry decimal strings
+            // instead (as `Amount` already does). Floats are rejected outright.
+            const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991; // 2^53 - 1
+            if let Some(value) = number.as_u64() {
+                if value > MAX_SAFE_INTEGER {
+                    return Err(ChainError::CanonicalIntegerOutOfSafeRange);
+                }
+                Ok(Value::Number(number))
+            } else if let Some(value) = number.as_i64() {
+                if value < -(MAX_SAFE_INTEGER as i64) {
+                    return Err(ChainError::CanonicalIntegerOutOfSafeRange);
+                }
                 Ok(Value::Number(number))
             } else {
                 Err(ChainError::NonIntegerCanonicalNumber)
@@ -175,5 +189,29 @@ mod tests {
             canonical_json_string(&serde_json::json!({ "unsafe": 1.5 })),
             Err(ChainError::NonIntegerCanonicalNumber)
         ));
+    }
+
+    #[test]
+    fn integers_beyond_the_js_safe_range_are_rejected() {
+        // X3: match the TS canonical encoder, which rejects any integer above
+        // Number.MAX_SAFE_INTEGER, so a large bare integer can never diverge
+        // between Rust and the browser inside a signed payload.
+        let max_safe = 9_007_199_254_740_991u64; // 2^53 - 1
+        assert!(canonical_json_string(&serde_json::json!({ "n": max_safe })).is_ok());
+
+        let too_big = 9_007_199_254_740_992u64; // 2^53
+        assert!(matches!(
+            canonical_json_string(&serde_json::json!({ "n": too_big })),
+            Err(ChainError::CanonicalIntegerOutOfSafeRange)
+        ));
+
+        let too_negative = -9_007_199_254_740_992i64; // -(2^53)
+        assert!(matches!(
+            canonical_json_string(&serde_json::json!({ "n": too_negative })),
+            Err(ChainError::CanonicalIntegerOutOfSafeRange)
+        ));
+
+        let min_safe = -9_007_199_254_740_991i64; // -(2^53 - 1)
+        assert!(canonical_json_string(&serde_json::json!({ "n": min_safe })).is_ok());
     }
 }
