@@ -17,6 +17,7 @@ pub mod contract;
 pub mod dex;
 pub mod fees;
 pub mod genesis;
+pub mod governance;
 pub mod grants;
 pub mod hex_bytes;
 pub mod inflation;
@@ -79,6 +80,12 @@ pub use fees::{
     StoragePricing, StorageRefund, NAMESPACE_FEE_LEAF_DOMAIN,
 };
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
+pub use governance::{
+    gov_vote_escrow_address, GovProposalStatus, GovernanceAction, GovernanceConfig,
+    GovernanceInstance, GovernanceInstanceId, Proposal as GovernanceProposal, ProposalId,
+    VoteChoice, VoteRecord, GOVERNANCE_INSTANCE_LEAF_DOMAIN, GOVERNANCE_PROPOSAL_LEAF_DOMAIN,
+    GOVERNANCE_VOTE_LEAF_DOMAIN, MAX_GOVERNANCE_BPS,
+};
 pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
 pub use mandate::{
@@ -468,6 +475,43 @@ pub enum ChainError {
     InvalidNftMetadata,
     #[error("nft serial or supply counter overflowed the maximum representable value")]
     NftSerialOverflow,
+    #[error(
+        "a governance instance is already registered for this namespace, creator, and create nonce"
+    )]
+    GovernanceInstanceAlreadyExists,
+    #[error("no governance instance is registered for this instance id")]
+    GovernanceInstanceNotFound,
+    #[error("no governance proposal is registered for this proposal id")]
+    GovernanceProposalNotFound,
+    #[error("proposer does not hold the minimum weight-token balance to open a proposal")]
+    GovernanceProposalThresholdNotMet,
+    #[error("governance proposal voting has closed")]
+    GovernanceVotingClosed,
+    #[error("governance proposal voting is still open")]
+    GovernanceVotingOpen,
+    #[error("this account has already voted on this governance proposal")]
+    GovernanceAlreadyVoted,
+    #[error("governance vote weight must be greater than zero")]
+    GovernanceVoteWeightZero,
+    #[error("governance proposal is not active")]
+    GovernanceProposalNotActive,
+    #[error("governance proposal has not passed")]
+    GovernanceProposalNotPassed,
+    #[error("governance proposal timelock has not elapsed")]
+    GovernanceTimelockNotElapsed,
+    #[error("governance instance treasury is insufficient for this payout")]
+    GovernanceTreasuryInsufficient,
+    #[error("governance proposal has already been resolved")]
+    GovernanceAlreadyResolved,
+    #[error("governance proposal is not resolved yet")]
+    GovernanceProposalNotResolved,
+    #[error("this account has nothing locked to reclaim on this governance proposal")]
+    GovernanceNothingToReclaim,
+    #[error(
+        "governance config is invalid (zero voting period or a quorum/approval threshold above \
+         10000 basis points)"
+    )]
+    InvalidGovernanceConfig,
     #[error("a contract is already registered for this code id")]
     ContractAlreadyExists,
     #[error("no contract is registered for this code id")]
