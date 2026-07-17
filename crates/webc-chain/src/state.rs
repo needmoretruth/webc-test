@@ -3370,6 +3370,21 @@ mod tests {
         ML_DSA_65_SIGNATURE_LEN,
     };
 
+    /// Round-trips `state` through the storage-at-rest bincode config — WEBC
+    /// §15.14 variable-length integers, exactly what `webc-storage` writes to
+    /// disk — so these crash-restart tests exercise the real on-disk format
+    /// rather than a throwaway one. The whole chain state uses tuple-keyed maps,
+    /// so it must go through bincode (a non-string-key binary format) rather than
+    /// the canonical-JSON path that drives `state_root` and signing.
+    fn bincode_restart(state: &ChainState) -> ChainState {
+        use bincode::Options;
+        let options = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .reject_trailing_bytes();
+        let bytes = options.serialize(state).expect("state serializes");
+        options.deserialize(&bytes).expect("state deserializes")
+    }
+
     fn funded_state() -> (ChainConfig, ChainState, Keypair, Keypair) {
         let config = ChainConfig::default();
         let alice = Keypair::from_seed([1u8; 32]);
@@ -4777,8 +4792,7 @@ mod tests {
 
         // The whole chain state uses tuple-keyed maps, so it round-trips through
         // bincode (a non-string-key format) rather than JSON.
-        let bytes = bincode::serialize(&state).unwrap();
-        let restored: ChainState = bincode::deserialize(&bytes).unwrap();
+        let restored = bincode_restart(&state);
         assert_eq!(restored, state);
         assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
     }
@@ -6962,8 +6976,7 @@ mod tests {
             .expect("created");
         assert!(!state.storage_deposits.is_zero());
 
-        let bytes = bincode::serialize(&state).expect("state serializes");
-        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        let restored = bincode_restart(&state);
         assert_eq!(restored.storage_deposits, state.storage_deposits);
         assert_eq!(
             restored.objects[&object_id].deposit,
@@ -8402,8 +8415,7 @@ mod tests {
         // a serialized-then-restored copy. Pruning is a pure function of committed
         // state, so both must produce identical state, root, and events.
         // bincode (not JSON) because state maps use non-string tuple keys.
-        let snapshot = bincode::serialize(&state).unwrap();
-        let mut restored: ChainState = bincode::deserialize(&snapshot).unwrap();
+        let mut restored = bincode_restart(&state);
         let live_events = state.distribute_epoch_rewards(&config).unwrap();
         let restored_events = restored.distribute_epoch_rewards(&config).unwrap();
         assert_eq!(state, restored);
@@ -9037,8 +9049,7 @@ mod tests {
         );
         assert!(!state.sponsor_budgets.is_zero());
 
-        let bytes = bincode::serialize(&state).expect("state serializes");
-        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        let restored = bincode_restart(&state);
         assert_eq!(
             restored.sponsors, state.sponsors,
             "restart preserves the sponsor registry and its per-user/day counters"
@@ -9231,8 +9242,7 @@ mod tests {
             "registry reflects the transfer before restart"
         );
 
-        let bytes = bincode::serialize(&state).expect("state serializes");
-        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        let restored = bincode_restart(&state);
         assert_eq!(
             restored.namespaces, state.namespaces,
             "restart preserves the namespace registry"
@@ -9543,8 +9553,7 @@ mod tests {
             state.namespace_fees[&ns].base_fee_per_unit > config.fee_policy.min_base_fee_per_unit
         );
 
-        let bytes = bincode::serialize(&state).expect("state serializes");
-        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        let restored = bincode_restart(&state);
         assert_eq!(
             restored.namespace_fees, state.namespace_fees,
             "restart preserves the per-namespace fee state"
