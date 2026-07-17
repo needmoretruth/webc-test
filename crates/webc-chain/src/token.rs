@@ -92,6 +92,30 @@ pub const MAX_TOKEN_SYMBOL_BYTES: usize = 12;
 /// absurd exponent. `18` matches the widely-used ERC-20 ceiling.
 pub const MAX_TOKEN_DECIMALS: u8 = 18;
 
+/// Native fungible-token parameters (Phase 13a, §15).
+///
+/// The launch value is a measurement-tuned placeholder; the METHOD (a flat native
+/// deposit locked for the token's life) is fixed. `#[serde(default)]` via the
+/// derived [`Default`] keeps a genesis written before tokens decodable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenConfig {
+    /// Native base units LOCKED from the creator's liquid balance into the
+    /// `token_deposits` bucket at creation. NON-REFUNDABLE for the token's life —
+    /// an anti-spam price (a burn-to-zero + close refund path is a later pass).
+    /// Placeholder: 1 WEBC.
+    pub creation_deposit: Amount,
+}
+
+impl Default for TokenConfig {
+    fn default() -> Self {
+        Self {
+            // 1 WEBC: a spam-resistant placeholder deposit (§15.22 method).
+            creation_deposit: Amount::from_webc(1),
+        }
+    }
+}
+
 /// Serializes a byte string as a lowercase hex string (shared by the bounded
 /// metadata-field codecs below).
 fn serialize_hex<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>

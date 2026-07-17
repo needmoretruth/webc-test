@@ -94,6 +94,22 @@ pub enum StateKeyKind {
     Mandate { mandate_id: crate::MandateId },
     /// Native service-registry entry for one service id (Phase 9b, §15.5).
     Service { service_id: crate::ServiceId },
+    /// Native fungible-token authority/supply record for one token id (Phase 13a, §15).
+    Token { token_id: crate::TokenId },
+    /// Native fungible-token balance for one holder of one token (Phase 13a, §15).
+    ///
+    /// The per-`(token, owner)` key is what makes token transfers parallel
+    /// schedulable: an ordinary transfer writes only the two account balance
+    /// keys, never one global per-token record.
+    TokenBalance {
+        token_id: crate::TokenId,
+        owner: Address,
+    },
+    /// Native fungible-token freeze marker for one account of one token (Phase 13a, §15).
+    TokenFreeze {
+        token_id: crate::TokenId,
+        account: Address,
+    },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
 }
@@ -233,6 +249,24 @@ impl StateKey {
     /// Returns the current service-registry key for `service_id` (Phase 9b, §15.5).
     pub const fn service(service_id: crate::ServiceId) -> Self {
         Self::current(StateKeyKind::Service { service_id })
+    }
+
+    /// Returns the current native-token record key for `token_id` (Phase 13a, §15).
+    pub const fn token(token_id: crate::TokenId) -> Self {
+        Self::current(StateKeyKind::Token { token_id })
+    }
+
+    /// Returns the current native-token balance key for `owner` of `token_id`
+    /// (Phase 13a, §15). This per-account key keeps token transfers free of any
+    /// global per-token bottleneck.
+    pub const fn token_balance(token_id: crate::TokenId, owner: Address) -> Self {
+        Self::current(StateKeyKind::TokenBalance { token_id, owner })
+    }
+
+    /// Returns the current native-token freeze marker key for `account` of
+    /// `token_id` (Phase 13a, §15).
+    pub const fn token_freeze(token_id: crate::TokenId, account: Address) -> Self {
+        Self::current(StateKeyKind::TokenFreeze { token_id, account })
     }
 
     /// Rejects keys whose schema is not supported by this executable.
@@ -466,6 +500,45 @@ mod tests {
             crate::canonical::canonical_json_string(&key).unwrap(),
             format!(
                 r#"{{"kind":{{"Service":{{"service_id":"{id}"}}}},"version":1}}"#,
+                id = "88".repeat(32),
+            )
+        );
+    }
+
+    #[test]
+    fn token_state_keys_have_a_stable_cross_language_wire_vector() {
+        // The token record, balance, and freeze keys are new StateKeyKind variants
+        // (Phase 13a, §15). Adding variants leaves the frozen every-state-key vector
+        // untouched (serde tags variants by name), so this separate vector pins the
+        // token keys' canonical JSON shape for a browser SDK mirror without moving
+        // the old hash. The per-(token, owner) balance key is what makes ordinary
+        // transfers parallel-schedulable without a global per-token bottleneck.
+        let token_id = crate::TokenId::new(Hash256([0x88; 32]));
+        let holder = Keypair::from_seed([9u8; 32]).address();
+
+        let record_key = StateKey::token(token_id);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&record_key).unwrap(),
+            format!(
+                r#"{{"kind":{{"Token":{{"token_id":"{id}"}}}},"version":1}}"#,
+                id = "88".repeat(32),
+            )
+        );
+        let balance_key = StateKey::token_balance(token_id, holder);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&balance_key).unwrap(),
+            format!(
+                r#"{{"kind":{{"TokenBalance":{{"owner":"{owner}","token_id":"{id}"}}}},"version":1}}"#,
+                owner = holder.to_base58(),
+                id = "88".repeat(32),
+            )
+        );
+        let freeze_key = StateKey::token_freeze(token_id, holder);
+        assert_eq!(
+            crate::canonical::canonical_json_string(&freeze_key).unwrap(),
+            format!(
+                r#"{{"kind":{{"TokenFreeze":{{"account":"{acct}","token_id":"{id}"}}}},"version":1}}"#,
+                acct = holder.to_base58(),
                 id = "88".repeat(32),
             )
         );

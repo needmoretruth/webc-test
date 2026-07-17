@@ -119,11 +119,11 @@ pub use staking::{
 };
 pub use state::{
     AccountStateProof, ChainConfig, ChainState, Event, OrderCloseReason, Receipt,
-    SupplyInvariantReport,
+    SupplyInvariantReport, TokenSupplyReport,
 };
 pub use state_key::{ProtocolStateKey, StateKey, StateKeyKind, MAX_TRANSACTION_STATE_KEYS};
 pub use token::{
-    TokenAuthorityKind, TokenId, TokenMetadata, TokenRecord, FROZEN_TOKEN_LEAF_DOMAIN,
+    TokenAuthorityKind, TokenConfig, TokenId, TokenMetadata, TokenRecord, FROZEN_TOKEN_LEAF_DOMAIN,
     MAX_TOKEN_DECIMALS, MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES, TOKEN_BALANCE_LEAF_DOMAIN,
     TOKEN_LEAF_DOMAIN,
 };

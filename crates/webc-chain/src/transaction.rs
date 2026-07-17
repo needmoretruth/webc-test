@@ -16,8 +16,8 @@ use crate::{
     ChainId, Epoch, ExternalChain, MandateCounterpartyPolicy, MandateId, ObjectId, ObjectVersion,
     PostQuantumRoot, PostQuantumRootReveal, ProtocolStateKey, ProtocolVersion, ServiceId,
     ServicePaymentFlags, ServicePrice, ServiceStatus, SessionKeyConstraints, SessionKeyId,
-    SlashingEvidence, StateKey, UnbondingRequestId, CURRENT_PROTOCOL_VERSION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
+    SlashingEvidence, StateKey, TokenAuthorityKind, TokenId, TokenMetadata, UnbondingRequestId,
+    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -668,6 +668,136 @@ pub enum Operation {
         /// Native principal moved to the service owner (excludes the fee).
         amount: Amount,
     },
+    /// Creates a native fungible token (Phase 13a, §15).
+    ///
+    /// Creator-signed (the sender is the token's `creator`). Derives the token id
+    /// from `(namespace, sender, create_nonce)` and records a
+    /// [`crate::TokenRecord`] with the given authorities. It LOCKS a native WEBC
+    /// creation deposit (`ChainConfig::token.creation_deposit`) from the creator's
+    /// liquid balance into the `token_deposits` bucket — an anti-spam price that is
+    /// NON-REFUNDABLE for the token's life; token creation NEVER mints or burns
+    /// native WEBC. Optionally mints `initial_supply` to `initial_recipient` at
+    /// creation. Fails if the derived id already exists (`TokenAlreadyExists`) or
+    /// the metadata is malformed (`InvalidTokenMetadata`). Any authorization lane
+    /// may pay the fee.
+    CreateToken {
+        /// Application namespace the token lives under; bound into the token id.
+        namespace: Hash256,
+        /// Creator-chosen uniquifier so one creator may create several tokens
+        /// under one namespace; part of the derived token id.
+        create_nonce: u64,
+        /// Bounded metadata (name, symbol, decimals, off-chain commitment).
+        metadata: TokenMetadata,
+        /// Initial mint authority; `None` creates the token with minting
+        /// permanently renounced (a fixed supply equal to `initial_supply`).
+        mint_authority: Option<Address>,
+        /// Initial freeze authority; `None` creates the token with freezing
+        /// permanently renounced.
+        freeze_authority: Option<Address>,
+        /// Amount minted to `initial_recipient` at creation (may be zero).
+        initial_supply: Amount,
+        /// Account credited `initial_supply` at creation.
+        initial_recipient: Address,
+    },
+    /// Mints new units of a token to a recipient (Phase 13a, §15).
+    ///
+    /// Must be signed by the token's current `mint_authority`; rejected if that
+    /// authority is `None` (minting renounced) or the signer differs
+    /// (`TokenMintNotAuthorized`). Increases the token's `issued_supply` and
+    /// credits `recipient`. Rejected if `recipient` is frozen
+    /// (`TokenAccountFrozen`). Moves no native WEBC beyond the fee. Any
+    /// authorization lane may pay the fee.
+    MintToken {
+        /// Token to mint.
+        token_id: TokenId,
+        /// Account credited the newly minted units.
+        recipient: Address,
+        /// Units minted.
+        amount: Amount,
+    },
+    /// Burns units of a token from the signer's own balance (Phase 13a, §15).
+    ///
+    /// A holder burns their OWN balance: decreases their balance and the token's
+    /// `issued_supply`. Rejected if the holder is frozen (`TokenAccountFrozen`) or
+    /// holds less than `amount` (`TokenInsufficientBalance`). Any authorization
+    /// lane may pay the fee.
+    BurnToken {
+        /// Token to burn.
+        token_id: TokenId,
+        /// Units burned from the signer's balance.
+        amount: Amount,
+    },
+    /// Transfers token units from the signer to a recipient (Phase 13a, §15).
+    ///
+    /// Holder→recipient. Rejected if the token is paused (`TokenPaused`), the
+    /// sender or recipient is frozen (`TokenAccountFrozen`), or the sender holds
+    /// less than `amount` (`TokenInsufficientBalance`). A sender balance that
+    /// reaches zero is pruned. This writes ONLY the two `(token, account)` balance
+    /// keys (the token record is read-only, consulted for the paused flag), so an
+    /// ordinary transfer never writes a global per-token object (a Phase 13
+    /// acceptance criterion). Any authorization lane may pay the fee.
+    TransferToken {
+        /// Token to transfer.
+        token_id: TokenId,
+        /// Account credited the transferred units.
+        recipient: Address,
+        /// Units transferred.
+        amount: Amount,
+    },
+    /// Pauses or unpauses all transfers of a token (Phase 13a, §15).
+    ///
+    /// Only the token's current `mint_authority` may pause/unpause (the Phase 13a
+    /// simplification keeps a single privileged authority rather than a dedicated
+    /// pause authority); rejected if minting is renounced
+    /// (`TokenMintNotAuthorized`). While paused, [`Self::TransferToken`] is
+    /// rejected. Any authorization lane may pay the fee.
+    SetTokenPaused {
+        /// Token whose paused flag changes.
+        token_id: TokenId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// Freezes one account's balance of a token (Phase 13a, §15).
+    ///
+    /// Freeze-authority-signed; rejected if freezing is renounced or the signer is
+    /// not the current freeze authority (`TokenFreezeNotAuthorized`). A frozen
+    /// account can neither send nor receive the token. Any authorization lane may
+    /// pay the fee.
+    FreezeTokenAccount {
+        /// Token whose account is frozen.
+        token_id: TokenId,
+        /// Account to freeze.
+        account: Address,
+    },
+    /// Thaws (unfreezes) one account's balance of a token (Phase 13a, §15).
+    ///
+    /// Freeze-authority-signed (the same authority check as
+    /// [`Self::FreezeTokenAccount`]). Removes the `(token, account)` freeze marker.
+    /// Any authorization lane may pay the fee.
+    ThawTokenAccount {
+        /// Token whose account is thawed.
+        token_id: TokenId,
+        /// Account to thaw.
+        account: Address,
+    },
+    /// Transfers or permanently renounces one of a token's authorities (Phase 13a,
+    /// §15).
+    ///
+    /// The CURRENT holder of the named authority may transfer it to a new address
+    /// (`Some`) or permanently renounce it (`None`). Rejected if the current
+    /// authority is already `None` (nothing to transfer) or the signer is not the
+    /// current authority (`TokenAuthorityNotAuthorized`). Renouncement is
+    /// PERMANENT: a `None` authority can never be restored (a Phase 13 acceptance
+    /// criterion, "revoked authority cannot return"). Any authorization lane may
+    /// pay the fee.
+    SetTokenAuthority {
+        /// Token whose authority changes.
+        token_id: TokenId,
+        /// Which authority (mint or freeze) is transferred/renounced.
+        authority_kind: TokenAuthorityKind,
+        /// New holder, or `None` to permanently renounce.
+        new_authority: Option<Address>,
+    },
 }
 
 impl Operation {
@@ -718,6 +848,19 @@ impl Operation {
             Self::UpdateService { .. }
             | Self::SetServiceStatus { .. }
             | Self::SpendUnderMandateToService { .. } => 10_000,
+            // Token creation is permissionless-for-a-fee: it records a record,
+            // locks a native deposit, and optionally mints — so the anti-spam price
+            // is a HIGH ordinary fee (comparable to contract registration).
+            Self::CreateToken { .. } => 30_000,
+            // Mint/burn/transfer move units on one or two balance records (transfer
+            // is the hot path); comparable to a native Transfer plus a record touch.
+            Self::MintToken { .. } | Self::BurnToken { .. } | Self::TransferToken { .. } => 1_000,
+            // Pause/freeze/thaw/authority rewrite one record or one freeze marker —
+            // single-record management operations.
+            Self::SetTokenPaused { .. }
+            | Self::FreezeTokenAccount { .. }
+            | Self::ThawTokenAccount { .. }
+            | Self::SetTokenAuthority { .. } => 5_000,
             Self::CreateFeed { .. } => 15_000,
             Self::RegisterReporter { .. }
             | Self::DeregisterReporter { .. }
@@ -1157,6 +1300,83 @@ impl Operation {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::mandate(*mandate_id));
                 push_unique_key(&mut read_only, StateKey::service(*service_id));
+            }
+            Self::CreateToken {
+                namespace,
+                create_nonce,
+                initial_supply,
+                initial_recipient,
+                ..
+            } => {
+                // Creation locks a native deposit from the creator's liquid balance
+                // and writes the new token record. The account key is in the
+                // default-lane base; declare it explicitly so a non-default fee lane
+                // is covered too. When it mints an initial supply, it also writes the
+                // recipient's per-account token balance. The token id is derived from
+                // the signer (creator), the namespace, and the create nonce, so the
+                // access list names the exact record at signing time.
+                let token_id = TokenId::derive(*namespace, sender, *create_nonce);
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::token(token_id));
+                if !initial_supply.is_zero() {
+                    push_unique_key(
+                        &mut read_write,
+                        StateKey::token_balance(token_id, *initial_recipient),
+                    );
+                }
+            }
+            Self::MintToken {
+                token_id,
+                recipient,
+                ..
+            } => {
+                // Mint raises issued_supply (writes the record) and credits the
+                // recipient's per-account token balance. Moves no native units
+                // beyond the fee (already covered by the lane base).
+                push_unique_key(&mut read_write, StateKey::token(*token_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::token_balance(*token_id, *recipient),
+                );
+            }
+            Self::BurnToken { token_id, .. } => {
+                // Burn lowers issued_supply (writes the record) and debits the
+                // signer's per-account token balance.
+                push_unique_key(&mut read_write, StateKey::token(*token_id));
+                push_unique_key(&mut read_write, StateKey::token_balance(*token_id, sender));
+            }
+            Self::TransferToken {
+                token_id,
+                recipient,
+                ..
+            } => {
+                // The token record is READ-ONLY (only its paused flag is consulted);
+                // the two per-account balance keys are the ONLY writes, so an
+                // ordinary transfer never writes a global per-token object (a Phase
+                // 13 acceptance criterion). Freeze state is read directly on the
+                // value path and is not declared here.
+                push_unique_key(&mut read_only, StateKey::token(*token_id));
+                push_unique_key(&mut read_write, StateKey::token_balance(*token_id, sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::token_balance(*token_id, *recipient),
+                );
+            }
+            Self::SetTokenPaused { token_id, .. }
+            | Self::SetTokenAuthority { token_id, .. } => {
+                // Pause / authority change rewrite one token record; move no native
+                // units, so they declare only the record beyond the fee lane base.
+                push_unique_key(&mut read_write, StateKey::token(*token_id));
+            }
+            Self::FreezeTokenAccount { token_id, account }
+            | Self::ThawTokenAccount { token_id, account } => {
+                // The record is read to check the freeze authority; the freeze marker
+                // is the only write. Freezing moves no native units.
+                push_unique_key(&mut read_only, StateKey::token(*token_id));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::token_freeze(*token_id, *account),
+                );
             }
             Self::InvokeContract {
                 code_id,

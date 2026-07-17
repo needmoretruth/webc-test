@@ -49,6 +49,10 @@ use crate::sponsorship::{
 };
 use crate::staking::{Delegation, StakingConfig, Validator, ValidatorStatus};
 use crate::state_key::StateAccessRecorder;
+use crate::token::{
+    TokenAuthorityKind, TokenConfig, TokenId, TokenRecord, FROZEN_TOKEN_LEAF_DOMAIN,
+    TOKEN_BALANCE_LEAF_DOMAIN, TOKEN_LEAF_DOMAIN,
+};
 use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
 use crate::{
@@ -122,6 +126,13 @@ pub struct ChainConfig {
     /// launch value is a measurement-tuned placeholder (§15.35 method).
     #[serde(default)]
     pub mandate: MandateConfig,
+    /// Native fungible-token parameters (Phase 13a, §15): the flat native creation
+    /// deposit locked (non-refundable) as an anti-spam price.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before native tokens decodable;
+    /// the launch value is a measurement-tuned placeholder (§15.35 method).
+    #[serde(default)]
+    pub token: TokenConfig,
     /// Total native supply, in base units, that the genesis allocation must sum
     /// to. `Some` on production genesis — mainnet and devnet both pin
     /// [`GENESIS_TOTAL_SUPPLY`] — so `ChainState::from_genesis` rejects any
@@ -163,6 +174,7 @@ impl Default for ChainConfig {
             contracts: ContractRuntimeConfig::default(),
             session_keys: SessionKeyConfig::default(),
             mandate: MandateConfig::default(),
+            token: TokenConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
             inactivity_leak: None,
@@ -625,6 +637,77 @@ pub enum Event {
         /// Native fee drawn from the mandate escrow for this spend.
         fee: Amount,
     },
+    /// A native fungible token was created (Phase 13a, §15).
+    TokenCreated {
+        /// Identity of the created token.
+        token_id: TokenId,
+        /// Account that created the token (its `creator`).
+        creator: Address,
+        /// Application namespace the token lives under.
+        namespace: Hash256,
+        /// Native deposit locked (non-refundable) as the anti-spam price.
+        deposit: Amount,
+        /// Amount minted to the initial recipient at creation (may be zero).
+        initial_supply: Amount,
+    },
+    /// Units of a token were minted to a recipient (Phase 13a, §15).
+    TokenMinted {
+        /// Token minted.
+        token_id: TokenId,
+        /// Account credited the newly minted units.
+        recipient: Address,
+        /// Units minted.
+        amount: Amount,
+        /// Token issued supply after the mint.
+        issued_supply: Amount,
+    },
+    /// Units of a token were burned from a holder (Phase 13a, §15).
+    TokenBurned {
+        /// Token burned.
+        token_id: TokenId,
+        /// Holder whose balance was reduced.
+        holder: Address,
+        /// Units burned.
+        amount: Amount,
+        /// Token issued supply after the burn.
+        issued_supply: Amount,
+    },
+    /// Token units moved from one holder to another (Phase 13a, §15).
+    TokenTransferred {
+        /// Token transferred.
+        token_id: TokenId,
+        /// Sending account.
+        from: Address,
+        /// Receiving account.
+        to: Address,
+        /// Units transferred.
+        amount: Amount,
+    },
+    /// A token's paused flag changed (Phase 13a, §15).
+    TokenPausedChanged {
+        /// Token whose paused flag changed.
+        token_id: TokenId,
+        /// New paused state.
+        paused: bool,
+    },
+    /// A token account was frozen or thawed (Phase 13a, §15).
+    TokenFreezeChanged {
+        /// Token whose account freeze state changed.
+        token_id: TokenId,
+        /// Account whose freeze state changed.
+        account: Address,
+        /// Whether the account is now frozen.
+        frozen: bool,
+    },
+    /// A token authority was transferred or permanently renounced (Phase 13a, §15).
+    TokenAuthorityChanged {
+        /// Token whose authority changed.
+        token_id: TokenId,
+        /// Which authority (mint or freeze) changed.
+        authority_kind: TokenAuthorityKind,
+        /// New holder, or `None` if the authority was permanently renounced.
+        new_authority: Option<Address>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,6 +919,55 @@ pub struct ChainState {
     /// hashed/consensus path.
     #[serde(default)]
     pub services: BTreeMap<ServiceId, ServiceEntry>,
+    /// Native fungible tokens, keyed by [`TokenId`] (Phase 13a, §15).
+    ///
+    /// Each [`TokenRecord`] holds a token's creator, bounded metadata, its two
+    /// configurable authorities (`Option`, where `None` is a permanent renounce),
+    /// its paused flag, and its running `issued_supply` (minted minus burned). A
+    /// token exists only after an explicit [`Operation::CreateToken`]. This is a
+    /// SEPARATE identity space from the bridge `asset_balances` map, so native-token
+    /// supply accounting stays isolated from the bridge trust model. Committed by
+    /// the state root through a dedicated Merkle sub-root (`TOKEN_LEAF_DOMAIN`), so
+    /// a create, mint, burn, pause, or authority change changes the state root.
+    /// Token supply is a separate asset and does NOT enter the native WEBC supply
+    /// reconciliation. A `BTreeMap` keeps iteration deterministic in the
+    /// hashed/consensus path.
+    #[serde(default)]
+    pub tokens: BTreeMap<TokenId, TokenRecord>,
+    /// Native token balances, keyed by `(TokenId, holder)` (Phase 13a, §15).
+    ///
+    /// The per-`(token, holder)` key is what makes ordinary [`Operation::TransferToken`]
+    /// parallel-schedulable: a transfer writes only the two account balance entries,
+    /// never one global per-token object. A zero balance is PRUNED (the entry is
+    /// removed when it hits zero) so the map stays bounded, mirroring how other maps
+    /// avoid storing zeros. Committed by the state root through a dedicated Merkle
+    /// sub-root (`TOKEN_BALANCE_LEAF_DOMAIN`). For every token,
+    /// `sum(balances) == issued_supply` (the per-token supply invariant, checked by
+    /// [`ChainState::token_supply_report`]).
+    #[serde(default)]
+    pub token_balances: BTreeMap<(TokenId, Address), Amount>,
+    /// Frozen token accounts, as `(TokenId, account)` pairs (Phase 13a, §15).
+    ///
+    /// A frozen `(token, account)` pair cannot SEND or RECEIVE that token. Only
+    /// currently-frozen pairs are present, so the committed set stays bounded — a
+    /// thaw removes the pair. Written only by [`Operation::FreezeTokenAccount`] /
+    /// [`Operation::ThawTokenAccount`] and read on the mint/burn/transfer value
+    /// paths. Committed by the state root through a dedicated Merkle sub-root
+    /// (`FROZEN_TOKEN_LEAF_DOMAIN`).
+    #[serde(default)]
+    pub frozen_token_accounts: BTreeSet<(TokenId, Address)>,
+    /// Native units LOCKED across every live token's non-refundable creation
+    /// deposit (Phase 13a, §15).
+    ///
+    /// Sum of every [`Operation::CreateToken`]'s `ChainConfig::token.creation_deposit`.
+    /// Creation moves units here from the creator's liquid balance; they stay locked
+    /// for the token's life (a non-refundable anti-spam price — a burn-to-zero +
+    /// close refund path is a later pass). Reconciled by [`SupplyInvariantReport`]
+    /// as a locked bucket and committed by the state root as a scalar (mirroring
+    /// `storage_deposits`/`sponsor_budgets`). Token BALANCES are a separate asset and
+    /// are NOT part of this native reconciliation.
+    #[serde(default)]
+    pub token_deposits: Amount,
     /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
     ///
     /// Each [`ContractManifest`] describes one registered contract (its identity,
@@ -935,6 +1067,8 @@ pub struct SupplyInvariantReport {
     pub dex_escrow: Amount,
     /// Native units locked across every live agent mandate (§15.32).
     pub mandate_escrow: Amount,
+    /// Native units locked across every live token's creation deposit (§15).
+    pub token_deposits: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -942,6 +1076,22 @@ pub struct SupplyInvariantReport {
     /// Checked sum of all non-duplicated buckets.
     pub accounted: Amount,
     /// Whether gross issuance exactly equals all buckets.
+    pub balanced: bool,
+}
+
+/// Deterministic per-token supply reconciliation (Phase 13a, §15).
+///
+/// For any one token, the running [`TokenRecord::issued_supply`] must equal the
+/// sum of every held balance. This report is a SEPARATE asset from native WEBC and
+/// never enters [`SupplyInvariantReport`]; it exists so tests and RPC callers can
+/// assert `sum(balances) == issued` after any token state transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenSupplyReport {
+    /// The token's recorded issued supply (total minted minus total burned).
+    pub issued: Amount,
+    /// Checked sum of every held balance for this token.
+    pub held: Amount,
+    /// Whether `issued` exactly equals `held`.
     pub balanced: bool,
 }
 
@@ -1017,6 +1167,10 @@ impl Default for ChainState {
             mandates: BTreeMap::new(),
             mandate_escrow: Amount::ZERO,
             services: BTreeMap::new(),
+            tokens: BTreeMap::new(),
+            token_balances: BTreeMap::new(),
+            frozen_token_accounts: BTreeSet::new(),
+            token_deposits: Amount::ZERO,
             contracts: BTreeMap::new(),
             contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
@@ -1215,6 +1369,7 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(self.oracle_revenue))
             .and_then(|amount| amount.checked_add(self.dex_escrow))
             .and_then(|amount| amount.checked_add(self.mandate_escrow))
+            .and_then(|amount| amount.checked_add(self.token_deposits))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -1234,6 +1389,7 @@ impl ChainState {
             oracle_revenue: self.oracle_revenue,
             dex_escrow: self.dex_escrow,
             mandate_escrow: self.mandate_escrow,
+            token_deposits: self.token_deposits,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -1770,6 +1926,9 @@ impl ChainState {
             dex_order_root: Hash256,
             mandate_root: Hash256,
             service_registry_root: Hash256,
+            token_root: Hash256,
+            token_balance_root: Hash256,
+            frozen_token_root: Hash256,
             contract_root: Hash256,
             contract_state_root: Hash256,
             namespace_fee_root: Hash256,
@@ -1781,6 +1940,7 @@ impl ChainState {
             oracle_revenue: Amount,
             dex_escrow: Amount,
             mandate_escrow: Amount,
+            token_deposits: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
@@ -1792,6 +1952,20 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V17 adds the native fungible-token system (Phase 13a, §15): the
+            // `token_root` sub-root commits every token record (creator, bounded
+            // metadata, both `Option` authorities, paused flag, issued supply), the
+            // `token_balance_root` sub-root commits every per-`(token, holder)`
+            // balance, and the `frozen_token_root` sub-root commits every frozen
+            // `(token, account)` pair, while the `token_deposits` scalar commits the
+            // aggregate locked native creation-deposit bucket (mirroring how
+            // `storage_deposits`/`sponsor_budgets` pair with their sub-roots). So a
+            // create / mint / burn / transfer / pause / freeze / thaw / authority
+            // change always changes the state root. Token supply is a SEPARATE asset
+            // from native WEBC and never enters the native supply reconciliation; the
+            // only native units that move are the ordinary fee and the creation
+            // deposit. The domain bump is a deliberate consensus-format change; no
+            // external fixture pins a prior root.
             // V16 adds the native service registry (Phase 9b, §15.5): the
             // `service_registry_root` sub-root commits every live service entry
             // (owner, namespace, categories, bounded fields, pricing, payment flows,
@@ -1854,7 +2028,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V16",
+            domain: "WEBC_STATE_COMMITMENT_V17",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1930,6 +2104,21 @@ impl ChainState {
                 SERVICE_REGISTRY_LEAF_DOMAIN,
                 self.services.iter(),
             )?,
+            // Native fungible-token system committed by its own ordered sub-roots
+            // (Phase 13a, §15): a create/mint/burn/pause/authority change moves
+            // `token_root`; a mint/burn/transfer moves `token_balance_root`; a
+            // freeze/thaw moves `frozen_token_root`; any of them changes the state
+            // root. The `token_deposits` scalar (below) commits the aggregate locked
+            // native creation-deposit bucket.
+            token_root: ordered_value_root(TOKEN_LEAF_DOMAIN, self.tokens.iter())?,
+            token_balance_root: ordered_value_root(
+                TOKEN_BALANCE_LEAF_DOMAIN,
+                self.token_balances.iter(),
+            )?,
+            frozen_token_root: ordered_set_root(
+                FROZEN_TOKEN_LEAF_DOMAIN,
+                self.frozen_token_accounts.iter(),
+            )?,
             // Interim contract runtime committed by its own ordered sub-roots (Phase
             // 7a, ADR-0014): registering a contract changes `contract_root`; any
             // contract state write changes `contract_state_root`; either changes the
@@ -1954,6 +2143,7 @@ impl ChainState {
             oracle_revenue: self.oracle_revenue,
             dex_escrow: self.dex_escrow,
             mandate_escrow: self.mandate_escrow,
+            token_deposits: self.token_deposits,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
@@ -4077,6 +4267,264 @@ impl ChainState {
                     fee: total_fee,
                 });
             }
+            Operation::CreateToken {
+                namespace,
+                create_nonce,
+                metadata,
+                mint_authority,
+                freeze_authority,
+                initial_supply,
+                initial_recipient,
+            } => {
+                // Self-contained native token creation (§15): records a token in its
+                // OWN identity space (never the bridge `asset_balances`) and locks a
+                // NON-REFUNDABLE native creation deposit (liquid -> token_deposits) as
+                // the anti-spam price. Token creation NEVER mints or burns native
+                // WEBC. The account key is declared explicitly so a non-default fee
+                // lane is covered (mirrors CreateObject).
+                let token_id = TokenId::derive(*namespace, tx.sender, *create_nonce);
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::token(token_id))?;
+                if !initial_supply.is_zero() {
+                    access.write(StateKey::token_balance(token_id, *initial_recipient))?;
+                }
+                if self.tokens.contains_key(&token_id) {
+                    return Err(ChainError::TokenAlreadyExists);
+                }
+                // Validate metadata before locking any deposit; a malformed record
+                // fails closed and rolls the whole transaction back. `issued_supply`
+                // starts at the optional initial mint, keeping the per-token invariant
+                // (`sum(balances) == issued_supply`) true from creation.
+                let record = TokenRecord::new(
+                    tx.sender,
+                    metadata.clone(),
+                    *mint_authority,
+                    *freeze_authority,
+                    *initial_supply,
+                )?;
+                // Lock the deposit; `debit_native` fails closed if the creator cannot
+                // afford it, so a token can never exist without its deposit.
+                let deposit = config.token.creation_deposit;
+                self.debit_native(tx.sender, deposit)?;
+                self.token_deposits = self
+                    .token_deposits
+                    .checked_add(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.tokens.insert(token_id, record);
+                // A brand-new token has no frozen accounts, so the initial mint needs
+                // no freeze check.
+                self.credit_token(token_id, *initial_recipient, *initial_supply)?;
+                events.push(Event::TokenCreated {
+                    token_id,
+                    creator: tx.sender,
+                    namespace: *namespace,
+                    deposit,
+                    initial_supply: *initial_supply,
+                });
+            }
+            Operation::MintToken {
+                token_id,
+                recipient,
+                amount,
+            } => {
+                access.write(StateKey::token(*token_id))?;
+                access.write(StateKey::token_balance(*token_id, *recipient))?;
+                // Authorize against the CURRENT mint authority: a renounced (None)
+                // authority rejects, and any signer that is not the authority rejects.
+                // The checked-add of `issued_supply` is computed under the immutable
+                // borrow, then applied after crediting so the borrow is released.
+                let next_issued = {
+                    let token = self.tokens.get(token_id).ok_or(ChainError::TokenNotFound)?;
+                    match token.mint_authority {
+                        Some(authority) if authority == tx.sender => {}
+                        _ => return Err(ChainError::TokenMintNotAuthorized),
+                    }
+                    token
+                        .issued_supply
+                        .checked_add(*amount)
+                        .ok_or(ChainError::TokenSupplyOverflow)?
+                };
+                // A frozen recipient cannot receive. Freeze state is read directly on
+                // the value path (not via the access recorder), matching the minimal
+                // transfer access list.
+                if self.frozen_token_accounts.contains(&(*token_id, *recipient)) {
+                    return Err(ChainError::TokenAccountFrozen);
+                }
+                // Credit the recipient and raise issued supply by the same amount.
+                // Token mint NEVER touches native WEBC supply.
+                self.credit_token(*token_id, *recipient, *amount)?;
+                self.tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .issued_supply = next_issued;
+                events.push(Event::TokenMinted {
+                    token_id: *token_id,
+                    recipient: *recipient,
+                    amount: *amount,
+                    issued_supply: next_issued,
+                });
+            }
+            Operation::BurnToken { token_id, amount } => {
+                access.write(StateKey::token(*token_id))?;
+                access.write(StateKey::token_balance(*token_id, tx.sender))?;
+                if !self.tokens.contains_key(token_id) {
+                    return Err(ChainError::TokenNotFound);
+                }
+                // A frozen holder cannot burn.
+                if self.frozen_token_accounts.contains(&(*token_id, tx.sender)) {
+                    return Err(ChainError::TokenAccountFrozen);
+                }
+                // Debit the holder's OWN balance first (fails closed on insufficient
+                // balance, pruning a zero remainder), then lower issued supply by the
+                // same amount. Since a successful debit proves `balance >= amount` and
+                // the per-token invariant keeps `issued_supply >= balance`, the
+                // issued-supply subtraction cannot underflow. Burn NEVER touches
+                // native WEBC supply.
+                self.debit_token(*token_id, tx.sender, *amount)?;
+                let token = self
+                    .tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?;
+                token.issued_supply = token
+                    .issued_supply
+                    .checked_sub(*amount)
+                    .ok_or(ChainError::TokenSupplyOverflow)?;
+                let issued_supply = token.issued_supply;
+                events.push(Event::TokenBurned {
+                    token_id: *token_id,
+                    holder: tx.sender,
+                    amount: *amount,
+                    issued_supply,
+                });
+            }
+            Operation::TransferToken {
+                token_id,
+                recipient,
+                amount,
+            } => {
+                // The token record is READ-ONLY (only its paused flag is consulted);
+                // the two per-account balance keys are the ONLY writes — an ordinary
+                // transfer never writes a global per-token object (Phase 13 acceptance
+                // criterion). A transfer conserves the token's supply, so
+                // `issued_supply` (and thus the record) is never written.
+                access.read(StateKey::token(*token_id))?;
+                access.write(StateKey::token_balance(*token_id, tx.sender))?;
+                access.write(StateKey::token_balance(*token_id, *recipient))?;
+                let paused = self
+                    .tokens
+                    .get(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .paused;
+                if paused {
+                    return Err(ChainError::TokenPaused);
+                }
+                // Neither sender nor recipient may be frozen (read directly).
+                if self.frozen_token_accounts.contains(&(*token_id, tx.sender))
+                    || self.frozen_token_accounts.contains(&(*token_id, *recipient))
+                {
+                    return Err(ChainError::TokenAccountFrozen);
+                }
+                // Debit the sender (pruning a zero remainder), then credit the
+                // recipient by the same amount.
+                self.debit_token(*token_id, tx.sender, *amount)?;
+                self.credit_token(*token_id, *recipient, *amount)?;
+                events.push(Event::TokenTransferred {
+                    token_id: *token_id,
+                    from: tx.sender,
+                    to: *recipient,
+                    amount: *amount,
+                });
+            }
+            Operation::SetTokenPaused { token_id, paused } => {
+                access.write(StateKey::token(*token_id))?;
+                let token = self
+                    .tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?;
+                // Only the current mint authority may pause/unpause (Phase 13a keeps a
+                // single privileged authority); a renounced (None) mint authority
+                // rejects.
+                match token.mint_authority {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::TokenMintNotAuthorized),
+                }
+                token.paused = *paused;
+                events.push(Event::TokenPausedChanged {
+                    token_id: *token_id,
+                    paused: *paused,
+                });
+            }
+            Operation::FreezeTokenAccount { token_id, account } => {
+                access.read(StateKey::token(*token_id))?;
+                access.write(StateKey::token_freeze(*token_id, *account))?;
+                // Authorize against the CURRENT freeze authority; a renounced (None)
+                // authority rejects.
+                let authority = self
+                    .tokens
+                    .get(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::TokenFreezeNotAuthorized),
+                }
+                self.frozen_token_accounts.insert((*token_id, *account));
+                events.push(Event::TokenFreezeChanged {
+                    token_id: *token_id,
+                    account: *account,
+                    frozen: true,
+                });
+            }
+            Operation::ThawTokenAccount { token_id, account } => {
+                access.read(StateKey::token(*token_id))?;
+                access.write(StateKey::token_freeze(*token_id, *account))?;
+                let authority = self
+                    .tokens
+                    .get(token_id)
+                    .ok_or(ChainError::TokenNotFound)?
+                    .freeze_authority;
+                match authority {
+                    Some(a) if a == tx.sender => {}
+                    _ => return Err(ChainError::TokenFreezeNotAuthorized),
+                }
+                self.frozen_token_accounts.remove(&(*token_id, *account));
+                events.push(Event::TokenFreezeChanged {
+                    token_id: *token_id,
+                    account: *account,
+                    frozen: false,
+                });
+            }
+            Operation::SetTokenAuthority {
+                token_id,
+                authority_kind,
+                new_authority,
+            } => {
+                access.write(StateKey::token(*token_id))?;
+                let token = self
+                    .tokens
+                    .get_mut(token_id)
+                    .ok_or(ChainError::TokenNotFound)?;
+                let current = match authority_kind {
+                    TokenAuthorityKind::Mint => token.mint_authority,
+                    TokenAuthorityKind::Freeze => token.freeze_authority,
+                };
+                // Only the CURRENT holder may transfer/renounce. A renounced (None)
+                // authority has nothing to transfer, so it can never be restored —
+                // renouncement is PERMANENT (a Phase 13 acceptance criterion).
+                match current {
+                    Some(authority) if authority == tx.sender => {}
+                    _ => return Err(ChainError::TokenAuthorityNotAuthorized),
+                }
+                match authority_kind {
+                    TokenAuthorityKind::Mint => token.mint_authority = *new_authority,
+                    TokenAuthorityKind::Freeze => token.freeze_authority = *new_authority,
+                }
+                events.push(Event::TokenAuthorityChanged {
+                    token_id: *token_id,
+                    authority_kind: *authority_kind,
+                    new_authority: *new_authority,
+                });
+            }
             Operation::RegisterContract { manifest } => {
                 // Default lane only: the registration fee draws from and burns
                 // liquid (supply-neutral, like feed creation). The manifest record
@@ -4576,6 +5024,94 @@ impl ChainState {
             .checked_add(amount)
             .ok_or(ChainError::ArithmeticOverflow)?;
         Ok(())
+    }
+
+    /// Credits `amount` of `token_id` to `holder`'s token balance (Phase 13a, §15).
+    ///
+    /// A zero credit is a no-op (so no zero entry is ever created). Checked
+    /// addition; overflow returns [`ChainError::TokenSupplyOverflow`]. This moves
+    /// only the token's own balance — never native WEBC.
+    fn credit_token(
+        &mut self,
+        token_id: TokenId,
+        holder: Address,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let entry = self
+            .token_balances
+            .entry((token_id, holder))
+            .or_insert(Amount::ZERO);
+        *entry = entry
+            .checked_add(amount)
+            .ok_or(ChainError::TokenSupplyOverflow)?;
+        Ok(())
+    }
+
+    /// Debits `amount` of `token_id` from `holder`'s token balance, PRUNING a
+    /// balance that reaches zero (Phase 13a, §15).
+    ///
+    /// A zero debit is a no-op. Rejects an insufficient balance with
+    /// [`ChainError::TokenInsufficientBalance`] (a missing entry is a zero balance).
+    /// When the remaining balance is zero the entry is removed, so the balance map
+    /// never stores zeros and stays bounded. Moves only the token's own balance —
+    /// never native WEBC.
+    fn debit_token(
+        &mut self,
+        token_id: TokenId,
+        holder: Address,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let current = self
+            .token_balances
+            .get(&(token_id, holder))
+            .copied()
+            .unwrap_or(Amount::ZERO);
+        let remaining = current
+            .checked_sub(amount)
+            .ok_or(ChainError::TokenInsufficientBalance)?;
+        if remaining.is_zero() {
+            self.token_balances.remove(&(token_id, holder));
+        } else {
+            self.token_balances.insert((token_id, holder), remaining);
+        }
+        Ok(())
+    }
+
+    /// Reconciles one token's issued supply against the sum of its held balances
+    /// (Phase 13a, §15).
+    ///
+    /// For any token, `issued_supply` must equal the sum of every held balance.
+    /// This is a SEPARATE asset from native WEBC and never enters
+    /// [`Self::supply_invariant_report`]. Returns [`ChainError::TokenNotFound`] if
+    /// the token does not exist. Checked addition over the held balances.
+    pub fn token_supply_report(
+        &self,
+        token_id: TokenId,
+    ) -> Result<TokenSupplyReport, ChainError> {
+        let issued = self
+            .tokens
+            .get(&token_id)
+            .ok_or(ChainError::TokenNotFound)?
+            .issued_supply;
+        let mut held = Amount::ZERO;
+        for ((token, _holder), balance) in self.token_balances.iter() {
+            if *token == token_id {
+                held = held
+                    .checked_add(*balance)
+                    .ok_or(ChainError::TokenSupplyOverflow)?;
+            }
+        }
+        Ok(TokenSupplyReport {
+            issued,
+            held,
+            balanced: issued == held,
+        })
     }
 
     /// Attempts to draw `total_fee` from application `namespace`'s sponsor budget.
@@ -5744,6 +6280,9 @@ mod tests {
             }),
             ("mandate_escrow", |s| {
                 s.mandate_escrow = Amount::from_units(s.mandate_escrow.0 + 1)
+            }),
+            ("token_deposits", |s| {
+                s.token_deposits = Amount::from_units(s.token_deposits.0 + 1)
             }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
