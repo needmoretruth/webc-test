@@ -24,6 +24,7 @@ pub mod round;
 pub mod scheduler;
 pub mod session_key;
 pub mod slashing;
+pub mod sponsorship;
 pub mod staking;
 pub mod state;
 pub mod state_key;
@@ -74,6 +75,9 @@ pub use session_key::{
     SESSION_KEY_AUTHORIZATION_DOMAIN,
 };
 pub use slashing::{InactivityLeakConfig, SlashingEvidence, SlashingOutcome, SlashingPolicy};
+pub use sponsorship::{
+    sponsor_state_key_hash, AppSponsor, SponsorUserWindow, SponsorshipConfig, SPONSOR_LEAF_DOMAIN,
+};
 pub use staking::{
     Delegation, StakingConfig, Validator, ValidatorStatus, SEVEN_DAY_TARGET_AT_ONE_MINUTE_EPOCHS,
 };
@@ -254,6 +258,20 @@ pub enum ChainError {
     AuthorizationLaneDepositZero,
     #[error("storage pricing refund basis points exceed 10000")]
     InvalidStoragePricing,
+    #[error("sponsorship configuration is invalid (day-window must be non-zero)")]
+    InvalidSponsorshipConfig,
+    #[error("application sponsor already exists for this namespace")]
+    AppSponsorAlreadyExists,
+    #[error("application sponsor was not found for this namespace")]
+    AppSponsorNotFound,
+    #[error("only the sponsor owner may fund or withdraw this application sponsor")]
+    AppSponsorNotOwner,
+    #[error("application sponsor daily budget cap exceeds the protocol maximum")]
+    AppSponsorDailyCapTooHigh,
+    #[error("application sponsor budget is insufficient for this withdrawal: needed {needed}, available {available}")]
+    AppSponsorBudgetInsufficient { needed: Amount, available: Amount },
+    #[error("fee sponsorship must use the default authorization lane")]
+    SponsorshipRequiresDefaultLane,
     #[error("object already exists")]
     ObjectAlreadyExists,
     #[error("object was not found")]

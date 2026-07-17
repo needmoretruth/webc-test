@@ -5,6 +5,7 @@
 //! keys each native operation is expected to touch. Runtime enforcement lives in
 //! `state` and fails atomically if execution diverges from that signed list.
 
+use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
     ChainId, ExternalChain, ObjectId, ObjectVersion, PostQuantumRoot, PostQuantumRootReveal,
@@ -318,6 +319,41 @@ pub enum Operation {
         /// Replay-protected source message; real-fund proofs remain disabled.
         message: BridgeMessage,
     },
+    /// Registers the sender as the fee sponsor for an application namespace (§15.35).
+    ///
+    /// Creates the per-app sponsor record, sets the app-chosen per-day spend cap
+    /// (rejected if above the protocol hard cap), and moves `initial_funding`
+    /// native base units from the sender's liquid balance into the sponsor budget.
+    RegisterAppSponsor {
+        /// Application namespace this sponsor underwrites (the same namespace used
+        /// by the app's objects — "application" is the sponsoring unit).
+        namespace: Hash256,
+        /// App-chosen maximum sponsored fee spend per day-window, in base units,
+        /// bounded by `SponsorshipConfig::max_app_daily_budget`.
+        daily_budget_cap: Amount,
+        /// Initial native base units moved from liquid balance into the budget.
+        initial_funding: Amount,
+    },
+    /// Adds native base units to an existing application sponsor budget.
+    ///
+    /// Only the sponsor owner may fund it. Moves `amount` from the sender's liquid
+    /// balance into the app's sponsor budget.
+    FundAppSponsor {
+        /// Existing application namespace whose sponsor budget is topped up.
+        namespace: Hash256,
+        /// Native base units moved from liquid balance into the budget.
+        amount: Amount,
+    },
+    /// Withdraws unspent native base units from an application sponsor budget.
+    ///
+    /// Only the sponsor owner may withdraw. Moves `amount` from the app's sponsor
+    /// budget back to the owner's liquid balance; fails if it exceeds the budget.
+    WithdrawAppSponsor {
+        /// Existing application namespace whose sponsor budget is drawn down.
+        namespace: Hash256,
+        /// Native base units returned to the owner's liquid balance.
+        amount: Amount,
+    },
 }
 
 impl Operation {
@@ -347,7 +383,23 @@ impl Operation {
             Self::SubmitSlashingEvidence { .. } => 20_000,
             Self::BridgeLock { .. } | Self::BridgeBurn { .. } => 50_000,
             Self::BridgeMint { .. } | Self::BridgeRelease { .. } => 75_000,
+            Self::RegisterAppSponsor { .. }
+            | Self::FundAppSponsor { .. }
+            | Self::WithdrawAppSponsor { .. } => 10_000,
         }
+    }
+
+    /// Whether this operation may have its fee paid by an application sponsor.
+    ///
+    /// Fee sponsorship is deliberately restricted to **simple operations** at
+    /// launch (§15.35): only a native `Transfer` qualifies. Critical, structural,
+    /// staking, bridge, object, and sponsor-management operations are never
+    /// sponsorable, so a sponsor budget can only ever underwrite ordinary
+    /// user-facing payments. The allowlist is intentionally minimal and can be
+    /// widened later with measurement; it is defined in code (not config) so the
+    /// set of sponsorable operations is fixed by the protocol, not by a sponsor.
+    pub fn is_sponsorable(&self) -> bool {
+        matches!(self, Self::Transfer { .. })
     }
 
     /// Builds the exact current-version access list for this native operation.
@@ -556,6 +608,18 @@ impl Operation {
                     );
                 }
             }
+            Self::RegisterAppSponsor { namespace, .. }
+            | Self::FundAppSponsor { namespace, .. }
+            | Self::WithdrawAppSponsor { namespace, .. } => {
+                // Sponsor management moves native units between the owner's liquid
+                // balance and the app's sponsor budget, so it writes both the
+                // sender account and the app's sponsor state key.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(
+                    &mut read_write,
+                    StateKey::application(*namespace, sponsor_state_key_hash()),
+                );
+            }
         }
         if !matches!(
             self,
@@ -620,6 +684,23 @@ pub struct Transaction {
     pub access_list: AccessList,
     /// Sender's execution-unit and price bounds.
     pub fee: FeeBid,
+    /// Optional sponsoring application namespace (fee sponsorship, §15.35).
+    ///
+    /// When `Some(namespace)`, the sender opts into having that application's
+    /// pre-funded sponsor budget pay this transaction's fee, subject to hard
+    /// per-user / per-operation / per-app-per-day caps and the simple-operation
+    /// restriction ([`Operation::is_sponsorable`]). Sponsorship is **best-effort
+    /// (fail-open)**: if any cap or the budget does not permit it — or the
+    /// operation is not sponsorable — the sender pays normally, never more than
+    /// the fee already authorized by `fee`. Must use the default authorization
+    /// lane.
+    ///
+    /// `None` is the default and is **omitted from the wire**, so every existing
+    /// (non-sponsored) transaction serializes byte-for-byte as before and the
+    /// frozen `WEBC_SIGNED_TRANSACTION_V4` signing vectors are unchanged. The
+    /// field is a purely additive, backward-compatible superset of V4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsor: Option<Hash256>,
     /// Ed25519 signature over canonical signing bytes, or `None` before signing.
     pub signature: Option<SignatureBytes>,
 }
@@ -729,6 +810,7 @@ impl Transaction {
             operation,
             access_list,
             fee,
+            sponsor: None,
             signature: None,
         }
     }
@@ -741,6 +823,46 @@ impl Transaction {
         fee: FeeBid,
     ) -> Result<Self, ChainError> {
         Self::for_operation_in_lane(keypair, AuthorizationLaneId::DEFAULT, nonce, operation, fee)
+    }
+
+    /// Builds access (including the sponsor state key), opts into fee sponsorship
+    /// by `sponsor_namespace`, and signs for the devnet chain's default lane.
+    ///
+    /// Sponsorship is best-effort and applies only on the default lane and only
+    /// to sponsorable operations; the runtime enforces the hard caps and falls
+    /// open to normal self-payment when they do not permit it. The returned
+    /// access list is a superset covering both the sponsored and the self-pay
+    /// execution paths, so neither path can trigger an undeclared/unused
+    /// access-list failure.
+    pub fn for_sponsored_operation(
+        keypair: &Keypair,
+        nonce: u64,
+        operation: Operation,
+        fee: FeeBid,
+        sponsor_namespace: Hash256,
+    ) -> Result<Self, ChainError> {
+        let sender = keypair.address();
+        let mut access_list =
+            operation.default_access_list_for_lane(sender, AuthorizationLaneId::DEFAULT)?;
+        push_unique_key(
+            &mut access_list.read_write,
+            StateKey::application(sponsor_namespace, sponsor_state_key_hash()),
+        );
+        let mut tx = Self::new_unsigned_in_lane_on_chain(
+            CURRENT_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            sender,
+            keypair.public_key(),
+            AuthorizationLaneId::DEFAULT,
+            LEGACY_AUTHORIZATION_POLICY_REVISION,
+            nonce,
+            operation,
+            access_list,
+            fee,
+        );
+        tx.sponsor = Some(sponsor_namespace);
+        tx.sign(keypair)?;
+        Ok(tx)
     }
 
     /// Builds and signs on devnet under an already installed policy revision.
@@ -910,6 +1032,10 @@ impl Transaction {
     /// The `signature` field itself is intentionally excluded from signing,
     /// so the same struct can carry its own signature without circularity.
     fn signing_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        // `sponsor` is skipped when `None`, so a non-sponsored transaction's
+        // signing payload is byte-identical to the frozen V4 vectors; a sponsored
+        // transaction adds exactly one `sponsor` key. The signed field binds the
+        // sponsor choice to the sender's signature.
         #[derive(Serialize)]
         struct SigningPayload<'a> {
             domain: &'static str,
@@ -923,6 +1049,8 @@ impl Transaction {
             operation: &'a Operation,
             access_list: &'a AccessList,
             fee: FeeBid,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sponsor: Option<Hash256>,
         }
 
         let payload = SigningPayload {
@@ -937,6 +1065,7 @@ impl Transaction {
             operation: &self.operation,
             access_list: &self.access_list,
             fee: self.fee,
+            sponsor: self.sponsor,
         };
         crate::canonical::canonical_json_bytes(&payload)
     }
@@ -982,6 +1111,8 @@ mod tests {
             operation: &'a Operation,
             access_list: &'a AccessList,
             fee: FeeBid,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sponsor: Option<Hash256>,
         }
         let payload = SigningPayload {
             domain: SIGNING_DOMAIN,
@@ -995,6 +1126,7 @@ mod tests {
             operation: &tx.operation,
             access_list: &tx.access_list,
             fee: tx.fee,
+            sponsor: tx.sponsor,
         };
         crate::canonical::canonical_json_string(&payload).unwrap()
     }
