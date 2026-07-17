@@ -20,6 +20,7 @@ pub mod hex_bytes;
 pub mod inflation;
 pub mod namespace;
 pub mod object;
+pub mod oracle;
 pub mod protocol;
 pub mod round;
 pub mod scheduler;
@@ -65,6 +66,10 @@ pub use grants::StakeGrant;
 pub use inflation::{BootstrapIssuance, InflationSchedule};
 pub use namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_DATA_BYTES};
+pub use oracle::{
+    accuracy_weight, median, Feed, FeedId, FeedValue, OracleConfig, OracleReporter,
+    ORACLE_ACCURACY_SCALE, ORACLE_FEED_LEAF_DOMAIN, ORACLE_REPORTER_LEAF_DOMAIN,
+};
 pub use protocol::{
     AuthorizationLaneId, BaseUnits, BlockHeight, ChainId, ChainIdError, Epoch, Nonce,
     ProtocolVersion, ValidatorId, CURRENT_PROTOCOL_VERSION,
@@ -285,6 +290,22 @@ pub enum ChainError {
     AppSponsorBudgetInsufficient { needed: Amount, available: Amount },
     #[error("fee sponsorship must use the default authorization lane")]
     SponsorshipRequiresDefaultLane,
+    #[error(
+        "oracle configuration is invalid (settlement cadence and liveness window must be non-zero)"
+    )]
+    InvalidOracleConfig,
+    #[error("oracle feed already exists for this feed id")]
+    OracleFeedAlreadyExists,
+    #[error("oracle feed was not found for this feed id")]
+    OracleFeedNotFound,
+    #[error("reporter is already registered on this oracle feed")]
+    OracleReporterAlreadyRegistered,
+    #[error("reporter is not registered on this oracle feed")]
+    OracleReporterNotFound,
+    #[error("this oracle operation must use the default authorization lane")]
+    OracleRequiresDefaultLane,
+    #[error("oracle read-fee payment must be greater than zero")]
+    OracleReadAmountZero,
     #[error("application namespace is already registered")]
     NamespaceAlreadyRegistered,
     #[error("application namespace is not registered")]
