@@ -340,6 +340,42 @@ describe("transaction signing schema", () => {
     );
   });
 
+  it("rejects non-lowercase object id/namespace/data hex to keep Rust parity (X2)", () => {
+    // object_id and namespace are Hash256 and data is bounded lowercase hex in
+    // Rust; a mixed-case field re-serializes lowercase there, so signing it here
+    // produces a silent mismatch. Validate each hex field in the constructor.
+    const id = "ab".repeat(32);
+    const namespace = "cd".repeat(32);
+    expect(() =>
+      createObject({ objectId: id.toUpperCase(), namespace, data: "ab" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      createObject({ objectId: id, namespace: namespace.toUpperCase(), data: "ab" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      createObject({ objectId: id, namespace, data: "AB" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      mutateObject({ objectId: id, namespace, expectedVersion: 1, data: "Cd" }),
+    ).toThrow(/lowercase hex/u);
+    expect(() =>
+      transferObject({
+        objectId: id.toUpperCase(),
+        namespace,
+        expectedVersion: 2,
+        newOwner: "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3",
+      }),
+    ).toThrow(/lowercase hex/u);
+    // Odd-length (non-byte-aligned) hex is also rejected before signing.
+    expect(() =>
+      createObject({ objectId: id, namespace, data: "abc" }),
+    ).toThrow(/lowercase hex/u);
+    // Well-formed lowercase fields still construct.
+    expect(
+      createObject({ objectId: id, namespace, data: "ab" }),
+    ).toEqual({ CreateObject: { object_id: id, namespace, data: "ab" } });
+  });
+
   it("rejects non-lowercase bridge recipient hex to keep Rust parity (X1)", () => {
     // Rust emits and re-serializes the recipient as lowercase hex, so an
     // upper/mixed-case recipient here would sign bytes Rust never re-produces,

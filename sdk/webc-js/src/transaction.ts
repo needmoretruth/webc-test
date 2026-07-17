@@ -204,6 +204,9 @@ export function createObject(args: {
   namespace: string;
   data: string;
 }): OperationJson {
+  requireLowercaseHex(args.objectId, "object id");
+  requireLowercaseHex(args.namespace, "object namespace");
+  requireLowercaseHex(args.data, "object data");
   return {
     CreateObject: {
       object_id: args.objectId,
@@ -220,6 +223,9 @@ export function mutateObject(args: {
   expectedVersion: number;
   data: string;
 }): OperationJson {
+  requireLowercaseHex(args.objectId, "object id");
+  requireLowercaseHex(args.namespace, "object namespace");
+  requireLowercaseHex(args.data, "object data");
   return {
     MutateObject: {
       object_id: args.objectId,
@@ -237,6 +243,8 @@ export function transferObject(args: {
   expectedVersion: number;
   newOwner: WebcAddress;
 }): OperationJson {
+  requireLowercaseHex(args.objectId, "object id");
+  requireLowercaseHex(args.namespace, "object namespace");
   return {
     TransferObject: {
       object_id: args.objectId,
