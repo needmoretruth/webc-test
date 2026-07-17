@@ -154,6 +154,27 @@ export interface FaucetReceipt {
 }
 
 /**
+ * One page of a cursor-paginated list endpoint. `nextCursor` is the opaque token
+ * to pass back as `cursor` for the following page, or `null` on the last page.
+ */
+export interface Page<T> {
+  readonly items: readonly T[];
+  readonly nextCursor: string | null;
+}
+
+/** Filters for {@link WebcNodeClient.listServices} (`GET /v1/services`). */
+export interface ListServicesOptions {
+  /** Restrict to services carrying this 32-byte-hex taxonomy category tag. */
+  readonly category?: string;
+  /** Restrict to services registered under this 32-byte-hex namespace. */
+  readonly namespace?: string;
+  /** Opaque pagination cursor from a previous page's `nextCursor`. */
+  readonly cursor?: string;
+  /** Maximum ids to return in the page (node-bounded). */
+  readonly limit?: number;
+}
+
+/**
  * A validator's eligibility or penalty state, mirroring the Rust
  * `ValidatorStatus` serde enum: the unit variants serialize as bare strings and
  * the data-carrying variants as a single-key tagged object.
@@ -367,6 +388,23 @@ export class WebcNodeClient {
       await this.#get(`/v1/services/${encodeURIComponent(id)}`),
       id,
     );
+  }
+
+  /**
+   * Lists registered service ids for discovery (`GET /v1/services`), optionally
+   * filtered by `category` / `namespace` and cursor-paginated. Returns only the
+   * 32-byte-hex ids; hydrate a full {@link ServiceEntry} for one with
+   * {@link getService}. The response is strictly parsed and fails closed on a
+   * malformed page.
+   */
+  async listServices(options: ListServicesOptions = {}): Promise<Page<string>> {
+    const query = buildListQuery({
+      category: requireOptionalHex32Query(options.category, "category"),
+      namespace: requireOptionalHex32Query(options.namespace, "namespace"),
+      cursor: options.cursor,
+      limit: requireOptionalLimitQuery(options.limit),
+    });
+    return parseHex32Page(await this.#get(`/v1/services${query}`), "service_ids");
   }
 
   /**
@@ -818,6 +856,75 @@ function parseFaucetReceipt(value: unknown): FaucetReceipt {
     newBalance: requireAmount(value.new_balance, "new_balance"),
     disclaimer: requireString(value.disclaimer, "disclaimer"),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Paginated list-endpoint helpers. Query values are validated BEFORE they reach
+// the URL (a malformed filter fails closed rather than hitting the node), and the
+// page envelope `{ <items_field>: [...], next_cursor: string | null }` is strictly
+// parsed exactly like the record reads.
+// ---------------------------------------------------------------------------
+
+/** Validates an optional 32-byte-hex query filter, or returns undefined. */
+function requireOptionalHex32Query(
+  value: string | undefined,
+  field: string,
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    throw new Error(`${field} filter must be 32-byte lowercase hex`);
+  }
+  return value;
+}
+
+/** Validates an optional non-negative page limit, or returns undefined. */
+function requireOptionalLimitQuery(value: number | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error("limit must be a non-negative integer");
+  }
+  return value;
+}
+
+/** Builds a `?a=1&b=2` query string from defined params, skipping undefined ones. */
+function buildListQuery(
+  params: Record<string, string | number | undefined>,
+): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined) {
+      continue;
+    }
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  }
+  return parts.length > 0 ? `?${parts.join("&")}` : "";
+}
+
+/** Strictly parses an optional `next_cursor` (a non-empty string, or `null`). */
+function parseNextCursor(value: unknown): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  throw new Error("node response field next_cursor is not a string or null");
+}
+
+/** Strictly parses a `{ <field>: hex32[], next_cursor }` id page (fail-closed). */
+function parseHex32Page(value: unknown, field: string): Page<string> {
+  const record = requireRecord(value, "list page");
+  rejectUnknownKeys(record, [field, "next_cursor"], "list page");
+  const raw = record[field];
+  if (!Array.isArray(raw)) {
+    throw new Error(`node response field ${field} is not an array`);
+  }
+  const items = raw.map((entry, index) => requireHex32(entry, `${field}[${index}]`));
+  return Object.freeze({ items, nextCursor: parseNextCursor(record.next_cursor) });
 }
 
 // ---------------------------------------------------------------------------
