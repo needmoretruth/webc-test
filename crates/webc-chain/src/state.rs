@@ -2637,7 +2637,10 @@ impl ChainState {
                 // so the supply invariant is unaffected (only the ordinary fee
                 // moves). Any authorization lane may pay the fee — there is no
                 // account balance to draw from — so no default-lane restriction.
-                access.write(StateKey::application(*namespace, namespace_state_key_hash()))?;
+                access.write(StateKey::application(
+                    *namespace,
+                    namespace_state_key_hash(),
+                ))?;
                 if self.namespaces.contains_key(namespace) {
                     return Err(ChainError::NamespaceAlreadyRegistered);
                 }
@@ -2652,7 +2655,10 @@ impl ChainState {
                 namespace,
                 new_owner,
             } => {
-                access.write(StateKey::application(*namespace, namespace_state_key_hash()))?;
+                access.write(StateKey::application(
+                    *namespace,
+                    namespace_state_key_hash(),
+                ))?;
                 // Only the current owner may transfer. Validate existence and
                 // ownership before mutating, so a non-owner's attempt fails closed
                 // and leaves the record unchanged (the whole tx rolls back).
@@ -9168,8 +9174,12 @@ mod tests {
             .execute_transaction(&create(&alice, 0x02, 2), &config)
             .expect("object creation is not blocked by another account's namespace claim");
 
-        assert!(state.objects.contains_key(&ObjectId::new(Hash256([0x01; 32]))));
-        assert!(state.objects.contains_key(&ObjectId::new(Hash256([0x02; 32]))));
+        assert!(state
+            .objects
+            .contains_key(&ObjectId::new(Hash256([0x01; 32]))));
+        assert!(state
+            .objects
+            .contains_key(&ObjectId::new(Hash256([0x02; 32]))));
         assert_eq!(state.namespaces[&namespace].owner, bob.address());
         assert!(state.supply_invariant_report().unwrap().balanced);
     }

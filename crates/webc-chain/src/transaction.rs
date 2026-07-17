@@ -643,8 +643,7 @@ impl Operation {
                     StateKey::application(*namespace, sponsor_state_key_hash()),
                 );
             }
-            Self::RegisterNamespace { namespace }
-            | Self::TransferNamespace { namespace, .. } => {
+            Self::RegisterNamespace { namespace } | Self::TransferNamespace { namespace, .. } => {
                 // The registry claim/transfer only reads and writes the namespace's
                 // registry record; it moves no native units, so it does not declare
                 // the sender account beyond what the fee lane already covers. The
