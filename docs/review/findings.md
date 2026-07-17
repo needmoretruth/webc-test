@@ -199,12 +199,16 @@ not deeply audited.
   with proof). Cross-epoch certificate anchoring stays E4. Tests:
   `webc-net::send_to_reaches_only_the_named_peer` and
   `webc-node/tests/consensus_sync_gating.rs`.
-- **C8 — LOW — `has_two_thirds_power` threshold arithmetic is correct but
-  fragile/undocumented.** `consensus.rs:170-178`. The nonstandard form
-  `(total/3)*2 + ((total%3)*2)/3` is actually a strict >2/3 test and avoids the
-  `total*2` u128 overflow that the naive `power*3 > total*2` would risk near
-  u128::MAX — that is likely the real reason. Document the overflow rationale and
-  add a property test. Not a bug today.
+- **C8 — LOW — RESOLVED (commit `ff289e3`) — `has_two_thirds_power` threshold
+  arithmetic is correct but fragile/undocumented.** `consensus.rs:170-178`. The
+  nonstandard form `(total/3)*2 + ((total%3)*2)/3` is a strict >2/3 test that
+  avoids the `total*2` u128 overflow the naive `power*3 > total*2` would risk near
+  u128::MAX. **Fix:** extracted into the documented, overflow-safe
+  `strictly_exceeds_fraction` helper (used by both the 2/3 and 1/3 checks) with
+  proptest coverage vs. the naive reference and an explicit `u128::MAX` overflow
+  test. Reproduced/covered first by `two_thirds_threshold_matches_reference`,
+  `one_third_threshold_matches_reference`, and
+  `two_thirds_threshold_does_not_overflow_near_u128_max`.
 - **Verified good (consensus):** quorum math is checked and returns false on a
   zero/empty set (cannot finalize); locking conforms (a locked node never prevotes
   a conflicting value); first-vote-wins per (round, validator, type) prevents
@@ -541,12 +545,15 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
   `transaction.ts:202-248`: `createObject`/`mutateObject`/`transferObject` pass hex
   through unvalidated → same silent mismatch class as X1. CONFIRMED. Fix:
   lowercase-validate these fields in the TS constructors.
-- **X3 — LOW — integer-range parity.** `canonical.rs:74` accepts any
-  `is_u64()||is_i64()` integer and re-emits it; `canonical.ts:65` rejects anything
-  above `Number.isSafeInteger` (2^53-1). A `u64` counter above 2^53 carried as a
-  JSON number would diverge (or the TS side rejects a payload Rust accepts). Fix:
-  encode large integer fields as decimal strings on both sides (as amounts already
-  are), or have Rust reject >2^53-1 in `canonicalize_value`.
+- **X3 — LOW — RESOLVED (commit `ff289e3`) — integer-range parity.**
+  `canonical.rs:74` accepted any `is_u64()||is_i64()` integer and re-emitted it;
+  `canonical.ts:65` rejects anything above `Number.isSafeInteger` (2^53-1). **Fix:**
+  `canonicalize_value` now rejects an integer outside ±(2^53-1) via
+  `ChainError::CanonicalIntegerOutOfSafeRange`, matching the TS encoder, so no bare
+  integer can diverge between Rust and the browser in a signed payload. Amounts
+  already use decimal strings; the authorization-policy revision bound is exactly
+  2^53-1, so the same rule is now enforced one layer earlier for every field.
+  Reproduced first by `integers_beyond_the_js_safe_range_are_rejected`.
 - **X4 — LOW — amount-string parity.** Amounts are decimal strings both sides
   (parity holds for well-formed input), but the TS constructors don't validate the
   amount-string shape; a value Rust's u128 decimal form would not produce could be
@@ -586,13 +593,21 @@ These were surfaced but not fully audited; several are latent-but-serious.
   `block_timestamps_must_strictly_increase`,
   `produce_block_clamps_timestamp_to_stay_monotonic`, and
   `future_drift_bound_tolerates_skew_and_rejects_gross_drift`.
-- **E3 — MEDIUM — Merkle proof DoS + leaf/internal domain separation.**
-  `merkle.rs:88` `verify_merkle_proof` loops over `proof.steps` with no length
-  bound (browser/light clients verify node-supplied proofs → a huge proof pins
-  client CPU); `hash_pair` uses one domain for internal nodes with no distinct leaf
-  prefix, and odd layers duplicate the last node (the RFC-6962 second-preimage
-  "duplicate-last" foot-gun). Fix: cap proof length, add a distinct leaf-vs-internal
-  domain prefix, and review odd-layer handling.
+- **E3 — MEDIUM — RESOLVED (commit `c797f00`; residual documented) — Merkle proof
+  DoS + leaf/internal domain separation.** `merkle.rs:88` `verify_merkle_proof`
+  looped over `proof.steps` with no length bound (browser/light clients verify
+  node-supplied proofs → a huge proof pins client CPU); `hash_pair` uses one domain
+  for internal nodes, and odd layers duplicate the last node. **Fix (DoS, the
+  exploitable part):** `verify_merkle_proof` rejects proofs longer than
+  `MAX_MERKLE_PROOF_STEPS` (64, i.e. 2^64 leaves) before hashing. **Second-preimage
+  analysis (documented in the module):** internal nodes carry the `WEBC_MERKLE_V1`
+  domain, distinct from every separately-domained caller leaf, so the RFC-6962
+  leaf/internal confusion does not apply here even though leaves are pre-hashed.
+  **Residual (deferred, documented):** removing the odd-layer duplicate-last would
+  change every historical root and the cross-language SDK root computation, so it is
+  a deliberate coordinated root-format change, not a silent one; it cannot forge
+  WEBC's fixed-leaf-set consensus roots. Reproduced first by
+  `verify_rejects_an_over_length_proof_without_hashing_it`.
 - **E4 — P1 — long-range / weak-subjectivity sync.** State sync hands a late node
   a block + certificate, validator sets are per-epoch snapshots, and state is
   latest-only (ST/§4.2) — a fresh node has no trusted anchor and must trust whoever
