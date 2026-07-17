@@ -382,19 +382,34 @@ supply invariant reconciles; build==import deterministic. **Deferred delegated
 mechanics** (§15.13/15.18/15.37): AMM/shared-pool curve pricing, multi-hop
 routing, finer tick sizes, complex slippage — later refinements.
 
-### Autonomous continuation: Phase 9 — agent commerce (§15.5/§15.32)
+### Phase 9 — agent commerce (§15.5/§15.32)
 
-Native and buildable. **First assess the "mandate":** §15.5's agent mandate (an
-instantly-revocable authorization carrying total budget, expiry, counterparty
-allowlist, per-transaction limits) is very close to the EXISTING constrained
-session-key system (`session_key.rs`: `SessionKeyConstraints` with amount budget,
-expiry, allowed operations, per-tx limits, instant revoke). So the mandate is
-largely already implemented — the fresh Phase 9 work is (1) documenting/closing any
-mandate gap (e.g. an explicit counterparty allowlist if session keys lack it), and
-(2) the **service registry** (§15.5b: an on-chain registry where services publish
-machine-readable prices/interfaces for agent discovery — a bounded native registry
-like the oracle-feed / namespace registries). HTTP-402 payment flows (§15.5c) are
-SDK/integration-level and can follow. Then the remaining phases (10 proofs/PQ, 11
+**Mandate — DONE (9a).** The spec (`agent-commerce.md` §2) is explicit that a
+mandate is a SEPARATE primitive from session keys: session keys authorize the
+owner's own device flows; a mandate authorizes a DISTINCT agent identity with its
+own key and audit trail. Implemented as `mandate.rs`: a PRE-FUNDED, instantly-
+revocable on-chain mandate (`GrantMandate`/`TopUpMandate`/`SpendUnderMandate`/
+`RevokeMandate`) enforcing budget + per-tx max + expiry + daily rate-limit +
+counterparty policy (Open | Allowlist of recipients/category tags), no
+re-delegation, agent-key-signed spends, full audit trail. New `mandate_escrow`
+supply bucket (grant locks, spend draws, revoke/expire-reclaim returns the
+remainder); state-commitment domain V14→V15; adversarial coverage of every
+rejection path + supply-balanced assertions. Merged 69a4840.
+
+**Service registry — in progress (9b).** A bounded, namespace-scoped, fee-priced
+native registry (`service_registry.rs`, §15.5b/§3 of `agent-commerce.md`) where
+services publish machine-readable categories/prices/interfaces for agent
+discovery — built like the oracle-feed / namespace registries, only the current
+revision in committed state (monotonic `revision`; history is archival). Closes
+the mandate category-allowlist loop with a service-scoped spend
+(`SpendUnderMandateToService`) that resolves `Category` tags against a service's
+registered categories. Domain V15→V16.
+
+**Follow-ups (later, mostly non-consensus):** HTTP-402 payment flow (§4) and the
+SDK agent toolkit (mandate management UI, agent discover→validate→pay→retry
+client, service challenge/verify middleware) are SDK/integration-level. The
+docs-as-data registry snapshot and the flagship agent-marketplace showcase ride
+on the primitives above. Then the remaining phases (10 proofs/PQ, 11
 fast-path+benchmarks, 12 web platform, 13 tokens/NFTs, 14 bridges, 15 validator
 ops, 16 testnet/distribution, 17 mainnet gates, 18 production bridges, 19 phase-2)
 are increasingly owner-gated (bridge trust model, mainnet) or need external
