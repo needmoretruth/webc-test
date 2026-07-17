@@ -3312,6 +3312,55 @@ mod tests {
     }
 
     #[test]
+    fn dex_operations_have_stable_wire_vectors() {
+        // Pins the canonical (sorted, JS-safe) JSON of the native DEX operations
+        // (Phase 8, §15.37). `canonical_json_bytes` is the signing/state-root
+        // encoder the browser SDK's `canonicalJson` mirrors: object keys are sorted
+        // recursively, `Amount`/`Price` are decimal STRINGS, `order_id` is lowercase
+        // hex, `deadline_height` a number, `fill_or_cancel` a bool. These exact
+        // strings are cross-checked in `sdk/webc-js/src/native-ops.test.ts`, so DEX
+        // has real Rust<->TS byte parity (it previously had none).
+        let order_id = crate::OrderId::new(webc_crypto::Hash256([0x88; 32]));
+        let submit = Operation::SubmitOrder {
+            order_id,
+            pair: crate::TradingPair {
+                base: crate::AssetId::NativeWebc,
+                quote: crate::AssetId::External {
+                    origin_chain: crate::ExternalChain::Ethereum,
+                    symbol: "USDC".to_owned(),
+                    contract_or_mint: "0x1234".to_owned(),
+                },
+            },
+            side: crate::OrderSide::Sell,
+            amount: Amount::from_units(1_000),
+            limit_price: crate::Price(5),
+            deadline_height: 0,
+            fill_or_cancel: false,
+        };
+        // Strict serde round-trip (the enum is `deny_unknown_fields`).
+        let text = serde_json::to_string(&submit).expect("submit serializes");
+        assert_eq!(serde_json::from_str::<Operation>(&text).unwrap(), submit);
+        let submit_canonical = String::from_utf8(
+            crate::canonical::canonical_json_bytes(&submit).expect("canonical submit"),
+        )
+        .unwrap();
+        assert_eq!(
+            submit_canonical,
+            "{\"SubmitOrder\":{\"amount\":\"1000\",\"deadline_height\":0,\"fill_or_cancel\":false,\"limit_price\":\"5\",\"order_id\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"pair\":{\"base\":\"NativeWebc\",\"quote\":{\"External\":{\"contract_or_mint\":\"0x1234\",\"origin_chain\":\"Ethereum\",\"symbol\":\"USDC\"}}},\"side\":\"Sell\"}}"
+        );
+
+        let cancel = Operation::CancelOrder { order_id };
+        let cancel_canonical = String::from_utf8(
+            crate::canonical::canonical_json_bytes(&cancel).expect("canonical cancel"),
+        )
+        .unwrap();
+        assert_eq!(
+            cancel_canonical,
+            "{\"CancelOrder\":{\"order_id\":\"8888888888888888888888888888888888888888888888888888888888888888\"}}"
+        );
+    }
+
+    #[test]
     fn nft_operations_have_stable_wire_vectors() {
         // Pins the canonical JSON of the native NFT operations (Phase 13b, §15) so a
         // browser SDK mirror must reproduce these exact field names and sorted-key
