@@ -280,7 +280,8 @@ mod tests {
     use super::*;
     use crate::{
         Amount, DoubleVoteEvidence, FeeBid, FeePolicy, GenesisAccount, GenesisConfig,
-        GenesisValidator, Operation, SignedVote, SlashingEvidence, ValidatorStatus, Vote, VoteType,
+        GenesisValidator, ObjectId, Operation, SignedVote, SlashingEvidence, ValidatorStatus, Vote,
+        VoteType,
     };
     use webc_crypto::Keypair;
 
@@ -705,6 +706,77 @@ mod tests {
         ));
         // A rejected block leaves the importer's state untouched.
         assert_eq!(importer_state, before);
+    }
+
+    #[test]
+    fn fair_packing_rejects_a_single_namespace_monopolizing_a_block() {
+        // Phase 6 acceptance: a block that packs one application namespace beyond its
+        // fair per-block share is invalid, so a Byzantine proposer cannot let one hot
+        // app monopolize capacity (apply_block re-runs this and rejects it too). Cap
+        // = 100_000 * 5000 / 10_000 = 50_000 units = 2 object ops; a third exceeds it.
+        let config = ChainConfig {
+            fee_policy: FeePolicy {
+                target_block_units: 50_000,
+                max_block_units: 100_000,
+                namespace_block_share_bps: 5_000,
+                ..FeePolicy::default()
+            },
+            ..ChainConfig::default()
+        };
+        let alice = Keypair::from_seed([71u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let namespace = Hash256::digest(b"greedy-app");
+        let object_op = |nonce: u64| {
+            Transaction::for_operation(
+                &alice,
+                nonce,
+                Operation::CreateObject {
+                    object_id: ObjectId::new(Hash256::digest(format!("obj-{nonce}").as_bytes())),
+                    namespace,
+                    data: Vec::new(),
+                },
+                FeeBid {
+                    gas_limit: 30_000,
+                    max_fee_per_unit: 1,
+                    priority_fee_per_unit: 0,
+                },
+            )
+            .expect("object op signs")
+        };
+
+        // Two object ops in one namespace fit the fair share and build a valid block.
+        let mut ok_state = ChainState::from_genesis(&genesis).unwrap();
+        build_block(
+            &mut ok_state,
+            &config,
+            build_input(&config, alice.address()),
+            vec![object_op(0), object_op(1)],
+            Vec::new(),
+        )
+        .expect("two object ops fit the namespace share");
+
+        // A third pushes the namespace past its share cap: the whole block is
+        // rejected and the caller's state is left unchanged.
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            build_block(
+                &mut state,
+                &config,
+                build_input(&config, alice.address()),
+                vec![object_op(0), object_op(1), object_op(2)],
+                Vec::new(),
+            ),
+            Err(ChainError::NamespaceBlockShareExceeded { maximum: 50_000, .. })
+        ));
+        assert_eq!(state, before);
     }
 
     #[test]

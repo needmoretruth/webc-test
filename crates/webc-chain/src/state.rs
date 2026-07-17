@@ -9290,4 +9290,276 @@ mod tests {
         assert_eq!(state.namespaces[&namespace].owner, bob.address());
         assert!(state.supply_invariant_report().unwrap().balanced);
     }
+
+    // ----- Phase 6: localized (per-namespace) fee pricing -----
+
+    /// Runs one block's fee finalization with `namespace` charged `units` this
+    /// block and a zero total (so the global base fee decays), asserting success.
+    fn finish_block_with_namespace_usage(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        namespace: Hash256,
+        units: u64,
+    ) {
+        let mut usage = BTreeMap::new();
+        usage.insert(namespace, units);
+        state
+            .finish_block(0, &usage, config)
+            .expect("block finalization succeeds");
+    }
+
+    fn create_in(namespace: Hash256, seed: &[u8]) -> Operation {
+        Operation::CreateObject {
+            object_id: ObjectId::new(Hash256::digest(seed)),
+            namespace,
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn namespace_congestion_raises_only_its_own_localized_price() {
+        // Phase 6 headline acceptance: heavy load in namespace A raises A's own
+        // localized base fee, while an unrelated namespace B stays at the network
+        // floor — one application's congestion never raises another's price.
+        let (config, mut state, _alice, bob) = funded_state();
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let ns_a = Hash256::digest(b"app-a");
+        let ns_b = Hash256::digest(b"app-b");
+        let hot = config.fee_policy.per_namespace_target_units * 3;
+
+        // Drive many blocks that saturate ONLY namespace A.
+        for _ in 0..24 {
+            finish_block_with_namespace_usage(&mut state, &config, ns_a, hot);
+        }
+
+        let a_fee = state.namespace_fees[&ns_a].base_fee_per_unit;
+        assert!(a_fee > min, "namespace A congestion must raise A's localized fee");
+
+        // Namespace B never appeared in any usage map: it carries no record and is
+        // priced at exactly the network minimum, unaffected by A's congestion.
+        assert!(state.namespace_fees.get(&ns_b).is_none());
+        assert_eq!(
+            state.base_fee_per_unit_for(&create_in(ns_b, b"b-obj"), &config),
+            min,
+            "an idle namespace prices at the floor regardless of another's congestion"
+        );
+        // A's object operations are priced by A's raised localized fee.
+        assert_eq!(
+            state.base_fee_per_unit_for(&create_in(ns_a, b"a-obj"), &config),
+            a_fee
+        );
+        // Account-scoped operations keep the global base fee, independent of A.
+        assert_eq!(
+            state.base_fee_per_unit_for(
+                &Operation::Transfer {
+                    to: bob.address(),
+                    amount: Amount::from_units(1),
+                },
+                &config,
+            ),
+            state.current_base_fee_per_unit
+        );
+    }
+
+    #[test]
+    fn localized_base_fee_never_drops_below_the_network_minimum() {
+        let (config, mut state, _alice, _bob) = funded_state();
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let ns = Hash256::digest(b"floor-ns");
+        for _ in 0..20 {
+            finish_block_with_namespace_usage(
+                &mut state,
+                &config,
+                ns,
+                config.fee_policy.per_namespace_target_units * 3,
+            );
+        }
+        let raised = state.namespace_fees[&ns].base_fee_per_unit;
+        assert!(raised > min);
+
+        // Idle it: the localized fee decays monotonically, never below the floor,
+        // and once it returns to the floor the record is dropped entirely (so the
+        // committed map stays bounded to currently-congested namespaces).
+        let idle = BTreeMap::new();
+        let mut previous = raised;
+        for _ in 0..2_000 {
+            state.finish_block(0, &idle, &config).expect("finish");
+            let now = state
+                .namespace_fees
+                .get(&ns)
+                .map(|s| s.base_fee_per_unit)
+                .unwrap_or(min);
+            assert!(now <= previous, "localized fee decays monotonically while idle");
+            assert!(now >= min, "localized fee never drops below the network minimum");
+            previous = now;
+        }
+        assert!(
+            state.namespace_fees.get(&ns).is_none(),
+            "a namespace back at the floor carries no committed record"
+        );
+    }
+
+    #[test]
+    fn object_op_pays_localized_fee_and_account_ops_are_unaffected() {
+        // End-to-end charging: after congesting namespace `ns`, an object op there
+        // is charged its raised localized fee, while a native Transfer keeps paying
+        // the global base fee. Supply still reconciles.
+        let (config, mut state, alice, bob) = funded_state();
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let ns = Hash256::digest(b"hot-app");
+        for _ in 0..24 {
+            finish_block_with_namespace_usage(
+                &mut state,
+                &config,
+                ns,
+                config.fee_policy.per_namespace_target_units * 3,
+            );
+        }
+        let localized = state.namespace_fees[&ns].base_fee_per_unit;
+        assert!(localized > min);
+        // The global fee decayed to the floor across those idle-total blocks.
+        assert_eq!(state.current_base_fee_per_unit, min);
+
+        // A native Transfer (account-scoped) pays the GLOBAL base fee, so a max-fee
+        // at the floor still clears despite the namespace congestion.
+        let before = state.accounts[&alice.address()].balance.0;
+        let transfer = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::Transfer {
+                to: bob.address(),
+                amount: Amount::from_units(1),
+            },
+            unit_fee(1_000),
+        )
+        .expect("transfer signs");
+        state
+            .execute_transaction(&transfer, &config)
+            .expect("transfer clears at the global base fee");
+        let spent = before - state.accounts[&alice.address()].balance.0;
+        assert_eq!(
+            spent,
+            1 + 500 * u128::from(min),
+            "transfer pays amount + units*global_base_fee, not the localized fee"
+        );
+
+        // An object op in the congested namespace priced with a floor max-fee is now
+        // rejected (its localized base fee is above the floor)...
+        let cheap = Transaction::for_operation(
+            &alice,
+            1,
+            create_in(ns, b"o1"),
+            unit_fee(30_000),
+        )
+        .expect("create signs");
+        assert!(matches!(
+            state.execute_transaction(&cheap, &config),
+            Err(ChainError::FeeTooLow)
+        ));
+
+        // ...and clears when the bid covers the localized fee, charged units*localized.
+        let burned_before = state.burned_fees.0;
+        let pool_before = state.validator_fee_pool.0;
+        let create = Transaction::for_operation(
+            &alice,
+            1,
+            create_in(ns, b"o1"),
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: localized,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("create signs");
+        state
+            .execute_transaction(&create, &config)
+            .expect("object op clears at the localized fee");
+        let fee_charged = (state.burned_fees.0 - burned_before) + (state.validator_fee_pool.0 - pool_before);
+        assert_eq!(
+            fee_charged,
+            20_000 * u128::from(localized),
+            "object op is charged units*localized_base_fee"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn localized_base_fees_are_deterministic_across_runs() {
+        // Determinism: identical usage sequences produce identical localized fees
+        // and state roots, independent of run.
+        let (config, _seed_state, _a, _b) = funded_state();
+        let ns1 = Hash256::digest(b"n1");
+        let ns2 = Hash256::digest(b"n2");
+        let run = || {
+            let (_c, mut state, _a, _b) = funded_state();
+            for round in 0..15u64 {
+                let mut usage = BTreeMap::new();
+                usage.insert(ns1, config.fee_policy.per_namespace_target_units * 2 + round);
+                usage.insert(ns2, config.fee_policy.per_namespace_target_units / 2);
+                state.finish_block(round + 1, &usage, &config).expect("finish");
+            }
+            (state.namespace_fees.clone(), state.state_root().expect("root"))
+        };
+        assert_eq!(run(), run(), "localized fees are a deterministic function of usage");
+    }
+
+    #[test]
+    fn namespace_fee_state_survives_bincode_restart_with_stable_state_root() {
+        // Crash-restart (bincode round-trip): the committed localized fee state and
+        // the state root must survive, so a node cannot silently diverge on
+        // localized pricing after reloading from disk.
+        let (config, mut state, _alice, _bob) = funded_state();
+        let ns = Hash256::digest(b"restart-fee-ns");
+        for _ in 0..12 {
+            finish_block_with_namespace_usage(
+                &mut state,
+                &config,
+                ns,
+                config.fee_policy.per_namespace_target_units * 3,
+            );
+        }
+        assert!(state.namespace_fees[&ns].base_fee_per_unit > config.fee_policy.min_base_fee_per_unit);
+
+        let bytes = bincode::serialize(&state).expect("state serializes");
+        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        assert_eq!(
+            restored.namespace_fees, state.namespace_fees,
+            "restart preserves the per-namespace fee state"
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "localized fee state is committed by the state root across a restart"
+        );
+    }
+
+    #[test]
+    fn namespace_fee_state_is_committed_by_the_state_root() {
+        // E8 extension: the localized per-namespace fee map is a committed consensus
+        // field (via the namespace_fee_root sub-root), so inserting or changing a
+        // namespace's localized fee must change the state root. Otherwise two nodes
+        // could diverge on localized pricing yet share a state root.
+        let (_config, base, _a, _b) = funded_state();
+        let root = base.state_root().unwrap();
+        let ns = Hash256::digest(b"fee-commit-ns");
+
+        let mut inserted = base.clone();
+        inserted
+            .namespace_fees
+            .insert(ns, NamespaceFeeState { base_fee_per_unit: 7 });
+        assert_ne!(
+            inserted.state_root().unwrap(),
+            root,
+            "adding a localized fee must change the state root (E8)"
+        );
+
+        let mut changed = inserted.clone();
+        changed.namespace_fees.get_mut(&ns).unwrap().base_fee_per_unit = 8;
+        assert_ne!(
+            changed.state_root().unwrap(),
+            inserted.state_root().unwrap(),
+            "changing a localized fee must change the state root (E8)"
+        );
+    }
 }

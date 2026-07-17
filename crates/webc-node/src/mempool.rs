@@ -547,6 +547,102 @@ mod tests {
         .unwrap()
     }
 
+    fn create_object(from: &Keypair, namespace: Hash256, obj_seed: &[u8], nonce: u64) -> Transaction {
+        Transaction::for_operation(
+            from,
+            nonce,
+            Operation::CreateObject {
+                object_id: webc_chain::ObjectId::new(Hash256::digest(obj_seed)),
+                namespace,
+                data: Vec::new(),
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fair_packing_defers_a_hot_namespace_but_admits_other_namespaces() {
+        // Phase 6 acceptance: when one application namespace floods the pool, the
+        // fair packer includes only up to its per-block share cap and defers the
+        // rest, while still admitting an unrelated namespace's transactions — one
+        // hot app cannot monopolize block capacity.
+        let hot = keypair(1);
+        let other = keypair(2);
+        // A small block so the cap is a couple of object operations: cap =
+        // 100_000 * 5000 / 10_000 = 50_000 units = 2 object operations (20_000 each);
+        // a third would exceed it.
+        let config = ChainConfig {
+            fee_policy: webc_chain::FeePolicy {
+                target_block_units: 50_000,
+                max_block_units: 100_000,
+                namespace_block_share_bps: 5_000,
+                ..webc_chain::FeePolicy::default()
+            },
+            ..ChainConfig::default()
+        };
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![
+                GenesisAccount {
+                    address: hot.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+                GenesisAccount {
+                    address: other.address(),
+                    balance: Amount::from_webc(1_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).unwrap();
+        let ns_hot = Hash256::digest(b"hot-namespace");
+        let ns_other = Hash256::digest(b"other-namespace");
+
+        let mut pool = Mempool::new(MempoolConfig::default());
+        // Three object creates in the hot namespace (only two fit under the cap).
+        for nonce in 0..3u64 {
+            pool.insert(
+                create_object(&hot, ns_hot, format!("hot-{nonce}").as_bytes(), nonce),
+                &state,
+                &config,
+                NOW,
+            )
+            .unwrap();
+        }
+        // One object create in an unrelated namespace.
+        pool.insert(
+            create_object(&other, ns_other, b"other-0", 0),
+            &state,
+            &config,
+            NOW,
+        )
+        .unwrap();
+
+        let block = pool.select_block(&state, &config, u64::MAX, NOW);
+
+        let hot_selected = block
+            .iter()
+            .filter(|tx| tx.operation.fee_namespace() == Some(ns_hot))
+            .count();
+        let other_selected = block
+            .iter()
+            .filter(|tx| tx.operation.fee_namespace() == Some(ns_other))
+            .count();
+        assert_eq!(
+            hot_selected, 2,
+            "the hot namespace is capped at its fair per-block share (2 object ops)"
+        );
+        assert_eq!(
+            other_selected, 1,
+            "an unrelated namespace's transaction is still admitted alongside the hot one"
+        );
+    }
+
     #[test]
     fn full_pool_evicts_lowest_fee_for_a_strictly_higher_bidder() {
         // H2: a full pool admits a strictly higher bidder by evicting the

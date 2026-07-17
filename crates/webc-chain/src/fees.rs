@@ -243,14 +243,20 @@ pub struct NamespaceFeeState {
 /// Raises the fee toward `current + current*(used-target)/(target*denominator)`
 /// when `used > target` (minimum +1 so a persistently full target always moves),
 /// symmetrically lowers it when `used < target`, and floors the result at `min`.
-/// Callers must validate `target != 0` and `denominator != 0` first. Deterministic
-/// checked arithmetic that fails closed on overflow.
+/// `min_decrease_step` sets the smallest downward move when `used < target`: `0`
+/// preserves the plain EIP-1559 rule (a small fee can stall just above the floor),
+/// while `1` guarantees the fee decays all the way to `min` when persistently idle
+/// — the localized path uses `1` so an uncongested namespace always returns to the
+/// floor and its committed record is dropped, keeping the per-namespace fee map
+/// bounded. Callers must validate `target != 0` and `denominator != 0` first.
+/// Deterministic checked arithmetic that fails closed on overflow.
 fn adjust_base_fee(
     current: u64,
     units_used: u64,
     target: u64,
     denominator: u64,
     min: u64,
+    min_decrease_step: u64,
 ) -> Result<u64, ChainError> {
     let current = current.max(min);
     if units_used == target {
@@ -279,11 +285,13 @@ fn adjust_base_fee(
             .ok_or(ChainError::ArithmeticOverflow)?
             / u128::from(target)
             / u128::from(denominator);
-        let decrease = u64::try_from(decrease).map_err(|_| ChainError::ArithmeticOverflow)?;
-        Ok(current
-            .checked_sub(decrease)
-            .ok_or(ChainError::ArithmeticOverflow)?
-            .max(min))
+        let decrease = u64::try_from(decrease)
+            .map_err(|_| ChainError::ArithmeticOverflow)?
+            .max(min_decrease_step);
+        // `saturating_sub` cannot underflow; the `.max(min)` floor is what actually
+        // bounds the result (the plain-EIP-1559 decrease is always `<= current`, and
+        // a forced `min_decrease_step` only ever drives `current` down toward `min`).
+        Ok(current.saturating_sub(decrease).max(min))
     }
 }
 
@@ -306,6 +314,9 @@ pub fn next_base_fee(current: u64, units_used: u64, policy: &FeePolicy) -> Resul
         policy.target_block_units,
         policy.base_fee_adjustment_denominator,
         policy.min_base_fee_per_unit,
+        // The single global base fee keeps the plain EIP-1559 rule (no forced
+        // downward step); it is one scalar and never accumulates records.
+        0,
     )
 }
 
@@ -335,6 +346,9 @@ pub fn next_localized_base_fee(
         policy.per_namespace_target_units,
         policy.base_fee_adjustment_denominator,
         policy.min_base_fee_per_unit,
+        // Force at least a 1-unit downward step when idle so an uncongested
+        // namespace always decays to the floor and sheds its committed record.
+        1,
     )
 }
 
@@ -435,6 +449,19 @@ mod tests {
             next_localized_base_fee(policy.min_base_fee_per_unit, 0, &policy).unwrap(),
             policy.min_base_fee_per_unit
         );
+    }
+
+    #[test]
+    fn localized_base_fee_decays_all_the_way_to_the_floor_when_idle() {
+        // The forced 1-unit downward step guarantees an idle namespace returns to
+        // the network floor (a plain EIP-1559 decrease stalls just above it), so a
+        // once-congested namespace's committed record can always be dropped.
+        let policy = FeePolicy::default();
+        let mut fee = 1_000u64;
+        for _ in 0..10_000 {
+            fee = next_localized_base_fee(fee, 0, &policy).expect("valid policy");
+        }
+        assert_eq!(fee, policy.min_base_fee_per_unit, "idle localized fee reaches the floor");
     }
 
     #[test]
