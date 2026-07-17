@@ -505,6 +505,33 @@ trust model, mainnet governance) or needs external resources (benchmarks, audits
 live bridges). Surface those to the owner rather than deciding alone. A separate
 **transaction-system** goal runs independently on `codex/transaction-system`.
 
+### SDK native-operation coverage — DONE (Phase 12 sliver)
+
+The TypeScript SDK (`sdk/webc-js`) now exposes **all 38 new native operations**
+(tokens, NFTs, governance, mandate, service registry, oracle, DEX) plus 13 new
+state-key kinds, with cross-language canonical-JSON parity tests pinned against
+the Rust wire vectors. `defaultAccessList` replicates every Rust access-list arm
+in exact insertion order (including TransferToken's both-parties `TokenFreeze`
+reads); the six state-derived ops (governance vote/resolve/execute/reclaim/open,
+mandate→service spend) expose `accessListFor*` helpers mirroring the Rust `for_*`
+constructors and `signTransaction` refuses to auto-derive them. Merged into main
+e51e7de. A follow-up (75519c6) added the Rust `dex_operations_have_stable_wire_vectors`
+test so DEX — previously the one family with no Rust vector — now has real
+Rust↔TS byte parity.
+
+### In progress — HTTP-402 agent-payment flow (Phase 9 §4, agent-commerce flagship)
+
+An SDK helper (`sdk/webc-js/src/http402.ts`) for the agent-commerce showcase: an
+agent validates a `402` challenge against the on-chain registry entry (price +
+pay-to must match, defeating a compromised endpoint), pays via
+`SpendUnderMandateToService` under its mandate, and retries with a verifiable
+payment reference. Registry entry is caller-provided (decoupled from node-API
+gaps); tested with mock challenges + all failure modes. After this, the next
+autonomous candidates are node read-APIs for the new state (token balances / NFT
+ownership / governance proposals / service registry — needed so apps can QUERY
+these, touches `webc-node`) and more fuzz/property hardening of the fund-moving
+op decoders. Everything beyond stays owner-gated/external per the list above.
+
 ### Original Phase 13 rationale — native tokens / NFTs / app governance
 
 Chosen next because it is the cleanest FULLY-AUTONOMOUS native block: spec-decided
