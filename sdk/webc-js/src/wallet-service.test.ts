@@ -535,6 +535,52 @@ describe("trusted wallet service persistence", () => {
     if (overLimit && !overLimit.ok) expect(overLimit.error.code).toBe("LIMIT_EXCEEDED");
   });
 
+  it("rejects a reconnect whose carried spend exceeds the new cumulative cap (S5)", async () => {
+    // A prior grant spent 2 WEBC. Reconnecting with a 1 WEBC cumulative cap must
+    // be refused cleanly (LIMIT_EXCEEDED), not create a grant whose spend already
+    // exceeds its cap and then fail opaquely on the next write/transfer.
+    const restored: PersistedPermissionGrant[] = [
+      {
+        origin: HOST_ORIGIN,
+        authorization_lane: "a".repeat(64),
+        scopes: ["sign_native_transfer"],
+        limits: LIMITS,
+        spent_amount: "2000000000000",
+      },
+    ];
+    const source = new CapturingSource();
+    const service = new TrustedWalletService({
+      wallet,
+      chainId: CHAIN_ID,
+      expectedSource: source,
+      confirm: async () => true,
+      restoredGrants: restored,
+    });
+    await service.handleMessage({
+      origin: HOST_ORIGIN,
+      source,
+      data: {
+        channel: WALLET_MESSAGE_CHANNEL,
+        version: WALLET_MESSAGE_VERSION,
+        request_id: requestId("1"),
+        method: "connect",
+        params: {
+          scopes: ["sign_native_transfer"],
+          limits: {
+            max_amount_per_transaction: "1000000000000",
+            max_total_amount: "1000000000000",
+            max_fee_per_transaction: "10000",
+          },
+        },
+      },
+    });
+    const response = source.messages.at(-1)?.response;
+    expect(response?.ok).toBe(false);
+    if (response && !response.ok) {
+      expect(response.error.code).toBe("LIMIT_EXCEEDED");
+    }
+  });
+
   it("keeps a restored grant dormant until the origin reconnects", async () => {
     const restored: PersistedPermissionGrant[] = [
       {

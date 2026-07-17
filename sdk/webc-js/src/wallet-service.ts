@@ -258,6 +258,20 @@ export class TrustedWalletService {
     request: WalletRequest,
   ): Promise<WalletConnectionResult | SignedTransactionJson | { revoked: true }> {
     if (request.method === "connect") {
+      const requestedLimits = parseSpendLimits(request.params.limits);
+      const previous = this.#grants.get(origin);
+      // Cumulative spend carries over across a reconnect so a hostile host cannot
+      // reset its budget by reconnecting; only an explicit revoke clears it. If
+      // the newly requested cumulative cap is BELOW what was already spent, refuse
+      // cleanly here (before the user is even prompted) instead of building a
+      // grant whose spend already exceeds its own cap — which would otherwise
+      // surface later as an opaque INTERNAL_ERROR (persistence) after approval.
+      if (previous && previous.spentAmount > requestedLimits.maxTotalAmount) {
+        throw serviceError(
+          "LIMIT_EXCEEDED",
+          "already-spent amount exceeds the requested cumulative limit; revoke before reconnecting with a lower limit",
+        );
+      }
       const approved = await this.#confirm({
         kind: "connect",
         origin,
@@ -265,18 +279,15 @@ export class TrustedWalletService {
         limits: request.params.limits,
       });
       if (!approved) throw serviceError("USER_REJECTED", "user rejected connection");
-      const previous = this.#grants.get(origin);
       // The lane is deterministic per origin, so an existing grant's lane is
-      // reused without another signature. Cumulative spend carries over across a
-      // reconnect so a hostile host cannot reset a spend budget by reconnecting;
-      // only an explicit revoke clears it. A fresh session id is always issued.
+      // reused without another signature. A fresh session id is always issued.
       const authorizationLane =
         previous?.authorizationLane ??
         (await deriveOriginAuthorizationLane(this.#wallet, origin));
       const sessionId = createWalletRequestId();
       const grant: PermissionGrant = {
         limitsJson: request.params.limits,
-        limits: parseSpendLimits(request.params.limits),
+        limits: requestedLimits,
         authorizationLane,
         sessionId,
         spentAmount: previous?.spentAmount ?? 0n,
