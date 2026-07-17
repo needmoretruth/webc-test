@@ -364,7 +364,8 @@ and independent external review before production use.
 
 ## Goal progress checkpoint
 
-Checkpoint on 2026-07-18: the isolated branch is pushed through `528ef4d`.
+Implementation checkpoint on 2026-07-18: the isolated branch contains code
+through `ee25016`; the paused-goal record below is a later docs-only handoff.
 ADR-0012 and `4d54170` freeze the shared interfaces. `d25eb57` adds the
 versioned `FeeSummaryV1` accounting boundary without changing V4 execution.
 `ee09e61` routes every schema-1 `ChainStore` record through a bounded,
@@ -391,6 +392,89 @@ milestone with the last pushed commit, passed tests, remaining limitation, and
 exact next item. This is the recovery pointer if a usage/session limit ends the
 agent. Do not change the global continuation/status documents until final main
 integration.
+
+### Paused-goal handoff (2026-07-18)
+
+The owner asked to stop implementation and leave a durable continuation point.
+Before this handoff edit, `codex/transaction-system` was clean and local `HEAD`,
+the local tracking ref, and `refs/heads/codex/transaction-system` on `origin`
+were all verified equal at `ee2501603ec2736eb193854e1be6d6d8f8da345c`. The
+goal is **not complete** and must not be merged to `main` from this checkpoint.
+
+What is durable on the goal branch:
+
+- `4d54170`: ADR-0012 shared lifecycle/proof interface freeze;
+- `d25eb57`: checked `FeeSummaryV1` base/priority/reserve/refund accounting;
+- `ee09e61`: bounded schema-1 storage codec integration;
+- `b405e6b`: pure indexed transparent Merkle proof integration;
+- `528ef4d`: V5 Rust/browser wire, action/cancel, ID, exact-decimal, and
+  sponsor foundation integration;
+- `ee25016`: tested-foundation checkpoint and honest remaining-scope record.
+
+The last integrated focused gate, run from the goal worktree, passed:
+
+```text
+cargo +1.96.0-x86_64-pc-windows-gnu fmt --check
+cargo +1.96.0-x86_64-pc-windows-gnu test -p webc-proof          # 10 passed
+cargo +1.96.0-x86_64-pc-windows-gnu test -p webc-chain transaction_v5::tests
+                                                               # 7 passed
+cargo +1.96.0-x86_64-pc-windows-gnu clippy -p webc-proof -p webc-chain \
+  --all-targets -- -D warnings
+pnpm check                                                     # 81 SDK + 3 widget
+```
+
+The bounded storage integration was separately rechecked on the goal branch
+with `cargo test -p webc-storage` (32 passed) and strict crate clippy. These are
+focused milestone gates, not evidence for the still-required final full
+workspace, restart, three-validator, dependency, or fuzz gates.
+
+Important boundaries a continuation must not mistake for completion:
+
+- `CURRENT_PROTOCOL_VERSION` remains 1 and V4 execution/fixtures are unchanged;
+- `sdk/webc-js/src/transaction-v5.ts` builds and is exported, but has no dedicated
+  behavior test or frozen Rust/TypeScript V5 signing/ID fixture yet;
+- `webc-proof` currently owns only `IndexedMerkleProofV1`; checkpoint,
+  authority-transition, finalized-transaction proof, and browser parity remain;
+- `ChainStore` still uses schema 1 apart from the bounded codec; lifecycle
+  schema 2, migration, pending/finalized indexes, and atomic lifecycle batches
+  remain;
+- V5 validation/preparation, typed receipts/events, two-level execution,
+  mempool/runtime/V2 API activation, and all end-to-end acceptance tests remain;
+- no STARK dependency, prover, or verifier has been started, as required before
+  Phase 5.5.
+
+Exact continuation sequence:
+
+1. Start from the current clean `origin/codex/transaction-system` (its last code
+   checkpoint is `ee25016` followed by this docs-only handoff), then re-run
+   `git status`, `git log`, and the required-document protocol. Do not continue
+   directly on the three old agent branches: their tips (`bc1e75f`, `a5cd93b`,
+   `e3e417d`) are already merged. Fast-forward an old worktree to the goal branch
+   and create a new `codex/tx-*` branch, or create a fresh verified
+   worktree/branch from `origin/codex/transaction-system`.
+2. Add one immutable V5 vector to the inline Rust transaction tests and a new
+   TypeScript V5 test. Freeze canonical signing bytes, signature, complete JSON,
+   transaction ID, action digest, and sponsored-use bindings; keep every V4
+   vector byte unchanged. Commit, test, and push this independently.
+3. Add focused V1 receipt/event/index wrapper and leaf-hashing modules in
+   `webc-chain`, including fee reconciliation, position/ID binding, failed-event
+   prohibition, equal transaction/receipt counts, and Rust/TypeScript vectors.
+4. Refactor the existing native-operation transition behind one reusable
+   action executor, then add `ValidatedTransaction`, `PreparedTransaction`, and
+   the parent fee/nonce/sponsor plus child action/event overlay. Preserve V4
+   behavior until protocol-2 activation and test success, chargeable failure,
+   rollback, cancel, sponsor replay/budget/revocation, access-prefix, fee, nonce,
+   supply, and a failed transaction followed by an unrelated success.
+5. Only after those chain interfaces are stable, implement storage schema 2 and
+   its resumable migration, then V5 mempool/lifecycle/runtime/V2 HTTP/WebSocket
+   consumers. In parallel where file ownership is disjoint, implement the V4
+   header/authority/checkpoint/finalized-proof chain and browser verifier.
+6. Update this checkpoint after every merged milestone. Update global
+   `implementation-status.md` and `continuation-guide.md` only during the final
+   main integration, exactly as the goal-branch rule above requires.
+
+No owner decision is pending for these steps. Technical choices remain delegated
+and must be recorded in this decision log or a superseding ADR rather than chat.
 
 ## Partial blockers and owner-reserved decisions
 
