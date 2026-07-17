@@ -24,6 +24,7 @@
 //! reporting any mismatch as [`StorageError::Inconsistent`] or
 //! [`StorageError::Corruption`] so the node fails closed on a damaged store.
 
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use webc_chain::{
@@ -114,11 +115,7 @@ impl<K: KvStore> ChainStore<K> {
                     META_SCHEMA_VERSION,
                     CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec(),
                 );
-                batch.put(
-                    Table::Meta,
-                    META_CHAIN_ID,
-                    bincode::serialize(expected_chain_id)?,
-                );
+                batch.put(Table::Meta, META_CHAIN_ID, encode(expected_chain_id)?);
                 store.commit(batch)?;
             }
             Some(bytes) => {
@@ -212,7 +209,7 @@ impl<K: KvStore> ChainStore<K> {
             }
             return Ok(());
         }
-        let state_bytes = bincode::serialize(genesis)?;
+        let state_bytes = encode(genesis)?;
         let tip = ChainTip {
             height: 0,
             block_hash: None,
@@ -220,7 +217,7 @@ impl<K: KvStore> ChainStore<K> {
         };
         let mut batch = WriteBatch::new();
         batch.put(Table::StateSnapshots, be(0).to_vec(), state_bytes);
-        batch.put(Table::Meta, META_TIP, bincode::serialize(&tip)?);
+        batch.put(Table::Meta, META_TIP, encode(&tip)?);
         self.store.commit(batch)
     }
 
@@ -271,8 +268,8 @@ impl<K: KvStore> ChainStore<K> {
             .block
             .hash()
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
-        let block_bytes = bincode::serialize(commit.block)?;
-        let state_bytes = bincode::serialize(commit.state)?;
+        let block_bytes = encode(commit.block)?;
+        let state_bytes = encode(commit.state)?;
         let new_tip = ChainTip {
             height: header.height,
             block_hash: Some(block_hash),
@@ -298,14 +295,14 @@ impl<K: KvStore> ChainStore<K> {
             batch.put(
                 Table::ValidatorSets,
                 be(header.epoch).to_vec(),
-                bincode::serialize(validator_set)?,
+                encode(validator_set)?,
             );
         }
         if let Some(certificate) = commit.certificate {
             batch.put(
                 Table::Certificates,
                 be(header.height).to_vec(),
-                bincode::serialize(certificate)?,
+                encode(certificate)?,
             );
         }
         // The consensus journal for this height is obsolete the moment the
@@ -315,7 +312,7 @@ impl<K: KvStore> ChainStore<K> {
         batch.delete(Table::ConsensusWal, be(header.height).to_vec());
         // The tip advances in the same batch, so it is never observable ahead of
         // its block or state.
-        batch.put(Table::Meta, META_TIP, bincode::serialize(&new_tip)?);
+        batch.put(Table::Meta, META_TIP, encode(&new_tip)?);
         self.store.commit(batch)
     }
 
@@ -399,7 +396,7 @@ impl<K: KvStore> ChainStore<K> {
         batch.put(
             Table::ConsensusWal,
             be(record.height).to_vec(),
-            bincode::serialize(record)?,
+            encode(record)?,
         );
         self.store.commit(batch)
     }
@@ -421,9 +418,36 @@ impl<K: KvStore> ChainStore<K> {
     }
 }
 
+/// Bincode configuration for at-rest storage values (WEBC §15.14).
+///
+/// Variable-length integer encoding, so a small [`webc_chain::Amount`] — whose
+/// non-human-readable `Serialize` emits `serialize_u128` — and small counts cost
+/// a few bytes instead of a fixed 16/8. Trailing bytes are rejected so a stored
+/// value must decode to exactly its bytes (fail closed on corruption). No byte
+/// limit: a full [`ChainState`] snapshot can legitimately exceed one wire frame,
+/// and stored values are this node's own prior writes, not hostile network input.
+///
+/// Every write ([`encode`]) and read ([`decode`]) MUST use this identical config,
+/// or a value written under one would misparse under the other. This replaces the
+/// previous fixed-int `bincode::serialize`/`deserialize`, so the storage-at-rest
+/// byte layout changed (§15.14); the environment is an ephemeral prototype, so no
+/// on-disk migration is provided — a store written by an older build is not read
+/// back by this one.
+fn storage_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .reject_trailing_bytes()
+}
+
+/// Serializes a value into the at-rest [`storage_options`] byte layout.
+fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, bincode::Error> {
+    storage_options().serialize(value)
+}
+
 /// Decodes a bincode value, mapping any failure to a corruption error.
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, StorageError> {
-    bincode::deserialize(bytes)
+    storage_options()
+        .deserialize(bytes)
         .map_err(|error| StorageError::Corruption(format!("stored value is malformed: {error}")))
 }
 
@@ -696,18 +720,14 @@ mod tests {
         batch.put(
             Table::Meta,
             META_CHAIN_ID.to_vec(),
-            bincode::serialize(&ChainId::devnet()).unwrap(),
+            encode(&ChainId::devnet()).unwrap(),
         );
         let tip = ChainTip {
             height: 5,
             block_hash: Some(Hash256([7u8; 32])),
             state_root: Hash256([9u8; 32]),
         };
-        batch.put(
-            Table::Meta,
-            META_TIP.to_vec(),
-            bincode::serialize(&tip).unwrap(),
-        );
+        batch.put(Table::Meta, META_TIP.to_vec(), encode(&tip).unwrap());
         backend.commit(batch).unwrap();
         let err = ChainStore::open(backend, &ChainId::devnet()).unwrap_err();
         assert!(matches!(err, StorageError::Inconsistent(_)));

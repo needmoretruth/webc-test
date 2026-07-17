@@ -3,11 +3,22 @@
 //!
 //! # Bincode config
 //!
-//! Fixed-int encoding keeps leading fields (magic, version) at stable byte
-//! offsets so a frame can be rejected cheaply before its payload is trusted, and
-//! rejecting trailing bytes forces a frame to consume exactly its bytes. Both
-//! the message envelope and the handshake frames use this identical bincode
-//! config (via [`encode`]/[`decode`]).
+//! Variable-length integer encoding (WEBC §15.14): every integer in a frame —
+//! most importantly every [`webc_chain::Amount`] — is written as a bincode
+//! varint, so a small value costs a few bytes instead of a fixed 16 (`u128`) or 8
+//! (`u64`). Rejecting trailing bytes forces a frame to consume exactly its bytes,
+//! and a hard byte cap ([`MAX_FRAME_BYTES`]) bounds a hostile length/count prefix
+//! (finding N6). Both the message envelope and the handshake frames use this
+//! identical bincode config (via [`encode`]/[`decode`]).
+//!
+//! The clear frame header (magic + wire version) is written by [`crate::wire`] as
+//! raw bytes *outside* bincode, so it stays at fixed offsets regardless of the
+//! integer encoding: a foreign or wrong-version frame is still rejected before
+//! its varint payload is decoded. The handshake `HandshakeHello` carries its own
+//! magic/version as its first bincode fields, so bumping the wire version means a
+//! peer speaking the other integer encoding fails the version check (or the
+//! decode) and cleanly refuses to peer rather than misparsing — which is why this
+//! encoding change is gated behind a `NET_PROTOCOL_VERSION` bump (3 → 4).
 //!
 //! # Transparent frame compression (WEBC §15.19/§15.24)
 //!
@@ -62,25 +73,32 @@ const ZSTD_LEVEL: i32 = 3;
 /// codec entirely and cost exactly one tag byte.
 const MIN_COMPRESS_LEN: usize = 64;
 
-/// Shared bincode config: fixed-int lengths, no trailing bytes, and a hard byte
-/// cap ([`MAX_FRAME_BYTES`]).
+/// Shared bincode config: variable-length integers, no trailing bytes, and a
+/// hard byte cap ([`MAX_FRAME_BYTES`]).
+///
+/// Variable-length integers (WEBC §15.14): `.with_varint_encoding()` makes every
+/// integer — and therefore every [`webc_chain::Amount`], whose non-human-readable
+/// `Serialize` emits `serialize_u128` — encode compactly, a few bytes for a small
+/// value instead of a fixed 16. This is a wire-format change, gated behind the
+/// `NET_PROTOCOL_VERSION` 3 → 4 bump so a v3 peer never misparses a v4 frame.
 ///
 /// Why the explicit limit (finding N6): a hostile frame can embed a
-/// length/count prefix claiming billions of elements. The inbound decode is
-/// already bounded in practice — the transport hands the codec a slice no larger
-/// than `MAX_FRAME_BYTES` (the length-delimited codec's `max_frame_length` plus
-/// [`crate::wire::decode_message`]'s own check), and serde caps its speculative
-/// pre-allocation — but that is defense-by-accident. Binding the limit to
-/// `MAX_FRAME_BYTES` here makes the codec fail closed on its own bound rather
-/// than an external one: it rejects any attempt to serialize a value larger than
-/// one legal frame at the source, so no code path can produce or trust an
-/// over-frame buffer, and if the codec is ever pointed at an unbounded reader the
-/// same cap applies to decode. Defense-in-depth for a length-prefix memory/CPU
-/// exhaustion attack (AGENTS.md pitfall 4: bound hostile input before allocating
-/// or looping on it).
+/// length/count prefix claiming billions of elements. Varint encoding does *not*
+/// weaken this — the limit is what bounds it, not the integer width. The inbound
+/// decode is already bounded in practice — the transport hands the codec a slice
+/// no larger than `MAX_FRAME_BYTES` (the length-delimited codec's
+/// `max_frame_length` plus [`crate::wire::decode_message`]'s own check), and
+/// serde caps its speculative pre-allocation — but that is defense-by-accident.
+/// Binding the limit to `MAX_FRAME_BYTES` here makes the codec fail closed on its
+/// own bound rather than an external one: it rejects any attempt to serialize a
+/// value larger than one legal frame at the source, so no code path can produce
+/// or trust an over-frame buffer, and if the codec is ever pointed at an
+/// unbounded reader the same cap applies to decode. Defense-in-depth for a
+/// length-prefix memory/CPU exhaustion attack (AGENTS.md pitfall 4: bound hostile
+/// input before allocating or looping on it).
 pub(crate) fn frame_options() -> impl Options {
     bincode::DefaultOptions::new()
-        .with_fixint_encoding()
+        .with_varint_encoding()
         .reject_trailing_bytes()
         .with_limit(MAX_FRAME_BYTES as u64)
 }
@@ -220,6 +238,23 @@ mod tests {
         let encoded = encode(&value).expect("encode within limit");
         let decoded: Vec<u64> = decode(&encoded).expect("decode within limit");
         assert_eq!(decoded, value);
+    }
+
+    /// The §15.14 payoff in the codec itself: variable-length integer encoding
+    /// makes a small `u128` cost a few bytes, not a fixed 16 — the mechanism
+    /// behind the per-`Amount` wire savings. Every value across the range must
+    /// still round-trip exactly, including `u128::MAX` (which under bincode's
+    /// varint costs one marker byte more than fixint's 16 — the accepted
+    /// trade-off: only the very largest values pay full width).
+    #[test]
+    fn small_integers_use_varint_and_are_compact() {
+        assert!(encode(&1u128).unwrap().len() < 16);
+        assert!(encode(&255u128).unwrap().len() < 16);
+        assert!(encode(&300u128).unwrap().len() < 16);
+        for value in [0u128, 1, 250, 251, 300, u64::MAX as u128, u128::MAX] {
+            let bytes = encode(&value).unwrap();
+            assert_eq!(decode::<u128>(&bytes).unwrap(), value, "value {value}");
+        }
     }
 
     /// Every payload must survive compress/decompress byte-for-byte, whatever the

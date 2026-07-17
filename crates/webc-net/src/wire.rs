@@ -33,7 +33,15 @@ pub const NET_PROTOCOL_MAGIC: [u8; 4] = *b"WEBC";
 /// parse a v3 frame's body. The handshake pins this version and stays
 /// uncompressed, so mismatched peers cleanly refuse to connect (a typed
 /// `UnsupportedVersion`) rather than misparse.
-pub const NET_PROTOCOL_VERSION: u16 = 3;
+///
+/// v4 (P6, WEBC §15.14): the bincode config switched from fixed-int to
+/// variable-length integer encoding (`codec::frame_options`), so every integer in
+/// a frame body — most importantly every [`webc_chain::Amount`] — is now a varint
+/// (a small value costs a few bytes instead of a fixed 16). This changes the byte
+/// layout of every frame and of the bincode handshake frames, so a v3 node cannot
+/// parse a v4 body. The handshake pins this version: a v3 and a v4 node detect the
+/// mismatch and refuse to peer rather than misparse.
+pub const NET_PROTOCOL_VERSION: u16 = 4;
 
 /// Length of the clear frame header: the fixed magic followed by the
 /// little-endian wire version. These bytes are never compressed, so
@@ -158,7 +166,7 @@ mod tests {
     use webc_chain::{Amount, FeeBid, Operation, Transaction};
     use webc_crypto::Keypair;
 
-    fn sample_transaction() -> Transaction {
+    fn transaction_with_amount(amount: Amount) -> Transaction {
         let sender = Keypair::from_seed([9u8; 32]);
         let recipient = Keypair::from_seed([10u8; 32]);
         Transaction::for_operation(
@@ -166,7 +174,7 @@ mod tests {
             0,
             Operation::Transfer {
                 to: recipient.address(),
-                amount: Amount::from_webc(1),
+                amount,
             },
             FeeBid {
                 gas_limit: 1_000,
@@ -175,6 +183,44 @@ mod tests {
             },
         )
         .expect("sign sample transaction")
+    }
+
+    fn sample_transaction() -> Transaction {
+        transaction_with_amount(Amount::from_webc(1))
+    }
+
+    /// WEBC §15.14 on the wire: an `Amount` is now variable-length, so a
+    /// transaction moving a tiny amount serializes in strictly fewer bytes than
+    /// the same transaction moving a near-maximal amount. Under the old fixed-int
+    /// encoding both bodies were identical in size (the amount was always 16
+    /// bytes); the size gap here is the direct proof the amount became a varint,
+    /// while both still round-trip exactly through the full frame path.
+    #[test]
+    fn a_small_amount_serializes_smaller_than_a_large_one_and_both_round_trip() {
+        let small =
+            NetMessage::Transaction(Box::new(transaction_with_amount(Amount::from_units(1))));
+        let large = NetMessage::Transaction(Box::new(transaction_with_amount(Amount(u128::MAX))));
+
+        // Compare the raw bincode bodies (not the compressed frames): the
+        // high-entropy signature makes the payload incompressible, but comparing
+        // the raw payloads isolates the amount-field width from any zstd choice.
+        let small_len = encode_frame(&small).expect("encode small").len();
+        let large_len = encode_frame(&large).expect("encode large").len();
+        assert!(
+            small_len < large_len,
+            "a small amount ({small_len} B) must serialize smaller than a large one ({large_len} B)"
+        );
+
+        for message in [small, large] {
+            let decoded = decode_message(&encode_message(&message).expect("encode frame"))
+                .expect("decode frame");
+            let (NetMessage::Transaction(sent), NetMessage::Transaction(got)) =
+                (&message, &decoded)
+            else {
+                panic!("expected transaction messages");
+            };
+            assert_eq!(sent.hash().unwrap(), got.hash().unwrap());
+        }
     }
 
     #[test]
@@ -460,6 +506,23 @@ mod tests {
         assert!(matches!(
             decode_message(&encoded).unwrap_err(),
             NetError::UnsupportedVersion { actual: 0xFFFF }
+        ));
+    }
+
+    /// A frame carrying the previous wire version (v3, the last fixed-int format)
+    /// is rejected at the clear header before its varint body is ever decoded, so
+    /// a v3 and a v4 node cleanly refuse to peer rather than misparse (WEBC §15.14
+    /// encoding change gated behind the `NET_PROTOCOL_VERSION` 3 → 4 bump).
+    #[test]
+    fn rejects_the_previous_wire_version() {
+        assert_eq!(NET_PROTOCOL_VERSION, 4, "this test pins the v3 → v4 bump");
+        let message = NetMessage::Transaction(Box::new(sample_transaction()));
+        let mut encoded = encode_message(&message).unwrap();
+        // Stamp the little-endian version field (bytes 4..6) back to 3.
+        encoded[4..6].copy_from_slice(&3u16.to_le_bytes());
+        assert!(matches!(
+            decode_message(&encoded).unwrap_err(),
+            NetError::UnsupportedVersion { actual: 3 }
         ));
     }
 
