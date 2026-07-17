@@ -3748,13 +3748,22 @@ impl ChainState {
                     if self.current_epoch > mandate.expiry_epoch.get() {
                         return Err(ChainError::MandateExpired);
                     }
-                    if *amount > mandate.per_tx_max {
-                        return Err(ChainError::MandatePerTxExceeded);
+                    if amount.is_zero() {
+                        return Err(ChainError::MandateZeroAmount);
                     }
-                    // The budget covers BOTH the principal and the fee.
+                    // The budget covers BOTH the principal and the fee, so the
+                    // per-transaction cap must bound their SUM, not the principal
+                    // alone. The fee is agent-chosen (via the priority bid) and is
+                    // drawn from the same escrow; bounding only `amount` would let a
+                    // single high-fee spend drain the whole budget past the per-tx
+                    // and per-day limits the principal set. Checking `amount + fee`
+                    // is what makes `per_tx_max` a real per-spend blast-radius cap.
                     let charge = amount
                         .checked_add(total_fee)
                         .ok_or(ChainError::ArithmeticOverflow)?;
+                    if charge > mandate.per_tx_max {
+                        return Err(ChainError::MandatePerTxExceeded);
+                    }
                     let next_spent = mandate
                         .spent
                         .checked_add(charge)
@@ -3997,13 +4006,19 @@ impl ChainState {
                     if self.current_epoch > mandate.expiry_epoch.get() {
                         return Err(ChainError::MandateExpired);
                     }
-                    if *amount > mandate.per_tx_max {
-                        return Err(ChainError::MandatePerTxExceeded);
+                    if amount.is_zero() {
+                        return Err(ChainError::MandateZeroAmount);
                     }
-                    // The budget covers BOTH the principal and the fee.
+                    // `per_tx_max` bounds the TOTAL leaving escrow per spend
+                    // (principal + agent-chosen fee), not the principal alone — see
+                    // the `SpendUnderMandate` arm for why bounding `amount` alone
+                    // would let one high-fee spend drain the whole budget.
                     let charge = amount
                         .checked_add(total_fee)
                         .ok_or(ChainError::ArithmeticOverflow)?;
+                    if charge > mandate.per_tx_max {
+                        return Err(ChainError::MandatePerTxExceeded);
+                    }
                     let next_spent = mandate
                         .spent
                         .checked_add(charge)
@@ -5950,9 +5965,12 @@ mod tests {
 
     #[test]
     fn spend_over_budget_is_rejected() {
+        // Because grant enforces `per_tx_max <= budget_total`, a single spend can
+        // never exceed the budget without first exceeding the per-tx cap, so the
+        // budget bound is a CUMULATIVE limit: two within-cap spends whose running
+        // total overflows the budget must be rejected on the second.
         let config = mandate_config(1_440);
         let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
-        // Budget only just covers one small spend + fee; a large spend overflows it.
         let mandate_id = grant_mandate(
             &mut state,
             &config,
@@ -5960,16 +5978,15 @@ mod tests {
             &agent,
             0,
             0,
-            Amount::from_units(50_000),
+            Amount::from_units(100_000), // budget covers one 60_000 spend, not two
             Epoch::new(100),
-            Amount::from_units(50_000),
-            0,
+            Amount::from_units(60_000), // per-tx cap (<= budget_total)
+            0,                          // unlimited rate, so only the budget binds
             MandateCounterpartyPolicy::Open,
         )
         .unwrap();
-        let before = state.clone();
-        // 45_000 + 10_000 fee = 55_000 > 50_000 budget.
-        let err = mandate_exec(
+        // First spend: 50_000 + 10_000 fee = 60_000, within both cap and budget.
+        mandate_exec(
             &mut state,
             &config,
             &agent,
@@ -5977,7 +5994,21 @@ mod tests {
             Operation::SpendUnderMandate {
                 mandate_id,
                 recipient: recipient.address(),
-                amount: Amount::from_units(45_000),
+                amount: Amount::from_units(50_000),
+            },
+        )
+        .expect("first within-budget spend succeeds");
+        let before = state.clone();
+        // Second identical spend brings cumulative spent to 120_000 > 100_000.
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            1,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(50_000),
             },
         )
         .unwrap_err();
@@ -6016,6 +6047,97 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ChainError::MandatePerTxExceeded));
+    }
+
+    #[test]
+    fn fee_bid_cannot_inflate_a_spend_past_per_tx_max() {
+        // Regression: a mandate spend draws BOTH the principal and the fee from
+        // escrow, and the fee is agent-chosen via the priority bid. If the per-tx
+        // cap bounded only the principal, one spend with a huge fee could drain the
+        // whole budget past the per-tx and per-day limits the principal set (with
+        // ~half recoverable through the validator fee pool). The cap must bound
+        // principal + fee.
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let budget = Amount::from_units(2_000_000);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            budget,
+            Epoch::new(100),
+            Amount::from_units(1_000), // the tiny per-tx cap the principal intends
+            1,                         // and one spend per day
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let before = state.clone();
+        // A within-cap principal (1_000) but a fee inflated via the priority bid:
+        // base fee is 1/unit, so a max/priority of 100/99 pays 100/unit over 10_000
+        // units = 1_000_000 fee — 1000x the per-tx cap, still inside the 2_000_000
+        // budget. Pre-fix this spend succeeded and drained ~1_000_000 in one tx.
+        let tx = Transaction::for_operation(
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::from_units(1_000),
+            },
+            FeeBid {
+                gas_limit: 100_000,
+                max_fee_per_unit: 100,
+                priority_fee_per_unit: 99,
+            },
+        )
+        .expect("spend tx signs");
+        let err = state.execute_transaction(&tx, &config).unwrap_err();
+        assert!(
+            matches!(err, ChainError::MandatePerTxExceeded),
+            "a fee-inflated spend must be capped, got {err:?}"
+        );
+        // The drain was fully rejected: escrow and all state are untouched.
+        assert_eq!(state, before, "rejected spend leaves state unchanged");
+    }
+
+    #[test]
+    fn zero_amount_spend_is_rejected() {
+        // A zero-principal spend delivers nothing but would still burn budget via
+        // the fee; reject it so a mandate cannot be bled by fee-only spends.
+        let config = mandate_config(1_440);
+        let (mut state, principal, agent, recipient, _stranger) = mandate_fixture(&config);
+        let mandate_id = grant_mandate(
+            &mut state,
+            &config,
+            &principal,
+            &agent,
+            0,
+            0,
+            Amount::from_units(500_000),
+            Epoch::new(100),
+            Amount::from_units(200_000),
+            0,
+            MandateCounterpartyPolicy::Open,
+        )
+        .unwrap();
+        let before = state.clone();
+        let err = mandate_exec(
+            &mut state,
+            &config,
+            &agent,
+            0,
+            Operation::SpendUnderMandate {
+                mandate_id,
+                recipient: recipient.address(),
+                amount: Amount::ZERO,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::MandateZeroAmount));
+        assert_eq!(state, before, "rejected spend leaves state unchanged");
     }
 
     #[test]
@@ -7071,7 +7193,9 @@ mod tests {
             assert!(matches!(err, ChainError::MandatePerTxExceeded));
         }
 
-        // Over-budget: budget only just covers one small spend + fee.
+        // Over-budget is a CUMULATIVE limit (per_tx_max <= budget_total): two
+        // within-cap spends whose running total overflows the budget are rejected
+        // on the second.
         {
             let (mut state, principal, agent, owner, _other) = service_fixture(&config);
             let service_id =
@@ -7080,20 +7204,30 @@ mod tests {
                 &mut state,
                 &principal,
                 &agent,
-                Amount::from_units(50_000),
-                Amount::from_units(50_000),
+                Amount::from_units(60_000),  // per_tx
+                Amount::from_units(100_000), // budget covers one 60_000 spend, not two
                 100,
                 0,
             );
-            // 45_000 + 10_000 fee = 55_000 > 50_000 budget.
-            let err = spend_to_service(
+            spend_to_service(
                 &mut state,
                 &config,
                 &agent,
                 0,
                 mandate_id,
                 service_id,
-                Amount::from_units(45_000),
+                Amount::from_units(50_000),
+                owner.address(),
+            )
+            .expect("first within-budget spend succeeds");
+            let err = spend_to_service(
+                &mut state,
+                &config,
+                &agent,
+                1,
+                mandate_id,
+                service_id,
+                Amount::from_units(50_000),
                 owner.address(),
             )
             .unwrap_err();

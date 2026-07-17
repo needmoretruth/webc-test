@@ -383,6 +383,26 @@ amount/nonce/version math is checked. `execute_transaction` mutates a clone and
 commits only on `Ok`, and its sole non-test caller (`block_builder.rs:90`)
 propagates errors, so an invalid tx cannot be cheaply block-included.
 
+**M1 — P2 — RESOLVED (Phase 9a mandate) — mandate per-tx cap ignored the fee.**
+An adversarial re-review of the just-shipped native agent mandate found that
+`SpendUnderMandate` / `SpendUnderMandateToService` bounded only the principal
+`amount` against `per_tx_max`, while the value actually leaving `mandate_escrow`
+is `amount + total_fee`, and the fee is agent-chosen via the priority bid and
+drawn from the same escrow. A hostile agent could set a within-cap principal but
+a huge fee, draining the whole budget in one transaction — 1000× the `per_tx_max`
+the principal set and bypassing `rate_limit_per_day` — with ~half recoverable
+through the validator fee pool (supply stayed conserved, so this was value
+extraction/grief, not a mint). **Fix:** both spend arms now compute
+`charge = amount + total_fee` and reject `charge > per_tx_max`, making `per_tx_max`
+a true per-spend blast-radius cap (principal + fee); zero-`amount` fee-only spends
+are also rejected (`MandateZeroAmount`). Reproduced first with
+`fee_bid_cannot_inflate_a_spend_past_per_tx_max` (asserts `MandatePerTxExceeded`
+and that the rejected spend leaves state byte-identical) and `zero_amount_spend_is_rejected`.
+Because grant enforces `per_tx_max <= budget_total`, `MandateBudgetExceeded` is now
+correctly reachable only cumulatively (the over-budget tests exercise two
+within-cap spends). Everything else in the mandate path (supply conservation,
+agent-key binding, replay, determinism, panic-safety) verified clean.
+
 ## webc-chain — supply / staking / bridge (verified findings)
 
 - **G1 — MEDIUM — RESOLVED (commit `9c77a35`) — genesis supply invariant is

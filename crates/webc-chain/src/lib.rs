@@ -374,6 +374,8 @@ pub enum ChainError {
     MandateRevoked,
     #[error("mandate has expired and rejects all spends")]
     MandateExpired,
+    #[error("mandate spend must move a non-zero principal amount")]
+    MandateZeroAmount,
     #[error("mandate spend exceeds the per-transaction maximum")]
     MandatePerTxExceeded,
     #[error("mandate spend exceeds the remaining escrowed budget")]

@@ -249,7 +249,11 @@ pub struct Mandate {
     pub spent: Amount,
     /// Last consensus epoch (inclusive) in which the mandate may be spent.
     pub expiry_epoch: Epoch,
-    /// Maximum native principal one mandate-signed spend may move (excludes fee).
+    /// Maximum native value one mandate-signed spend may draw from escrow,
+    /// counting the principal moved PLUS the transaction fee. The fee is
+    /// agent-chosen and paid from the same escrow, so the cap bounds their sum:
+    /// bounding the principal alone would let a single high-fee spend drain the
+    /// whole budget past this per-transaction limit (enforced in `state`).
     pub per_tx_max: Amount,
     /// Maximum spends per rate-limit window. `0` means unlimited (no per-day cap).
     pub rate_limit_per_day: u32,
