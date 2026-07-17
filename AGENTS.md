@@ -43,6 +43,7 @@ In all three: **the repository, not chat memory, is the durable handoff.** Every
 - **Stop and ask ONLY for a genuinely user-owned decision:** a change to confirmed monetary policy or genesis distribution, the production-bridge trust/proof model for real funds, mainnet governance or emergency-power design, or anything that would change a decision recorded in `docs/decision-record.md`. The full list of deferred user decisions is in "User decisions still required later" below.
 - **When you do ask, ask in plain-prose chat:** lay out the candidate options with their details, pros, cons, and a recommendation. Do **not** use the built-in structured question UI for these.
 - **"continue" always means:** resume the first incomplete item per the start protocol and proceed autonomously.
+- **Drive multi-item work to completion; do not interrupt it with mid-way status reports or permission checks.** When the user hands you a body of work (e.g. "resolve the whole findings backlog"), set an explicit end-goal for yourself and run to it — reproduce/fix/gate/commit/push each item and move straight to the next. Progress is shown by frequent commits, not by stopping to narrate. Surface to the user only at true completion, for a genuinely user-owned decision, or for a hard blocker you cannot resolve.
 
 ### Always, as you work
 - Commit and push every coherent, tested step (this is an ephemeral cloud env — see "Persistent session continuation and repository safety"). Never leave valuable work local-only or committed-but-unpushed.
@@ -93,6 +94,11 @@ ever drifts:
 - Genesis supply: `10,000,000 WEBC`; native precision: 12 decimals; amounts
   u128 with 256-bit multiply intermediates and variable-length encoding
   (§15.14)
+- Devnet initializes the same `10,000,000 WEBC` total as mainnet (owner-confirmed
+  2026-07-17), held in a single valueless faucet account; the confirmed
+  distribution buckets (§15.38) are applied at the Phase 5 economics stage, not at
+  the devnet faucet. A genesis whose accounts do not sum to the declared total is
+  rejected (`from_genesis`; finding G1).
 - Inflation: 10% initial, ×0.8 each year, 1% floor (§7)
 - Genesis distribution (decided, §15.33/15.38): 25% contributors / 5%
   validator-bootstrap ceiling / 30% usage subsidies / 15% airdrop in three
@@ -293,6 +299,31 @@ future session.
 - **Still apply the security rules to dependencies:** pin versions, prefer maintained
   and widely-used crates, and keep security-critical ones behind a replaceable
   boundary. Reuse does not mean trust blindly.
+
+## Parallel subagents and durable work — standing rule
+
+This is a standing user instruction (given 2026-07-17), not a one-off. It applies in
+every current and future session.
+
+- **Use parallel subagents by default for independent tracks, scaled to the host's
+  performance.** Fan work out across subagents when tracks are independent (separate
+  crates or languages), but bound concurrency to the machine: heavy `cargo` builds are
+  CPU-bound, so on a small host (e.g. 4 cores) keep to roughly 2–3 concurrent builds
+  and prefer splitting by crate/language (a `pnpm`/TypeScript track does not contend
+  with a Rust build). Over-parallelizing on a small host thrashes CPU and disk and is
+  slower, not faster. Partition tracks so concurrent agents touch DISJOINT files
+  (ideally different crates) to avoid merge conflicts, and give each parallel
+  implementer its own git worktree.
+- **Subagents MUST commit and push frequently — this is a hard durability rule.** The
+  container is ephemeral AND a subagent's reasoning/context is lost entirely when the
+  session ends; only committed-and-pushed code survives. Every subagent that changes
+  code must commit each coherent, tested step and `git push` its own branch
+  immediately — never let a subagent finish a step with work uncommitted or unpushed.
+- **The orchestrator keeps `main` green and consolidated.** The main session
+  integrates each pushed agent branch into `main`, runs the full gate, and pushes, so
+  `main` always holds every completed step and the owner never has to merge by hand.
+  Keep durable-doc edits (`docs/review/findings.md` and the two status docs) with the
+  orchestrator to avoid cross-agent conflicts on the same files.
 
 ## Security-first implementation rules
 
