@@ -13,6 +13,17 @@ pub const WEBC_DECIMALS: u32 = 12;
 /// Number of indivisible base units in one WEBC.
 pub const WEBC_UNIT: u128 = 1_000_000_000_000;
 
+/// Confirmed genesis total supply: exactly 10,000,000 WEBC (WEBC-DEFINITION §15.14).
+///
+/// Both mainnet and devnet initialize this same total (owner-confirmed
+/// 2026-07-17). A production genesis pins it through
+/// `ChainConfig::expected_total_supply` so `ChainState::from_genesis` rejects
+/// any allocation whose accounts do not sum to it (finding G1 — the supply
+/// invariant alone is tautological and never pins the total). In-crate test
+/// fixtures that intentionally use a small allocation leave the expectation
+/// unset.
+pub const GENESIS_TOTAL_SUPPLY: Amount = Amount::from_webc(10_000_000);
+
 /// Native WEBC amount in the smallest indivisible unit.
 ///
 /// 1 WEBC = 1,000,000,000,000 base units. `u128` gives enough room for long-lived
@@ -31,9 +42,14 @@ impl Amount {
 
     /// Converts whole WEBC to native base units.
     ///
-    /// `u64::MAX * WEBC_UNIT` fits in the `u128` representation.
-    pub fn from_webc(whole: u64) -> Self {
-        Self(u128::from(whole) * WEBC_UNIT)
+    /// `u64::MAX * WEBC_UNIT` fits in the `u128` representation. `const` so
+    /// compile-time supply constants such as [`GENESIS_TOTAL_SUPPLY`] can be
+    /// defined from a whole-WEBC figure.
+    #[allow(clippy::cast_lossless)]
+    pub const fn from_webc(whole: u64) -> Self {
+        // Widening `u64` -> `u128` is lossless; `u128::from` is not yet
+        // const-stable, so the widening cast is required inside a `const fn`.
+        Self((whole as u128) * WEBC_UNIT)
     }
 
     /// Returns whether the amount contains zero base units.

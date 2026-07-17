@@ -30,7 +30,7 @@ pub mod transaction;
 pub mod unbonding;
 
 pub use account::Account;
-pub use amount::{Amount, WEBC_DECIMALS, WEBC_UNIT};
+pub use amount::{Amount, GENESIS_TOTAL_SUPPLY, WEBC_DECIMALS, WEBC_UNIT};
 pub use authorization::AuthorizationLane;
 pub use authorization_policy::{
     active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
@@ -144,6 +144,8 @@ pub enum ChainError {
     ValidatorAlreadyExists(webc_crypto::Address),
     #[error("duplicate genesis account: {0}")]
     DuplicateGenesisAccount(webc_crypto::Address),
+    #[error("genesis allocation sums to {actual} but the chain config pins the total supply at {expected}")]
+    GenesisSupplyMismatch { expected: Amount, actual: Amount },
     #[error("validator not found: {0}")]
     ValidatorNotFound(webc_crypto::Address),
     #[error("validator is not active: {0}")]

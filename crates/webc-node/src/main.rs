@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use webc_chain::{
     build_block, Amount, BlockBuildInput, ChainConfig, ChainState, FeeBid, GenesisAccount,
-    GenesisConfig, Operation, Transaction,
+    GenesisConfig, Operation, Transaction, GENESIS_TOTAL_SUPPLY,
 };
 use webc_crypto::{Hash256, Keypair, PublicKeyBytes};
 use webc_net::{spawn_network, NetworkConfig};
@@ -97,11 +97,18 @@ fn run(
 
     // Fixed devnet faucet identity. Devnet only; these units carry no value.
     let faucet = Keypair::from_seed([7u8; 32]);
+    // Devnet initializes the same 10,000,000 WEBC total as mainnet
+    // (owner-confirmed 2026-07-17), held in the single valueless faucet account.
+    // Pinning `expected_total_supply` makes `from_genesis` reject any allocation
+    // that does not sum to the declared total (finding G1).
     let genesis = GenesisConfig {
-        chain: ChainConfig::default(),
+        chain: ChainConfig {
+            expected_total_supply: Some(GENESIS_TOTAL_SUPPLY),
+            ..ChainConfig::default()
+        },
         accounts: vec![GenesisAccount {
             address: faucet.address(),
-            balance: Amount::from_webc(1_000_000),
+            balance: GENESIS_TOTAL_SUPPLY,
         }],
         validators: Vec::new(),
     };

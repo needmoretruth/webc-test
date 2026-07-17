@@ -55,6 +55,16 @@ pub struct ChainConfig {
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
+    /// Total native supply, in base units, that the genesis allocation must sum
+    /// to. `Some` on production genesis — mainnet and devnet both pin
+    /// [`GENESIS_TOTAL_SUPPLY`] — so `ChainState::from_genesis` rejects any
+    /// allocation whose minted supply differs (finding G1; the supply invariant
+    /// on its own is tautological and never pins the total). `None` skips the
+    /// check for trusted in-crate test fixtures that use small allocations.
+    ///
+    /// [`GENESIS_TOTAL_SUPPLY`]: crate::GENESIS_TOTAL_SUPPLY
+    #[serde(default)]
+    pub expected_total_supply: Option<Amount>,
 }
 
 impl Default for ChainConfig {
@@ -69,6 +79,7 @@ impl Default for ChainConfig {
             inflation: InflationSchedule::default(),
             bridge: BridgeConfig::default(),
             session_keys: SessionKeyConfig::default(),
+            expected_total_supply: None,
         }
     }
 }
@@ -482,6 +493,23 @@ impl ChainState {
         }
 
         state.inflation_year_start_supply = state.minted_supply;
+
+        // G1: pin the declared total supply. `minted_supply` is the checked sum
+        // of all genesis account balances; staking only relocates units between
+        // an account's liquid and staked buckets and never changes gross
+        // issuance, so this is the single place a wrong-total genesis is caught.
+        // The `balanced` invariant below cannot catch it because it is
+        // tautological (it re-sums the very buckets `minted_supply` was defined
+        // from). Production genesis sets `Some(GENESIS_TOTAL_SUPPLY)`; trusted
+        // in-crate fixtures leave it `None`.
+        if let Some(expected) = genesis.chain.expected_total_supply {
+            if state.minted_supply != expected {
+                return Err(ChainError::GenesisSupplyMismatch {
+                    expected,
+                    actual: state.minted_supply,
+                });
+            }
+        }
 
         if !state.supply_invariant_report()?.balanced {
             return Err(ChainError::SupplyInvariantViolation);
@@ -2548,7 +2576,7 @@ mod tests {
         AuthorizationPolicyRevision, DoubleVoteEvidence, FeeBid, GenesisAccount, GenesisValidator,
         Nonce, Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
         SessionKeyConstraints, SignedVote, SlashingEvidence, ValidatorSet, Vote, VoteType,
-        MAX_AUTHORIZATION_POLICY_REVISION,
+        GENESIS_TOTAL_SUPPLY, MAX_AUTHORIZATION_POLICY_REVISION,
     };
     use proptest::prelude::*;
     use std::sync::OnceLock;
@@ -2571,6 +2599,69 @@ mod tests {
         };
         let state = ChainState::from_genesis(&genesis).unwrap();
         (config, state, alice, bob)
+    }
+
+    // ----- G1: genesis total-supply pinning -----
+
+    #[test]
+    fn genesis_pins_the_declared_total_supply() {
+        // A production genesis pins the total; an allocation that does not sum
+        // to it is rejected (finding G1). Before this fix `from_genesis`
+        // accepted any total, because the supply invariant is tautological.
+        let faucet = Keypair::from_seed([9u8; 32]);
+        let chain = ChainConfig {
+            expected_total_supply: Some(GENESIS_TOTAL_SUPPLY),
+            ..ChainConfig::default()
+        };
+        let short = GenesisConfig {
+            chain,
+            accounts: vec![GenesisAccount {
+                address: faucet.address(),
+                balance: Amount::from_webc(1_000_000), // only 1M, not the pinned 10M
+            }],
+            validators: Vec::new(),
+        };
+        match ChainState::from_genesis(&short) {
+            Err(ChainError::GenesisSupplyMismatch { expected, actual }) => {
+                assert_eq!(expected, GENESIS_TOTAL_SUPPLY);
+                assert_eq!(actual, Amount::from_webc(1_000_000));
+            }
+            other => panic!("expected GenesisSupplyMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn genesis_accepts_an_allocation_matching_the_declared_total() {
+        let faucet = Keypair::from_seed([9u8; 32]);
+        let genesis = GenesisConfig {
+            chain: ChainConfig {
+                expected_total_supply: Some(GENESIS_TOTAL_SUPPLY),
+                ..ChainConfig::default()
+            },
+            accounts: vec![GenesisAccount {
+                address: faucet.address(),
+                balance: GENESIS_TOTAL_SUPPLY,
+            }],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("exact declared total is accepted");
+        assert_eq!(state.minted_supply, GENESIS_TOTAL_SUPPLY);
+    }
+
+    #[test]
+    fn genesis_without_a_declared_total_skips_the_pin() {
+        // Trusted in-crate fixtures leave the expectation unset (the default)
+        // and may use any small allocation.
+        let alice = Keypair::from_seed([1u8; 32]);
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        assert!(ChainState::from_genesis(&genesis).is_ok());
     }
 
     // ----- session-key test helpers -----
