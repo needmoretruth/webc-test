@@ -17,6 +17,7 @@
 //! top up already-funded accounts, and labels its drips as valueless test units.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Mutex;
 
 use webc_chain::{
@@ -729,6 +730,118 @@ impl<K: KvStore> NodeService<K> {
             .get(&mandate_id)
             .cloned()
             .ok_or(ApiError::NotFound)
+    }
+}
+
+// ----- paginated discovery / list accessors (Phase 9/13 native state) -----
+
+/// Default page size when a caller supplies no `limit`.
+pub const DEFAULT_PAGE_LIMIT: usize = 50;
+
+/// Hard upper bound on a page size. A larger requested `limit` is clamped to this,
+/// so an unauthenticated caller can never force an unbounded response out of a map
+/// that grows without limit.
+pub const MAX_PAGE_LIMIT: usize = 200;
+
+/// Per-request scan multiplier for FILTERED list pages (e.g. services-by-category).
+/// Such a page examines at most `FILTER_SCAN_MULTIPLIER * limit` map entries even if
+/// fewer (or none) match, then returns a `next_cursor` so the client continues —
+/// this bounds the work one request can cost over a sparse filter regardless of map
+/// size.
+const FILTER_SCAN_MULTIPLIER: usize = 4;
+
+/// Clamps a requested page limit into `1..=MAX_PAGE_LIMIT`, applying
+/// `DEFAULT_PAGE_LIMIT` when unset. A `0` clamps up to `1` so a page always makes
+/// forward progress (a zero-size page with a cursor could never advance).
+fn clamp_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .clamp(1, MAX_PAGE_LIMIT)
+}
+
+/// Decodes an opaque hash-shaped cursor (32-byte lowercase hex) into a `Hash256`,
+/// mapping any malformed input to a fail-closed `InvalidRequest`.
+fn decode_hash_cursor(raw: &str) -> Result<Hash256, ApiError> {
+    let bytes = hex::decode(raw).map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let fixed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    Ok(Hash256(fixed))
+}
+
+/// One entry in a services listing: the service's id alongside its full current
+/// `ServiceEntry` revision (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct ServiceListItem {
+    pub service_id: ServiceId,
+    #[serde(flatten)]
+    pub entry: ServiceEntry,
+}
+
+/// A paginated services page: `next_cursor` is non-null iff more may remain.
+#[derive(Debug, serde::Serialize)]
+pub struct ServicesPage {
+    pub items: Vec<ServiceListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// Bounded, cursor-paginated DISCOVERY reads over the Phase 9/13 native-state maps.
+///
+/// Every accessor here is a pure, deterministic ASCENDING walk of a committed
+/// `webc_chain::ChainState` `BTreeMap`, taken under the single service lock, that
+/// clones out at most `limit` records and returns an opaque `next_cursor` (the last
+/// key it visited) so the client can resume. A FILTERED walk additionally caps the
+/// scan at `FILTER_SCAN_MULTIPLIER * limit` VISITED entries, matching or not, then
+/// hands back a cursor — this bounds the per-request work over a sparse filter so a
+/// hostile query can never force a whole-map scan.
+///
+/// A malformed cursor/limit/id maps to `ApiError::InvalidRequest`. Nothing here
+/// reads a clock, network, or randomness, and nothing panics on hostile input.
+impl<K: KvStore> NodeService<K> {
+    /// Lists registered services in ascending `ServiceId` order. With `category`,
+    /// returns only entries whose `categories` set contains that tag (a bounded
+    /// filtered scan); without it, lists every service (a bounded range).
+    pub fn services(
+        &self,
+        category: Option<Hash256>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ServicesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let services = &inner.node.state().services;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(ServiceId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, entry) in services.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            let matched = match &category {
+                Some(tag) => entry.categories.contains(tag),
+                None => true,
+            };
+            if matched {
+                items.push(ServiceListItem {
+                    service_id: *id,
+                    entry: entry.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(ServicesPage { items, next_cursor })
     }
 }
 

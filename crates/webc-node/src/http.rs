@@ -25,6 +25,7 @@
 //! - `GET  /tokens/{id}/supply`         per-token supply reconciliation
 //! - `GET  /nft/collections/{id}`       NFT collection record by hex id
 //! - `GET  /nft/collections/{id}/items/{serial}` one NFT item
+//! - `GET  /services`                   paginated services (optional `category`)
 //! - `GET  /services/{id}`              service-registry entry by hex id
 //! - `GET  /governance/instances/{id}`  governance instance by hex id
 //! - `GET  /governance/proposals/{id}`  governance proposal by hex id
@@ -42,7 +43,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -59,7 +60,7 @@ use webc_storage::KvStore;
 
 use crate::service::{
     AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NodeService, SealSummary,
-    SubmitReceipt, ValidatorSummary, ValidatorsResponse, API_VERSION,
+    ServicesPage, SubmitReceipt, ValidatorSummary, ValidatorsResponse, API_VERSION,
 };
 
 /// Default maximum request body size (1 MiB), bounding hostile payloads.
@@ -283,6 +284,20 @@ fn parse_hash(raw: &str) -> Result<Hash256, ApiRejection> {
     Ok(Hash256(fixed))
 }
 
+/// Query parameters for the services listing: an optional hex `category` tag plus
+/// pagination. `deny_unknown_fields` rejects any stray parameter with a 400 (via the
+/// `Query` extractor).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceListParams {
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 /// Builds the versioned API router with a request-body size limit.
 pub fn router<K>(state: AppState<K>) -> Router
 where
@@ -308,6 +323,7 @@ where
             "/v1/nft/collections/{id}/items/{serial}",
             get(nft_item::<K>),
         )
+        .route("/v1/services", get(list_services::<K>))
         .route("/v1/services/{id}", get(service_entry::<K>))
         .route(
             "/v1/governance/instances/{id}",
@@ -452,6 +468,21 @@ async fn mandate<K: KvStore>(
 ) -> Result<Json<webc_chain::Mandate>, ApiRejection> {
     let mandate_id = MandateId::new(parse_hash(&id)?);
     Ok(Json(state.service().mandate(mandate_id)?))
+}
+
+async fn list_services<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Query(params): Query<ServiceListParams>,
+) -> Result<Json<ServicesPage>, ApiRejection> {
+    let category = match params.category.as_deref() {
+        Some(raw) => Some(parse_hash(raw)?),
+        None => None,
+    };
+    Ok(Json(state.service().services(
+        category,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
 }
 
 async fn block_by_height<K: KvStore>(
@@ -1200,6 +1231,210 @@ mod tests {
             format!("/v1/mandates/{bad}"),
         ] {
             let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated services-by-category discovery endpoint -----
+
+    /// Two disjoint taxonomy tags used to exercise the category filter.
+    const CATEGORY_A: Hash256 = Hash256([0xa1; 32]);
+    const CATEGORY_B: Hash256 = Hash256([0xb2; 32]);
+
+    /// Builds a service holding `count` registered services under one namespace,
+    /// each tagged by `categories_for(i)`, and returns the state, the creator
+    /// address, and the derived `ServiceId`s (in creation order). Registrations go
+    /// through the real `RegisterService` create op via `submit_and_seal`.
+    fn services_state(
+        count: usize,
+        categories_for: impl Fn(usize) -> BTreeSet<Hash256>,
+    ) -> (AppState<MemoryKvStore>, Vec<ServiceId>) {
+        let creator = Keypair::from_seed([41u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+        let mut ids = Vec::new();
+        for i in 0..count {
+            seal_op(
+                &state,
+                &creator,
+                i as u64,
+                Operation::RegisterService {
+                    namespace,
+                    create_nonce: i as u64,
+                    categories: categories_for(i),
+                    title: format!("svc-{i}").into_bytes(),
+                    endpoint: b"https://acme.example/api".to_vec(),
+                    interface: Hash256([0x4f; 32]),
+                    pricing: Vec::new(),
+                    payment_flags: ServicePaymentFlags {
+                        on_chain_direct: false,
+                        http_402: true,
+                        subscription: false,
+                    },
+                },
+            );
+            ids.push(ServiceId::derive(namespace, creator.address(), i as u64));
+        }
+        (state, ids)
+    }
+
+    /// Walks every page of a services listing (following `next_cursor`), asserting
+    /// each page holds at most `limit` items, and returns the concatenated
+    /// `service_id`s in the order served. `query` is the query string without a
+    /// leading `?` or any `cursor` (e.g. `"limit=3"` or `"category=..&limit=2"`).
+    async fn walk_services(app: &Router, query: &str, limit: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!("/v1/services?{query}&cursor={c}"),
+                None => format!("/v1/services?{query}"),
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                ids.push(item["service_id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(ids.len() < 100_000, "pagination failed to terminate");
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn services_list_paginates_ascending_without_overlap() {
+        // Seven services, no categories: listing all must walk every one exactly
+        // once, in ascending service-id order, across bounded pages.
+        let (state, ids) = services_state(7, |_| BTreeSet::new());
+        let app = router(state);
+        let expected: BTreeSet<String> = ids.iter().map(|id| hash_hex(id.hash())).collect();
+
+        let walked = walk_services(&app, "limit=3", 3).await;
+        // Ascending key order and no duplicates.
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(
+            walked, sorted,
+            "items must be in ascending service-id order"
+        );
+        let unique: BTreeSet<String> = walked.iter().cloned().collect();
+        assert_eq!(unique.len(), walked.len(), "no id may repeat across pages");
+        // Exactly the seeded set, nothing missed.
+        assert_eq!(unique, expected);
+
+        // The first page is full and carries a cursor; the response also flattens
+        // the underlying ServiceEntry (owner/status/payment flags) alongside the id.
+        let first = body_value(get_response(&app, "/v1/services?limit=3".to_string()).await).await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["status"], "Active");
+        assert_eq!(first["items"][0]["payment_flags"]["http_402"], true);
+    }
+
+    #[tokio::test]
+    async fn services_category_filter_returns_only_matches() {
+        // i%3==0 -> {A}, i%3==1 -> {B}, i%3==2 -> untagged.
+        let (state, ids) = services_state(9, |i| {
+            let mut set = BTreeSet::new();
+            match i % 3 {
+                0 => {
+                    set.insert(CATEGORY_A);
+                }
+                1 => {
+                    set.insert(CATEGORY_B);
+                }
+                _ => {}
+            }
+            set
+        });
+        let app = router(state);
+        let cat_a_hex = hash_hex(CATEGORY_A);
+
+        let expected_a: BTreeSet<String> = (0..9)
+            .filter(|i| i % 3 == 0)
+            .map(|i| hash_hex(ids[i].hash()))
+            .collect();
+        let walked_a = walk_services(&app, &format!("category={cat_a_hex}&limit=2"), 2).await;
+        let got_a: BTreeSet<String> = walked_a.iter().cloned().collect();
+        assert_eq!(got_a, expected_a, "only category-A services are returned");
+        // Ascending order preserved under the filter.
+        let mut sorted_a = walked_a.clone();
+        sorted_a.sort();
+        assert_eq!(walked_a, sorted_a);
+
+        // A category tag no service declares yields an empty, cursor-null page.
+        let none_hex = hash_hex(Hash256([0xee; 32]));
+        let body =
+            body_value(get_response(&app, format!("/v1/services?category={none_hex}")).await).await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn services_limit_is_clamped_to_the_hard_maximum() {
+        // With more services than the hard cap, an over-large limit is clamped: the
+        // first page holds exactly MAX_PAGE_LIMIT items and carries a cursor.
+        let over = crate::service::MAX_PAGE_LIMIT + 1;
+        let (state, _ids) = services_state(over, |_| BTreeSet::new());
+        let app = router(state);
+
+        let body =
+            body_value(get_response(&app, "/v1/services?limit=100000".to_string()).await).await;
+        assert_eq!(
+            body["items"].as_array().unwrap().len(),
+            crate::service::MAX_PAGE_LIMIT
+        );
+        assert!(body["next_cursor"].is_string());
+    }
+
+    #[tokio::test]
+    async fn services_empty_state_returns_empty_page() {
+        let (state, _ids) = services_state(0, |_| BTreeSet::new());
+        let app = router(state);
+        let body = body_value(get_response(&app, "/v1/services".to_string()).await).await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn services_malformed_params_are_rejected() {
+        let (state, _ids) = services_state(1, |_| BTreeSet::new());
+        let app = router(state);
+        for uri in [
+            // Non-hex cursor.
+            "/v1/services?cursor=zz",
+            // Non-numeric limit (rejected by the Query extractor).
+            "/v1/services?limit=abc",
+            // Non-hex category tag.
+            "/v1/services?category=zz",
+            // Unknown query parameter (deny_unknown_fields).
+            "/v1/services?bogus=1",
+        ] {
+            let response = get_response(&app, uri.to_string()).await;
             assert_eq!(
                 response.status(),
                 StatusCode::BAD_REQUEST,
