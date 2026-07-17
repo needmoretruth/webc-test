@@ -38,6 +38,9 @@ import type {
   MandateCounterpartyPolicyJson,
   NftAuthorityKindJson,
   NftMetadataJson,
+  ServicePaymentFlagsJson,
+  ServicePriceJson,
+  ServiceStatusJson,
   SlashingEvidenceJson,
   SignedTransactionJson,
   StateAccessListJson,
@@ -590,6 +593,67 @@ function requireGovernanceAction(action: GovernanceActionJson): void {
     action.TreasuryTransfer.amount,
     "treasury transfer amount",
   );
+}
+
+/**
+ * Canonicalizes a service category set: validates each 32-byte hex tag, then
+ * sorts and deduplicates to match Rust's `BTreeSet<Hash256>` order (fixed-length
+ * lowercase hex sorts identically to the raw bytes). Rejects more than
+ * `MAX_SERVICE_CATEGORIES` entries.
+ */
+function canonicalServiceCategories(categories: HexString[]): HexString[] {
+  if (!Array.isArray(categories)) {
+    throw new Error("service categories must be an array");
+  }
+  for (const category of categories) {
+    requireHash256Hex(category, "service category");
+  }
+  const sorted = [...new Set(categories)].sort();
+  if (sorted.length > 8) {
+    throw new Error("service categories exceed the maximum of 8");
+  }
+  return sorted;
+}
+
+/** Validates one `ServicePrice`, mirroring the Rust bounds. */
+function requireServicePrice(price: ServicePriceJson): void {
+  requireHash256Hex(price.operation, "service price operation");
+  requireCanonicalAmount(price.price, "service price");
+  // The unit label may be empty (only its ≤ 32-byte length is bounded in Rust).
+  requireBoundedHex(price.unit, "service price unit", 32, false);
+}
+
+/**
+ * Validates the service's variable-length fields, mirroring
+ * `ServiceEntry::validate` and the `bounded_*_hex` codecs: non-empty title
+ * (≤ 64 bytes), non-empty endpoint (≤ 256 bytes), ≤ 16 pricing entries.
+ */
+function requireServiceFields(args: {
+  title: HexString;
+  endpoint: HexString;
+  interface: HexString;
+  pricing: ServicePriceJson[];
+  paymentFlags: ServicePaymentFlagsJson;
+}): void {
+  requireBoundedHex(args.title, "service title", 64, true);
+  requireBoundedHex(args.endpoint, "service endpoint", 256, true);
+  requireHash256Hex(args.interface, "service interface");
+  if (!Array.isArray(args.pricing) || args.pricing.length > 16) {
+    throw new Error("service pricing exceeds the maximum of 16 entries");
+  }
+  for (const price of args.pricing) {
+    requireServicePrice(price);
+  }
+  const flags = args.paymentFlags;
+  if (
+    typeof flags !== "object" ||
+    flags === null ||
+    typeof flags.on_chain_direct !== "boolean" ||
+    typeof flags.http_402 !== "boolean" ||
+    typeof flags.subscription !== "boolean"
+  ) {
+    throw new Error("invalid service payment flags");
+  }
 }
 
 /** Largest value Rust's `u128` amount encoding can represent. */
@@ -1240,6 +1304,126 @@ export function revokeMandate(mandateId: HexString): OperationJson {
 }
 
 // ---------------------------------------------------------------------------
+// Service registry operations (Phase 9b, §15.5).
+//
+// Field names and value encodings mirror the Rust `Operation` serde output pinned
+// by `service_registry_operations_have_stable_wire_vectors`. Byte-string fields
+// (title, endpoint, price unit) are LOWERCASE HEX; amounts are decimal strings;
+// categories serialize as a sorted, deduplicated array (Rust `BTreeSet<Hash256>`).
+// ---------------------------------------------------------------------------
+
+/**
+ * Registers a service. `title`/`endpoint` and each price `unit` are LOWERCASE HEX
+ * of their bytes. The service id is derived on-chain from `(namespace, owner,
+ * createNonce)`; use `deriveServiceIdHex` to precompute it.
+ */
+export function registerService(args: {
+  namespace: HexString;
+  createNonce: number;
+  categories: HexString[];
+  title: HexString;
+  endpoint: HexString;
+  interface: HexString;
+  pricing: ServicePriceJson[];
+  paymentFlags: ServicePaymentFlagsJson;
+}): OperationJson {
+  requireHash256Hex(args.namespace, "service namespace");
+  requireCountU64(args.createNonce, "service create nonce");
+  const categories = canonicalServiceCategories(args.categories);
+  requireServiceFields(args);
+  return {
+    RegisterService: {
+      namespace: args.namespace,
+      create_nonce: args.createNonce,
+      categories,
+      title: args.title,
+      endpoint: args.endpoint,
+      interface: args.interface,
+      pricing: args.pricing,
+      payment_flags: args.paymentFlags,
+    },
+  };
+}
+
+/** Updates a registered service's mutable fields (owner-only). */
+export function updateService(args: {
+  serviceId: HexString;
+  categories: HexString[];
+  title: HexString;
+  endpoint: HexString;
+  interface: HexString;
+  pricing: ServicePriceJson[];
+  paymentFlags: ServicePaymentFlagsJson;
+}): OperationJson {
+  requireHash256Hex(args.serviceId, "service id");
+  const categories = canonicalServiceCategories(args.categories);
+  requireServiceFields(args);
+  return {
+    UpdateService: {
+      service_id: args.serviceId,
+      categories,
+      title: args.title,
+      endpoint: args.endpoint,
+      interface: args.interface,
+      pricing: args.pricing,
+      payment_flags: args.paymentFlags,
+    },
+  };
+}
+
+/** Sets a registered service's lifecycle status (owner-only). */
+export function setServiceStatus(
+  serviceId: HexString,
+  status: ServiceStatusJson,
+): OperationJson {
+  requireHash256Hex(serviceId, "service id");
+  return { SetServiceStatus: { service_id: serviceId, status } };
+}
+
+/**
+ * Spends against a mandate to pay a registered service (agent-signed). Its access
+ * list needs the service's OWNER account, which is state-derived (resolved from
+ * the registry entry) — build it with `accessListForServiceSpend`.
+ */
+export function spendUnderMandateToService(
+  mandateId: HexString,
+  serviceId: HexString,
+  amount: string,
+): OperationJson {
+  requireHash256Hex(mandateId, "mandate id");
+  requireHash256Hex(serviceId, "service id");
+  requireCanonicalAmount(amount, "spend under mandate to service amount");
+  return {
+    SpendUnderMandateToService: {
+      mandate_id: mandateId,
+      service_id: serviceId,
+      amount,
+    },
+  };
+}
+
+/**
+ * Full access list for `SpendUnderMandateToService`, mirroring Rust
+ * `Transaction::for_service_spend`: the base list plus the service OWNER account
+ * (the registry pay-to), resolved by the caller from the service entry.
+ */
+export function accessListForServiceSpend(args: {
+  sender: WebcAddress;
+  mandateId: HexString;
+  serviceId: HexString;
+  serviceOwner: WebcAddress;
+  authorizationLane?: AuthorizationLaneIdJson;
+}): StateAccessListJson {
+  const list = defaultAccessList(
+    args.sender,
+    spendUnderMandateToService(args.mandateId, args.serviceId, "0"),
+    args.authorizationLane ?? DEFAULT_AUTHORIZATION_LANE,
+  );
+  pushUniqueKey(list.read_write, accountKey(args.serviceOwner));
+  return list;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1329,6 +1513,11 @@ function extraReadOnlyKeys(
   if ("ReclaimVote" in operation) {
     // Reclaim READS the resolved proposal and writes only the voter's lock.
     return [governanceProposalKey(operation.ReclaimVote.proposal_id)];
+  }
+  // --- Service registry ---------------------------------------------------
+  if ("SpendUnderMandateToService" in operation) {
+    // The service entry is READ to resolve the pay-to owner.
+    return [serviceKey(operation.SpendUnderMandateToService.service_id)];
   }
   return [];
 }
@@ -1427,6 +1616,15 @@ export async function defaultAccessListAsync(
       return assembleAccessList(sender, authorizationLane, [
         accountKey(sender),
         mandateKey(mandateId),
+      ]);
+    }
+    if ("RegisterService" in operation) {
+      const { namespace, create_nonce } = operation.RegisterService;
+      const serviceId = await deriveServiceIdHex(namespace, sender, create_nonce);
+      // Registration records only the entry (it moves no native units beyond the
+      // fee lane), so only the derived service key is added.
+      return assembleAccessList(sender, authorizationLane, [
+        serviceKey(serviceId),
       ]);
     }
     if ("CreateGovernanceInstance" in operation) {
@@ -1799,6 +1997,18 @@ function extraReadWriteKeys(
     const { mandate_id, recipient } = operation.SpendUnderMandate;
     return [accountKey(sender), mandateKey(mandate_id), accountKey(recipient)];
   }
+  // --- Service registry (Phase 9b, §15.5) ---------------------------------
+  if ("UpdateService" in operation) {
+    return [serviceKey(operation.UpdateService.service_id)];
+  }
+  if ("SetServiceStatus" in operation) {
+    return [serviceKey(operation.SetServiceStatus.service_id)];
+  }
+  if ("SpendUnderMandateToService" in operation) {
+    // BASE list; the service OWNER account is added by accessListForServiceSpend.
+    const { mandate_id } = operation.SpendUnderMandateToService;
+    return [accountKey(sender), mandateKey(mandate_id)];
+  }
   // Incoming bridge messages need an asynchronous replay hash. Slashing also
   // needs live delegation/cooling owners, so the synchronous builder fails.
   // `CreateToken` needs an async token-id derivation, so it also lands here.
@@ -1994,6 +2204,20 @@ export async function deriveMandateIdHex(
     hexToBytes(agentKey),
     nonceBe(grantNonce, "grant nonce"),
   ]);
+}
+
+/** Derives a service id from `(namespace, owner, createNonce)`. */
+export function deriveServiceIdHex(
+  namespace: HexString,
+  owner: WebcAddress,
+  createNonce: number,
+): Promise<string> {
+  return deriveNamespaceCreatorId(
+    SERVICE_ID_DOMAIN,
+    namespace,
+    owner,
+    createNonce,
+  );
 }
 
 /**
@@ -2195,6 +2419,13 @@ export function governanceVoteKey(
 /** Returns the record key for one agent mandate. */
 export function mandateKey(mandateId: HexString): StateKeyJson {
   return { version: 1, kind: { Mandate: { mandate_id: mandateId } } };
+}
+
+// --- Service registry state key (Phase 9b, §15.5) --------------------------
+
+/** Returns the registry-entry key for one service. */
+export function serviceKey(serviceId: HexString): StateKeyJson {
+  return { version: 1, kind: { Service: { service_id: serviceId } } };
 }
 
 /** Returns a protocol singleton key in schema version 1. */

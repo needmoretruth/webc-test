@@ -51,11 +51,18 @@ import {
   nftItemKey,
   openProposal,
   protocolKey,
+  accessListForServiceSpend,
+  deriveServiceIdHex,
   reclaimVote,
+  registerService,
   resolveProposal,
   revokeMandate,
+  serviceKey,
+  setServiceStatus,
   spendUnderMandate,
+  spendUnderMandateToService,
   topUpMandate,
+  updateService,
   setNftAuthority,
   setNftCollectionPaused,
   setTokenAuthority,
@@ -72,6 +79,7 @@ import {
 import type {
   GovernanceConfigJson,
   NftMetadataJson,
+  ServicePriceJson,
   TokenMetadataJson,
 } from "./types";
 
@@ -698,6 +706,131 @@ describe("agent mandate state key and access lists", () => {
       accountKey(sender),
       mandateKey(mandateId),
       feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+});
+
+describe("service registry operation wire vectors", () => {
+  const PRICING: ServicePriceJson[] = [
+    { operation: "0b".repeat(32), price: "1000", unit: hexOfText("call") },
+  ];
+  const PAYMENT_FLAGS = {
+    on_chain_direct: true,
+    http_402: false,
+    subscription: false,
+  };
+
+  it("pins RegisterService canonical JSON (categories, pricing, flags)", () => {
+    const op = registerService({
+      namespace: "55".repeat(32),
+      createNonce: 7,
+      categories: ["c1".repeat(32)],
+      title: hexOfText("inference"),
+      endpoint: hexOfText("https://api.example/infer"),
+      interface: "1f".repeat(32),
+      pricing: PRICING,
+      paymentFlags: PAYMENT_FLAGS,
+    });
+    expect(canonicalJson(op)).toBe(
+      `{"RegisterService":{"categories":["${"c1".repeat(32)}"],"create_nonce":7,` +
+        `"endpoint":"${hexOfText("https://api.example/infer")}","interface":"${"1f".repeat(32)}",` +
+        `"namespace":"${"55".repeat(32)}","payment_flags":{"http_402":false,"on_chain_direct":true,` +
+        `"subscription":false},"pricing":[{"operation":"${"0b".repeat(32)}","price":"1000",` +
+        `"unit":"${hexOfText("call")}"}],"title":"${hexOfText("inference")}"}}`,
+    );
+  });
+
+  it("pins SetServiceStatus and SpendUnderMandateToService canonical JSON", () => {
+    expect(canonicalJson(setServiceStatus(ID_88, "Paused"))).toBe(
+      `{"SetServiceStatus":{"service_id":"${ID_88}","status":"Paused"}}`,
+    );
+    expect(canonicalJson(spendUnderMandateToService(ID_99, ID_88, "7"))).toBe(
+      `{"SpendUnderMandateToService":{"amount":"7","mandate_id":"${ID_99}","service_id":"${ID_88}"}}`,
+    );
+  });
+
+  it("sorts and deduplicates service categories into BTreeSet order", () => {
+    const op = updateService({
+      serviceId: ID_88,
+      categories: ["c2".repeat(32), "c1".repeat(32), "c2".repeat(32)],
+      title: hexOfText("svc"),
+      endpoint: hexOfText("https://x"),
+      interface: "1f".repeat(32),
+      pricing: [],
+      paymentFlags: PAYMENT_FLAGS,
+    });
+    expect(op).toMatchObject({
+      UpdateService: { categories: ["c1".repeat(32), "c2".repeat(32)] },
+    });
+  });
+});
+
+describe("service registry state key and access lists", () => {
+  it("pins Service canonical JSON", () => {
+    expect(canonicalJson(serviceKey(ID_88))).toBe(
+      `{"kind":{"Service":{"service_id":"${ID_88}"}},"version":1}`,
+    );
+  });
+
+  it("declares only the entry record on SetServiceStatus", async () => {
+    const sender = await addressFromSeedByte(1);
+    const list = defaultAccessList(sender, setServiceStatus(ID_88, "Paused"));
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      serviceKey(ID_88),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+
+  it("names the derived service record on RegisterService", async () => {
+    const sender = await addressFromSeedByte(1);
+    const serviceId = await deriveServiceIdHex("55".repeat(32), sender, 7);
+    const list = await defaultAccessListAsync(
+      sender,
+      registerService({
+        namespace: "55".repeat(32),
+        createNonce: 7,
+        categories: [],
+        title: hexOfText("svc"),
+        endpoint: hexOfText("https://x"),
+        interface: "1f".repeat(32),
+        pricing: [],
+        paymentFlags: {
+          on_chain_direct: true,
+          http_402: false,
+          subscription: false,
+        },
+      }),
+    );
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      serviceKey(serviceId),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+
+  it("refuses to auto-build SpendUnderMandateToService, and helper adds owner", async () => {
+    const sender = await addressFromSeedByte(1);
+    const owner = await addressFromSeedByte(3);
+    await expect(
+      defaultAccessListAsync(sender, spendUnderMandateToService(ID_99, ID_88, "7")),
+    ).rejects.toThrow();
+    const list = accessListForServiceSpend({
+      sender,
+      mandateId: ID_99,
+      serviceId: ID_88,
+      serviceOwner: owner,
+    });
+    expect(list.read_only).toEqual([
+      protocolKey("BaseFee"),
+      serviceKey(ID_88),
+      authorizationPolicyKey(sender),
+    ]);
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      mandateKey(ID_99),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+      accountKey(owner),
     ]);
   });
 });

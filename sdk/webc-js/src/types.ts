@@ -255,6 +255,8 @@ export type StateKeyKindJson =
   | { GovernanceVote: { proposal_id: HexString; voter: WebcAddress } }
   // --- Agent mandates (Phase 9a, §15.32) ----------------------------------
   | { Mandate: { mandate_id: HexString } }
+  // --- Service registry (Phase 9b, §15.5) ---------------------------------
+  | { Service: { service_id: HexString } }
   | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
@@ -474,7 +476,59 @@ export type OperationJson =
         amount: string;
       };
     }
-  | { RevokeMandate: { mandate_id: HexString } };
+  | { RevokeMandate: { mandate_id: HexString } }
+  // --- Service registry (Phase 9b, §15.5) ---------------------------------
+  | {
+      RegisterService: {
+        namespace: HexString;
+        create_nonce: number;
+        categories: HexString[];
+        title: HexString;
+        endpoint: HexString;
+        interface: HexString;
+        pricing: ServicePriceJson[];
+        payment_flags: ServicePaymentFlagsJson;
+      };
+    }
+  | {
+      UpdateService: {
+        service_id: HexString;
+        categories: HexString[];
+        title: HexString;
+        endpoint: HexString;
+        interface: HexString;
+        pricing: ServicePriceJson[];
+        payment_flags: ServicePaymentFlagsJson;
+      };
+    }
+  | { SetServiceStatus: { service_id: HexString; status: ServiceStatusJson } }
+  | {
+      SpendUnderMandateToService: {
+        mandate_id: HexString;
+        service_id: HexString;
+        amount: string;
+      };
+    };
+
+/** Lifecycle status of a registered service, mirroring Rust `ServiceStatus`. */
+export type ServiceStatusJson = "Active" | "Paused";
+
+/** One priced operation a service exposes, mirroring Rust `ServicePrice`. */
+export interface ServicePriceJson {
+  /** 32-byte lowercase-hex operation discriminant. */
+  operation: HexString;
+  /** Price in native base units (decimal string). */
+  price: string;
+  /** Unit label, LOWERCASE HEX of its bytes (≤ 32 bytes). */
+  unit: HexString;
+}
+
+/** Accepted payment flows, mirroring Rust `ServicePaymentFlags`. */
+export interface ServicePaymentFlagsJson {
+  on_chain_direct: boolean;
+  http_402: boolean;
+  subscription: boolean;
+}
 
 /**
  * One allowlist entry, mirroring Rust `MandateCounterparty` (externally tagged):
