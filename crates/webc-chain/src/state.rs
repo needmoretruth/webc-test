@@ -13,7 +13,7 @@ use crate::authorization_policy::{
     active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
 };
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
-use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy};
+use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy, StoragePricing};
 use crate::genesis::GenesisConfig;
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
 use crate::session_key::{
@@ -53,6 +53,13 @@ pub struct ChainConfig {
     pub slashing: SlashingPolicy,
     pub inflation: InflationSchedule,
     pub bridge: BridgeConfig,
+    /// Occupancy-priced storage deposit + deletion rebate policy (§15.22).
+    ///
+    /// `#[serde(default)]` keeps a genesis written before storage pricing
+    /// decodable; the default locks a cheap refundable deposit per object byte
+    /// and refunds 90% on delete (burning 10% as the occupancy fee).
+    #[serde(default)]
+    pub storage_pricing: StoragePricing,
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
@@ -90,6 +97,7 @@ impl Default for ChainConfig {
             slashing: SlashingPolicy::default(),
             inflation: InflationSchedule::default(),
             bridge: BridgeConfig::default(),
+            storage_pricing: StoragePricing::default(),
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
@@ -251,6 +259,15 @@ pub enum Event {
         to: Address,
         version: ObjectVersion,
     },
+    ObjectDeleted {
+        object_id: ObjectId,
+        /// Object owner who authorized the deletion and received the refund.
+        owner: Address,
+        /// Native base units returned to the owner's liquid balance.
+        refund: Amount,
+        /// Native base units burned as the storage occupancy fee.
+        burned: Amount,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +339,15 @@ pub struct ChainState {
     pub burned_fees: Amount,
     /// Native units destroyed by verified objective penalties.
     pub slashed_units: Amount,
+    /// Refundable native units locked as object storage deposits (§15.22).
+    ///
+    /// Total of every live object's recorded `deposit`. `CreateObject` moves
+    /// units here from the creator's liquid balance; `MutateObject` resizes the
+    /// lock; `DeleteObject` moves them out as an owner refund plus a burned
+    /// occupancy remainder. Reconciled by [`SupplyInvariantReport`] like the
+    /// other locked buckets, and committed by the state root as a scalar.
+    #[serde(default)]
+    pub storage_deposits: Amount,
     pub validator_fee_pool: Amount,
     pub minted_supply: Amount,
     /// Gross issued supply captured at the start of the current inflation year.
@@ -361,6 +387,8 @@ pub struct SupplyInvariantReport {
     pub pending_rewards: Amount,
     /// Collected fee rewards awaiting distribution.
     pub fee_reward_pool: Amount,
+    /// Refundable native units locked as object storage deposits (§15.22).
+    pub storage_deposits: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -430,6 +458,7 @@ impl Default for ChainState {
             processed_slashing_evidence: BTreeSet::new(),
             burned_fees: Amount::ZERO,
             slashed_units: Amount::ZERO,
+            storage_deposits: Amount::ZERO,
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
             inflation_year_start_supply: Amount::ZERO,
@@ -606,6 +635,7 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(lane_fees))
             .and_then(|amount| amount.checked_add(pending_rewards))
             .and_then(|amount| amount.checked_add(self.validator_fee_pool))
+            .and_then(|amount| amount.checked_add(self.storage_deposits))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -619,6 +649,7 @@ impl ChainState {
             lane_fees,
             pending_rewards,
             fee_reward_pool: self.validator_fee_pool,
+            storage_deposits: self.storage_deposits,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -1063,6 +1094,7 @@ impl ChainState {
             unbonding_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
+            storage_deposits: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
@@ -1073,10 +1105,12 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            // V7 adds `last_block_timestamp_ms` (finding E2). The domain bump is a
+            // V8 adds the `storage_deposits` scalar (§15.22 storage deposit +
+            // deletion rebate). The per-object deposit rides inside the object
+            // sub-root (it is a `StateObject` field). The domain bump is a
             // deliberate consensus-format change; no external fixture pins the
-            // prior V6 root.
-            domain: "WEBC_STATE_COMMITMENT_V7",
+            // prior V7 root. V7 added `last_block_timestamp_ms` (finding E2).
+            domain: "WEBC_STATE_COMMITMENT_V8",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1092,7 +1126,9 @@ impl ChainState {
                 b"WEBC_SESSION_KEY_LEAF_V1",
                 self.session_keys.iter(),
             )?,
-            object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V1", self.objects.iter())?,
+            // V2: the object leaf now includes the recorded storage deposit
+            // (§15.22), so a resize/refund changes the object sub-root.
+            object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V2", self.objects.iter())?,
             validator_root: ordered_value_root(b"WEBC_VALIDATOR_LEAF_V1", self.validators.iter())?,
             delegation_root: ordered_value_root(
                 b"WEBC_DELEGATION_LEAF_V1",
@@ -1117,6 +1153,7 @@ impl ChainState {
             unbonding_root: leaf_hash(b"WEBC_UNBONDING_QUEUE_V1", &self.unbonding)?,
             burned_fees: self.burned_fees,
             slashed_units: self.slashed_units,
+            storage_deposits: self.storage_deposits,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
@@ -1637,11 +1674,29 @@ impl ChainState {
             } => {
                 access.write(StateKey::object(*object_id))?;
                 access.write(StateKey::application(*namespace, object_id.hash()))?;
+                // The storage deposit is locked from the creator's liquid
+                // balance, so this operation also writes the sender account
+                // (already recorded on the default lane; declared explicitly so
+                // it is covered on a non-default fee lane too).
+                access.write(StateKey::account(tx.sender))?;
                 if self.objects.contains_key(object_id) {
                     return Err(ChainError::ObjectAlreadyExists);
                 }
-                let object =
+                let mut object =
                     StateObject::new_owned(*object_id, *namespace, tx.sender, data.clone())?;
+                // §15.22: lock a refundable storage deposit proportional to the
+                // deterministic stored byte count. `debit_native` fails closed
+                // (rolling the whole transaction back) if the creator cannot
+                // afford it, so an object can never exist without its deposit.
+                let deposit = config
+                    .storage_pricing
+                    .deposit_for_bytes(object.data.len())?;
+                self.debit_native(tx.sender, deposit)?;
+                object.deposit = deposit;
+                self.storage_deposits = self
+                    .storage_deposits
+                    .checked_add(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
                 let version = object.version;
                 self.objects.insert(*object_id, object);
                 events.push(Event::ObjectCreated {
@@ -1659,14 +1714,54 @@ impl ChainState {
             } => {
                 access.write(StateKey::object(*object_id))?;
                 access.write(StateKey::application(*namespace, object_id.hash()))?;
+                // A resize locks or refunds the difference against the sender's
+                // liquid balance, so the sender account is written here too.
+                access.write(StateKey::account(tx.sender))?;
                 validate_object_data(data)?;
+                let new_deposit = config.storage_pricing.deposit_for_bytes(data.len())?;
+                // Validate ownership/version and read the current deposit, then
+                // release the object borrow before touching balances (which
+                // borrow `self` mutably through the native credit/debit helpers).
+                let old_deposit = {
+                    let object = self
+                        .objects
+                        .get_mut(object_id)
+                        .ok_or(ChainError::ObjectNotFound)?;
+                    validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
+                    object.deposit
+                };
+                // Keep the locked deposit exactly matching the new byte size:
+                // lock the extra when growing (fail closed if unaffordable),
+                // refund the difference when shrinking. Both conserve supply
+                // (liquid <-> storage_deposits).
+                if new_deposit > old_deposit {
+                    let extra = new_deposit
+                        .checked_sub(old_deposit)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    self.debit_native(tx.sender, extra)?;
+                    self.storage_deposits = self
+                        .storage_deposits
+                        .checked_add(extra)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                } else if old_deposit > new_deposit {
+                    let refund = old_deposit
+                        .checked_sub(new_deposit)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    self.storage_deposits = self
+                        .storage_deposits
+                        .checked_sub(refund)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                    self.credit_native(tx.sender, refund)?;
+                }
+                // Commit the new revision, bytes, and matching deposit only after
+                // the balance move succeeded.
                 let object = self
                     .objects
                     .get_mut(object_id)
                     .ok_or(ChainError::ObjectNotFound)?;
-                validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
                 object.version = object.version.checked_next()?;
                 object.data = data.clone();
+                object.deposit = new_deposit;
                 events.push(Event::ObjectMutated {
                     object_id: *object_id,
                     version: object.version,
@@ -1692,6 +1787,46 @@ impl ChainState {
                     from: tx.sender,
                     to: *new_owner,
                     version: object.version,
+                });
+            }
+            Operation::DeleteObject {
+                object_id,
+                namespace,
+                expected_version,
+            } => {
+                access.write(StateKey::object(*object_id))?;
+                access.write(StateKey::application(*namespace, object_id.hash()))?;
+                // The deletion refund credits the owner's liquid balance.
+                access.write(StateKey::account(tx.sender))?;
+                // Validate ownership/version and read the recorded deposit, then
+                // release the borrow before settling balances.
+                let deposit = {
+                    let object = self
+                        .objects
+                        .get(object_id)
+                        .ok_or(ChainError::ObjectNotFound)?;
+                    validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
+                    object.deposit
+                };
+                // §15.22: refund the majority to the owner, burn the occupancy
+                // remainder. `refund + burned == deposit`, so the deposit leaves
+                // `storage_deposits` with no mint or loss.
+                let split = config.storage_pricing.refund_split(deposit)?;
+                self.storage_deposits = self
+                    .storage_deposits
+                    .checked_sub(deposit)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(tx.sender, split.refund)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(split.burned)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.objects.remove(object_id);
+                events.push(Event::ObjectDeleted {
+                    object_id: *object_id,
+                    owner: tx.sender,
+                    refund: split.refund,
+                    burned: split.burned,
                 });
             }
             Operation::Transfer { to, amount } => {
@@ -3196,6 +3331,9 @@ mod tests {
             }),
             ("slashed_units", |s| {
                 s.slashed_units = Amount::from_units(s.slashed_units.0 + 1)
+            }),
+            ("storage_deposits", |s| {
+                s.storage_deposits = Amount::from_units(s.storage_deposits.0 + 1)
             }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
@@ -6094,6 +6232,272 @@ mod tests {
                 .supply_invariant_report()
                 .expect("object report")
                 .balanced
+        );
+    }
+
+    #[test]
+    fn storage_deposit_locks_on_create_resizes_on_mutate_and_refunds_on_delete() {
+        // §15.22: writing object state locks a refundable native deposit
+        // proportional to stored bytes; deleting refunds the majority and burns
+        // the occupancy remainder. Supply must reconcile at every step.
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256::digest(b"deposit-ns");
+        let object_id = ObjectId::new(Hash256::digest(b"deposit-obj"));
+        let per_byte = config.storage_pricing.deposit_per_byte;
+        assert!(per_byte > 0, "default pricing must lock a real deposit");
+        let deposit_for = |len: usize| Amount::from_units(u128::from(per_byte) * len as u128);
+        let issued = state.minted_supply;
+        let assert_balanced = |s: &ChainState| {
+            assert!(
+                s.supply_invariant_report().expect("report").balanced,
+                "supply must reconcile"
+            );
+        };
+
+        let fee = FeeBid {
+            gas_limit: 30_000,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        };
+
+        // --- Create: liquid -> storage_deposits ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let create = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![0u8; 10],
+            },
+            fee,
+        )
+        .expect("create signs");
+        let create_fee = Amount::from_units(u128::from(create.required_units())); // base fee 1/unit
+        state
+            .execute_transaction(&create, &config)
+            .expect("object created");
+        assert_eq!(state.storage_deposits, deposit_for(10));
+        assert_eq!(state.objects[&object_id].deposit, deposit_for(10));
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(create_fee)
+                .and_then(|b| b.checked_sub(deposit_for(10)))
+                .unwrap(),
+            "create must debit both the fee and the storage deposit"
+        );
+        assert_eq!(state.minted_supply, issued, "create mints no supply");
+        assert_balanced(&state);
+
+        // --- Mutate grow: 10 -> 30 bytes locks the extra ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let grow = Transaction::for_operation(
+            &alice,
+            1,
+            Operation::MutateObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::INITIAL,
+                data: vec![0u8; 30],
+            },
+            fee,
+        )
+        .expect("grow signs");
+        let grow_fee = Amount::from_units(u128::from(grow.required_units()));
+        state.execute_transaction(&grow, &config).expect("grew");
+        assert_eq!(state.storage_deposits, deposit_for(30));
+        assert_eq!(state.objects[&object_id].deposit, deposit_for(30));
+        let extra = deposit_for(30).checked_sub(deposit_for(10)).unwrap();
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(grow_fee)
+                .and_then(|b| b.checked_sub(extra))
+                .unwrap(),
+        );
+        assert_balanced(&state);
+
+        // --- Mutate shrink: 30 -> 5 bytes refunds the difference ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let shrink = Transaction::for_operation(
+            &alice,
+            2,
+            Operation::MutateObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::new(2),
+                data: vec![0u8; 5],
+            },
+            fee,
+        )
+        .expect("shrink signs");
+        let shrink_fee = Amount::from_units(u128::from(shrink.required_units()));
+        state.execute_transaction(&shrink, &config).expect("shrank");
+        assert_eq!(state.storage_deposits, deposit_for(5));
+        assert_eq!(state.objects[&object_id].deposit, deposit_for(5));
+        let refunded = deposit_for(30).checked_sub(deposit_for(5)).unwrap();
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(shrink_fee)
+                .and_then(|b| b.checked_add(refunded))
+                .unwrap(),
+        );
+        assert_balanced(&state);
+
+        // --- Delete: storage_deposits -> refund + burned ---
+        let liquid_before = state.accounts[&alice.address()].balance;
+        let burned_before = state.burned_fees;
+        let split = config
+            .storage_pricing
+            .refund_split(deposit_for(5))
+            .expect("split");
+        assert_eq!(
+            split.refund.checked_add(split.burned).unwrap(),
+            deposit_for(5)
+        );
+        assert!(
+            !split.burned.is_zero(),
+            "occupancy fee must burn a remainder"
+        );
+        let delete = Transaction::for_operation(
+            &alice,
+            3,
+            Operation::DeleteObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::new(3),
+            },
+            fee,
+        )
+        .expect("delete signs");
+        let delete_fee = Amount::from_units(u128::from(delete.required_units()));
+        let receipt = state
+            .execute_transaction(&delete, &config)
+            .expect("deleted");
+        assert!(!state.objects.contains_key(&object_id), "object removed");
+        assert_eq!(state.storage_deposits, Amount::ZERO);
+        assert!(receipt.events.iter().any(|event| matches!(
+            event,
+            Event::ObjectDeleted { refund, burned, .. }
+                if *refund == split.refund && *burned == split.burned
+        )));
+        // The delete fee burns half its fee too, so account for both burn sources.
+        let delete_fee_burn = split_fee(delete_fee).burned;
+        assert_eq!(
+            state.burned_fees,
+            burned_before
+                .checked_add(split.burned)
+                .and_then(|b| b.checked_add(delete_fee_burn))
+                .unwrap(),
+            "deletion burns the occupancy remainder plus the fee burn"
+        );
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_sub(delete_fee)
+                .and_then(|b| b.checked_add(split.refund))
+                .unwrap(),
+            "owner is refunded the majority of the deposit"
+        );
+        assert_eq!(state.minted_supply, issued, "delete mints no supply");
+        assert_balanced(&state);
+    }
+
+    #[test]
+    fn insufficient_balance_storage_deposit_create_fails_closed() {
+        // A creator who cannot afford the storage deposit fails closed and leaves
+        // no partial object or deposit behind (the whole transaction rolls back).
+        let (config, mut state, alice, bob) = funded_state();
+        // Fund bob with just enough for one fee but far less than a big deposit.
+        let seed = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::Transfer {
+                to: bob.address(),
+                amount: Amount::from_units(30_000),
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("seed signs");
+        state
+            .execute_transaction(&seed, &config)
+            .expect("bob funded");
+
+        let namespace = Hash256::digest(b"poor-ns");
+        let object_id = ObjectId::new(Hash256::digest(b"poor-obj"));
+        // Deposit for 100 bytes = 100_000 base units, above bob's post-fee balance.
+        let create = Transaction::for_operation(
+            &bob,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![0u8; 100],
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("create signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&create, &config),
+            Err(ChainError::InsufficientBalance { .. })
+        ));
+        assert_eq!(state, before, "failed create leaves no partial state");
+        assert!(!state.objects.contains_key(&object_id));
+        assert_eq!(state.storage_deposits, Amount::ZERO);
+        assert!(state.supply_invariant_report().expect("report").balanced);
+    }
+
+    #[test]
+    fn storage_deposits_survive_bincode_restart_with_stable_state_root() {
+        // A crash-restart (bincode round-trip of the whole state) must preserve
+        // the locked storage deposits and the committed state root, so a node
+        // cannot silently diverge on the new bucket after reloading from disk.
+        let (config, mut state, alice, _bob) = funded_state();
+        let namespace = Hash256::digest(b"restart-ns");
+        let object_id = ObjectId::new(Hash256::digest(b"restart-obj"));
+        let create = Transaction::for_operation(
+            &alice,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![7u8; 42],
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("create signs");
+        state
+            .execute_transaction(&create, &config)
+            .expect("created");
+        assert!(!state.storage_deposits.is_zero());
+
+        let bytes = bincode::serialize(&state).expect("state serializes");
+        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        assert_eq!(restored.storage_deposits, state.storage_deposits);
+        assert_eq!(
+            restored.objects[&object_id].deposit,
+            state.objects[&object_id].deposit
+        );
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "storage_deposits is committed by the state root across a restart"
         );
     }
 

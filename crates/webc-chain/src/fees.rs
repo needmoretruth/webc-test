@@ -1,8 +1,11 @@
-//! Deterministic base-fee adjustment and protocol fee splitting.
+//! Deterministic base-fee adjustment, protocol fee splitting, and storage-deposit pricing.
 //!
-//! This module owns only integer fee arithmetic. It does not debit accounts or
-//! choose block contents. All calculations fail closed on invalid policy values
-//! or overflow so hostile configuration cannot silently clamp consensus state.
+//! This module owns only integer fee/pricing arithmetic. It does not debit
+//! accounts or choose block contents. All calculations fail closed on invalid
+//! policy values or overflow so hostile configuration cannot silently clamp
+//! consensus state. Storage deposits priced here are refundable capital, not a
+//! fee: the state machine locks them separately and only the deletion occupancy
+//! remainder is ever burned.
 
 use crate::{Amount, ChainError};
 use serde::{Deserialize, Serialize};
@@ -55,6 +58,94 @@ pub fn split_fee(total: Amount) -> FeeBreakdown {
         total,
         burned,
         validator_reward,
+    }
+}
+
+/// Occupancy-priced storage deposit + deletion rebate policy (WEBC-DEFINITION §15.22).
+///
+/// Writing object state locks a refundable native deposit proportional to the
+/// object's stored bytes (Sui-style occupancy pricing). Deleting the object
+/// refunds `refund_bps` of the recorded deposit to the owner and burns the
+/// remainder as the occupancy fee, which discourages parking dead state on
+/// every validator forever. The deposit is refundable capital held in the
+/// `storage_deposits` supply bucket while locked; only the burned remainder ever
+/// leaves circulation. Launch constants are measurement-tuned placeholders
+/// (§15.35); the mechanism, not the exact numbers, is what is fixed here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePricing {
+    /// Native base units locked per stored object byte. A small placeholder;
+    /// `0` disables storage deposits entirely (no lock, no refund, no burn).
+    pub deposit_per_byte: u64,
+    /// Basis points (`0..=10_000`) of a deposit refunded to the owner on
+    /// deletion; the remaining `10_000 - refund_bps` is burned as the occupancy
+    /// fee. `9_000` = 90% refunded, 10% burned.
+    pub refund_bps: u16,
+}
+
+impl Default for StoragePricing {
+    fn default() -> Self {
+        // Cheap placeholder: 1000 base units/byte is 1e-9 WEBC/byte, so a full
+        // 64 KiB object locks well under 0.0001 WEBC. 90% is refunded on delete.
+        Self {
+            deposit_per_byte: 1_000,
+            refund_bps: 9_000,
+        }
+    }
+}
+
+/// Conserving split of a released storage deposit on object deletion.
+///
+/// `refund + burned == deposit` always holds, so settlement neither mints nor
+/// loses native units — it only moves them out of the `storage_deposits` bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRefund {
+    /// Native base units returned to the owner's liquid balance.
+    pub refund: Amount,
+    /// Native base units permanently burned as the occupancy fee.
+    pub burned: Amount,
+}
+
+impl StoragePricing {
+    /// Rejects a policy whose refund share is outside the basis-point range.
+    ///
+    /// `refund_bps > 10_000` would compute a refund larger than the deposit and
+    /// a negative (underflowing) burn, so it is rejected before any settlement.
+    pub fn validate(&self) -> Result<(), ChainError> {
+        if self.refund_bps > 10_000 {
+            return Err(ChainError::InvalidStoragePricing);
+        }
+        Ok(())
+    }
+
+    /// Refundable deposit that must be locked for `byte_len` stored object bytes.
+    ///
+    /// Deterministic checked arithmetic: `byte_len * deposit_per_byte`, in native
+    /// base units. Object byte length is bounded by `MAX_OBJECT_DATA_BYTES`, so
+    /// the product cannot realistically overflow `u128`, but the multiply is
+    /// still checked to fail closed on hostile input rather than wrap.
+    pub fn deposit_for_bytes(&self, byte_len: usize) -> Result<Amount, ChainError> {
+        let bytes = u128::try_from(byte_len).map_err(|_| ChainError::ArithmeticOverflow)?;
+        bytes
+            .checked_mul(u128::from(self.deposit_per_byte))
+            .map(Amount::from_units)
+            .ok_or(ChainError::ArithmeticOverflow)
+    }
+
+    /// Splits a recorded deposit into `(refund, burned)` on object deletion.
+    ///
+    /// `refund = deposit * refund_bps / 10_000` (no overflow in the intermediate)
+    /// and `burned = deposit - refund`, so the two always sum back to `deposit`.
+    /// Fails closed if the policy's refund share is invalid.
+    pub fn refund_split(&self, deposit: Amount) -> Result<StorageRefund, ChainError> {
+        self.validate()?;
+        let refund = deposit
+            .checked_mul_bps(self.refund_bps)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let burned = deposit
+            .checked_sub(refund)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        Ok(StorageRefund { refund, burned })
     }
 }
 
@@ -119,6 +210,70 @@ mod tests {
         let fee = Amount::from_units(101);
         let split = split_fee(fee);
         assert_eq!(split.burned.0 + split.validator_reward.0, fee.0);
+    }
+
+    #[test]
+    fn storage_deposit_scales_with_bytes_and_splits_conservingly() {
+        let pricing = StoragePricing {
+            deposit_per_byte: 1_000,
+            refund_bps: 9_000,
+        };
+        // Deposit is exactly byte_len * deposit_per_byte.
+        assert_eq!(pricing.deposit_for_bytes(0).unwrap(), Amount::from_units(0));
+        let deposit = pricing.deposit_for_bytes(64).unwrap();
+        assert_eq!(deposit, Amount::from_units(64_000));
+
+        // The refund/burn split always sums back to the deposit (no mint/loss).
+        let split = pricing.refund_split(deposit).unwrap();
+        assert_eq!(split.refund, Amount::from_units(57_600)); // 90%
+        assert_eq!(split.burned, Amount::from_units(6_400)); // 10%
+        assert_eq!(
+            split.refund.checked_add(split.burned).unwrap(),
+            deposit,
+            "refund + burn must reconstruct the deposit"
+        );
+    }
+
+    #[test]
+    fn storage_pricing_edges_are_exact_and_fail_closed() {
+        // Full refund keeps the whole deposit; zero burn.
+        let full = StoragePricing {
+            deposit_per_byte: 5,
+            refund_bps: 10_000,
+        };
+        let split = full.refund_split(Amount::from_units(101)).unwrap();
+        assert_eq!(split.refund, Amount::from_units(101));
+        assert_eq!(split.burned, Amount::ZERO);
+
+        // Zero refund burns the entire deposit.
+        let none = StoragePricing {
+            deposit_per_byte: 5,
+            refund_bps: 0,
+        };
+        let split = none.refund_split(Amount::from_units(101)).unwrap();
+        assert_eq!(split.refund, Amount::ZERO);
+        assert_eq!(split.burned, Amount::from_units(101));
+
+        // An out-of-range refund share is rejected before any settlement.
+        let invalid = StoragePricing {
+            deposit_per_byte: 1,
+            refund_bps: 10_001,
+        };
+        assert!(matches!(
+            invalid.refund_split(Amount::from_units(1)),
+            Err(ChainError::InvalidStoragePricing)
+        ));
+        assert!(matches!(
+            invalid.validate(),
+            Err(ChainError::InvalidStoragePricing)
+        ));
+
+        // A zero per-byte price disables deposits.
+        let disabled = StoragePricing {
+            deposit_per_byte: 0,
+            refund_bps: 9_000,
+        };
+        assert_eq!(disabled.deposit_for_bytes(4_096).unwrap(), Amount::ZERO);
     }
 
     #[test]

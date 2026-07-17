@@ -25,7 +25,7 @@ use webc_crypto::Address;
 /// The grant is defined over `[start_epoch, start_epoch + vest_epochs)`: at
 /// `start_epoch` nothing is vested, and after `vest_epochs` full epochs the whole
 /// grant is vested. Vesting is realized only by epochs the beneficiary actually
-/// validated correctly — the program advances [`credited_epochs`] only for such
+/// validated correctly — the program advances [`Self::credited_epochs`] only for such
 /// epochs, so downtime simply does not progress vesting (it does not, by itself,
 /// forfeit). A forfeiture (early exit / slashable fault) freezes vesting and
 /// returns the locked remainder.
@@ -63,7 +63,7 @@ impl StakeGrant {
 
     /// The units vested so far: `total × min(credited, vest_epochs) / vest_epochs`
     /// (floored). A forfeited grant vests nothing further beyond what it had at
-    /// forfeiture — callers should read [`vested`] before calling [`forfeit`] if
+    /// forfeiture — callers should read [`Self::vested`] before calling [`Self::forfeit`] if
     /// they need the pre-forfeit figure. `vest_epochs` is guaranteed non-zero by
     /// the constructor.
     pub fn vested(&self) -> Result<Amount, ChainError> {

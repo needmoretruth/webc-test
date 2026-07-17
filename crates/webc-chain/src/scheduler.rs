@@ -266,7 +266,49 @@ mod tests {
     }
 
     #[test]
-    fn same_wallet_objects_in_distinct_namespaces_share_a_batch() {
+    fn distinct_wallet_objects_in_distinct_namespaces_share_a_batch() {
+        // Object creation locks a storage deposit from the creator's liquid
+        // balance (§15.22), so two creates by DIFFERENT wallets in different
+        // namespaces still touch disjoint state and can run in parallel — the
+        // namespace/account isolation the scheduler exists to exploit.
+        let operation = |label: &'static [u8]| Operation::CreateObject {
+            object_id: ObjectId::new(Hash256::digest_many([b"object", label])),
+            namespace: Hash256::digest_many([b"namespace", label]),
+            data: label.to_vec(),
+        };
+        let first = Transaction::for_operation_in_lane(
+            &Keypair::from_seed([12u8; 32]),
+            AuthorizationLaneId::new(Hash256::digest(b"lane-a")),
+            0,
+            operation(b"a"),
+            FeeBid {
+                gas_limit: 30_000,
+                ..FeeBid::default()
+            },
+        )
+        .expect("first object signs");
+        let second = Transaction::for_operation_in_lane(
+            &Keypair::from_seed([13u8; 32]),
+            AuthorizationLaneId::new(Hash256::digest(b"lane-b")),
+            0,
+            operation(b"b"),
+            FeeBid {
+                gas_limit: 30_000,
+                ..FeeBid::default()
+            },
+        )
+        .expect("second object signs");
+
+        assert_eq!(parallel_batches(&[first, second]), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn same_wallet_object_creates_serialize_on_the_deposit_funding_account() {
+        // Two creates by the SAME wallet — even in different namespaces and fee
+        // lanes — both lock a storage deposit from that wallet's single liquid
+        // balance, so they conflict on the sender account and must be scheduled
+        // sequentially. This mirrors Sui's shared gas coin serializing an owner's
+        // transactions, and prevents parallel double-spend of the same balance.
         let wallet = Keypair::from_seed([12u8; 32]);
         let operation = |label: &'static [u8]| Operation::CreateObject {
             object_id: ObjectId::new(Hash256::digest_many([b"object", label])),
@@ -296,6 +338,6 @@ mod tests {
         )
         .expect("second object signs");
 
-        assert_eq!(parallel_batches(&[first, second]), vec![vec![0, 1]]);
+        assert_eq!(parallel_batches(&[first, second]), vec![vec![0], vec![1]]);
     }
 }
