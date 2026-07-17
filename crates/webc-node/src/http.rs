@@ -20,6 +20,7 @@
 //! - `GET  /accounts/{address}`         account snapshot
 //! - `GET  /accounts/{address}/proof`   Merkle account proof
 //! - `GET  /accounts/{address}/token-balances` paginated balances held by an address
+//! - `GET  /accounts/{address}/mandates` paginated mandates whose principal is an address
 //! - `GET  /objects/{id}`               persistent object by hex id
 //! - `GET  /tokens/{id}`                native token record by hex id
 //! - `GET  /tokens/{id}/balances/{address}` a holder's token balance
@@ -62,9 +63,9 @@ use webc_crypto::{Address, Hash256};
 use webc_storage::KvStore;
 
 use crate::service::{
-    AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NftItemsPage, NodeService,
-    ProposalsPage, SealSummary, ServicesPage, SubmitReceipt, TokenBalancesPage, ValidatorSummary,
-    ValidatorsResponse, API_VERSION,
+    AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, MandatesPage, NftItemsPage,
+    NodeService, ProposalsPage, SealSummary, ServicesPage, SubmitReceipt, TokenBalancesPage,
+    ValidatorSummary, ValidatorsResponse, API_VERSION,
 };
 
 /// Default maximum request body size (1 MiB), bounding hostile payloads.
@@ -356,6 +357,10 @@ where
             "/v1/accounts/{address}/token-balances",
             get(account_token_balances::<K>),
         )
+        .route(
+            "/v1/accounts/{address}/mandates",
+            get(account_mandates::<K>),
+        )
         .route("/v1/validators", get(validators::<K>))
         .route("/v1/validators/{address}", get(validator::<K>))
         .route("/v1/supply", get(supply::<K>))
@@ -579,6 +584,19 @@ async fn account_token_balances<K: KvStore>(
 ) -> Result<Json<TokenBalancesPage>, ApiRejection> {
     let address = parse_address(&address)?;
     Ok(Json(state.service().account_token_balances(
+        address,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn account_mandates<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(address): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<MandatesPage>, ApiRejection> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.service().account_mandates(
         address,
         params.cursor.as_deref(),
         params.limit,
@@ -2094,6 +2112,145 @@ mod tests {
             format!("/v1/accounts/{holder}/token-balances?limit=abc"),
             // Unknown query parameter.
             format!("/v1/accounts/{holder}/token-balances?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated account-mandates discovery endpoint -----
+
+    /// Builds a service where `principal` has granted `count` mandates (to one agent
+    /// key, varying the grant nonce), plus one mandate granted by a different
+    /// principal. Returns the state, the principal, a stranger holding none, and the
+    /// principal's mandate ids in grant order.
+    fn mandates_state(count: u64) -> (AppState<MemoryKvStore>, Address, Address, Vec<MandateId>) {
+        let creator = Keypair::from_seed([81u8; 32]);
+        let other = Keypair::from_seed([82u8; 32]);
+        let agent = Keypair::from_seed([83u8; 32]);
+        let stranger = Keypair::from_seed([222u8; 32]);
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![
+                GenesisAccount {
+                    address: creator.address(),
+                    balance: Amount::from_webc(10_000_000),
+                },
+                GenesisAccount {
+                    address: other.address(),
+                    balance: Amount::from_webc(10_000_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        let grant = |grant_nonce: u64| Operation::GrantMandate {
+            agent_key: agent.public_key(),
+            grant_nonce,
+            budget_total: Amount::from_webc(10),
+            expiry_epoch: Epoch::new(1_000_000),
+            per_tx_max: Amount::from_webc(1),
+            rate_limit_per_day: 0,
+            counterparty_policy: MandateCounterpartyPolicy::Open,
+        };
+
+        let mut ids = Vec::new();
+        for i in 0..count {
+            seal_op(&state, &creator, i, grant(i));
+            ids.push(MandateId::derive(creator.address(), &agent.public_key(), i));
+        }
+        // A mandate granted by a different principal — must not appear for `creator`.
+        seal_op(&state, &other, 0, grant(0));
+
+        (state, creator.address(), stranger.address(), ids)
+    }
+
+    /// Walks every page of an address's mandates, asserting each page is within
+    /// `limit`, and returns the mandate ids in served order.
+    async fn walk_mandates(app: &Router, address: &str, limit: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let base = format!("/v1/accounts/{address}/mandates?limit={limit}");
+            let uri = match &cursor {
+                Some(c) => format!("{base}&cursor={c}"),
+                None => base,
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                ids.push(item["mandate_id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(ids.len() < 100_000, "pagination failed to terminate");
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn mandates_paginate_and_filter_by_principal() {
+        let (state, principal, stranger, mandate_ids) = mandates_state(5);
+        let app = router(state);
+        let expected: BTreeSet<String> = mandate_ids.iter().map(|id| hash_hex(id.hash())).collect();
+
+        let walked = walk_mandates(&app, &principal.to_string(), 2).await;
+        // Ascending by mandate id, no duplicates.
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(walked, sorted, "ascending mandate-id order");
+        let got: BTreeSet<String> = walked.iter().cloned().collect();
+        assert_eq!(got.len(), walked.len(), "no mandate repeats");
+        // Exactly this principal's mandates, excluding the other principal's.
+        assert_eq!(got, expected);
+
+        // The first page flattens the Mandate record.
+        let first = body_value(
+            get_response(&app, format!("/v1/accounts/{principal}/mandates?limit=2")).await,
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["principal"], principal.to_string());
+        assert_eq!(first["items"][0]["revoked"], false);
+
+        // An address that is the principal of no mandate yields an empty page.
+        let body =
+            body_value(get_response(&app, format!("/v1/accounts/{stranger}/mandates")).await).await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn mandates_reject_malformed_inputs() {
+        let (state, principal, _stranger, _ids) = mandates_state(1);
+        let app = router(state);
+        let principal = principal.to_string();
+        for uri in [
+            // Malformed principal address.
+            "/v1/accounts/not-an-address/mandates".to_string(),
+            // Non-hex cursor.
+            format!("/v1/accounts/{principal}/mandates?cursor=zz"),
+            // Non-numeric limit.
+            format!("/v1/accounts/{principal}/mandates?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/accounts/{principal}/mandates?bogus=1"),
         ] {
             let response = get_response(&app, uri.clone()).await;
             assert_eq!(

@@ -859,6 +859,22 @@ pub struct TokenBalancesPage {
     pub next_cursor: Option<String>,
 }
 
+/// One entry in an address's mandates listing: the mandate's id alongside its full
+/// `Mandate` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct MandateListItem {
+    pub mandate_id: MandateId,
+    #[serde(flatten)]
+    pub mandate: Mandate,
+}
+
+/// A paginated mandates page.
+#[derive(Debug, serde::Serialize)]
+pub struct MandatesPage {
+    pub items: Vec<MandateListItem>,
+    pub next_cursor: Option<String>,
+}
+
 /// Bounded, cursor-paginated DISCOVERY reads over the Phase 9/13 native-state maps.
 ///
 /// Every accessor here is a pure, deterministic ASCENDING walk of a committed
@@ -1061,6 +1077,50 @@ impl<K: KvStore> NodeService<K> {
             }
         }
         Ok(TokenBalancesPage { items, next_cursor })
+    }
+
+    /// Lists the mandates whose `principal == address`, ascending by `MandateId`.
+    /// Mandates are keyed by their opaque `MandateId`, so this is a bounded filtered
+    /// scan (at most `FILTER_SCAN_MULTIPLIER * limit` entries per page); the cursor
+    /// carries the last-visited id for forward progress. An address that is the
+    /// principal of no mandate is a 200 with an empty page.
+    pub fn account_mandates(
+        &self,
+        address: Address,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<MandatesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let mandates = &inner.node.state().mandates;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(MandateId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, mandate) in mandates.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            if mandate.principal == address {
+                items.push(MandateListItem {
+                    mandate_id: *id,
+                    mandate: mandate.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(MandatesPage { items, next_cursor })
     }
 }
 
