@@ -217,6 +217,37 @@ faucet devnet staking UX, stake-locked-grant / vest-by-operation primitives
 (Phase 16). After Phase 5 comes the **Phase 5.5 core freeze + independent
 security review**, whose per-finding prerequisite this session satisfied.
 
+### Phase 5 progress (2026-07-17)
+
+Landed this session (each reproduce/test → gate → commit → push; full workspace
+gate green incl. SDK):
+
+- **Task 10 — public validator/supply endpoints:** `GET /v1/validators`,
+  `/v1/validators/{addr}`, `/v1/supply`; SDK node-client `getValidators/
+  getValidator/getSupply`.
+- **Task 12 — bootstrap issuance (decided):** opt-in `ChainConfig.bootstrap_issuance`;
+  stake-keyed budget capped by the base per-period budget; sunset epoch; supply
+  conserved.
+- **Task 6b — compounding:** `CompoundValidatorRewards` / `CompoundDelegatorRewards`
+  restake accrued rewards in place (supply-neutral, ratio-guarded).
+- **Task 11 — faucet-funded staking UX:** `stake-register/-delegate/-undelegate/
+  -claim` + `faucet-stake` CLI subcommands over the in-process service.
+- **Task 13 — grant/vest primitive:** `grants::StakeGrant` (stake-locked,
+  vest-by-credited-epoch, forfeit-reverts); Phase 16 accounting integration
+  deferred.
+- **ADR-0012 + flexible scaffolding:** the Ethereum/Solana/Sui/Polkadot/Cardano
+  comparison and the inactivity-leak + correlation-scaled slashing design;
+  `InactivityLeakConfig` (opt-in, disabled) with tested per-epoch leak math;
+  `SlashingPolicy` marked provisional.
+
+**Deferred within Phase 5 (owner-gated / consensus-safety, tracked in ADR-0012):**
+the slashing severity numbers, correlated-slashing behavior, the downtime→jail
+path, and the inactivity-leak consensus wiring (recovery mode) all await the
+owner confirming ADR-0012's recovery family + constants. Other severe evidence
+types (invalid-transition, fraudulent-bridge) need their objective artifacts,
+which are later-phase (runtime / bridge). Tasks 1–7 (ratio/minimums/queues/
+snapshots/commission/rewards/inflation) were already implemented and test-covered.
+
 **Owner-owned items still deferred** (do not decide alone; full list in AGENTS.md
 "User decisions still required later"): the Phase-5 economics numbers above; the
 production-bridge trust/proof model; the weak-subjectivity trust-anchor source
