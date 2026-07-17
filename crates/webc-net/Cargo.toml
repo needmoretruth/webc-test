@@ -27,6 +27,12 @@ futures-util = { version = "0.3", features = ["sink"] }
 bytes = "1"
 # OS randomness for fresh handshake challenges (reused workspace pin).
 rand_core = { workspace = true }
+# Transparent on-the-wire frame compression (WEBC §15.19/§15.24: zstd on by
+# default across wire and storage). Same pin as the storage crate's at-rest
+# compression, so both sides of that decision share one codec; the
+# `zstd`/`zstd-safe`/`zstd-sys` bindings are MIT / (MIT OR Apache-2.0) and
+# already pass the cargo-deny licence gate (vendored via webc-storage).
+zstd = "0.13"
 
 # `io-util` (AsyncReadExt) is test-only: the DoS-hardening tests drive raw
 # sockets to exercise handshake timeouts and connection caps.

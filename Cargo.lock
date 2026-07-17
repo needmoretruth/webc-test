@@ -1314,6 +1314,7 @@ dependencies = [
  "tokio-util",
  "webc-chain",
  "webc-crypto",
+ "zstd",
 ]
 
 [[package]]

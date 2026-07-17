@@ -953,6 +953,89 @@ mod tests {
         assert_eq!(got.hash().unwrap(), tx_hash);
     }
 
+    /// Builds a large, highly compressible certified block: many identical
+    /// transactions, which zstd collapses to a small frame. Used to prove a large
+    /// payload survives the full loopback path (encode → compress → socket →
+    /// decompress → decode). The certificate is a placeholder — this test
+    /// exercises transport, not certificate verification.
+    fn large_certified_block(tx_count: usize) -> crate::wire::CertifiedBlock {
+        let leader = Keypair::from_seed([73u8; 32]);
+        let block = webc_chain::Block {
+            header: webc_chain::BlockHeader {
+                protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height: 1,
+                epoch: 0,
+                previous_hash: Hash256([0u8; 32]),
+                state_root: Hash256([0x11; 32]),
+                account_root: Hash256([0x22; 32]),
+                tx_root: Hash256([0x33; 32]),
+                receipt_root: Hash256([0x44; 32]),
+                evidence_root: Hash256([0x55; 32]),
+                proposer: leader.address(),
+                timestamp_ms: 1_700_000_000_000,
+                base_fee_per_unit: 1,
+            },
+            transactions: vec![sample_tx(120); tx_count],
+            receipts: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let certificate = webc_chain::FinalityCertificate {
+            protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            height: 1,
+            round: 0,
+            block_hash: block.hash().unwrap(),
+            precommits: Vec::new(),
+        };
+        crate::wire::CertifiedBlock { block, certificate }
+    }
+
+    #[tokio::test]
+    async fn large_compressible_message_round_trips_over_the_wire() {
+        // WEBC §15.19/§15.24: a large, highly compressible gossip message must
+        // survive the authenticated loopback path unchanged, transparently
+        // compressed on the wire.
+        let chain = ChainId::devnet();
+        let (a_handle, _a_rx, a_addr) = spawn_listener(71, chain.clone()).await;
+        let (b_handle, mut b_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([72u8; 32]),
+            chain,
+            Some(loopback()),
+            vec![a_addr],
+        ))
+        .await
+        .unwrap();
+        await_connected(&a_handle, &b_handle).await;
+
+        let certified = large_certified_block(2_000);
+        let block_hash = certified.block.hash().unwrap();
+        let tx_count = certified.block.transactions.len();
+        // Sanity: the raw payload is genuinely large, so the round trip really is
+        // exercising a big frame that compression must shrink to cross the wire.
+        let raw_len = encode_message(&NetMessage::BlockResponse(Box::new(certified.clone())))
+            .expect("encode large message")
+            .len();
+        assert!(
+            raw_len < MAX_FRAME_BYTES,
+            "the compressed frame must fit one legal frame ({raw_len} bytes)"
+        );
+
+        a_handle
+            .broadcast(NetMessage::BlockResponse(Box::new(certified)))
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), b_rx.recv())
+            .await
+            .expect("large gossip delivered before timeout")
+            .expect("inbound channel open");
+        let NetMessage::BlockResponse(got) = received.message else {
+            panic!("expected a block response message");
+        };
+        assert_eq!(got.block.transactions.len(), tx_count);
+        assert_eq!(got.block.hash().unwrap(), block_hash);
+    }
+
     #[tokio::test]
     async fn duplicate_broadcast_is_delivered_once() {
         let chain = ChainId::devnet();

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use webc_chain::{Block, FinalityCertificate, SignedProposal, SignedVote, Transaction};
 use webc_crypto::Hash256;
 
-use crate::codec::{decode as decode_frame, encode as encode_frame};
+use crate::codec::{
+    compress_payload, decode as decode_frame, decompress_payload, encode as encode_frame,
+};
 use crate::error::NetError;
 
 /// Fixed four-byte tag beginning every WEBC network frame.
@@ -23,9 +25,21 @@ pub const NET_PROTOCOL_MAGIC: [u8; 4] = *b"WEBC";
 ///
 /// v2 (C5): `SignedProposal` gained a `proof_of_lock` prevote set, changing the
 /// bincode layout of `NetMessage::Proposal`, so a v1 node cannot decode a v2
-/// proposal frame. The handshake pins this version, so mismatched peers refuse
-/// to connect rather than misparse.
-pub const NET_PROTOCOL_VERSION: u16 = 2;
+/// proposal frame.
+///
+/// v3 (P6, WEBC §15.19/§15.24): the message-envelope payload gained a transparent
+/// compression tag (`codec::compress_payload`), so the bytes after the header are
+/// now `tag + raw-or-zstd` rather than a bare bincode payload — a v2 node cannot
+/// parse a v3 frame's body. The handshake pins this version and stays
+/// uncompressed, so mismatched peers cleanly refuse to connect (a typed
+/// `UnsupportedVersion`) rather than misparse.
+pub const NET_PROTOCOL_VERSION: u16 = 3;
+
+/// Length of the clear frame header: the fixed magic followed by the
+/// little-endian wire version. These bytes are never compressed, so
+/// [`decode_message`] can reject a foreign or incompatible frame at fixed offsets
+/// before decompressing or deserializing any attacker-controlled payload.
+const FRAME_HEADER_LEN: usize = NET_PROTOCOL_MAGIC.len() + 2;
 
 /// Maximum size of a single decoded frame payload, in bytes.
 ///
@@ -70,44 +84,49 @@ pub struct CertifiedBlock {
     pub certificate: FinalityCertificate,
 }
 
-/// Self-describing envelope wrapping one [`NetMessage`] on the wire.
+/// Encodes one message into its exact frame bytes.
 ///
-/// The magic and version are serialized first so [`decode_message`] can reject
-/// an incompatible frame cheaply before trusting the payload.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Envelope {
-    magic: [u8; 4],
-    version: u16,
-    payload: NetMessage,
-}
-
-/// Encodes one message into its exact frame bytes (magic + version + payload).
+/// Frame layout: `magic (4) ++ version_le (2) ++ body`, where `body` is the
+/// transparent compression envelope produced by [`compress_payload`] over the
+/// bincode of the message — a 1-byte tag (`0x00` raw / `0x01` zstd) followed by
+/// the raw bytes or a zstd frame, whichever is smaller (WEBC §15.19/§15.24). The
+/// magic and version stay in the clear so a peer can reject an incompatible frame
+/// before touching the payload. Compression is on by default and applies only to
+/// this post-handshake message envelope; the handshake frames are left raw (see
+/// [`compress_payload`]).
 pub fn encode_message(message: &NetMessage) -> Result<Vec<u8>, NetError> {
-    let envelope = Envelope {
-        magic: NET_PROTOCOL_MAGIC,
-        version: NET_PROTOCOL_VERSION,
-        payload: message.clone(),
-    };
-    let bytes = encode_frame(&envelope)?;
-    if bytes.len() > MAX_FRAME_BYTES {
+    // Serialize the payload (bincode, itself capped at MAX_FRAME_BYTES by the
+    // shared codec), then wrap it in the compression envelope.
+    let payload = encode_frame(message)?;
+    let body = compress_payload(&payload);
+
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+    frame.extend_from_slice(&NET_PROTOCOL_MAGIC);
+    frame.extend_from_slice(&NET_PROTOCOL_VERSION.to_le_bytes());
+    frame.extend_from_slice(&body);
+    // Defense in depth at the length-delimited layer: the encoded (compressed)
+    // frame must still fit one legal frame, matching the transport codec's
+    // `max_frame_length`.
+    if frame.len() > MAX_FRAME_BYTES {
         return Err(NetError::FrameTooLarge {
             maximum: MAX_FRAME_BYTES,
         });
     }
-    Ok(bytes)
+    Ok(frame)
 }
 
-/// Decodes one frame, rejecting foreign magic, unsupported versions, oversize
-/// payloads, and trailing bytes before returning the message.
+/// Decodes one frame, rejecting foreign magic, unsupported versions, oversize or
+/// bomb payloads, and trailing bytes before returning the message.
 pub fn decode_message(bytes: &[u8]) -> Result<NetMessage, NetError> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(NetError::FrameTooLarge {
             maximum: MAX_FRAME_BYTES,
         });
     }
-    // Cheaply reject an incompatible frame before deserializing the payload:
-    // the first bytes are the fixed magic, then the little-endian version.
-    if bytes.len() < 6 {
+    // Cheaply reject an incompatible frame before decompressing/deserializing the
+    // payload: the first bytes are the fixed magic, then the little-endian
+    // version — both live in the clear, ahead of the compression tag.
+    if bytes.len() < FRAME_HEADER_LEN {
         return Err(NetError::MalformedFrame);
     }
     if bytes[0..4] != NET_PROTOCOL_MAGIC {
@@ -117,9 +136,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<NetMessage, NetError> {
     if version != NET_PROTOCOL_VERSION {
         return Err(NetError::UnsupportedVersion { actual: version });
     }
-    // The shared codec rejects trailing bytes: a frame consumes exactly its bytes.
-    let envelope: Envelope = decode_frame(bytes)?;
-    Ok(envelope.payload)
+    // Decompress the body under the frame budget (this rejects a decompression
+    // bomb before allocating unbounded memory), then decode the payload. The
+    // shared codec rejects trailing bytes: a frame consumes exactly its bytes.
+    let payload = decompress_payload(&bytes[FRAME_HEADER_LEN..])?;
+    let message: NetMessage = decode_frame(&payload)?;
+    Ok(message)
 }
 
 /// Stable content identity of an encoded frame, used to suppress gossip loops.
@@ -277,6 +299,117 @@ mod tests {
             panic!("expected a block response message");
         };
         assert_eq!(got.block.hash().unwrap(), block.hash().unwrap());
+    }
+
+    #[test]
+    fn large_compressible_message_is_smaller_on_the_wire_and_round_trips() {
+        // A block carrying many identical transactions is large and highly
+        // compressible (WEBC §15.19/§15.24): the on-wire frame must come out well
+        // under the raw bincode payload, yet still decode back to the same message.
+        let leader = Keypair::from_seed([8u8; 32]);
+        let mut block = sample_block(leader.address());
+        block.transactions = vec![sample_transaction(); 2_000];
+        let certificate = FinalityCertificate {
+            protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+            chain_id: webc_chain::ChainId::devnet(),
+            height: 1,
+            round: 0,
+            block_hash: block.hash().unwrap(),
+            precommits: vec![sample_vote(&leader)],
+        };
+        let message = NetMessage::BlockResponse(Box::new(CertifiedBlock {
+            block: block.clone(),
+            certificate,
+        }));
+
+        let raw_payload = encode_frame(&message).expect("bincode the payload");
+        let encoded = encode_message(&message).expect("encode the frame");
+        // The compression tag sits right after the clear magic+version header.
+        assert_eq!(
+            encoded[FRAME_HEADER_LEN], 0x01,
+            "a large compressible payload must be sent zstd-compressed"
+        );
+        assert!(
+            encoded.len() < raw_payload.len() / 2,
+            "compressed frame ({} bytes) must be far smaller than the raw payload ({} bytes)",
+            encoded.len(),
+            raw_payload.len()
+        );
+
+        let decoded = decode_message(&encoded).expect("decode the frame");
+        let NetMessage::BlockResponse(got) = decoded else {
+            panic!("expected a block response message");
+        };
+        assert_eq!(got.block.transactions.len(), 2_000);
+        assert_eq!(got.block.hash().unwrap(), block.hash().unwrap());
+    }
+
+    #[test]
+    fn a_wire_decompression_bomb_is_rejected() {
+        // End-to-end anti-zip-bomb check at the frame boundary: a hand-forged
+        // frame whose zstd body would expand past MAX_FRAME_BYTES is rejected with
+        // a typed error (no panic, no gigabyte allocation). Built by hand: a valid
+        // clear header, then the zstd tag over a frame that decompresses past the
+        // cap.
+        let bomb = crate::codec::compress_payload(&vec![0u8; MAX_FRAME_BYTES + 1]);
+        // `compress_payload` chose zstd for an all-zero buffer over the cap.
+        assert_eq!(bomb[0], 0x01, "the bomb body must be zstd-tagged");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&NET_PROTOCOL_MAGIC);
+        frame.extend_from_slice(&NET_PROTOCOL_VERSION.to_le_bytes());
+        frame.extend_from_slice(&bomb);
+        // The whole forged frame is tiny, so it clears the length checks and
+        // reaches the bounded decompressor, which rejects it.
+        assert!(
+            matches!(
+                decode_message(&frame),
+                Err(NetError::FrameTooLarge { maximum }) if maximum == MAX_FRAME_BYTES
+            ),
+            "a frame that decompresses past the cap must be rejected as FrameTooLarge"
+        );
+    }
+
+    #[test]
+    fn a_truncated_compressed_frame_is_rejected() {
+        // A genuinely compressed frame, chopped mid-zstd-body, must yield a typed
+        // error rather than a panic.
+        let leader = Keypair::from_seed([9u8; 32]);
+        let mut block = sample_block(leader.address());
+        block.transactions = vec![sample_transaction(); 2_000];
+        let certificate = FinalityCertificate {
+            protocol_version: webc_chain::CURRENT_PROTOCOL_VERSION,
+            chain_id: webc_chain::ChainId::devnet(),
+            height: 1,
+            round: 0,
+            block_hash: block.hash().unwrap(),
+            precommits: vec![sample_vote(&leader)],
+        };
+        let message = NetMessage::BlockResponse(Box::new(CertifiedBlock { block, certificate }));
+        let encoded = encode_message(&message).expect("encode the frame");
+        assert_eq!(
+            encoded[FRAME_HEADER_LEN], 0x01,
+            "payload must be compressed"
+        );
+        // Keep the header and the tag, drop the tail of the zstd body.
+        let truncated = &encoded[..FRAME_HEADER_LEN + 1 + 8];
+        assert!(
+            decode_message(truncated).is_err(),
+            "a truncated compressed frame must be rejected, not decoded"
+        );
+    }
+
+    #[test]
+    fn an_unknown_compression_tag_is_rejected() {
+        // A valid clear header followed by an unknown compression tag is malformed.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&NET_PROTOCOL_MAGIC);
+        frame.extend_from_slice(&NET_PROTOCOL_VERSION.to_le_bytes());
+        frame.push(0xEE); // neither RAW (0x00) nor ZSTD (0x01)
+        frame.extend_from_slice(b"whatever");
+        assert!(matches!(
+            decode_message(&frame).unwrap_err(),
+            NetError::MalformedFrame
+        ));
     }
 
     #[test]
