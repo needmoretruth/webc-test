@@ -486,3 +486,138 @@ function resolveNow(now: number | undefined): number {
   }
   return now;
 }
+
+// ---------------------------------------------------------------------------
+// Payment + retry (steps 3 and 4)
+// ---------------------------------------------------------------------------
+
+/** Inputs to `buildPayment`. */
+export interface BuildPaymentArgs {
+  /** Agent (mandate) wallet that signs the spend. Its key must match the mandate. */
+  agentWallet: WebcWallet;
+  /** Mandate to charge against, 32-byte lowercase hex. */
+  mandateId: HexString;
+  /** The parsed challenge to pay (re-validated here — see below). */
+  challenge: PaymentChallenge;
+  /** The on-chain registry entry the challenge is validated against. */
+  serviceEntry: ServiceEntry;
+  /** Canonical chain id the spend is signed for. */
+  chainId: string;
+  /** Agent-account nonce for the spend transaction. */
+  nonce: number;
+  /** Fee bid for the spend. */
+  fee: FeeBid;
+  /** Non-default authorization lane, if the agent pays from one. */
+  authorizationLane?: AuthorizationLaneIdJson;
+  /** Authorization-policy revision the agent signs under (default 0). */
+  authorizationPolicyRevision?: number;
+  /** `now` (epoch seconds) for the expiry check; defaults to wall clock. */
+  now?: number;
+}
+
+/**
+ * Builds and signs the mandate payment for a validated challenge (step 3), then
+ * derives the retry reference (step 4). Returns both.
+ *
+ * `buildPayment` ALWAYS re-runs `validateChallenge` first, so a caller cannot skip
+ * the on-chain price/pay-to check by handing an unvalidated challenge straight to
+ * the payment builder — the flow fails closed. The transaction is a
+ * `SpendUnderMandateToService` composed from the existing `transaction.ts`
+ * builders (`spendUnderMandateToService` + `accessListForServiceSpend`), so its
+ * operation JSON and access list are byte-identical to what those builders
+ * already produce; this module adds no new operation shape.
+ *
+ * The spend pays the challenge's `service_id` for the challenge's `price.amount`,
+ * to the registered `serviceEntry.owner`. It does NOT embed the invoice nonce in
+ * the on-chain operation (the operation carries no free field); the nonce travels
+ * in the returned `PaymentReference`, which the service correlates to the tx hash
+ * on-chain, matching §4.
+ */
+export async function buildPayment(
+  args: BuildPaymentArgs,
+): Promise<PaymentResult> {
+  validateChallenge(args.challenge, args.serviceEntry, { now: args.now });
+
+  const operation = spendUnderMandateToService(
+    args.mandateId,
+    args.challenge.service_id,
+    args.challenge.price.amount,
+  );
+  const accessList = accessListForServiceSpend({
+    sender: args.agentWallet.address,
+    mandateId: args.mandateId,
+    serviceId: args.challenge.service_id,
+    // The pay-to owner: equal to `challenge.pay_to` (validation just proved it),
+    // but sourced from the trusted on-chain entry, never from the endpoint.
+    serviceOwner: args.serviceEntry.owner,
+    authorizationLane: args.authorizationLane,
+  });
+  const transaction = await signTransaction(
+    args.agentWallet,
+    args.chainId,
+    args.nonce,
+    operation,
+    args.fee,
+    accessList,
+    args.authorizationLane,
+    undefined,
+    args.authorizationPolicyRevision ?? 0,
+  );
+  const txHash = await transactionHashHex(transaction);
+  const reference = makeRetry({
+    mandateId: args.mandateId,
+    serviceId: args.challenge.service_id,
+    txHash,
+    invoiceNonce: args.challenge.invoice_nonce,
+  });
+  return { transaction, reference };
+}
+
+/**
+ * Builds the `PaymentReference` the agent re-sends on the retry request (step 4).
+ * Every field is validated (fail closed), so a malformed reference can never be
+ * emitted. `buildPayment` calls this for you; it is exported for callers that sign
+ * a spend by other means and still want a canonical reference.
+ */
+export function makeRetry(args: {
+  mandateId: HexString;
+  serviceId: HexString;
+  txHash: HexString;
+  invoiceNonce: HexString;
+}): PaymentReference {
+  return {
+    mandate_id: parseHash256(args.mandateId, "reference.mandate_id"),
+    service_id: parseHash256(args.serviceId, "reference.service_id"),
+    tx_hash: parseHash256(args.txHash, "reference.tx_hash"),
+    invoice_nonce: parseBoundedHex(
+      args.invoiceNonce,
+      "reference.invoice_nonce",
+      MAX_INVOICE_NONCE_BYTES,
+    ),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Dispute / audit primitive (step 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Produces the dispute/audit tuple for record-keeping (step 5): the mandate id,
+ * invoice nonce, service id, and tx hash. Accepts a `PaymentReference` (the object
+ * the agent sent on retry) and re-validates each field, so only well-formed tuples
+ * enter an audit log. The result is a plain object with a fixed field order,
+ * directly serializable (e.g. via `canonicalJson`) for durable storage; a
+ * service's non-delivery is provable against this tuple for track-record flags.
+ */
+export function auditRecord(reference: PaymentReference): AuditRecord {
+  return {
+    mandate_id: parseHash256(reference.mandate_id, "audit.mandate_id"),
+    invoice_nonce: parseBoundedHex(
+      reference.invoice_nonce,
+      "audit.invoice_nonce",
+      MAX_INVOICE_NONCE_BYTES,
+    ),
+    service_id: parseHash256(reference.service_id, "audit.service_id"),
+    tx_hash: parseHash256(reference.tx_hash, "audit.tx_hash"),
+  };
+}
