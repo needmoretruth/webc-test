@@ -13,7 +13,10 @@ use crate::authorization_policy::{
     active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
 };
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
-use crate::fees::{next_base_fee, split_fee, FeeBreakdown, FeePolicy, StoragePricing};
+use crate::fees::{
+    next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
+    StoragePricing, NAMESPACE_FEE_LEAF_DOMAIN,
+};
 use crate::genesis::GenesisConfig;
 use crate::namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
 use crate::object::{validate_object_data, ObjectOwner, StateObject};
@@ -444,6 +447,23 @@ pub struct ChainState {
     /// object creation on ownership is a later-phase policy decision.
     #[serde(default)]
     pub namespaces: BTreeMap<Hash256, NamespaceRecord>,
+    /// Localized (per-application-namespace) base-fee state (Phase 6, §8 isolation).
+    ///
+    /// Maps a currently-congested application namespace to its [`NamespaceFeeState`]
+    /// (its own EIP-1559 base fee). Object operations under a namespace are priced
+    /// by this localized fee; account-scoped operations keep
+    /// `current_base_fee_per_unit`. A namespace's fee adjusts each block from only
+    /// that namespace's own usage vs `FeePolicy::per_namespace_target_units`, so one
+    /// application's congestion never raises another's price. A namespace resting at
+    /// `min_base_fee_per_unit` carries no entry (pricing at the floor is identical to
+    /// having none), so the map holds only congested namespaces and stays bounded.
+    /// Committed by the state root through a dedicated Merkle sub-root
+    /// (`NAMESPACE_FEE_LEAF_DOMAIN`), so any localized-fee change changes the state
+    /// root. Holds no native units — it changes the fee *rate*, never the accounting
+    /// — so it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub namespace_fees: BTreeMap<Hash256, NamespaceFeeState>,
     pub validator_fee_pool: Amount,
     pub minted_supply: Amount,
     /// Gross issued supply captured at the start of the current inflation year.
@@ -560,6 +580,7 @@ impl Default for ChainState {
             sponsors: BTreeMap::new(),
             sponsor_budgets: Amount::ZERO,
             namespaces: BTreeMap::new(),
+            namespace_fees: BTreeMap::new(),
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
             inflation_year_start_supply: Amount::ZERO,
@@ -862,14 +883,46 @@ impl ChainState {
         Ok(TransactionAuthorization::SessionKey(id))
     }
 
-    /// Commits the next deterministic base fee after a completed block.
+    /// The base fee in base units per execution unit that prices `operation`.
     ///
-    /// `units_used` is measured in execution units and must not exceed the
-    /// configured block maximum. Invalid policy or overflow leaves state
-    /// unchanged and returns an error to the whole-block overlay.
+    /// Object operations are priced by their namespace's localized base fee (Phase 6
+    /// §8); every other operation keeps the global `current_base_fee_per_unit`. Both
+    /// are read as block-constant values (localized fees are only adjusted by
+    /// [`finish_block`] after every transaction has executed), so all transactions
+    /// in a block observe a single stable price.
+    pub fn base_fee_per_unit_for(&self, operation: &Operation, config: &ChainConfig) -> u64 {
+        match operation.fee_namespace() {
+            Some(namespace) => self.localized_base_fee_per_unit(&namespace, config),
+            None => self.current_base_fee_per_unit,
+        }
+    }
+
+    /// A namespace's current localized base fee, floored at the network minimum.
+    ///
+    /// A namespace with no record is priced at `min_base_fee_per_unit` — pricing at
+    /// the floor is what "no record" means — so an uncongested namespace is charged
+    /// exactly the network minimum and is never affected by any other namespace.
+    fn localized_base_fee_per_unit(&self, namespace: &Hash256, config: &ChainConfig) -> u64 {
+        self.namespace_fees
+            .get(namespace)
+            .map(|state| state.base_fee_per_unit)
+            .unwrap_or(config.fee_policy.min_base_fee_per_unit)
+            .max(config.fee_policy.min_base_fee_per_unit)
+    }
+
+    /// Commits the next deterministic base fees after a completed block.
+    ///
+    /// `units_used` is the block's total execution units (must not exceed the
+    /// configured block maximum); `namespace_units` is each namespace's own
+    /// execution-unit usage this block. The global base fee reacts to total
+    /// fullness; each namespace's localized base fee reacts to only its own usage,
+    /// so one application's congestion never moves another's price. Invalid policy
+    /// or overflow leaves state unchanged and returns an error to the whole-block
+    /// overlay.
     pub fn finish_block(
         &mut self,
         units_used: u64,
+        namespace_units: &BTreeMap<Hash256, u64>,
         config: &ChainConfig,
     ) -> Result<(), ChainError> {
         self.current_base_fee_per_unit = next_base_fee(
@@ -877,6 +930,44 @@ impl ChainState {
             units_used,
             &config.fee_policy,
         )?;
+        self.adjust_namespace_fees(namespace_units, config)?;
+        Ok(())
+    }
+
+    /// Re-prices every congested namespace from its own per-block usage.
+    ///
+    /// Adjusts the union of currently-tracked namespaces (so idle ones decay) and
+    /// namespaces used this block (so newly hot ones rise), each by the same
+    /// EIP-1559 rule as the global fee but against `per_namespace_target_units`
+    /// using only that namespace's own units. A namespace whose new fee returns to
+    /// the network floor loses its record, keeping the committed map bounded to
+    /// currently-congested namespaces. Deterministic ordered iteration.
+    fn adjust_namespace_fees(
+        &mut self,
+        namespace_units: &BTreeMap<Hash256, u64>,
+        config: &ChainConfig,
+    ) -> Result<(), ChainError> {
+        let min = config.fee_policy.min_base_fee_per_unit;
+        let mut namespaces: BTreeSet<Hash256> = self.namespace_fees.keys().copied().collect();
+        namespaces.extend(namespace_units.keys().copied());
+        for namespace in namespaces {
+            let current = self
+                .namespace_fees
+                .get(&namespace)
+                .map(|state| state.base_fee_per_unit)
+                .unwrap_or(min)
+                .max(min);
+            let used = namespace_units.get(&namespace).copied().unwrap_or(0);
+            let next = next_localized_base_fee(current, used, &config.fee_policy)?;
+            if next <= min {
+                // Back at the network floor: identical to having no record, so drop
+                // it to keep the committed map bounded to congested namespaces.
+                self.namespace_fees.remove(&namespace);
+            } else {
+                self.namespace_fees
+                    .insert(namespace, NamespaceFeeState { base_fee_per_unit: next });
+            }
+        }
         Ok(())
     }
 
@@ -1200,6 +1291,7 @@ impl ChainState {
             unbonding_root: Hash256,
             sponsor_root: Hash256,
             namespace_root: Hash256,
+            namespace_fee_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
             storage_deposits: Amount,
@@ -1214,18 +1306,22 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            // V10 adds the application namespace registry (§8 isolation): the
+            // V11 adds localized (per-application-namespace) fee state (Phase 6, §8
+            // isolation): the `namespace_fee_root` sub-root commits every congested
+            // namespace's localized base fee, so a localized-fee change changes the
+            // state root. It adds no new scalar and locks no native units (localized
+            // pricing changes the fee rate, never the accounting). The domain bump is
+            // a deliberate consensus-format change; no external fixture pins a prior
+            // root. V10 added the application namespace registry (§8 isolation): the
             // `namespace_root` sub-root commits every namespace ownership record, so
-            // a claim or transfer changes the state root. It adds no new scalar
-            // (the registry locks no native units). The domain bump is a deliberate
-            // consensus-format change; no external fixture pins the prior V9 root.
-            // V9 added the fee-sponsorship state (§15.35): the `sponsor_root`
-            // sub-root commits every per-app sponsor record (budget, caps, and
-            // per-user/day counters), and the `sponsor_budgets` scalar commits the
-            // aggregate locked bucket (mirroring how `storage_deposits` pairs with
-            // the object sub-root). V8 added the `storage_deposits` scalar (§15.22);
-            // V7 added `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V10",
+            // a claim or transfer changes the state root. V9 added the
+            // fee-sponsorship state (§15.35): the `sponsor_root` sub-root commits
+            // every per-app sponsor record (budget, caps, and per-user/day counters),
+            // and the `sponsor_budgets` scalar commits the aggregate locked bucket
+            // (mirroring how `storage_deposits` pairs with the object sub-root). V8
+            // added the `storage_deposits` scalar (§15.22); V7 added
+            // `last_block_timestamp_ms` (finding E2).
+            domain: "WEBC_STATE_COMMITMENT_V11",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1274,6 +1370,13 @@ impl ChainState {
             // (§8 isolation): a claim or ownership transfer changes this root and
             // therefore the state root.
             namespace_root: ordered_value_root(NAMESPACE_LEAF_DOMAIN, self.namespaces.iter())?,
+            // Localized per-namespace fee state committed by its own ordered sub-root
+            // (Phase 6, §8 isolation): a change to any namespace's localized base fee
+            // changes this root and therefore the state root.
+            namespace_fee_root: ordered_value_root(
+                NAMESPACE_FEE_LEAF_DOMAIN,
+                self.namespace_fees.iter(),
+            )?,
             burned_fees: self.burned_fees,
             slashed_units: self.slashed_units,
             storage_deposits: self.storage_deposits,
@@ -1424,10 +1527,14 @@ impl ChainState {
         if tx.fee.gas_limit < units {
             return Err(ChainError::GasLimitTooLow);
         }
+        // The base fee this transaction pays is the global one for account-scoped
+        // operations and the operation's namespace-localized one for object
+        // operations (Phase 6 §8). Both are block-constant reads committed by the
+        // `BaseFee` protocol key already declared in every access list, so localized
+        // pricing needs no new access-list key or scheduler change.
         access.read(StateKey::protocol(ProtocolStateKey::BaseFee))?;
-        let fee_per_unit = tx
-            .fee
-            .effective_fee_per_unit(self.current_base_fee_per_unit)?;
+        let base_fee_per_unit = self.base_fee_per_unit_for(&tx.operation, config);
+        let fee_per_unit = tx.fee.effective_fee_per_unit(base_fee_per_unit)?;
         let total_fee = Amount(
             u128::from(units)
                 .checked_mul(u128::from(fee_per_unit))

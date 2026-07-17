@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeePolicy {
     /// Network-wide minimum base fee in base units per execution unit.
+    ///
+    /// Every base fee — the global one and every localized per-namespace one — is
+    /// floored here, so this is the "small network-wide floor" that still applies
+    /// during global overload (§7 "Localized pricing").
     pub min_base_fee_per_unit: u64,
     /// Desired execution units per block; must be non-zero.
     pub target_block_units: u64,
@@ -25,6 +29,37 @@ pub struct FeePolicy {
     pub max_block_units: u64,
     /// Maximum proportional change divisor; must be non-zero.
     pub base_fee_adjustment_denominator: u64,
+    /// Per-application-namespace congestion target in execution units (localized
+    /// fees, §8 "Application isolation").
+    ///
+    /// A namespace's own localized base fee adjusts by the same EIP-1559 rule as
+    /// the global base fee, but measured against THIS target using only that
+    /// namespace's own per-block usage — so a busy namespace raises only its own
+    /// price and one application's congestion never moves another's. Must be
+    /// non-zero. A testnet-measured placeholder (§15.35), defaulting to a quarter
+    /// of `target_block_units`.
+    #[serde(default = "default_per_namespace_target_units")]
+    pub per_namespace_target_units: u64,
+    /// Fair-packing cap: the maximum share of `max_block_units` a single
+    /// application namespace may consume in one block, in basis points
+    /// (`0..=10_000`).
+    ///
+    /// Reserves block capacity for other namespaces so one hot application cannot
+    /// monopolize a block (Phase 6 acceptance). `0` disables the cap (a namespace
+    /// is then bounded only by `max_block_units`). A testnet-measured placeholder
+    /// (§15.35), defaulting to 50%.
+    #[serde(default = "default_namespace_block_share_bps")]
+    pub namespace_block_share_bps: u16,
+}
+
+/// Default per-namespace congestion target: a quarter of the global block target.
+fn default_per_namespace_target_units() -> u64 {
+    250_000
+}
+
+/// Default fair-packing share cap: 50% of the block per namespace.
+fn default_namespace_block_share_bps() -> u16 {
+    5_000
 }
 
 impl Default for FeePolicy {
@@ -34,7 +69,33 @@ impl Default for FeePolicy {
             target_block_units: 1_000_000,
             max_block_units: 2_000_000,
             base_fee_adjustment_denominator: 8,
+            per_namespace_target_units: default_per_namespace_target_units(),
+            namespace_block_share_bps: default_namespace_block_share_bps(),
         }
+    }
+}
+
+impl FeePolicy {
+    /// Per-block execution-unit cap for a single application namespace (fair packing).
+    ///
+    /// Returns `max_block_units * namespace_block_share_bps / 10_000`, at least `1`.
+    /// A `namespace_block_share_bps` of `0` disables the cap and returns
+    /// `max_block_units` (a namespace bounded only by the whole-block limit). A
+    /// share above `10_000` is rejected as an invalid policy. Deterministic checked
+    /// integer arithmetic that fails closed rather than wrapping.
+    pub fn namespace_block_unit_cap(&self) -> Result<u64, ChainError> {
+        if self.namespace_block_share_bps == 0 {
+            return Ok(self.max_block_units);
+        }
+        if self.namespace_block_share_bps > 10_000 {
+            return Err(ChainError::InvalidFeePolicy);
+        }
+        let cap = u128::from(self.max_block_units)
+            .checked_mul(u128::from(self.namespace_block_share_bps))
+            .ok_or(ChainError::ArithmeticOverflow)?
+            / 10_000;
+        let cap = u64::try_from(cap).map_err(|_| ChainError::ArithmeticOverflow)?;
+        Ok(cap.max(1))
     }
 }
 
@@ -149,27 +210,52 @@ impl StoragePricing {
     }
 }
 
-/// Computes the next block's base fee in base units per execution unit.
+/// Domain tag for the localized per-namespace fee-state Merkle sub-root.
 ///
-/// `units_used` is the deterministic execution-unit total for the completed
-/// block. Invalid zero divisors, a target above the hard limit, or arithmetic
-/// overflow returns an error instead of saturating consensus state.
-pub fn next_base_fee(current: u64, units_used: u64, policy: &FeePolicy) -> Result<u64, ChainError> {
-    if policy.target_block_units == 0
-        || policy.base_fee_adjustment_denominator == 0
-        || policy.max_block_units < policy.target_block_units
-        || units_used > policy.max_block_units
-    {
-        return Err(ChainError::InvalidFeePolicy);
-    }
-    let current = current.max(policy.min_base_fee_per_unit);
-    let target = policy.target_block_units;
-    let denominator = policy.base_fee_adjustment_denominator;
+/// Each `(namespace, NamespaceFeeState)` entry is a leaf under this domain, so any
+/// change to a namespace's localized base fee changes the state root. Bumping this
+/// constant is a consensus-format change.
+pub const NAMESPACE_FEE_LEAF_DOMAIN: &[u8] = b"WEBC_NAMESPACE_FEE_LEAF_V1";
 
+/// Localized (per-application-namespace) base-fee state (§8 "Application isolation").
+///
+/// One record per currently-congested namespace. `base_fee_per_unit` is that
+/// namespace's own EIP-1559 base fee, adjusted each block from ONLY that
+/// namespace's own execution-unit usage and floored at the network-wide
+/// `min_base_fee_per_unit`. A namespace resting at the floor carries no record —
+/// pricing at the floor is identical to having none — so the map holds only
+/// congested namespaces and stays bounded. Committed by the state root through the
+/// [`NAMESPACE_FEE_LEAF_DOMAIN`] sub-root; it locks no native units, so it does not
+/// enter supply reconciliation (localized pricing changes the *rate*, never the
+/// accounting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceFeeState {
+    /// This namespace's localized base fee, in base units per execution unit.
+    ///
+    /// Always strictly above `min_base_fee_per_unit` while a record exists (a value
+    /// at or below the floor is dropped by the block-finish adjustment).
+    pub base_fee_per_unit: u64,
+}
+
+/// Shared EIP-1559 integer base-fee adjustment.
+///
+/// Raises the fee toward `current + current*(used-target)/(target*denominator)`
+/// when `used > target` (minimum +1 so a persistently full target always moves),
+/// symmetrically lowers it when `used < target`, and floors the result at `min`.
+/// Callers must validate `target != 0` and `denominator != 0` first. Deterministic
+/// checked arithmetic that fails closed on overflow.
+fn adjust_base_fee(
+    current: u64,
+    units_used: u64,
+    target: u64,
+    denominator: u64,
+    min: u64,
+) -> Result<u64, ChainError> {
+    let current = current.max(min);
     if units_used == target {
         return Ok(current);
     }
-
     if units_used > target {
         let delta = units_used
             .checked_sub(target)
@@ -197,8 +283,59 @@ pub fn next_base_fee(current: u64, units_used: u64, policy: &FeePolicy) -> Resul
         Ok(current
             .checked_sub(decrease)
             .ok_or(ChainError::ArithmeticOverflow)?
-            .max(policy.min_base_fee_per_unit))
+            .max(min))
     }
+}
+
+/// Computes the next block's global base fee in base units per execution unit.
+///
+/// `units_used` is the deterministic execution-unit total for the completed
+/// block. Invalid zero divisors, a target above the hard limit, or arithmetic
+/// overflow returns an error instead of saturating consensus state.
+pub fn next_base_fee(current: u64, units_used: u64, policy: &FeePolicy) -> Result<u64, ChainError> {
+    if policy.target_block_units == 0
+        || policy.base_fee_adjustment_denominator == 0
+        || policy.max_block_units < policy.target_block_units
+        || units_used > policy.max_block_units
+    {
+        return Err(ChainError::InvalidFeePolicy);
+    }
+    adjust_base_fee(
+        current,
+        units_used,
+        policy.target_block_units,
+        policy.base_fee_adjustment_denominator,
+        policy.min_base_fee_per_unit,
+    )
+}
+
+/// Computes a namespace's next localized base fee from its OWN block usage.
+///
+/// Identical EIP-1559 integer math to [`next_base_fee`], but measured against the
+/// per-namespace target ([`FeePolicy::per_namespace_target_units`]) using only this
+/// namespace's own execution units — so one application's congestion never moves
+/// another application's localized price (Phase 6 acceptance). Floored at the
+/// network-wide `min_base_fee_per_unit`, so a namespace with no congestion decays
+/// toward — and rests at — the floor. Fails closed on an invalid policy or on a
+/// usage above the whole-block hard limit.
+pub fn next_localized_base_fee(
+    current: u64,
+    namespace_units_used: u64,
+    policy: &FeePolicy,
+) -> Result<u64, ChainError> {
+    if policy.per_namespace_target_units == 0
+        || policy.base_fee_adjustment_denominator == 0
+        || namespace_units_used > policy.max_block_units
+    {
+        return Err(ChainError::InvalidFeePolicy);
+    }
+    adjust_base_fee(
+        current,
+        namespace_units_used,
+        policy.per_namespace_target_units,
+        policy.base_fee_adjustment_denominator,
+        policy.min_base_fee_per_unit,
+    )
 }
 
 #[cfg(test)]
@@ -283,6 +420,91 @@ mod tests {
     }
 
     #[test]
+    fn localized_base_fee_rises_only_from_its_own_usage() {
+        let policy = FeePolicy::default();
+        // Namespace usage above its per-namespace target raises the localized fee.
+        let hot = next_localized_base_fee(10, policy.per_namespace_target_units * 2, &policy)
+            .expect("valid policy");
+        assert!(hot > 10, "over-target namespace usage must raise the fee");
+        // Usage below the target lowers it, but never below the network floor.
+        let cool = next_localized_base_fee(10, 0, &policy).expect("valid policy");
+        assert!(cool < 10);
+        assert!(cool >= policy.min_base_fee_per_unit);
+        // A low current fee with no usage cannot fall under the network minimum.
+        assert_eq!(
+            next_localized_base_fee(policy.min_base_fee_per_unit, 0, &policy).unwrap(),
+            policy.min_base_fee_per_unit
+        );
+    }
+
+    #[test]
+    fn localized_base_fee_fails_closed_on_invalid_policy_and_overflow() {
+        let invalid = FeePolicy {
+            per_namespace_target_units: 0,
+            ..FeePolicy::default()
+        };
+        assert!(matches!(
+            next_localized_base_fee(10, 0, &invalid),
+            Err(ChainError::InvalidFeePolicy)
+        ));
+        // Usage above the whole-block hard limit is rejected before any math.
+        assert!(matches!(
+            next_localized_base_fee(10, FeePolicy::default().max_block_units + 1, &FeePolicy::default()),
+            Err(ChainError::InvalidFeePolicy)
+        ));
+        let overflow = FeePolicy {
+            min_base_fee_per_unit: 1,
+            per_namespace_target_units: 1,
+            max_block_units: 2,
+            base_fee_adjustment_denominator: 1,
+            ..FeePolicy::default()
+        };
+        assert!(matches!(
+            next_localized_base_fee(u64::MAX, 2, &overflow),
+            Err(ChainError::ArithmeticOverflow)
+        ));
+    }
+
+    #[test]
+    fn namespace_block_unit_cap_is_a_share_of_the_block() {
+        let policy = FeePolicy::default();
+        // 50% of the 2_000_000 default block.
+        assert_eq!(policy.namespace_block_unit_cap().unwrap(), 1_000_000);
+        // Zero share bps disables the cap (bounded only by the whole block).
+        let disabled = FeePolicy {
+            namespace_block_share_bps: 0,
+            ..FeePolicy::default()
+        };
+        assert_eq!(
+            disabled.namespace_block_unit_cap().unwrap(),
+            policy.max_block_units
+        );
+        // A share above 100% is rejected as an invalid policy.
+        let bad = FeePolicy {
+            namespace_block_share_bps: 10_001,
+            ..FeePolicy::default()
+        };
+        assert!(matches!(
+            bad.namespace_block_unit_cap(),
+            Err(ChainError::InvalidFeePolicy)
+        ));
+    }
+
+    #[test]
+    fn fee_policy_deserializes_without_the_new_localized_knobs() {
+        // A genesis written before localized fees omits the new fields; serde
+        // defaults must fill them so an older config still decodes deterministically.
+        let json = r#"{
+            "min_base_fee_per_unit": 1,
+            "target_block_units": 1000000,
+            "max_block_units": 2000000,
+            "base_fee_adjustment_denominator": 8
+        }"#;
+        let policy: FeePolicy = serde_json::from_str(json).expect("legacy policy decodes");
+        assert_eq!(policy, FeePolicy::default());
+    }
+
+    #[test]
     fn invalid_policy_and_overflow_fail_closed() {
         let invalid = FeePolicy {
             target_block_units: 0,
@@ -298,6 +520,7 @@ mod tests {
             target_block_units: 1,
             max_block_units: 2,
             base_fee_adjustment_denominator: 1,
+            ..FeePolicy::default()
         };
         assert!(matches!(
             next_base_fee(u64::MAX, 2, &overflow),

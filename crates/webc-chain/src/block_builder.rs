@@ -11,6 +11,7 @@ use crate::{
     Transaction,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use webc_crypto::{merkle_root, Address, Hash256};
 
 /// Maximum objective slashing artifacts carried by one block.
@@ -91,24 +92,56 @@ pub fn build_block(
         next_state.apply_block_slashing_evidence(item, config)?;
     }
 
+    // Fair packing (Phase 6 acceptance): a single application namespace may not
+    // consume more than its per-block share cap, so one hot application cannot
+    // monopolize block capacity. Enforced here as a hard consensus validity rule —
+    // `apply_block` re-runs this function, so a Byzantine proposer that over-packs
+    // one namespace produces a block every honest node rejects. The proposer's
+    // mempool selects a compliant, fair set up front (webc-node `select_block`).
+    let namespace_unit_cap = config.fee_policy.namespace_block_unit_cap()?;
+    let mut namespace_units: BTreeMap<Hash256, u64> = BTreeMap::new();
     for transaction in &transactions {
+        let tx_units = transaction.required_units();
         let projected_units = units_used
-            .checked_add(transaction.required_units())
+            .checked_add(tx_units)
             .ok_or(ChainError::ArithmeticOverflow)?;
         if projected_units > config.fee_policy.max_block_units {
             return Err(ChainError::BlockUnitsExceeded {
                 maximum: config.fee_policy.max_block_units,
             });
         }
+        // Object operations are namespace-scoped; enforce the fair-packing cap on
+        // this namespace's running total before executing.
+        let namespace_projected = if let Some(namespace) = transaction.operation.fee_namespace() {
+            let projected = namespace_units
+                .get(&namespace)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(tx_units)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            if projected > namespace_unit_cap {
+                return Err(ChainError::NamespaceBlockShareExceeded {
+                    namespace,
+                    maximum: namespace_unit_cap,
+                });
+            }
+            Some((namespace, projected))
+        } else {
+            None
+        };
         let receipt = next_state.execute_transaction(transaction, config)?;
         units_used = projected_units;
+        if let Some((namespace, projected)) = namespace_projected {
+            namespace_units.insert(namespace, projected);
+        }
         receipts.push(receipt);
     }
 
     // Base-fee adjustment is a protocol state update caused by block fullness.
     // The header records the fee used by this block, while `state_root` commits
-    // to the next base fee after the block is finished.
-    next_state.finish_block(units_used, config)?;
+    // to the next global base fee and every congested namespace's next localized
+    // base fee after the block is finished.
+    next_state.finish_block(units_used, &namespace_units, config)?;
     // Record this block's timestamp so the next block must exceed it (E2). This
     // is committed by `state_root`, so all nodes agree on the monotonic clock.
     next_state.last_block_timestamp_ms = input.timestamp_ms;

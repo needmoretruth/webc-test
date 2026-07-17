@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, BinaryHeap};
 
 use webc_chain::{AuthorizationLaneId, ChainConfig, ChainError, ChainState, Transaction};
-use webc_crypto::Address;
+use webc_crypto::{Address, Hash256};
 
 /// Tuning knobs for mempool admission and retention.
 #[derive(Clone, Debug)]
@@ -358,7 +358,6 @@ impl Mempool {
         max_units: u64,
         now_ms: u64,
     ) -> Vec<Transaction> {
-        let base_fee = state.current_base_fee_per_unit;
 
         // Build each sender/lane's gap-free runnable run, in nonce order.
         let mut runs: BTreeMap<(Address, AuthorizationLaneId), Vec<&Entry>> = BTreeMap::new();
@@ -409,8 +408,14 @@ impl Mempool {
         }
 
         // Effective fee ignoring an unaffordable base fee: an underpriced head
-        // disqualifies its whole run.
-        let effective = |entry: &Entry| entry.tx.fee.effective_fee_per_unit(base_fee).ok();
+        // disqualifies its whole run. Object operations are priced by their
+        // namespace's localized base fee, account-scoped ones by the global base
+        // fee (Phase 6 §8), so affordability and priority use the same per-operation
+        // base fee the state machine will charge.
+        let effective = |entry: &Entry| {
+            let base_fee = state.base_fee_per_unit_for(&entry.tx.operation, config);
+            entry.tx.fee.effective_fee_per_unit(base_fee).ok()
+        };
 
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
         for (key, run) in &runs {
@@ -426,6 +431,17 @@ impl Mempool {
             }
         }
 
+        // Fair packing (Phase 6 acceptance): defer a namespace once it reaches its
+        // per-block share cap, but keep admitting other namespaces' transactions, so
+        // one hot application cannot monopolize the block. Best-effort here — an
+        // invalid policy falls back to the whole-block limit — because `build_block`
+        // is the hard validity gate; this only shapes the proposer's selection.
+        let namespace_unit_cap = config
+            .fee_policy
+            .namespace_block_unit_cap()
+            .unwrap_or(config.fee_policy.max_block_units);
+        let mut namespace_units: BTreeMap<Hash256, u64> = BTreeMap::new();
+
         let mut selected = Vec::new();
         let mut units_used = 0u64;
         while let Some(candidate) = heap.pop() {
@@ -436,8 +452,27 @@ impl Mempool {
                 // so drop this group and keep filling from other senders.
                 continue;
             }
+            // Fair-packing cap for namespace-scoped (object) operations: if this
+            // namespace is at its share, defer this group but keep filling others.
+            let namespace_projected =
+                if let Some(namespace) = candidate.entry.tx.operation.fee_namespace() {
+                    let projected_ns = namespace_units
+                        .get(&namespace)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(required);
+                    if projected_ns > namespace_unit_cap {
+                        continue;
+                    }
+                    Some((namespace, projected_ns))
+                } else {
+                    None
+                };
             selected.push(candidate.entry.tx.clone());
             units_used = projected;
+            if let Some((namespace, projected_ns)) = namespace_projected {
+                namespace_units.insert(namespace, projected_ns);
+            }
 
             // Advance this group's run to the next contiguous transaction.
             let run = &runs[&candidate.key];
