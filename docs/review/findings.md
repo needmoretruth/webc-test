@@ -465,13 +465,14 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 ## webc-storage — durability
 
-- **ST1 — MEDIUM — no chain identity is persisted or validated at the storage
-  layer.** `chainstore.rs:99,131`: `open` takes no expected chain-id and stores
-  none (only `META_SCHEMA_VERSION`, `META_TIP`); `verify_tip_consistency` checks
-  state-snapshot + `state_root` + block-header-hash but never chain id. CONFIRMED.
-  (The node layer claims to refuse a mismatched chain id — confirm that check
-  actually runs above `ChainStore`, else a store from another chain could be
-  resumed.) Fix: persist `ChainId` in Meta at first open and compare it in `open`.
+- **ST1 — MEDIUM — RESOLVED (commit `ed61134`) — no chain identity is persisted or
+  validated at the storage layer.** `chainstore.rs:99,131`: `open` took no expected
+  chain-id and stored none; `verify_tip_consistency` never checked chain id.
+  CONFIRMED. **Fix:** `ChainStore::open` now takes the expected `ChainId`, stamps it
+  in `Meta` (`META_CHAIN_ID`) on a fresh store alongside the schema version, and on
+  reopen rejects a mismatch with the new `StorageError::ChainIdMismatch` before any
+  state is read. `Node::open` passes its configured chain id through. Reproduced
+  first by `open_rejects_a_store_from_a_different_chain`.
 - Otherwise the storage seam looked sound (atomic per-block commit, corruption as a
   reported error) within the slices read; redb crash-atomicity across the
   block+state+cert+validator-set tuple was not adversarially exercised.
