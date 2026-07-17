@@ -370,10 +370,10 @@ pub struct NftCollection {
     /// Current freeze/thaw authority; `None` means freezing is permanently
     /// renounced.
     pub freeze_authority: Option<Address>,
-    /// Whether minting is currently paused (mint authority-controlled). A paused
-    /// collection rejects [`crate::Operation::MintNft`]; transfers of existing items
-    /// are unaffected in this pass (the pause gate is on the mint path, matching the
-    /// fungible-token pause on the transfer path — see `state` for the exact gates).
+    /// Whether the collection is currently paused (mint authority-controlled). A
+    /// paused collection rejects BOTH [`crate::Operation::MintNft`] and
+    /// [`crate::Operation::TransferNft`] (see `state` for the exact gates); burning
+    /// an item is still permitted so a paused collection never strands an owner.
     pub paused: bool,
     /// Next serial to assign on mint; monotonically increasing, NEVER decremented
     /// (so a burned serial is never reminted).

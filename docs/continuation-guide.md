@@ -450,12 +450,31 @@ markers as reads on the transfer path (+ scheduler regression test
 own freeze authority can freeze many accounts) is within that token's trust model
 and cost-bounded — informational, no change.
 
-**Next: Phase 13b — NFTs**, then **13c — application governance** (snapshots/
-quorum/timelocks/delegation/execution policy). NFTs are closer to the existing
-`object` model (per-item identity + owner + metadata) than to fungible balances;
-build a native NFT/collection registry (mint unique items, owner transfer,
-freeze/pause, royalty/metadata commitments) with the same determinism + deposit +
-domain-bump + adversarial-review discipline. Governance instances follow.
+**NFTs — DONE (13b).** Native NFT collections (`nft.rs`) with single-owner items
+keyed by `(collection_id, serial)`: CreateNftCollection / MintNft / TransferNft /
+BurnNft plus per-collection pause, per-item freeze/thaw, and permanent authority
+transfer/renounce. Monotonic `next_serial` (burned serials never reminted),
+optional `max_supply`, recorded-but-unenforced `royalty_bps`. Two invariants both
+enforced+tested: native WEBC supply balanced (deposit locked into a new
+`nft_deposits` bucket) and `minted_count - burned_count == live items`. Transfers
+write only the one item key; MintNft serializes on the collection record (serial
+is chain-assigned). Domain V17→V18. Merged 200c4fa. **Post-merge adversarial
+review returned CLEAN** — the subagent had applied the token-T1 lesson
+(declared==actual access verified end-to-end, mint/op races checked via
+`parallel_batches`); only a stale pause doc comment was corrected. Two invariants,
+authority renounce permanence, freeze/pause gating, and supply neutrality all
+verified.
+
+**Next: Phase 13c — application governance** (development-plan Phase 13:
+"governance instances — snapshots, quorum, timelocks, delegation, execution
+policy"). Native, autonomous. Design: a governance-instance registry (proposal +
+voting with a stake- or token-weighted snapshot taken at proposal time to prevent
+double-voting / after-snapshot manipulation — a Phase 13 acceptance criterion),
+quorum + timelock before execution, vote delegation, and a bounded execution
+policy. Decide the weight source (native stake vs a governance token) as
+design-within-scope. Same determinism + domain-bump + E8 + adversarial-review
+discipline. This completes Phase 13; the deferred cross-phase tail (SDK toolkit,
+HTTP-402, benchmarks, bridges, mainnet) remains owner-gated/external.
 
 ### Original Phase 13 rationale — native tokens / NFTs / app governance
 
