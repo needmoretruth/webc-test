@@ -15,28 +15,46 @@ import { canonicalJson } from "./canonical";
 import { bytesToHex } from "./hex";
 import { createWalletFromSeed } from "./wallet";
 import {
+  accessListForCastVote,
+  accessListForExecuteProposal,
+  accessListForOpenProposal,
+  accessListForReclaimVote,
+  accessListForResolveProposal,
   accountKey,
   authorizationPolicyKey,
   burnNft,
   burnToken,
+  castVote,
+  createGovernanceInstance,
   createNftCollection,
   createToken,
   defaultAccessList,
   defaultAccessListAsync,
+  deriveGovernanceInstanceIdHex,
+  deriveGovVoteEscrowAddress,
   deriveNftCollectionIdHex,
   deriveTokenIdHex,
+  executeProposal,
   feeAccumulatorKey,
   freezeNftItem,
   freezeTokenAccount,
+  fundGovernanceTreasury,
+  governanceInstanceKey,
+  governanceProposalKey,
+  governanceVoteKey,
   mintNft,
   mintToken,
   nftCollectionKey,
   nftItemKey,
+  openProposal,
   protocolKey,
+  reclaimVote,
+  resolveProposal,
   setNftAuthority,
   setNftCollectionPaused,
   setTokenAuthority,
   setTokenPaused,
+  signTransaction,
   thawNftItem,
   thawTokenAccount,
   tokenBalanceKey,
@@ -45,7 +63,11 @@ import {
   transferNft,
   transferToken,
 } from "./transaction";
-import type { NftMetadataJson, TokenMetadataJson } from "./types";
+import type {
+  GovernanceConfigJson,
+  NftMetadataJson,
+  TokenMetadataJson,
+} from "./types";
 
 const DEFAULT_LANE = "00".repeat(32);
 
@@ -61,6 +83,8 @@ function hexOfText(text: string): string {
 }
 
 const ID_88 = "88".repeat(32);
+const ID_99 = "99".repeat(32);
+const ID_77 = "77".repeat(32);
 
 describe("native token operation wire vectors", () => {
   it("pins CreateToken canonical JSON (nested metadata, Some/None authorities)", async () => {
@@ -328,6 +352,226 @@ describe("native NFT state keys and access lists", () => {
     expect(list.read_write).toEqual([
       accountKey(sender),
       nftCollectionKey(collectionId),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+});
+
+describe("native governance operation wire vectors", () => {
+  it("pins CreateGovernanceInstance canonical JSON (nested config)", () => {
+    const config: GovernanceConfigJson = {
+      voting_period_epochs: 10,
+      timelock_epochs: 3,
+      quorum_bps: 3_000,
+      proposal_threshold: "10",
+      approval_threshold_bps: 5_000,
+    };
+    const op = createGovernanceInstance({
+      namespace: "55".repeat(32),
+      createNonce: 7,
+      weightToken: ID_77,
+      config,
+    });
+    expect(canonicalJson(op)).toBe(
+      `{"CreateGovernanceInstance":{"config":{"approval_threshold_bps":5000,"proposal_threshold":"10",` +
+        `"quorum_bps":3000,"timelock_epochs":3,"voting_period_epochs":10},"create_nonce":7,` +
+        `"namespace":"${"55".repeat(32)}","weight_token":"${ID_77}"}}`,
+    );
+  });
+
+  it("pins Fund / OpenProposal / CastVote / Resolve / Execute / Reclaim JSON", async () => {
+    const recipient = await addressFromSeedByte(9);
+    expect(canonicalJson(fundGovernanceTreasury(ID_88, "100"))).toBe(
+      `{"FundGovernanceTreasury":{"amount":"100","instance_id":"${ID_88}"}}`,
+    );
+    expect(canonicalJson(openProposal(ID_88, "Signaling"))).toBe(
+      `{"OpenProposal":{"action":"Signaling","instance_id":"${ID_88}"}}`,
+    );
+    expect(
+      canonicalJson(
+        openProposal(ID_88, {
+          TreasuryTransfer: { recipient, amount: "42" },
+        }),
+      ),
+    ).toBe(
+      `{"OpenProposal":{"action":{"TreasuryTransfer":{"amount":"42","recipient":"${recipient}"}},` +
+        `"instance_id":"${ID_88}"}}`,
+    );
+    expect(canonicalJson(castVote(ID_99, "Yes", "5"))).toBe(
+      `{"CastVote":{"choice":"Yes","proposal_id":"${ID_99}","weight_amount":"5"}}`,
+    );
+    expect(canonicalJson(resolveProposal(ID_99))).toBe(
+      `{"ResolveProposal":{"proposal_id":"${ID_99}"}}`,
+    );
+    expect(canonicalJson(executeProposal(ID_99))).toBe(
+      `{"ExecuteProposal":{"proposal_id":"${ID_99}"}}`,
+    );
+    expect(canonicalJson(reclaimVote(ID_99))).toBe(
+      `{"ReclaimVote":{"proposal_id":"${ID_99}"}}`,
+    );
+  });
+});
+
+describe("native governance state keys and access lists", () => {
+  it("pins GovernanceInstance / Proposal / Vote canonical JSON", async () => {
+    const voter = await addressFromSeedByte(9);
+    expect(canonicalJson(governanceInstanceKey(ID_88))).toBe(
+      `{"kind":{"GovernanceInstance":{"instance_id":"${ID_88}"}},"version":1}`,
+    );
+    expect(canonicalJson(governanceProposalKey(ID_99))).toBe(
+      `{"kind":{"GovernanceProposal":{"proposal_id":"${ID_99}"}},"version":1}`,
+    );
+    expect(canonicalJson(governanceVoteKey(ID_99, voter))).toBe(
+      `{"kind":{"GovernanceVote":{"proposal_id":"${ID_99}","voter":"${voter}"}},"version":1}`,
+    );
+  });
+
+  it("names the derived instance record and weight-token read on create", async () => {
+    const sender = await addressFromSeedByte(1);
+    const config: GovernanceConfigJson = {
+      voting_period_epochs: 10,
+      timelock_epochs: 3,
+      quorum_bps: 3_000,
+      proposal_threshold: "10",
+      approval_threshold_bps: 5_000,
+    };
+    const instanceId = await deriveGovernanceInstanceIdHex("55".repeat(32), sender, 7);
+    const list = await defaultAccessListAsync(
+      sender,
+      createGovernanceInstance({
+        namespace: "55".repeat(32),
+        createNonce: 7,
+        weightToken: ID_77,
+        config,
+      }),
+    );
+    expect(list.read_only).toEqual([
+      protocolKey("BaseFee"),
+      tokenKey(ID_77),
+      authorizationPolicyKey(sender),
+    ]);
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      governanceInstanceKey(instanceId),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+
+  it("refuses to auto-build a state-derived access list for CastVote", async () => {
+    const sender = await addressFromSeedByte(1);
+    await expect(
+      defaultAccessListAsync(sender, castVote(ID_99, "Yes", "5")),
+    ).rejects.toThrow();
+  });
+
+  it("builds the full CastVote access list including escrow token keys", async () => {
+    const sender = await addressFromSeedByte(1);
+    const escrow = await deriveGovVoteEscrowAddress(ID_99);
+    const list = await accessListForCastVote({
+      sender,
+      proposalId: ID_99,
+      choice: "Yes",
+      weightAmount: "5",
+      weightToken: ID_77,
+    });
+    expect(list.read_only).toEqual([
+      protocolKey("BaseFee"),
+      authorizationPolicyKey(sender),
+      tokenKey(ID_77),
+      tokenFreezeKey(ID_77, sender),
+      tokenFreezeKey(ID_77, escrow),
+    ]);
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      governanceProposalKey(ID_99),
+      governanceVoteKey(ID_99, sender),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+      tokenBalanceKey(ID_77, sender),
+      tokenBalanceKey(ID_77, escrow),
+    ]);
+    // The full list signs cleanly as an explicit access list.
+    const wallet = await createWalletFromSeed(new Uint8Array(32).fill(1));
+    const tx = await signTransaction(
+      wallet,
+      "webc-devnet-1",
+      0,
+      castVote(ID_99, "Yes", "5"),
+      { gasLimit: 1000, maxFeePerUnit: 1, priorityFeePerUnit: 0 },
+      list,
+    );
+    expect(tx.access_list).toEqual(list);
+  });
+
+  it("builds the full ExecuteProposal treasury-payout access list", async () => {
+    const sender = await addressFromSeedByte(1);
+    const recipient = await addressFromSeedByte(9);
+    const list = accessListForExecuteProposal({
+      sender,
+      proposalId: ID_99,
+      payout: { instanceId: ID_88, recipient },
+    });
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      governanceProposalKey(ID_99),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+      governanceInstanceKey(ID_88),
+      accountKey(recipient),
+    ]);
+  });
+
+  it("builds the full ReclaimVote access list (proposal read, escrow balances)", async () => {
+    const sender = await addressFromSeedByte(1);
+    const escrow = await deriveGovVoteEscrowAddress(ID_99);
+    const list = await accessListForReclaimVote({
+      sender,
+      proposalId: ID_99,
+      weightToken: ID_77,
+    });
+    expect(list.read_only).toEqual([
+      protocolKey("BaseFee"),
+      governanceProposalKey(ID_99),
+      authorizationPolicyKey(sender),
+    ]);
+    expect(list.read_write).toEqual([
+      accountKey(sender),
+      governanceVoteKey(ID_99, sender),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+      tokenBalanceKey(ID_77, escrow),
+      tokenBalanceKey(ID_77, sender),
+    ]);
+  });
+
+  it("builds OpenProposal and ResolveProposal weight-token access lists", async () => {
+    const sender = await addressFromSeedByte(1);
+    const openList = accessListForOpenProposal({
+      sender,
+      instanceId: ID_88,
+      action: "Signaling",
+      weightToken: ID_77,
+    });
+    expect(openList.read_only).toEqual([
+      protocolKey("BaseFee"),
+      authorizationPolicyKey(sender),
+      tokenBalanceKey(ID_77, sender),
+    ]);
+    expect(openList.read_write).toEqual([
+      accountKey(sender),
+      governanceInstanceKey(ID_88),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+    const resolveList = accessListForResolveProposal({
+      sender,
+      proposalId: ID_99,
+      weightToken: ID_77,
+    });
+    expect(resolveList.read_only).toEqual([
+      protocolKey("BaseFee"),
+      authorizationPolicyKey(sender),
+      tokenKey(ID_77),
+    ]);
+    expect(resolveList.read_write).toEqual([
+      accountKey(sender),
+      governanceProposalKey(ID_99),
       feeAccumulatorKey(sender, DEFAULT_LANE),
     ]);
   });

@@ -249,6 +249,10 @@ export type StateKeyKindJson =
   // --- Native NFTs (Phase 13b, §15) ---------------------------------------
   | { NftCollection: { collection_id: HexString } }
   | { NftItem: { collection_id: HexString; serial: number } }
+  // --- Native governance (Phase 13c, §15) ---------------------------------
+  | { GovernanceInstance: { instance_id: HexString } }
+  | { GovernanceProposal: { proposal_id: HexString } }
+  | { GovernanceVote: { proposal_id: HexString; voter: WebcAddress } }
   | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
@@ -426,10 +430,56 @@ export type OperationJson =
         authority_kind: NftAuthorityKindJson;
         new_authority: WebcAddress | null;
       };
-    };
+    }
+  // --- Native governance (Phase 13c, §15) ---------------------------------
+  | {
+      CreateGovernanceInstance: {
+        namespace: HexString;
+        create_nonce: number;
+        weight_token: HexString;
+        config: GovernanceConfigJson;
+      };
+    }
+  | { FundGovernanceTreasury: { instance_id: HexString; amount: string } }
+  | { OpenProposal: { instance_id: HexString; action: GovernanceActionJson } }
+  | {
+      CastVote: {
+        proposal_id: HexString;
+        choice: VoteChoiceJson;
+        weight_amount: string;
+      };
+    }
+  | { ResolveProposal: { proposal_id: HexString } }
+  | { ExecuteProposal: { proposal_id: HexString } }
+  | { ReclaimVote: { proposal_id: HexString } };
 
 /** Which of a token's two authorities `SetTokenAuthority` targets. */
 export type TokenAuthorityKindJson = "Mint" | "Freeze";
+
+/** Immutable per-instance governance rule set, mirroring Rust `GovernanceConfig`. */
+export interface GovernanceConfigJson {
+  /** Voting window length in epochs (must be > 0). */
+  voting_period_epochs: number;
+  /** Delay in epochs after voting ends before a passed proposal may execute. */
+  timelock_epochs: number;
+  /** Participation quorum in basis points (≤ 10000). */
+  quorum_bps: number;
+  /** Minimum weight-token balance to open a proposal (decimal string). */
+  proposal_threshold: string;
+  /** Yes-ratio approval threshold in basis points (≤ 10000). */
+  approval_threshold_bps: number;
+}
+
+/**
+ * The single bounded typed effect a proposal carries, mirroring Rust
+ * `GovernanceAction` (externally tagged). `"Signaling"` has no on-chain effect.
+ */
+export type GovernanceActionJson =
+  | "Signaling"
+  | { TreasuryTransfer: { recipient: WebcAddress; amount: string } };
+
+/** One voter's choice, mirroring Rust `VoteChoice`. */
+export type VoteChoiceJson = "Yes" | "No" | "Abstain";
 
 /** Which of a collection's two authorities `SetNftAuthority` targets. */
 export type NftAuthorityKindJson = "Mint" | "Freeze";

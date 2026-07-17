@@ -32,6 +32,8 @@ import type {
   PostQuantumRootRevealJson,
   SessionKeyConstraintsJson,
   SessionKeyIdJson,
+  GovernanceActionJson,
+  GovernanceConfigJson,
   NftAuthorityKindJson,
   NftMetadataJson,
   SlashingEvidenceJson,
@@ -40,6 +42,7 @@ import type {
   StateKeyJson,
   TokenAuthorityKindJson,
   TokenMetadataJson,
+  VoteChoiceJson,
   WebcAddress,
 } from "./types.js";
 import type { WebcWallet } from "./wallet.js";
@@ -490,6 +493,40 @@ function requireNftMetadata(metadata: NftMetadataJson): void {
   requireHash256Hex(metadata.metadata_hash, "nft metadata hash");
 }
 
+/**
+ * Validates a governance config, mirroring Rust `GovernanceConfig::validate`:
+ * `voting_period_epochs` > 0, both bps ≤ 10000, `proposal_threshold` a canonical
+ * amount, epoch counts non-negative u64.
+ */
+function requireGovernanceConfig(config: GovernanceConfigJson): void {
+  requireCountU64(config.voting_period_epochs, "voting period epochs");
+  if (config.voting_period_epochs === 0) {
+    throw new Error("voting period epochs must be > 0");
+  }
+  requireCountU64(config.timelock_epochs, "timelock epochs");
+  requireBoundedU(config.quorum_bps, "quorum bps", 10_000);
+  requireCanonicalAmount(config.proposal_threshold, "proposal threshold");
+  requireBoundedU(config.approval_threshold_bps, "approval threshold bps", 10_000);
+}
+
+/** Validates a governance action, mirroring Rust `GovernanceAction`. */
+function requireGovernanceAction(action: GovernanceActionJson): void {
+  if (action === "Signaling") {
+    return;
+  }
+  if (
+    typeof action !== "object" ||
+    action === null ||
+    !("TreasuryTransfer" in action)
+  ) {
+    throw new Error("invalid governance action");
+  }
+  requireCanonicalAmount(
+    action.TreasuryTransfer.amount,
+    "treasury transfer amount",
+  );
+}
+
 /** Largest value Rust's `u128` amount encoding can represent. */
 const AMOUNT_U128_MAX = (1n << 128n) - 1n;
 
@@ -862,6 +899,213 @@ export function setNftAuthority(
 }
 
 // ---------------------------------------------------------------------------
+// Native governance operations (Phase 13c, §15).
+//
+// Field names and value encodings mirror the Rust `Operation` serde output pinned
+// by `governance_operations_have_stable_wire_vectors`. Amounts are decimal
+// strings; ids/tokens are 32-byte lowercase hex; the choice/action enums tag by
+// variant name.
+//
+// NOTE: OpenProposal / CastVote / ResolveProposal / ExecuteProposal / ReclaimVote
+// touch a key derived from ON-CHAIN state (the instance's weight token, or a
+// proposal payout) that the SDK cannot see. Their operation JSON is complete, but
+// their access list is not — build it with the matching `accessListFor*` helper,
+// passing the resolved value, exactly like the Rust `Transaction::for_*`
+// constructors. `signTransaction` refuses to auto-derive their access list.
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a governance instance bound to `weightToken` under `config`. The
+ * instance id is derived on-chain from `(namespace, creator, createNonce)`; use
+ * `deriveGovernanceInstanceIdHex` to precompute it.
+ */
+export function createGovernanceInstance(args: {
+  namespace: HexString;
+  createNonce: number;
+  weightToken: HexString;
+  config: GovernanceConfigJson;
+}): OperationJson {
+  requireHash256Hex(args.namespace, "governance namespace");
+  requireCountU64(args.createNonce, "governance create nonce");
+  requireHash256Hex(args.weightToken, "governance weight token");
+  requireGovernanceConfig(args.config);
+  return {
+    CreateGovernanceInstance: {
+      namespace: args.namespace,
+      create_nonce: args.createNonce,
+      weight_token: args.weightToken,
+      config: args.config,
+    },
+  };
+}
+
+/** Deposits native WEBC into an instance's treasury. */
+export function fundGovernanceTreasury(
+  instanceId: HexString,
+  amount: string,
+): OperationJson {
+  requireHash256Hex(instanceId, "governance instance id");
+  requireCanonicalAmount(amount, "fund governance treasury amount");
+  return { FundGovernanceTreasury: { instance_id: instanceId, amount } };
+}
+
+/** Opens a proposal carrying one typed `action` on an instance. */
+export function openProposal(
+  instanceId: HexString,
+  action: GovernanceActionJson,
+): OperationJson {
+  requireHash256Hex(instanceId, "governance instance id");
+  requireGovernanceAction(action);
+  return { OpenProposal: { instance_id: instanceId, action } };
+}
+
+/** Casts a lock-to-vote ballot; `weightAmount` weight-token units are locked. */
+export function castVote(
+  proposalId: HexString,
+  choice: VoteChoiceJson,
+  weightAmount: string,
+): OperationJson {
+  requireHash256Hex(proposalId, "governance proposal id");
+  requireCanonicalAmount(weightAmount, "cast vote weight amount");
+  return { CastVote: { proposal_id: proposalId, choice, weight_amount: weightAmount } };
+}
+
+/** Resolves a proposal after its voting period ends (permissionless). */
+export function resolveProposal(proposalId: HexString): OperationJson {
+  requireHash256Hex(proposalId, "governance proposal id");
+  return { ResolveProposal: { proposal_id: proposalId } };
+}
+
+/** Executes (or expires) a passed proposal within its execution window. */
+export function executeProposal(proposalId: HexString): OperationJson {
+  requireHash256Hex(proposalId, "governance proposal id");
+  return { ExecuteProposal: { proposal_id: proposalId } };
+}
+
+/** Reclaims the caller's locked weight after a proposal resolves. */
+export function reclaimVote(proposalId: HexString): OperationJson {
+  requireHash256Hex(proposalId, "governance proposal id");
+  return { ReclaimVote: { proposal_id: proposalId } };
+}
+
+// ---------------------------------------------------------------------------
+// State-derived access-list builders (Phase 13c/9b, §15).
+//
+// These mirror the Rust `Transaction::for_*` constructors: they take the base
+// access list and append the key(s) derived from ON-CHAIN state the operation
+// does not itself carry (an instance's weight token, a proposal's payout, a
+// service's owner). Resolve the value from the node, pass it here, and hand the
+// result to `signTransaction` as its explicit `accessList` argument. A stale
+// value fails closed on the node's access-list check.
+// ---------------------------------------------------------------------------
+
+/** Full access list for `OpenProposal` (adds the proposer's weight balance read). */
+export function accessListForOpenProposal(args: {
+  sender: WebcAddress;
+  instanceId: HexString;
+  action: GovernanceActionJson;
+  weightToken: HexString;
+  authorizationLane?: AuthorizationLaneIdJson;
+}): StateAccessListJson {
+  requireHash256Hex(args.weightToken, "governance weight token");
+  const list = defaultAccessList(
+    args.sender,
+    openProposal(args.instanceId, args.action),
+    args.authorizationLane ?? DEFAULT_AUTHORIZATION_LANE,
+  );
+  pushUniqueKey(list.read_only, tokenBalanceKey(args.weightToken, args.sender));
+  return list;
+}
+
+/**
+ * Full access list for `CastVote`. The lock moves weight-token units from the
+ * voter to the proposal's deterministic escrow, so this adds the token record
+ * (paused read), both freeze markers (voter + escrow), and both balance keys.
+ */
+export async function accessListForCastVote(args: {
+  sender: WebcAddress;
+  proposalId: HexString;
+  choice: VoteChoiceJson;
+  weightAmount: string;
+  weightToken: HexString;
+  authorizationLane?: AuthorizationLaneIdJson;
+}): Promise<StateAccessListJson> {
+  requireHash256Hex(args.weightToken, "governance weight token");
+  const list = defaultAccessList(
+    args.sender,
+    castVote(args.proposalId, args.choice, args.weightAmount),
+    args.authorizationLane ?? DEFAULT_AUTHORIZATION_LANE,
+  );
+  const escrow = await deriveGovVoteEscrowAddress(args.proposalId);
+  pushUniqueKey(list.read_only, tokenKey(args.weightToken));
+  pushUniqueKey(list.read_only, tokenFreezeKey(args.weightToken, args.sender));
+  pushUniqueKey(list.read_only, tokenFreezeKey(args.weightToken, escrow));
+  pushUniqueKey(list.read_write, tokenBalanceKey(args.weightToken, args.sender));
+  pushUniqueKey(list.read_write, tokenBalanceKey(args.weightToken, escrow));
+  return list;
+}
+
+/** Full access list for `ResolveProposal` (adds the weight-token supply read). */
+export function accessListForResolveProposal(args: {
+  sender: WebcAddress;
+  proposalId: HexString;
+  weightToken: HexString;
+  authorizationLane?: AuthorizationLaneIdJson;
+}): StateAccessListJson {
+  requireHash256Hex(args.weightToken, "governance weight token");
+  const list = defaultAccessList(
+    args.sender,
+    resolveProposal(args.proposalId),
+    args.authorizationLane ?? DEFAULT_AUTHORIZATION_LANE,
+  );
+  pushUniqueKey(list.read_only, tokenKey(args.weightToken));
+  return list;
+}
+
+/**
+ * Full access list for `ExecuteProposal`. A `TreasuryTransfer` payout writes the
+ * instance treasury and credits the recipient — pass `payout` resolved from the
+ * stored proposal; a `Signaling` proposal needs no extra keys (`payout = null`).
+ */
+export function accessListForExecuteProposal(args: {
+  sender: WebcAddress;
+  proposalId: HexString;
+  payout: { instanceId: HexString; recipient: WebcAddress } | null;
+  authorizationLane?: AuthorizationLaneIdJson;
+}): StateAccessListJson {
+  const list = defaultAccessList(
+    args.sender,
+    executeProposal(args.proposalId),
+    args.authorizationLane ?? DEFAULT_AUTHORIZATION_LANE,
+  );
+  if (args.payout !== null) {
+    requireHash256Hex(args.payout.instanceId, "governance instance id");
+    pushUniqueKey(list.read_write, governanceInstanceKey(args.payout.instanceId));
+    pushUniqueKey(list.read_write, accountKey(args.payout.recipient));
+  }
+  return list;
+}
+
+/** Full access list for `ReclaimVote` (adds both weight-token balance keys). */
+export async function accessListForReclaimVote(args: {
+  sender: WebcAddress;
+  proposalId: HexString;
+  weightToken: HexString;
+  authorizationLane?: AuthorizationLaneIdJson;
+}): Promise<StateAccessListJson> {
+  requireHash256Hex(args.weightToken, "governance weight token");
+  const list = defaultAccessList(
+    args.sender,
+    reclaimVote(args.proposalId),
+    args.authorizationLane ?? DEFAULT_AUTHORIZATION_LANE,
+  );
+  const escrow = await deriveGovVoteEscrowAddress(args.proposalId);
+  pushUniqueKey(list.read_write, tokenBalanceKey(args.weightToken, escrow));
+  pushUniqueKey(list.read_write, tokenBalanceKey(args.weightToken, args.sender));
+  return list;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -946,6 +1190,11 @@ function extraReadOnlyKeys(
   }
   if ("ThawNftItem" in operation) {
     return [nftCollectionKey(operation.ThawNftItem.collection_id)];
+  }
+  // --- Native governance --------------------------------------------------
+  if ("ReclaimVote" in operation) {
+    // Reclaim READS the resolved proposal and writes only the voter's lock.
+    return [governanceProposalKey(operation.ReclaimVote.proposal_id)];
   }
   return [];
 }
@@ -1035,6 +1284,23 @@ export async function defaultAccessListAsync(
         accountKey(sender),
         nftCollectionKey(collectionId),
       ]);
+    }
+    if ("CreateGovernanceInstance" in operation) {
+      const { namespace, create_nonce, weight_token } =
+        operation.CreateGovernanceInstance;
+      const instanceId = await deriveGovernanceInstanceIdHex(
+        namespace,
+        sender,
+        create_nonce,
+      );
+      // Creation writes the account and the new instance record; the weight token
+      // is READ to confirm it exists.
+      return assembleAccessList(
+        sender,
+        authorizationLane,
+        [accountKey(sender), governanceInstanceKey(instanceId)],
+        [tokenKey(weight_token)],
+      );
     }
     if (STATE_DERIVED_ACCESS_LIST_OPS.some((variant) => variant in operation)) {
       throw new Error(
@@ -1350,6 +1616,34 @@ function extraReadWriteKeys(
     const { collection_id, serial } = operation.ThawNftItem;
     return [nftItemKey(collection_id, serial)];
   }
+  // --- Native governance (Phase 13c, §15) — BASE lists --------------------
+  // The state-derived extras (weight token, payout, escrow) are added by the
+  // `accessListFor*` helpers; these are the base pushes from the Rust arms.
+  if ("FundGovernanceTreasury" in operation) {
+    const { instance_id } = operation.FundGovernanceTreasury;
+    return [accountKey(sender), governanceInstanceKey(instance_id)];
+  }
+  if ("OpenProposal" in operation) {
+    // The fresh proposal id is chain-assigned, created under the instance's write
+    // scope; only the instance record is declared here.
+    return [governanceInstanceKey(operation.OpenProposal.instance_id)];
+  }
+  if ("CastVote" in operation) {
+    const { proposal_id } = operation.CastVote;
+    return [
+      governanceProposalKey(proposal_id),
+      governanceVoteKey(proposal_id, sender),
+    ];
+  }
+  if ("ResolveProposal" in operation) {
+    return [governanceProposalKey(operation.ResolveProposal.proposal_id)];
+  }
+  if ("ExecuteProposal" in operation) {
+    return [governanceProposalKey(operation.ExecuteProposal.proposal_id)];
+  }
+  if ("ReclaimVote" in operation) {
+    return [governanceVoteKey(operation.ReclaimVote.proposal_id, sender)];
+  }
   // Incoming bridge messages need an asynchronous replay hash. Slashing also
   // needs live delegation/cooling owners, so the synchronous builder fails.
   // `CreateToken` needs an async token-id derivation, so it also lands here.
@@ -1362,20 +1656,24 @@ function assembleAccessList(
   sender: WebcAddress,
   authorizationLane: AuthorizationLaneIdJson,
   extra: StateKeyJson[],
+  extraReadOnly: StateKeyJson[] = [],
 ): StateAccessListJson {
   const readWrite = authorizationLane === DEFAULT_AUTHORIZATION_LANE
     ? [accountKey(sender)]
     : [authorizationLaneKey(sender, authorizationLane)];
   for (const key of extra) {
-    if (!readWrite.some((candidate) => canonicalKey(candidate) === canonicalKey(key))) {
-      readWrite.push(key);
-    }
+    pushUniqueKey(readWrite, key);
   }
   readWrite.push(feeAccumulatorKey(sender, authorizationLane));
-  return {
-    read_only: [protocolKey("BaseFee"), authorizationPolicyKey(sender)],
-    read_write: readWrite,
-  };
+  // Op-specific read-only keys (e.g. CreateGovernanceInstance's weight-token
+  // existence read) sit between the base fee and the authorization policy, in the
+  // Rust arm's insertion order.
+  const readOnly: StateKeyJson[] = [protocolKey("BaseFee")];
+  for (const key of extraReadOnly) {
+    pushUniqueKey(readOnly, key);
+  }
+  pushUniqueKey(readOnly, authorizationPolicyKey(sender));
+  return { read_only: readOnly, read_write: readWrite };
 }
 
 /** Returns the current state key for one native account. */
@@ -1491,6 +1789,37 @@ export function deriveNftCollectionIdHex(
     creator,
     createNonce,
   );
+}
+
+/** Derives a governance instance id from `(namespace, creator, createNonce)`. */
+export function deriveGovernanceInstanceIdHex(
+  namespace: HexString,
+  creator: WebcAddress,
+  createNonce: number,
+): Promise<string> {
+  return deriveNamespaceCreatorId(
+    GOVERNANCE_INSTANCE_ID_DOMAIN,
+    namespace,
+    creator,
+    createNonce,
+  );
+}
+
+/**
+ * Derives the deterministic per-proposal vote-lock escrow address, mirroring Rust
+ * `gov_vote_escrow_address`: `Address(SHA-256("WEBC_GOV_VOTE_ESCROW_V1" ||
+ * proposal_id))`, rendered `webc1...`. No keypair maps to it; the locked weight
+ * moves only via the reclaim transition.
+ */
+export async function deriveGovVoteEscrowAddress(
+  proposalId: HexString,
+): Promise<WebcAddress> {
+  requireHash256Hex(proposalId, "governance proposal id");
+  const digestHex = await digestManyHex([
+    GOV_VOTE_ESCROW_DOMAIN,
+    hexToBytes(proposalId),
+  ]);
+  return addressFromBytes(hexToBytes(digestHex));
 }
 
 /**
@@ -1655,6 +1984,35 @@ export function nftItemKey(
   return {
     version: 1,
     kind: { NftItem: { collection_id: collectionId, serial } },
+  };
+}
+
+// --- Native governance state keys (Phase 13c, §15) -------------------------
+
+/** Returns the authority/treasury record key for one instance. */
+export function governanceInstanceKey(instanceId: HexString): StateKeyJson {
+  return {
+    version: 1,
+    kind: { GovernanceInstance: { instance_id: instanceId } },
+  };
+}
+
+/** Returns the tally/status record key for one proposal. */
+export function governanceProposalKey(proposalId: HexString): StateKeyJson {
+  return {
+    version: 1,
+    kind: { GovernanceProposal: { proposal_id: proposalId } },
+  };
+}
+
+/** Returns the per-`(proposal, voter)` vote-lock key. */
+export function governanceVoteKey(
+  proposalId: HexString,
+  voter: WebcAddress,
+): StateKeyJson {
+  return {
+    version: 1,
+    kind: { GovernanceVote: { proposal_id: proposalId, voter } },
   };
 }
 
