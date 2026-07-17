@@ -20,8 +20,10 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use webc_chain::{
-    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, ObjectId, Operation,
-    StateObject, SupplyInvariantReport, Transaction, Validator,
+    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, GovernanceInstance,
+    GovernanceInstanceId, GovernanceProposal, Mandate, MandateId, NftCollection, NftCollectionId,
+    NftId, NftItem, ObjectId, Operation, ProposalId, ServiceEntry, ServiceId, StateObject,
+    SupplyInvariantReport, TokenId, TokenRecord, TokenSupplyReport, Transaction, Validator,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_storage::{KvStore, StorageError};
@@ -577,6 +579,156 @@ impl<K: KvStore> NodeService<K> {
         self.seal_block(now_ms)?.ok_or_else(|| {
             ApiError::Internal("submitted transaction did not seal into a block".to_owned())
         })
+    }
+}
+
+/// Read accessors for the Phase 9/13 native state (tokens, NFTs, service
+/// registry, governance, mandates).
+///
+/// Each is a pure point-read of the current committed [`webc_chain::ChainState`]
+/// maps — the same shape as [`Self::account`] / [`Self::object`] — cloning the
+/// requested record out under the single service lock and mapping an absent key
+/// to [`ApiError::NotFound`]. They reuse the record types' own `Serialize`
+/// derives (no wrapper types) and read no clock, so they are deterministic and
+/// safe to expose to hostile callers.
+impl<K: KvStore> NodeService<K> {
+    /// Returns a native token's authority/supply record, or `NotFound`.
+    pub fn token(&self, token_id: TokenId) -> Result<TokenRecord, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .tokens
+            .get(&token_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns `holder`'s balance of `token_id`.
+    ///
+    /// Zero-vs-404 choice: mirrors the chain's own balance semantics, where an
+    /// absent `(token, holder)` entry is indistinguishable from a zero balance (a
+    /// transfer prunes an entry that reaches zero — see `token_balances`). Once
+    /// the token exists, every address holds a well-defined balance of it,
+    /// [`Amount::ZERO`] when it holds none, so a holder with no entry is `200`
+    /// with zero rather than `404`. An UNKNOWN token is `NotFound`: reporting zero
+    /// for a nonexistent token would falsely imply the token exists, and this
+    /// matches how [`Self::account`] 404s an absent account rather than inventing
+    /// a zero.
+    pub fn token_balance(&self, token_id: TokenId, holder: Address) -> Result<Amount, ApiError> {
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.tokens.contains_key(&token_id) {
+            return Err(ApiError::NotFound);
+        }
+        Ok(state
+            .token_balances
+            .get(&(token_id, holder))
+            .copied()
+            .unwrap_or(Amount::ZERO))
+    }
+
+    /// Returns the per-token supply reconciliation (issued vs. held), or
+    /// `NotFound` for an unknown token.
+    ///
+    /// Reuses [`webc_chain::ChainState::token_supply_report`]; an inconsistency in
+    /// the committed state (never reachable through the state transitions) is an
+    /// internal error, not a client error.
+    pub fn token_supply(&self, token_id: TokenId) -> Result<TokenSupplyReport, ApiError> {
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.tokens.contains_key(&token_id) {
+            return Err(ApiError::NotFound);
+        }
+        state
+            .token_supply_report(token_id)
+            .map_err(|error| ApiError::Internal(error.to_string()))
+    }
+
+    /// Returns a native NFT collection record, or `NotFound`.
+    pub fn nft_collection(
+        &self,
+        collection_id: NftCollectionId,
+    ) -> Result<NftCollection, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .nft_collections
+            .get(&collection_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a single NFT item (owner, frozen flag, metadata commitment), or
+    /// `NotFound`.
+    pub fn nft_item(&self, nft_id: NftId) -> Result<NftItem, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .nft_items
+            .get(&nft_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a registered service entry (the full current revision: owner,
+    /// categories, pricing, payment flags, status), or `NotFound`. This is the
+    /// read the SDK's HTTP-402 `validateChallenge` needs so a caller no longer has
+    /// to supply the `ServiceEntry` itself.
+    pub fn service_entry(&self, service_id: ServiceId) -> Result<ServiceEntry, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .services
+            .get(&service_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a governance instance record, or `NotFound`.
+    pub fn governance_instance(
+        &self,
+        instance_id: GovernanceInstanceId,
+    ) -> Result<GovernanceInstance, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .governance_instances
+            .get(&instance_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a governance proposal record (status, tallies, eta), or `NotFound`.
+    pub fn governance_proposal(
+        &self,
+        proposal_id: ProposalId,
+    ) -> Result<GovernanceProposal, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .governance_proposals
+            .get(&proposal_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a mandate record (budget/spent/expiry/revoked/counterparty policy),
+    /// or `NotFound`.
+    pub fn mandate(&self, mandate_id: MandateId) -> Result<Mandate, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .mandates
+            .get(&mandate_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
     }
 }
 
