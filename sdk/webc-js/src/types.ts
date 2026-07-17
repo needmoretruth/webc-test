@@ -545,8 +545,12 @@ export interface TradingPairJson {
 /** Order direction, mirroring Rust `OrderSide`. */
 export type OrderSideJson = "Buy" | "Sell";
 
-/** Lifecycle status of a registered service, mirroring Rust `ServiceStatus`. */
-export type ServiceStatusJson = "Active" | "Paused";
+/**
+ * Lifecycle status of a registered service, mirroring Rust `ServiceStatus`. Only
+ * `"Active"` accepts payments; `"Paused"` and `"Retired"` both reject a spend (a
+ * paused service intends to return, a retired one does not).
+ */
+export type ServiceStatusJson = "Active" | "Paused" | "Retired";
 
 /** One priced operation a service exposes, mirroring Rust `ServicePrice`. */
 export interface ServicePriceJson {
@@ -643,6 +647,186 @@ export interface TokenMetadataJson {
   decimals: number;
   /** 32-byte lowercase-hex commitment to off-chain metadata. */
   metadata_hash: HexString;
+}
+
+// ---------------------------------------------------------------------------
+// Native-state RECORD shapes served by the node read endpoints (Phase 9/13).
+//
+// These mirror the Rust `webc-chain` serde JSON EXACTLY: snake_case field names,
+// `Amount` values as canonical decimal strings, `Option<Address>`/`Option<u64>`
+// as the value or `null`, enums in their serde form, byte-strings as lowercase
+// hex, and 32-byte ids/keys/hashes as 64-char lowercase hex. The
+// `WebcNodeClient` read methods fetch and STRICTLY parse each of these; the SDK
+// treats every node response as untrusted input.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-token authority and supply record, mirroring Rust `TokenRecord`
+ * (`GET /v1/tokens/{id}`). An authority is `null` when the power has been
+ * permanently RENOUNCED; `issued_supply` is the outstanding supply (total minted
+ * minus total burned) as a decimal string.
+ */
+export interface TokenRecord {
+  /** Account that created the token (immutable provenance). */
+  creator: WebcAddress;
+  /** Validated bounded metadata (name/symbol lowercase hex, decimals, commitment). */
+  metadata: TokenMetadataJson;
+  /** Mint (and pause) authority, or `null` if minting is permanently renounced. */
+  mint_authority: WebcAddress | null;
+  /** Freeze/thaw authority, or `null` if freezing is permanently renounced. */
+  freeze_authority: WebcAddress | null;
+  /** Whether transfers are currently paused. */
+  paused: boolean;
+  /** Outstanding supply (minted minus burned), decimal string of base units. */
+  issued_supply: string;
+}
+
+/**
+ * Deterministic per-token supply reconciliation, mirroring Rust
+ * `TokenSupplyReport` (`GET /v1/tokens/{id}/supply`). `balanced` is true when the
+ * recorded `issued` supply exactly equals the summed `held` balances.
+ */
+export interface TokenSupplyReport {
+  /** The token's recorded issued supply (decimal string of base units). */
+  issued: string;
+  /** Checked sum of every held balance for this token (decimal string). */
+  held: string;
+  /** Whether `issued` exactly equals `held`. */
+  balanced: boolean;
+}
+
+/**
+ * Per-collection authority and supply record, mirroring Rust `NftCollection`
+ * (`GET /v1/nft/collections/{id}`). Counters are u64 JSON numbers; `max_supply`
+ * is `null` when the collection has no hard cap.
+ */
+export interface NftCollection {
+  /** Account that created the collection (immutable provenance). */
+  creator: WebcAddress;
+  /** Validated bounded metadata (name/symbol lowercase hex, commitment). */
+  metadata: NftMetadataJson;
+  /** Mint (and pause) authority, or `null` if minting is permanently renounced. */
+  mint_authority: WebcAddress | null;
+  /** Freeze/thaw authority, or `null` if freezing is permanently renounced. */
+  freeze_authority: WebcAddress | null;
+  /** Whether the collection is currently paused. */
+  paused: boolean;
+  /** Next serial to assign on mint (monotonic, never decremented). */
+  next_serial: number;
+  /** Total items ever minted in this collection. */
+  minted_count: number;
+  /** Total items ever burned in this collection. */
+  burned_count: number;
+  /** Optional hard cap on total items ever minted, or `null` for no cap. */
+  max_supply: number | null;
+  /** Creator royalty commitment in basis points (≤ 10000; metadata only). */
+  royalty_bps: number;
+}
+
+/**
+ * Per-item ownership record, mirroring Rust `NftItem`
+ * (`GET /v1/nft/collections/{id}/items/{serial}`). An item is owned by exactly one
+ * address; `frozen` items can be neither transferred nor burned.
+ */
+export interface NftItem {
+  /** The single account that owns (and may transfer/burn) this item. */
+  owner: WebcAddress;
+  /** 32-byte lowercase-hex commitment to the item's off-chain metadata. */
+  item_metadata_hash: HexString;
+  /** Whether the item is frozen (freeze authority-controlled). */
+  frozen: boolean;
+}
+
+/** Lifecycle status of a governance proposal, mirroring Rust `GovProposalStatus`. */
+export type GovProposalStatusJson =
+  | "Active"
+  | "Defeated"
+  | "Passed"
+  | "Executed"
+  | "Expired";
+
+/**
+ * Per-instance authority and treasury record, mirroring Rust `GovernanceInstance`
+ * (`GET /v1/governance/instances/{id}`). `weight_token` is the 32-byte hex token
+ * id whose balances denominate voting weight; `treasury` is native base units as
+ * a decimal string.
+ */
+export interface GovernanceInstance {
+  /** Account that created the instance (immutable provenance). */
+  creator: WebcAddress;
+  /** 32-byte lowercase-hex id of the fungible token denominating voting weight. */
+  weight_token: HexString;
+  /** Immutable rule set (voting period, timelock, quorum, thresholds). */
+  config: GovernanceConfigJson;
+  /** Native WEBC the instance controls, decimal string of base units. */
+  treasury: string;
+  /** Monotonic counter assigning the next proposal its nonce. */
+  next_proposal_nonce: number;
+}
+
+/**
+ * Canonical proposal record, mirroring Rust `Proposal` (exported as
+ * `GovernanceProposal`; `GET /v1/governance/proposals/{id}`). The weight token and
+ * rule set are the snapshot captured at open time; `eta_epoch` is `null` while
+ * `Active` or once `Defeated`; the `yes`/`no`/`abstain` tallies are decimal
+ * strings of locked weight.
+ */
+export interface GovernanceProposal {
+  /** 32-byte lowercase-hex id of the owning instance (payout source). */
+  instance_id: HexString;
+  /** Account that opened the proposal. */
+  proposer: WebcAddress;
+  /** 32-byte lowercase-hex weight-token snapshot captured at open. */
+  weight_token: HexString;
+  /** Rule-set snapshot captured at open (immutable for the proposal's life). */
+  config: GovernanceConfigJson;
+  /** The single bounded typed effect this proposal carries. */
+  action: GovernanceActionJson;
+  /** Epoch the proposal opened. */
+  created_epoch: number;
+  /** Last epoch votes are accepted. */
+  voting_ends_epoch: number;
+  /** Execution-available epoch (set on pass), or `null` while active/defeated. */
+  eta_epoch: number | null;
+  /** Current lifecycle status. */
+  status: GovProposalStatusJson;
+  /** Total weight locked for `Yes` (decimal string). */
+  yes: string;
+  /** Total weight locked for `No` (decimal string). */
+  no: string;
+  /** Total weight locked for `Abstain` (decimal string). */
+  abstain: string;
+}
+
+/**
+ * One live agent-payment mandate, mirroring Rust `Mandate`
+ * (`GET /v1/mandates/{id}`). `agent_key` is the agent's 32-byte lowercase-hex
+ * Ed25519 public key; every amount is a decimal string of native base units;
+ * `expiry_epoch`/`window_index` are u64 JSON numbers.
+ */
+export interface Mandate {
+  /** Account that owns this mandate: funds, tops up, and may revoke it. */
+  principal: WebcAddress;
+  /** Agent Ed25519 signing key, 32-byte lowercase hex. */
+  agent_key: HexString;
+  /** Total native base units authorized over the mandate's life (decimal string). */
+  budget_total: string;
+  /** Native base units already spent (decimal string; only grows). */
+  spent: string;
+  /** Last consensus epoch (inclusive) in which the mandate may be spent. */
+  expiry_epoch: number;
+  /** Maximum native value one mandate-signed spend may draw (decimal string). */
+  per_tx_max: string;
+  /** Maximum spends per rate-limit window; `0` means unlimited. */
+  rate_limit_per_day: number;
+  /** Which counterparties spends may pay. */
+  counterparty_policy: MandateCounterpartyPolicyJson;
+  /** Whether the principal has revoked the mandate. */
+  revoked: boolean;
+  /** Rate-limit window `spends_in_window` belongs to. */
+  window_index: number;
+  /** Spends counted in `window_index` (reset each new window). */
+  spends_in_window: number;
 }
 
 /** External chain identifier; matches the Rust `ExternalChain` enum. */

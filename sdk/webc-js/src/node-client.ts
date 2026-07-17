@@ -18,6 +18,28 @@
  * test without relying on ambient globals.
  */
 
+import { addressToBytes } from "./address.js";
+import type { ServiceEntry } from "./http402.js";
+import type {
+  GovernanceActionJson,
+  GovernanceConfigJson,
+  GovernanceInstance,
+  GovernanceProposal,
+  GovProposalStatusJson,
+  Mandate,
+  MandateCounterpartyJson,
+  MandateCounterpartyPolicyJson,
+  NftCollection,
+  NftItem,
+  NftMetadataJson,
+  ServicePaymentFlagsJson,
+  ServicePriceJson,
+  ServiceStatusJson,
+  TokenMetadataJson,
+  TokenRecord,
+  TokenSupplyReport,
+} from "./types.js";
+
 /** The API version this client speaks; it must match the node's `/v1` prefix. */
 export const NODE_API_VERSION = "v1";
 
@@ -276,6 +298,103 @@ export class WebcNodeClient {
   /** Returns the supply-invariant reconciliation report. */
   async getSupply(): Promise<SupplyInvariantReport> {
     return parseSupplyInvariantReport(await this.#get("/v1/supply"));
+  }
+
+  /**
+   * Returns a native fungible-token record by 32-byte-hex id, throwing
+   * {@link NodeApiError} (404) if no such token exists.
+   */
+  async getToken(id: string): Promise<TokenRecord> {
+    return parseTokenRecord(await this.#get(`/v1/tokens/${encodeURIComponent(id)}`));
+  }
+
+  /**
+   * Returns a holder's balance of a token as a canonical decimal string of base
+   * units. A known token with no balance entry for the holder reads back as
+   * `"0"`; only an unknown token id throws {@link NodeApiError} (404).
+   */
+  async getTokenBalance(id: string, address: string): Promise<string> {
+    return parseAmountString(
+      await this.#get(
+        `/v1/tokens/${encodeURIComponent(id)}/balances/${encodeURIComponent(address)}`,
+      ),
+      "token balance",
+    );
+  }
+
+  /**
+   * Returns the per-token supply reconciliation for a token, throwing
+   * {@link NodeApiError} (404) if no such token exists.
+   */
+  async getTokenSupply(id: string): Promise<TokenSupplyReport> {
+    return parseTokenSupplyReport(
+      await this.#get(`/v1/tokens/${encodeURIComponent(id)}/supply`),
+    );
+  }
+
+  /**
+   * Returns an NFT collection record by 32-byte-hex id, throwing
+   * {@link NodeApiError} (404) if no such collection exists.
+   */
+  async getNftCollection(id: string): Promise<NftCollection> {
+    return parseNftCollection(
+      await this.#get(`/v1/nft/collections/${encodeURIComponent(id)}`),
+    );
+  }
+
+  /**
+   * Returns one NFT item by its collection id and serial, throwing
+   * {@link NodeApiError} (404) if no such item exists (or it was burned).
+   */
+  async getNftItem(id: string, serial: number): Promise<NftItem> {
+    return parseNftItem(
+      await this.#get(
+        `/v1/nft/collections/${encodeURIComponent(id)}/items/${encodeURIComponent(String(serial))}`,
+      ),
+    );
+  }
+
+  /**
+   * Returns a service-registry entry by 32-byte-hex id, throwing
+   * {@link NodeApiError} (404) if no such service exists. The returned
+   * {@link ServiceEntry} carries the requested `service_id` (the on-chain record
+   * omits it, since it is the map key) so the result feeds the HTTP-402 flow
+   * directly; it can be passed as the `ServiceEntrySource` to `validateChallenge`
+   * / `buildPayment`.
+   */
+  async getService(id: string): Promise<ServiceEntry> {
+    return parseServiceEntry(
+      await this.#get(`/v1/services/${encodeURIComponent(id)}`),
+      id,
+    );
+  }
+
+  /**
+   * Returns a governance instance by 32-byte-hex id, throwing
+   * {@link NodeApiError} (404) if no such instance exists.
+   */
+  async getGovernanceInstance(id: string): Promise<GovernanceInstance> {
+    return parseGovernanceInstance(
+      await this.#get(`/v1/governance/instances/${encodeURIComponent(id)}`),
+    );
+  }
+
+  /**
+   * Returns a governance proposal by 32-byte-hex id, throwing
+   * {@link NodeApiError} (404) if no such proposal exists.
+   */
+  async getGovernanceProposal(id: string): Promise<GovernanceProposal> {
+    return parseGovernanceProposal(
+      await this.#get(`/v1/governance/proposals/${encodeURIComponent(id)}`),
+    );
+  }
+
+  /**
+   * Returns an agent-payment mandate by 32-byte-hex id, throwing
+   * {@link NodeApiError} (404) if no such mandate exists.
+   */
+  async getMandate(id: string): Promise<Mandate> {
+    return parseMandate(await this.#get(`/v1/mandates/${encodeURIComponent(id)}`));
   }
 
   /**
@@ -699,4 +818,472 @@ function parseFaucetReceipt(value: unknown): FaucetReceipt {
     newBalance: requireAmount(value.new_balance, "new_balance"),
     disclaimer: requireString(value.disclaimer, "disclaimer"),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Native-state read parsers (Phase 9/13). These decode UNTRUSTED node responses
+// into the wire-mirror record types in `types.ts`, failing closed on a missing,
+// extra, or wrong-typed field — mirroring Rust's `#[serde(deny_unknown_fields)]`
+// on these records and the strict-decode discipline in `http402.ts`.
+// ---------------------------------------------------------------------------
+
+/** On-chain byte-length bounds these records enforce (mirrors the Rust consts). */
+const MAX_TOKEN_NAME_BYTES = 32;
+const MAX_TOKEN_SYMBOL_BYTES = 12;
+const MAX_TOKEN_DECIMALS = 18;
+const MAX_NFT_NAME_BYTES = 32;
+const MAX_NFT_SYMBOL_BYTES = 12;
+const MAX_NFT_ROYALTY_BPS = 10_000;
+const MAX_SERVICE_TITLE_BYTES = 64;
+const MAX_SERVICE_ENDPOINT_BYTES = 256;
+const MAX_SERVICE_PRICE_UNIT_BYTES = 32;
+const MAX_SERVICE_CATEGORIES = 8;
+const MAX_SERVICE_PRICING_ENTRIES = 16;
+const MAX_GOVERNANCE_BPS = 10_000;
+/** Largest value Rust's `u128` `Amount` can hold. */
+const AMOUNT_U128_MAX = (1n << 128n) - 1n;
+
+/** Requires an object, throwing a labeled error otherwise. */
+function requireRecord(value: unknown, ctx: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`node response ${ctx} is not an object`);
+  }
+  return value;
+}
+
+/** Rejects any key not in `allowed` (fail-closed on an extra field). */
+function rejectUnknownKeys(
+  obj: Record<string, unknown>,
+  allowed: readonly string[],
+  ctx: string,
+): void {
+  for (const key of Object.keys(obj)) {
+    if (!allowed.includes(key)) {
+      throw new Error(`node response ${ctx} has an unexpected field "${key}"`);
+    }
+  }
+}
+
+/**
+ * Requires a canonical unsigned decimal `Amount` within `u128` and returns it as
+ * the string (no sign, no leading zero, ≤ `u128::MAX`) — the only form Rust's
+ * `Amount` serializer emits.
+ */
+function requireAmountString(value: unknown, field: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length > 39 ||
+    !/^(0|[1-9][0-9]*)$/.test(value)
+  ) {
+    throw new Error(`node response field ${field} is not a valid amount`);
+  }
+  if (BigInt(value) > AMOUNT_U128_MAX) {
+    throw new Error(`node response field ${field} exceeds the u128 range`);
+  }
+  return value;
+}
+
+/** Requires a canonical `webc1...` address string (decodes to exactly 32 bytes). */
+function requireAddress(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`node response field ${field} is not an address string`);
+  }
+  try {
+    addressToBytes(value);
+  } catch {
+    throw new Error(`node response field ${field} is not a canonical webc address`);
+  }
+  return value;
+}
+
+/** Requires an address string or `null` (Rust `Option<Address>`). */
+function requireAddressOrNull(value: unknown, field: string): string | null {
+  return value === null ? null : requireAddress(value, field);
+}
+
+/** Requires a non-negative safe-integer count or `null` (Rust `Option<u64>`). */
+function requireCountOrNull(value: unknown, field: string): number | null {
+  return value === null ? null : requireCount(value, field);
+}
+
+/** Requires a count within `[0, max]` (an on-chain range-bounded integer). */
+function requireBoundedCount(value: unknown, field: string, max: number): number {
+  const count = requireCount(value, field);
+  if (count > max) {
+    throw new Error(`node response field ${field} exceeds its maximum of ${max}`);
+  }
+  return count;
+}
+
+/**
+ * Requires an even-length lowercase-hex byte string within `maxBytes` (the Rust
+ * bounded-hex codec form). An empty string is permitted (a zero-length field).
+ */
+function requireHexBytes(value: unknown, field: string, maxBytes: number): string {
+  if (typeof value !== "string" || !/^(?:[0-9a-f]{2})*$/.test(value)) {
+    throw new Error(`node response field ${field} is not lowercase byte hex`);
+  }
+  if (value.length / 2 > maxBytes) {
+    throw new Error(`node response field ${field} exceeds ${maxBytes} bytes`);
+  }
+  return value;
+}
+
+function parseTokenMetadata(value: unknown, ctx: string): TokenMetadataJson {
+  const obj = requireRecord(value, ctx);
+  rejectUnknownKeys(obj, ["name", "symbol", "decimals", "metadata_hash"], ctx);
+  return {
+    name: requireHexBytes(obj.name, `${ctx}.name`, MAX_TOKEN_NAME_BYTES),
+    symbol: requireHexBytes(obj.symbol, `${ctx}.symbol`, MAX_TOKEN_SYMBOL_BYTES),
+    decimals: requireBoundedCount(obj.decimals, `${ctx}.decimals`, MAX_TOKEN_DECIMALS),
+    metadata_hash: requireHex32(obj.metadata_hash, `${ctx}.metadata_hash`),
+  };
+}
+
+function parseTokenRecord(value: unknown): TokenRecord {
+  const obj = requireRecord(value, "token record");
+  rejectUnknownKeys(
+    obj,
+    ["creator", "metadata", "mint_authority", "freeze_authority", "paused", "issued_supply"],
+    "token record",
+  );
+  return {
+    creator: requireAddress(obj.creator, "creator"),
+    metadata: parseTokenMetadata(obj.metadata, "metadata"),
+    mint_authority: requireAddressOrNull(obj.mint_authority, "mint_authority"),
+    freeze_authority: requireAddressOrNull(obj.freeze_authority, "freeze_authority"),
+    paused: requireBool(obj.paused, "paused"),
+    issued_supply: requireAmountString(obj.issued_supply, "issued_supply"),
+  };
+}
+
+/** Parses the bare `Amount` string a token-balance endpoint returns. */
+function parseAmountString(value: unknown, field: string): string {
+  return requireAmountString(value, field);
+}
+
+function parseTokenSupplyReport(value: unknown): TokenSupplyReport {
+  const obj = requireRecord(value, "token supply report");
+  rejectUnknownKeys(obj, ["issued", "held", "balanced"], "token supply report");
+  return {
+    issued: requireAmountString(obj.issued, "issued"),
+    held: requireAmountString(obj.held, "held"),
+    balanced: requireBool(obj.balanced, "balanced"),
+  };
+}
+
+function parseNftMetadata(value: unknown, ctx: string): NftMetadataJson {
+  const obj = requireRecord(value, ctx);
+  rejectUnknownKeys(obj, ["name", "symbol", "metadata_hash"], ctx);
+  return {
+    name: requireHexBytes(obj.name, `${ctx}.name`, MAX_NFT_NAME_BYTES),
+    symbol: requireHexBytes(obj.symbol, `${ctx}.symbol`, MAX_NFT_SYMBOL_BYTES),
+    metadata_hash: requireHex32(obj.metadata_hash, `${ctx}.metadata_hash`),
+  };
+}
+
+function parseNftCollection(value: unknown): NftCollection {
+  const obj = requireRecord(value, "nft collection");
+  rejectUnknownKeys(
+    obj,
+    [
+      "creator",
+      "metadata",
+      "mint_authority",
+      "freeze_authority",
+      "paused",
+      "next_serial",
+      "minted_count",
+      "burned_count",
+      "max_supply",
+      "royalty_bps",
+    ],
+    "nft collection",
+  );
+  return {
+    creator: requireAddress(obj.creator, "creator"),
+    metadata: parseNftMetadata(obj.metadata, "metadata"),
+    mint_authority: requireAddressOrNull(obj.mint_authority, "mint_authority"),
+    freeze_authority: requireAddressOrNull(obj.freeze_authority, "freeze_authority"),
+    paused: requireBool(obj.paused, "paused"),
+    next_serial: requireCount(obj.next_serial, "next_serial"),
+    minted_count: requireCount(obj.minted_count, "minted_count"),
+    burned_count: requireCount(obj.burned_count, "burned_count"),
+    max_supply: requireCountOrNull(obj.max_supply, "max_supply"),
+    royalty_bps: requireBoundedCount(obj.royalty_bps, "royalty_bps", MAX_NFT_ROYALTY_BPS),
+  };
+}
+
+function parseNftItem(value: unknown): NftItem {
+  const obj = requireRecord(value, "nft item");
+  rejectUnknownKeys(obj, ["owner", "item_metadata_hash", "frozen"], "nft item");
+  return {
+    owner: requireAddress(obj.owner, "owner"),
+    item_metadata_hash: requireHex32(obj.item_metadata_hash, "item_metadata_hash"),
+    frozen: requireBool(obj.frozen, "frozen"),
+  };
+}
+
+function parseServiceStatus(value: unknown, field: string): ServiceStatusJson {
+  if (value === "Active" || value === "Paused" || value === "Retired") {
+    return value;
+  }
+  throw new Error(`node response field ${field} is not a valid service status`);
+}
+
+function parseServicePrice(value: unknown, ctx: string): ServicePriceJson {
+  const obj = requireRecord(value, ctx);
+  rejectUnknownKeys(obj, ["operation", "price", "unit"], ctx);
+  return {
+    operation: requireHex32(obj.operation, `${ctx}.operation`),
+    price: requireAmountString(obj.price, `${ctx}.price`),
+    unit: requireHexBytes(obj.unit, `${ctx}.unit`, MAX_SERVICE_PRICE_UNIT_BYTES),
+  };
+}
+
+function parseServicePaymentFlags(value: unknown, ctx: string): ServicePaymentFlagsJson {
+  const obj = requireRecord(value, ctx);
+  rejectUnknownKeys(obj, ["on_chain_direct", "http_402", "subscription"], ctx);
+  return {
+    on_chain_direct: requireBool(obj.on_chain_direct, `${ctx}.on_chain_direct`),
+    http_402: requireBool(obj.http_402, `${ctx}.http_402`),
+    subscription: requireBool(obj.subscription, `${ctx}.subscription`),
+  };
+}
+
+/**
+ * Parses the on-chain `ServiceEntry` record and returns an `http402` `ServiceEntry`
+ * carrying `serviceId` (the record omits the id — it is the map key). The id is
+ * re-validated as 32-byte hex so a caller cannot smuggle a malformed id through.
+ */
+function parseServiceEntry(value: unknown, serviceId: string): ServiceEntry {
+  const obj = requireRecord(value, "service entry");
+  rejectUnknownKeys(
+    obj,
+    [
+      "owner",
+      "namespace",
+      "categories",
+      "title",
+      "endpoint",
+      "interface",
+      "pricing",
+      "payment_flags",
+      "status",
+      "revision",
+    ],
+    "service entry",
+  );
+  if (!Array.isArray(obj.categories)) {
+    throw new Error("node response service entry.categories is not an array");
+  }
+  if (obj.categories.length > MAX_SERVICE_CATEGORIES) {
+    throw new Error("node response service entry.categories exceeds its maximum");
+  }
+  if (!Array.isArray(obj.pricing)) {
+    throw new Error("node response service entry.pricing is not an array");
+  }
+  if (obj.pricing.length > MAX_SERVICE_PRICING_ENTRIES) {
+    throw new Error("node response service entry.pricing exceeds its maximum");
+  }
+  return {
+    service_id: requireHex32(serviceId, "service_id"),
+    owner: requireAddress(obj.owner, "owner"),
+    namespace: requireHex32(obj.namespace, "namespace"),
+    categories: obj.categories.map((entry, index) =>
+      requireHex32(entry, `categories[${index}]`),
+    ),
+    title: requireHexBytes(obj.title, "title", MAX_SERVICE_TITLE_BYTES),
+    endpoint: requireHexBytes(obj.endpoint, "endpoint", MAX_SERVICE_ENDPOINT_BYTES),
+    interface: requireHex32(obj.interface, "interface"),
+    pricing: obj.pricing.map((entry, index) =>
+      parseServicePrice(entry, `pricing[${index}]`),
+    ),
+    payment_flags: parseServicePaymentFlags(obj.payment_flags, "payment_flags"),
+    status: parseServiceStatus(obj.status, "status"),
+    revision: requireCount(obj.revision, "revision"),
+  };
+}
+
+function parseGovernanceConfig(value: unknown, ctx: string): GovernanceConfigJson {
+  const obj = requireRecord(value, ctx);
+  rejectUnknownKeys(
+    obj,
+    [
+      "voting_period_epochs",
+      "timelock_epochs",
+      "quorum_bps",
+      "proposal_threshold",
+      "approval_threshold_bps",
+    ],
+    ctx,
+  );
+  return {
+    voting_period_epochs: requireCount(obj.voting_period_epochs, `${ctx}.voting_period_epochs`),
+    timelock_epochs: requireCount(obj.timelock_epochs, `${ctx}.timelock_epochs`),
+    quorum_bps: requireBoundedCount(obj.quorum_bps, `${ctx}.quorum_bps`, MAX_GOVERNANCE_BPS),
+    proposal_threshold: requireAmountString(obj.proposal_threshold, `${ctx}.proposal_threshold`),
+    approval_threshold_bps: requireBoundedCount(
+      obj.approval_threshold_bps,
+      `${ctx}.approval_threshold_bps`,
+      MAX_GOVERNANCE_BPS,
+    ),
+  };
+}
+
+function parseGovProposalStatus(value: unknown, field: string): GovProposalStatusJson {
+  if (
+    value === "Active" ||
+    value === "Defeated" ||
+    value === "Passed" ||
+    value === "Executed" ||
+    value === "Expired"
+  ) {
+    return value;
+  }
+  throw new Error(`node response field ${field} is not a valid proposal status`);
+}
+
+/** Parses the serde-tagged `GovernanceAction` enum (`"Signaling"` or a 1-key object). */
+function parseGovernanceAction(value: unknown, field: string): GovernanceActionJson {
+  if (value === "Signaling") {
+    return "Signaling";
+  }
+  if (isRecord(value) && value.TreasuryTransfer !== undefined) {
+    rejectUnknownKeys(value, ["TreasuryTransfer"], field);
+    const inner = requireRecord(value.TreasuryTransfer, `${field}.TreasuryTransfer`);
+    rejectUnknownKeys(inner, ["recipient", "amount"], `${field}.TreasuryTransfer`);
+    return {
+      TreasuryTransfer: {
+        recipient: requireAddress(inner.recipient, `${field}.TreasuryTransfer.recipient`),
+        amount: requireAmountString(inner.amount, `${field}.TreasuryTransfer.amount`),
+      },
+    };
+  }
+  throw new Error(`node response field ${field} is not a valid governance action`);
+}
+
+function parseGovernanceInstance(value: unknown): GovernanceInstance {
+  const obj = requireRecord(value, "governance instance");
+  rejectUnknownKeys(
+    obj,
+    ["creator", "weight_token", "config", "treasury", "next_proposal_nonce"],
+    "governance instance",
+  );
+  return {
+    creator: requireAddress(obj.creator, "creator"),
+    weight_token: requireHex32(obj.weight_token, "weight_token"),
+    config: parseGovernanceConfig(obj.config, "config"),
+    treasury: requireAmountString(obj.treasury, "treasury"),
+    next_proposal_nonce: requireCount(obj.next_proposal_nonce, "next_proposal_nonce"),
+  };
+}
+
+function parseGovernanceProposal(value: unknown): GovernanceProposal {
+  const obj = requireRecord(value, "governance proposal");
+  rejectUnknownKeys(
+    obj,
+    [
+      "instance_id",
+      "proposer",
+      "weight_token",
+      "config",
+      "action",
+      "created_epoch",
+      "voting_ends_epoch",
+      "eta_epoch",
+      "status",
+      "yes",
+      "no",
+      "abstain",
+    ],
+    "governance proposal",
+  );
+  return {
+    instance_id: requireHex32(obj.instance_id, "instance_id"),
+    proposer: requireAddress(obj.proposer, "proposer"),
+    weight_token: requireHex32(obj.weight_token, "weight_token"),
+    config: parseGovernanceConfig(obj.config, "config"),
+    action: parseGovernanceAction(obj.action, "action"),
+    created_epoch: requireCount(obj.created_epoch, "created_epoch"),
+    voting_ends_epoch: requireCount(obj.voting_ends_epoch, "voting_ends_epoch"),
+    eta_epoch: requireCountOrNull(obj.eta_epoch, "eta_epoch"),
+    status: parseGovProposalStatus(obj.status, "status"),
+    yes: requireAmountString(obj.yes, "yes"),
+    no: requireAmountString(obj.no, "no"),
+    abstain: requireAmountString(obj.abstain, "abstain"),
+  };
+}
+
+/** Parses one serde-tagged `MandateCounterparty` (`{Category}` or `{Recipient}`). */
+function parseMandateCounterparty(value: unknown, ctx: string): MandateCounterpartyJson {
+  const obj = requireRecord(value, ctx);
+  if (obj.Category !== undefined) {
+    rejectUnknownKeys(obj, ["Category"], ctx);
+    return { Category: requireHex32(obj.Category, `${ctx}.Category`) };
+  }
+  if (obj.Recipient !== undefined) {
+    rejectUnknownKeys(obj, ["Recipient"], ctx);
+    return { Recipient: requireAddress(obj.Recipient, `${ctx}.Recipient`) };
+  }
+  throw new Error(`node response ${ctx} is not a valid mandate counterparty`);
+}
+
+/** Parses the serde-tagged `MandateCounterpartyPolicy` (`"Open"` or `{Allowlist}`). */
+function parseMandateCounterpartyPolicy(
+  value: unknown,
+  field: string,
+): MandateCounterpartyPolicyJson {
+  if (value === "Open") {
+    return "Open";
+  }
+  if (isRecord(value) && value.Allowlist !== undefined) {
+    rejectUnknownKeys(value, ["Allowlist"], field);
+    if (!Array.isArray(value.Allowlist)) {
+      throw new Error(`node response ${field}.Allowlist is not an array`);
+    }
+    return {
+      Allowlist: value.Allowlist.map((entry, index) =>
+        parseMandateCounterparty(entry, `${field}.Allowlist[${index}]`),
+      ),
+    };
+  }
+  throw new Error(`node response field ${field} is not a valid counterparty policy`);
+}
+
+function parseMandate(value: unknown): Mandate {
+  const obj = requireRecord(value, "mandate");
+  rejectUnknownKeys(
+    obj,
+    [
+      "principal",
+      "agent_key",
+      "budget_total",
+      "spent",
+      "expiry_epoch",
+      "per_tx_max",
+      "rate_limit_per_day",
+      "counterparty_policy",
+      "revoked",
+      "window_index",
+      "spends_in_window",
+    ],
+    "mandate",
+  );
+  return {
+    principal: requireAddress(obj.principal, "principal"),
+    agent_key: requireHex32(obj.agent_key, "agent_key"),
+    budget_total: requireAmountString(obj.budget_total, "budget_total"),
+    spent: requireAmountString(obj.spent, "spent"),
+    expiry_epoch: requireCount(obj.expiry_epoch, "expiry_epoch"),
+    per_tx_max: requireAmountString(obj.per_tx_max, "per_tx_max"),
+    rate_limit_per_day: requireCount(obj.rate_limit_per_day, "rate_limit_per_day"),
+    counterparty_policy: parseMandateCounterpartyPolicy(
+      obj.counterparty_policy,
+      "counterparty_policy",
+    ),
+    revoked: requireBool(obj.revoked, "revoked"),
+    window_index: requireCount(obj.window_index, "window_index"),
+    spends_in_window: requireCount(obj.spends_in_window, "spends_in_window"),
+  };
 }
