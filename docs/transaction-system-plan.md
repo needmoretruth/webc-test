@@ -320,9 +320,60 @@ on 2026-07-17; implementation tests/commits remain pending.
 
 Review status: provisional and explicitly replaceable after later review.
 
+### 2026-07-17 — shared transaction lifecycle and proof interfaces
+
+Changed: [ADR-0012](adr/0012-transaction-lifecycle-and-finalized-proofs.md)
+freezes protocol-version-2 transaction/action/cancellation/sponsor shapes,
+typed validation/execution/block errors, two-level rollback, base/priority fee
+accounting, receipt/event/leaf formats, a single node runtime, durable lifecycle
+indexes, V2 APIs, indexed proofs, authority transitions, checkpoint policy, hard
+hostile-input bounds, compatibility, and module ownership.
+
+Why: independent audits of `webc-chain`, `webc-node`/`webc-storage`, and the
+proof boundary found that the V1 pieces do not share one failure, finality, or
+restart model. Freezing the boundary first prevents Rust, storage, networking,
+and TypeScript from encoding different meanings and prevents a chargeable user
+failure from aborting unrelated block work.
+
+Reused: existing canonical JSON, typed protocol integers, native operations,
+access recorder, fees/base-fee state, Merkle hashing, finality certificates,
+validator snapshots, `KvStore`, redb (`MIT OR Apache-2.0`), bounded network
+codec, axum/tokio, and browser canonical encoder. Sui and Agave official source
+were reviewed at the revisions and Apache-2.0 license links pinned in ADR-0012;
+no source was copied and no dependency was added.
+
+Rejected: optional fields added to V4, free failed work, partial action commits,
+one error enum for validation and execution, independent HTTP/consensus nodes,
+precomputed proof paths, one privileged checkpoint server, and an early STARK
+backend.
+
+Compatibility: V4/header-V3 vectors stay immutable; V5/header-V4 activate only
+with protocol version 2 and a coordinated devnet reset. Schema-2 migration
+backfills finalized legacy indexes, marks pending V4 entries unsupported, and
+never serves a V3 block as a V4 finalized proof. New transaction lifecycle
+routes use `/v2`.
+
+Proof: the pre-change Rust full gate passed from a clean target directory on
+2026-07-17; exact `pnpm` 11.7.0 `pnpm check` passed 81 `webc-js` tests, 3 widget
+tests, TypeScript checks, and documentation links. Implementation vectors,
+adversarial tests, and commits remain pending after this interface-freeze
+commit.
+
+Review status: accepted implementation direction; subject to adversarial tests
+and independent external review before production use.
+
 ## Goal progress checkpoint
 
-Initial state on 2026-07-17: planning complete; implementation not started.
+Checkpoint on 2026-07-17: the isolated branch is pushed through `5e65a8a`.
+Baseline fixes removed a Rust 1.96 clippy type-complexity failure and gave the
+browser permission-store KDF tests their existing 15-second cryptographic test
+budget. A fresh-target Rust full gate passed (`fmt`, strict workspace clippy,
+workspace tests, rustdoc, and node demo), and exact pnpm 11.7.0 `pnpm check`
+passed. Three read-only audits completed in verified worktrees; ADR-0012 records
+their shared interface decision. Implementation has not started. Exact next
+item: commit and push the interface freeze, then implement the V5 typed protocol
+and cross-language fixtures before node/storage/proof consumers.
+
 While the goal runs, update this branch-local section after each integrated
 milestone with the last pushed commit, passed tests, remaining limitation, and
 exact next item. This is the recovery pointer if a usage/session limit ends the
