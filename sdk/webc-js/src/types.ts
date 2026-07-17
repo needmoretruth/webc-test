@@ -181,6 +181,15 @@ export interface SignedTransactionJson {
   access_list: StateAccessListJson;
   fee: FeeBidJson;
   signature: HexString;
+  /**
+   * Optional sponsoring application namespace (fee sponsorship, §15.35): a
+   * 32-byte hash as a lowercase 64-char hex string. When present, the sender
+   * opts into having that app's pre-funded sponsor budget pay this transaction's
+   * fee (best-effort, fail-open). It is signed and, matching Rust's manual
+   * `Transaction` serializer, **omitted entirely from the canonical JSON when
+   * absent**, so every non-sponsored transaction is byte-identical to before.
+   */
+  sponsor?: HexString;
 }
 
 /** Versioned logical state key matching Rust `StateKey` canonical JSON. */
