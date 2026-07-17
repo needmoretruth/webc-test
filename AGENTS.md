@@ -313,7 +313,12 @@ every current and future session.
   with a Rust build). Over-parallelizing on a small host thrashes CPU and disk and is
   slower, not faster. Partition tracks so concurrent agents touch DISJOINT files
   (ideally different crates) to avoid merge conflicts, and give each parallel
-  implementer its own git worktree.
+  implementer its own git worktree. **Verify the isolation actually took effect
+  (`git worktree list` shows a new worktree for the agent) before trusting it —
+  in at least one environment `isolation: worktree` did not create a separate
+  worktree and agents collided on the shared main worktree (switching branch/HEAD
+  and clobbering each other). If isolation is not real, run the tracks
+  sequentially on `main` instead.**
 - **Subagents MUST commit and push frequently — this is a hard durability rule.** The
   container is ephemeral AND a subagent's reasoning/context is lost entirely when the
   session ends; only committed-and-pushed code survives. Every subagent that changes

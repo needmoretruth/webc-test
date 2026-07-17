@@ -162,25 +162,26 @@ finality-timing number (needs real hardware — a cloud container cannot produce
 it honestly); the optional multi-node-over-TCP Byzantine integration test (the
 machine-level property is already tested — do only if time permits).
 
-### In-flight parallel work — INTEGRATE THESE BRANCHES INTO main
+### Working method: sequential on main (worktree-isolation caveat)
 
-Working method is now in AGENTS.md ("Parallel subagents and durable work"): use
-parallel subagents scaled to host performance (this host = 4 cores → keep ~2–3
-concurrent cargo builds; split by crate/language); each subagent commits+pushes
-its own branch; the orchestrator merges each branch into `main`, runs the full
-gate, and pushes. As of the 2026-07-17 session two worktree subagents were
-launched and push to their own branches — **on resume, run `git branch -a` /
-`git fetch`, and if these branches exist, review and merge each into `main`
-(disjoint files → clean merge), gate, and push, then mark the findings resolved
-in `findings.md`:**
+Working method is in AGENTS.md ("Parallel subagents and durable work"). **CAVEAT
+discovered 2026-07-17: in this environment the Agent tool's `isolation: worktree`
+did NOT create a separate git worktree** — two launched agents collided on the
+shared main worktree (one switched the main branch, so a docs commit landed on a
+stray branch and had to be folded back). They were stopped. `claude/net-hardening`
+was never created; `claude/sdk-hex-parity` held only that docs commit and is now
+in `main` and deleted. **No finding work survived — N1–N6 and X1/X2 are still
+fully TODO in the backlog above.**
 
-- `claude/net-hardening` — webc-net N1/N2/N3/N5/N6 (kept webc-net public API
-  backward-compatible for webc-node).
-- `claude/sdk-hex-parity` — SDK X1/X2 (TypeScript; independent of Rust).
-
-Do the webc-chain + webc-node + webc-storage findings on `main` yourself
-(they are coupled: shared error enums and `apply_block`/`ChainStore::open`
-signature ripple), sequentially, since parallel cargo builds thrash 4 cores.
+Before relying on any parallel worktree agent, VERIFY `git worktree list` shows a
+NEW worktree for it; if it does not, STOP and run the tracks sequentially on
+`main`. Default plan on resume: do the whole backlog SEQUENTIALLY on `main`
+(4 cores make parallel cargo builds thrash anyway), reproduce-test-first → fix →
+gate → commit+push each finding. The webc-chain/webc-node/webc-storage findings
+are coupled (shared error enums, `apply_block`/`ChainStore::open` signature
+ripple) so they must be sequential regardless. The SDK track (X1/X2, pnpm — no
+Rust build contention) is the only safe parallel candidate, and only if isolation
+is verified to work.
 
 ### Decisions locked this session (do not re-litigate)
 
