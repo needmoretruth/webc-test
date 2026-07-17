@@ -34,6 +34,7 @@ pub mod sponsorship;
 pub mod staking;
 pub mod state;
 pub mod state_key;
+pub mod token;
 pub mod transaction;
 pub mod unbonding;
 
@@ -121,6 +122,11 @@ pub use state::{
     SupplyInvariantReport,
 };
 pub use state_key::{ProtocolStateKey, StateKey, StateKeyKind, MAX_TRANSACTION_STATE_KEYS};
+pub use token::{
+    TokenAuthorityKind, TokenId, TokenMetadata, TokenRecord, FROZEN_TOKEN_LEAF_DOMAIN,
+    MAX_TOKEN_DECIMALS, MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES, TOKEN_BALANCE_LEAF_DOMAIN,
+    TOKEN_LEAF_DOMAIN,
+};
 pub use transaction::{AccessList, FeeBid, Operation, Transaction};
 pub use unbonding::{
     CoolingTranche, UnbondingKind, UnbondingQueue, UnbondingRequest, UnbondingRequestId,
@@ -397,6 +403,34 @@ pub enum ChainError {
          categories/pricing)"
     )]
     InvalidServiceEntry,
+    #[error("a token is already registered for this namespace, creator, and create nonce")]
+    TokenAlreadyExists,
+    #[error("no token is registered for this token id")]
+    TokenNotFound,
+    #[error("token mint was not signed by the current mint authority (or minting is renounced)")]
+    TokenMintNotAuthorized,
+    #[error(
+        "token freeze/thaw was not signed by the current freeze authority (or freezing is \
+         renounced)"
+    )]
+    TokenFreezeNotAuthorized,
+    #[error(
+        "token authority transfer was not signed by the current authority (or it is already \
+         renounced)"
+    )]
+    TokenAuthorityNotAuthorized,
+    #[error("token account is frozen and cannot send or receive this token")]
+    TokenAccountFrozen,
+    #[error("token transfers are paused")]
+    TokenPaused,
+    #[error("insufficient token balance for this account")]
+    TokenInsufficientBalance,
+    #[error(
+        "token metadata is invalid (empty or over-length name/symbol, or out-of-range decimals)"
+    )]
+    InvalidTokenMetadata,
+    #[error("token issued supply overflowed the maximum representable amount")]
+    TokenSupplyOverflow,
     #[error("a contract is already registered for this code id")]
     ContractAlreadyExists,
     #[error("no contract is registered for this code id")]
