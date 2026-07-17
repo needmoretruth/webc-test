@@ -22,6 +22,7 @@ pub mod hex_bytes;
 pub mod inflation;
 pub mod mandate;
 pub mod namespace;
+pub mod nft;
 pub mod object;
 pub mod oracle;
 pub mod protocol;
@@ -85,6 +86,11 @@ pub use mandate::{
     MANDATE_LEAF_DOMAIN,
 };
 pub use namespace::{namespace_state_key_hash, NamespaceRecord, NAMESPACE_LEAF_DOMAIN};
+pub use nft::{
+    NftAuthorityKind, NftCollection, NftCollectionId, NftConfig, NftId, NftItem, NftMetadata,
+    MAX_NFT_NAME_BYTES, MAX_NFT_ROYALTY_BPS, MAX_NFT_SYMBOL_BYTES, NFT_COLLECTION_LEAF_DOMAIN,
+    NFT_ITEM_LEAF_DOMAIN,
+};
 pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_DATA_BYTES};
 pub use oracle::{
     accuracy_weight, median, Feed, FeedId, FeedValue, OracleConfig, OracleReporter,
@@ -431,6 +437,35 @@ pub enum ChainError {
     InvalidTokenMetadata,
     #[error("token issued supply overflowed the maximum representable amount")]
     TokenSupplyOverflow,
+    #[error("an nft collection is already registered for this namespace, creator, and create nonce")]
+    NftCollectionAlreadyExists,
+    #[error("no nft collection is registered for this collection id")]
+    NftCollectionNotFound,
+    #[error("no nft item is registered for this collection id and serial")]
+    NftItemNotFound,
+    #[error("nft mint was not signed by the current mint authority (or minting is renounced)")]
+    NftMintNotAuthorized,
+    #[error(
+        "nft freeze/thaw was not signed by the current freeze authority (or freezing is renounced)"
+    )]
+    NftFreezeNotAuthorized,
+    #[error(
+        "nft authority transfer was not signed by the current authority (or it is already \
+         renounced)"
+    )]
+    NftAuthorityNotAuthorized,
+    #[error("nft transfer/burn was not signed by the current item owner")]
+    NftNotOwner,
+    #[error("nft item is frozen and cannot be transferred or burned")]
+    NftItemFrozen,
+    #[error("nft collection is paused and cannot mint")]
+    NftCollectionPaused,
+    #[error("nft collection has reached its maximum supply and cannot mint")]
+    NftMaxSupplyReached,
+    #[error("nft metadata is invalid (empty or over-length name/symbol, or out-of-range royalty)")]
+    InvalidNftMetadata,
+    #[error("nft serial or supply counter overflowed the maximum representable value")]
+    NftSerialOverflow,
     #[error("a contract is already registered for this code id")]
     ContractAlreadyExists,
     #[error("no contract is registered for this code id")]
