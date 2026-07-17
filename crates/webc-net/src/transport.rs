@@ -80,6 +80,18 @@ const DEFAULT_MAX_INBOUND_CONNECTIONS: usize = 256;
 /// any single address to a small share of accept capacity.
 const DEFAULT_MAX_INBOUND_PER_IP: usize = 8;
 
+/// Default cap on the number of authenticated peers in the peer table.
+///
+/// Why 1024 (finding N3): a successful handshake adds one entry to `peers`, and
+/// the identity key it is keyed on is an unauthenticated name anyone can mint.
+/// Without a cap, a Sybil could inflate the table without bound — growing memory
+/// and, worse, multiplying every gossip message through `flood()` (amplification).
+/// A deterministic hard cap bounds both. 1024 is far beyond the peer count a
+/// healthy devnet node maintains, yet keeps the table and fan-out finite. Beyond
+/// the cap, further authenticated connections are rejected (peer scoring and
+/// eviction of the least useful peer are later work).
+const DEFAULT_MAX_PEERS: usize = 1024;
+
 /// A gossip message received from an authenticated peer.
 #[derive(Clone, Debug)]
 pub struct InboundMessage {
@@ -115,6 +127,11 @@ pub struct NetworkConfig {
     ///
     /// Keeps one host from consuming every inbound slot and locking others out.
     pub max_inbound_per_ip: usize,
+    /// Maximum number of authenticated peers in the peer table (finding N3).
+    ///
+    /// A deterministic hard cap; connections authenticated beyond it are
+    /// rejected so a Sybil cannot inflate the table or gossip fan-out.
+    pub max_peers: usize,
 }
 
 impl NetworkConfig {
@@ -138,6 +155,7 @@ impl NetworkConfig {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_inbound_connections: DEFAULT_MAX_INBOUND_CONNECTIONS,
             max_inbound_per_ip: DEFAULT_MAX_INBOUND_PER_IP,
+            max_peers: DEFAULT_MAX_PEERS,
         }
     }
 }
@@ -212,6 +230,10 @@ struct SharedConfig {
     chain_id: ChainId,
     /// Deadline bounding the authentication handshake (finding N1).
     handshake_timeout: std::time::Duration,
+    /// Hard cap on admitted peers (finding N3). A connection acquires one permit
+    /// after authenticating and holds it for its lifetime; when none is available
+    /// the peer is rejected, so the peer table can never exceed the cap.
+    peer_slots: Arc<Semaphore>,
 }
 
 /// Cloneable control handle to a running network worker.
@@ -296,6 +318,9 @@ pub async fn spawn_network(
         identity: config.identity,
         chain_id: config.chain_id,
         handshake_timeout: config.handshake_timeout,
+        // One permit per admissible peer (finding N3), shared by every inbound
+        // and outbound connection so the total admitted peer count is bounded.
+        peer_slots: Arc::new(Semaphore::new(config.max_peers.max(1))),
     });
 
     let (events_tx, events_rx) = mpsc::channel::<Event>(1024);
@@ -440,7 +465,21 @@ async fn run_connection(
         Err(_elapsed) => return Err(NetError::HandshakeTimedOut),
     };
 
-    // Authenticated. Register an outbound queue and start pumping frames.
+    // Bound the peer table (finding N3). The peer is now authenticated, but its
+    // identity key is an unauthenticated name anyone can mint, so a Sybil could
+    // otherwise add unbounded entries to `peers` — inflating memory and, worse,
+    // multiplying every gossip message through `flood()`. Admit it only if a peer
+    // slot is free; at the cap, reject this connection (it is dropped, freeing its
+    // inbound slot) instead of growing the table. The permit is held for the
+    // connection's lifetime and released when it ends, freeing the slot. Because
+    // the permit is acquired before `Event::Connected` is sent, the worker's
+    // `peers` table can never exceed the cap.
+    let _peer_slot = match shared.peer_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => return Err(NetError::PeerTableFull),
+    };
+
+    // Authenticated and admitted. Register an outbound queue and start pumping.
     let (out_tx, mut out_rx) = mpsc::channel::<Arc<Vec<u8>>>(PEER_SEND_CAPACITY);
     if events
         .send(Event::Connected {
@@ -955,6 +994,64 @@ mod tests {
         // Per-IP cap binds (global set high): two connections from 127.0.0.1 use
         // up the per-IP budget of 2, blocking a third from the same address.
         assert_inbound_cap_blocks_third(64, 2, 41).await;
+    }
+
+    #[tokio::test]
+    async fn peer_table_size_is_capped() {
+        // N3 reproduce: with max_peers = 1, only one authenticated peer is
+        // admitted; a second authenticates but is rejected, so the table never
+        // exceeds the cap. Pre-fix the table grew one entry per handshake, so a
+        // second (or a Sybil flood of) peers would all be admitted.
+        let chain = ChainId::devnet();
+        let mut server_cfg = NetworkConfig::new(
+            Keypair::from_seed([51u8; 32]),
+            chain.clone(),
+            Some(loopback()),
+            Vec::new(),
+        );
+        server_cfg.max_peers = 1;
+        let (server, _server_rx) = spawn_network(server_cfg).await.unwrap();
+        let addr = server.local_addr().expect("listener bound");
+
+        // First peer connects and fills the single slot.
+        let (peer1, _p1_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([52u8; 32]),
+            chain.clone(),
+            None,
+            vec![addr],
+        ))
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.connected_peers() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "first peer must be admitted"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        // Second peer dials and authenticates, but the table is full: it must be
+        // rejected, keeping the admitted peer count at the cap.
+        let (peer2, _p2_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([53u8; 32]),
+            chain,
+            None,
+            vec![addr],
+        ))
+        .await
+        .unwrap();
+        // Give the second peer several dial+handshake attempts.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(
+            server.connected_peers(),
+            1,
+            "peer table must never exceed max_peers, even under Sybil dialing"
+        );
+
+        // Keep both client handles alive through the assertion.
+        drop(peer1);
+        drop(peer2);
     }
 
     #[tokio::test]

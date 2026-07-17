@@ -44,6 +44,10 @@ pub enum NetError {
     /// The peer did not complete the handshake within the allowed deadline.
     #[error("handshake did not complete within the deadline")]
     HandshakeTimedOut,
+    /// The local peer table is at capacity, so a newly authenticated peer was
+    /// rejected to keep the table (and gossip fan-out) bounded (finding N3).
+    #[error("peer table is full; rejecting the connection")]
+    PeerTableFull,
     /// The background network worker is no longer running.
     #[error("network worker has stopped")]
     WorkerStopped,
