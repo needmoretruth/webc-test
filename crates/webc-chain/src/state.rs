@@ -2761,6 +2761,53 @@ mod tests {
         assert_eq!(state.validator_fee_pool, Amount::from_units(1));
     }
 
+    #[test]
+    fn every_scalar_state_counter_is_committed_by_the_state_root() {
+        // E8: the state root (canonical JSON) must commit every consensus field,
+        // so no field can be mutated on disk (the bincode restart path) without
+        // changing the committed root — otherwise two nodes could diverge on a
+        // JSON-invisible field yet share a state root. Map fields are covered by
+        // their dedicated sub-roots; this guards the scalar counters, which are
+        // the easiest to add and forget.
+        let (_config, base, _a, _b) = funded_state();
+        let root = base.state_root().unwrap();
+        let mutators: Vec<(&str, fn(&mut ChainState))> = vec![
+            ("burned_fees", |s| {
+                s.burned_fees = Amount::from_units(s.burned_fees.0 + 1)
+            }),
+            ("slashed_units", |s| {
+                s.slashed_units = Amount::from_units(s.slashed_units.0 + 1)
+            }),
+            ("validator_fee_pool", |s| {
+                s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
+            }),
+            ("minted_supply", |s| {
+                s.minted_supply = Amount::from_units(s.minted_supply.0 + 1)
+            }),
+            ("inflation_year_start_supply", |s| {
+                s.inflation_year_start_supply =
+                    Amount::from_units(s.inflation_year_start_supply.0 + 1)
+            }),
+            ("current_base_fee_per_unit", |s| {
+                s.current_base_fee_per_unit += 1
+            }),
+            ("current_epoch", |s| s.current_epoch += 1),
+            ("bridge_nonce", |s| s.bridge_nonce += 1),
+            ("last_block_timestamp_ms", |s| {
+                s.last_block_timestamp_ms += 1
+            }),
+        ];
+        for (name, mutate) in mutators {
+            let mut mutated = base.clone();
+            mutate(&mut mutated);
+            assert_ne!(
+                mutated.state_root().unwrap(),
+                root,
+                "mutating {name} must change the state root (E8)"
+            );
+        }
+    }
+
     // ----- session-key test helpers -----
 
     /// Process-wide ML-DSA-65 recovery keypair for session-key tests.

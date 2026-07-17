@@ -6,7 +6,7 @@
 //! errors through the reviewed `ed25519-dalek` implementation.
 
 use crate::{Address, CryptoError};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -158,6 +158,13 @@ impl Keypair {
 }
 
 /// Verifies an exact Ed25519 signature and rejects malformed keys/signatures.
+///
+/// Uses `verify_strict` (finding E6), which rejects non-canonical signature `S`
+/// components and small-order / torsion public keys. Malleable verification
+/// (`verify`) would accept a *different* valid signature encoding of the same
+/// message: benign for content binding, but a foot-gun anywhere a caller keyed
+/// on the signature bytes — e.g. equivocation detection. Honest signers always
+/// produce canonical signatures, so this rejects only maliciously reshaped ones.
 pub fn verify_signature(
     public_key: &PublicKeyBytes,
     message: &[u8],
@@ -167,7 +174,7 @@ pub fn verify_signature(
         .map_err(|_| CryptoError::InvalidPublicKey)?;
     let signature = Signature::from_bytes(signature.as_bytes());
     verifying_key
-        .verify(message, &signature)
+        .verify_strict(message, &signature)
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
