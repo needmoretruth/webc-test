@@ -5,6 +5,10 @@
 //! keys each native operation is expected to touch. Runtime enforcement lives in
 //! `state` and fails atomically if execution diverges from that signed list.
 
+use crate::contract::{
+    ContractManifest, CONTRACT_DECLARED_KEY_UNITS, CONTRACT_INPUT_BYTE_UNITS,
+    CONTRACT_INVOKE_BASE_UNITS,
+};
 use crate::namespace::namespace_state_key_hash;
 use crate::sponsorship::sponsor_state_key_hash;
 use crate::{
@@ -424,6 +428,42 @@ pub enum Operation {
         /// Native base units paid into the feed's revenue pool.
         amount: Amount,
     },
+    /// Registers an interim Rust-authored contract for a flat, burned fee
+    /// (Phase 7a, ADR-0014 interim path (c)).
+    ///
+    /// Commits the signed [`ContractManifest`] under `StateKey::module(code_id)`
+    /// and charges the configured registration fee (burned, supply-neutral, like
+    /// feed creation). Fails if `code_id` is already registered or the manifest is
+    /// malformed. Registers no untrusted bytecode — the manifest names an audited
+    /// built-in handler.
+    RegisterContract {
+        /// The contract's committed interface record (identity, namespace,
+        /// declared footprint, ABI/gas-schedule versions, built-in handler).
+        manifest: ContractManifest,
+    },
+    /// Invokes a registered contract's handler behind the native declared-access
+    /// and gas discipline (Phase 7a, ADR-0014 interim path (c)).
+    ///
+    /// Looks up the manifest by `code_id`, binds this signed operation to it
+    /// (`namespace` and `declared_keys` must match the manifest exactly), meters
+    /// the call against the sender's `gas_limit`, runs the audited handler over
+    /// only its declared footprint, and commits its state writes. An over-gas call
+    /// or an undeclared access rolls the whole transaction back atomically.
+    InvokeContract {
+        /// Registered contract identity (the manifest / `StateKey::module` key).
+        code_id: Hash256,
+        /// Application namespace the contract's state lives under; must equal the
+        /// manifest's `namespace`. Carried in the signed operation so the access
+        /// list is self-contained and the scheduler needs no manifest lookup.
+        namespace: Hash256,
+        /// The application key-hashes this call declares; must equal the manifest
+        /// `footprint`. Each becomes a `StateKey::application(namespace, key_hash)`
+        /// read_write in the access list.
+        declared_keys: Vec<Hash256>,
+        /// Bounded opaque input forwarded verbatim to the handler.
+        #[serde(with = "crate::hex_bytes")]
+        input: Vec<u8>,
+    },
 }
 
 impl Operation {
@@ -462,6 +502,31 @@ impl Operation {
             | Self::DeregisterReporter { .. }
             | Self::PayFeedRead { .. } => 10_000,
             Self::SubmitReport { .. } => 5_000,
+            // Registration validates a manifest, writes one record, and burns the
+            // fee — comparable to feed creation plus a record write.
+            Self::RegisterContract { .. } => 30_000,
+            // A contract call's admission cost is ahead-of-time boundable
+            // (ADR-0014 §3): a base plus the declared footprint size and input
+            // length. This is the fee settled up front; the runtime additionally
+            // meters per-host-op consumption against `gas_limit` during execution
+            // and hard-stops (fail-closed rollback) if it is exceeded. Saturating
+            // arithmetic keeps this panic-free on hostile lengths; the real input
+            // bound is enforced at execution.
+            Self::InvokeContract {
+                input,
+                declared_keys,
+                ..
+            } => {
+                let input_units = u64::try_from(input.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(CONTRACT_INPUT_BYTE_UNITS);
+                let key_units = u64::try_from(declared_keys.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(CONTRACT_DECLARED_KEY_UNITS);
+                CONTRACT_INVOKE_BASE_UNITS
+                    .saturating_add(input_units)
+                    .saturating_add(key_units)
+            }
         }
     }
 
@@ -752,6 +817,33 @@ impl Operation {
                 // feed's revenue pool, so it writes both the account and the feed.
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::oracle_feed(*feed_id));
+            }
+            Self::RegisterContract { manifest } => {
+                // Registration burns the fee from liquid and writes the contract's
+                // module (manifest) record. The account key is already in the
+                // default-lane base; declare the module record it creates.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::module(manifest.code_id));
+            }
+            Self::InvokeContract {
+                code_id,
+                namespace,
+                declared_keys,
+                ..
+            } => {
+                // The manifest record is read to resolve and bind the contract;
+                // the declared footprint keys (which must equal the manifest's) are
+                // the contract's application state, declared read_write so the
+                // signed access list and the scheduler agree with the manifest.
+                // The example contract moves no native value, so no extra account
+                // key beyond the default-lane fee source is required.
+                push_unique_key(&mut read_only, StateKey::module(*code_id));
+                for key_hash in declared_keys {
+                    push_unique_key(
+                        &mut read_write,
+                        StateKey::application(*namespace, *key_hash),
+                    );
+                }
             }
         }
         if !matches!(

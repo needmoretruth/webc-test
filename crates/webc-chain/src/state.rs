@@ -13,6 +13,11 @@ use crate::authorization_policy::{
     active_key_rotation_message, post_quantum_root_rotation_message, AccountAuthorizationPolicy,
 };
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
+use crate::contract::{
+    builtin_contract, BuiltinContract, ContractContext, ContractManifest, ContractRuntimeConfig,
+    ContractStateValue, GasMeter, CONTRACT_LEAF_DOMAIN, CONTRACT_STATE_LEAF_DOMAIN,
+    MAX_CONTRACT_INPUT_BYTES,
+};
 use crate::fees::{
     next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown, FeePolicy, NamespaceFeeState,
     StoragePricing, NAMESPACE_FEE_LEAF_DOMAIN,
@@ -85,6 +90,13 @@ pub struct ChainConfig {
     /// the launch values are measurement-tuned placeholders (§15.35 method).
     #[serde(default)]
     pub oracle: OracleConfig,
+    /// Interim contract runtime parameters (Phase 7a, ADR-0014): the flat, burned
+    /// contract-registration fee.
+    ///
+    /// `#[serde(default)]` keeps a genesis written before the contract runtime
+    /// decodable; the launch value is a measurement-tuned placeholder.
+    #[serde(default)]
+    pub contracts: ContractRuntimeConfig,
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
@@ -125,6 +137,7 @@ impl Default for ChainConfig {
             storage_pricing: StoragePricing::default(),
             sponsorship: SponsorshipConfig::default(),
             oracle: OracleConfig::default(),
+            contracts: ContractRuntimeConfig::default(),
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
@@ -260,6 +273,33 @@ pub enum Event {
         distributed: Amount,
         /// Native base units carried forward in the pool (division remainder).
         carried: Amount,
+    },
+    /// An interim Rust-authored contract was registered (Phase 7a, ADR-0014).
+    ContractRegistered {
+        /// Registered contract identity (the manifest / module key).
+        code_id: Hash256,
+        /// Application namespace the contract's state is isolated under.
+        namespace: Hash256,
+        /// Account that registered and owns the contract.
+        owner: Address,
+        /// Audited built-in handler the contract runs.
+        builtin: BuiltinContract,
+        /// Registration fee burned from the owner's liquid balance.
+        fee_burned: Amount,
+    },
+    /// A registered contract's handler was invoked (Phase 7a, ADR-0014).
+    ContractInvoked {
+        /// Registered contract identity that ran.
+        code_id: Hash256,
+        /// Application namespace whose state the call touched.
+        namespace: Hash256,
+        /// Account that invoked the contract.
+        caller: Address,
+        /// Total execution units the call consumed (admission plus metered
+        /// per-host-op consumption), within the sender's authorized `gas_limit`.
+        gas_consumed: u64,
+        /// Length in bytes of the handler's returned output.
+        output_len: u64,
     },
     ValidatorRegistered {
         operator: Address,
@@ -560,6 +600,30 @@ pub struct ChainState {
     /// committed by the state root as a scalar.
     #[serde(default)]
     pub oracle_revenue: Amount,
+    /// Interim contract registry, keyed by `code_id` (Phase 7a, ADR-0014).
+    ///
+    /// Each [`ContractManifest`] describes one registered contract (its identity,
+    /// application namespace, declared footprint, ABI/gas-schedule versions, and
+    /// audited built-in handler). Addressed for declared access by
+    /// `StateKey::module(code_id)`. Committed by the state root through a dedicated
+    /// Merkle sub-root (`CONTRACT_LEAF_DOMAIN`), so registering a contract changes
+    /// the state root. Holds no native units — the registration fee is burned — so
+    /// it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub contracts: BTreeMap<Hash256, ContractManifest>,
+    /// Interim contract application state, keyed by `(namespace, key_hash)` (Phase
+    /// 7a, ADR-0014).
+    ///
+    /// A contract's state lives under `StateKey::application(namespace, key_hash)`
+    /// for each `key_hash` in its manifest footprint; this map is the physical
+    /// backing store. Committed by the state root through a dedicated Merkle
+    /// sub-root (`CONTRACT_STATE_LEAF_DOMAIN`), so any contract write changes the
+    /// state root. Holds only opaque contract-owned bytes, never native units, so
+    /// it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub contract_state: BTreeMap<(Hash256, Hash256), ContractStateValue>,
     /// Localized (per-application-namespace) base-fee state (Phase 6, §8 isolation).
     ///
     /// Maps a currently-congested application namespace to its [`NamespaceFeeState`]
@@ -701,6 +765,8 @@ impl Default for ChainState {
             oracle_reporters: BTreeMap::new(),
             oracle_bonds: Amount::ZERO,
             oracle_revenue: Amount::ZERO,
+            contracts: BTreeMap::new(),
+            contract_state: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
@@ -1438,6 +1504,8 @@ impl ChainState {
             namespace_root: Hash256,
             oracle_feed_root: Hash256,
             oracle_reporter_root: Hash256,
+            contract_root: Hash256,
+            contract_state_root: Hash256,
             namespace_fee_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
@@ -1455,6 +1523,15 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
+            // V13 adds the interim contract runtime (Phase 7a, ADR-0014): the
+            // `contract_root` sub-root commits every registered contract manifest
+            // (identity, namespace, footprint, ABI/gas-schedule versions, handler)
+            // and the `contract_state_root` sub-root commits every contract state
+            // value, so a register or any contract write always changes the state
+            // root. It adds no new scalar and locks no native units (the
+            // registration fee is burned into the existing `burned_fees` scalar).
+            // The domain bump is a deliberate consensus-format change; no external
+            // fixture pins a prior root.
             // V12 adds the native oracle (Phase 7, §15.17): the `oracle_feed_root`
             // and `oracle_reporter_root` sub-roots commit every feed record
             // (creator, bond class, accrued revenue) and every bonded-reporter
@@ -1479,7 +1556,7 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V12",
+            domain: "WEBC_STATE_COMMITMENT_V13",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1538,6 +1615,15 @@ impl ChainState {
             oracle_reporter_root: ordered_value_root(
                 ORACLE_REPORTER_LEAF_DOMAIN,
                 self.oracle_reporters.iter(),
+            )?,
+            // Interim contract runtime committed by its own ordered sub-roots (Phase
+            // 7a, ADR-0014): registering a contract changes `contract_root`; any
+            // contract state write changes `contract_state_root`; either changes the
+            // state root.
+            contract_root: ordered_value_root(CONTRACT_LEAF_DOMAIN, self.contracts.iter())?,
+            contract_state_root: ordered_value_root(
+                CONTRACT_STATE_LEAF_DOMAIN,
+                self.contract_state.iter(),
             )?,
             // Localized per-namespace fee state committed by its own ordered sub-root
             // (Phase 6, §8 isolation): a change to any namespace's localized base fee
@@ -3099,6 +3185,113 @@ impl ChainState {
                     feed_id: *feed_id,
                     payer: tx.sender,
                     amount: *amount,
+                });
+            }
+            Operation::RegisterContract { manifest } => {
+                // Default lane only: the registration fee draws from and burns
+                // liquid (supply-neutral, like feed creation). The manifest record
+                // is committed under the reserved module key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::ContractRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::module(manifest.code_id))?;
+                // Validate the hostile manifest before touching supply or state.
+                manifest.validate(tx.sender)?;
+                if self.contracts.contains_key(&manifest.code_id) {
+                    return Err(ChainError::ContractAlreadyExists);
+                }
+                let fee = config.contracts.registration_fee;
+                self.debit_native(tx.sender, fee)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(fee)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.contracts.insert(manifest.code_id, manifest.clone());
+                events.push(Event::ContractRegistered {
+                    code_id: manifest.code_id,
+                    namespace: manifest.namespace,
+                    owner: tx.sender,
+                    builtin: manifest.builtin,
+                    fee_burned: fee,
+                });
+            }
+            Operation::InvokeContract {
+                code_id,
+                namespace,
+                declared_keys,
+                input,
+            } => {
+                // Bound the hostile input before any work.
+                if input.len() > MAX_CONTRACT_INPUT_BYTES {
+                    return Err(ChainError::ContractInputTooLarge {
+                        actual: input.len(),
+                        maximum: MAX_CONTRACT_INPUT_BYTES,
+                    });
+                }
+                // Resolve the manifest through the declared (read-only) module key.
+                access.read(StateKey::module(*code_id))?;
+                let manifest = self
+                    .contracts
+                    .get(code_id)
+                    .ok_or(ChainError::ContractNotFound)?
+                    .clone();
+                // Bind the signed operation to the committed manifest so the access
+                // list and the scheduler agree with the manifest and a call cannot
+                // under- or mis-declare what it touches.
+                if *namespace != manifest.namespace {
+                    return Err(ChainError::ContractNamespaceMismatch);
+                }
+                if declared_keys.as_slice() != manifest.footprint.as_slice() {
+                    return Err(ChainError::ContractFootprintMismatch);
+                }
+                // Seed the meter with the admission cost already priced into the fee
+                // (`units`), and cap it at the sender's authorized `gas_limit`; the
+                // handler's per-host-op consumption is metered on top and hard-stops
+                // on over-gas (fail-closed atomic rollback of the whole transaction).
+                let mut meter = GasMeter::new(tx.fee.gas_limit, units)?;
+                // Load the contract's whole declared footprint from committed state
+                // into a working set. Every footprint key is recorded/enforced
+                // through the shared recorder by `ContractContext`, so an omitted or
+                // padded access list fails closed exactly like a native op.
+                let mut working = BTreeMap::new();
+                for key_hash in &manifest.footprint {
+                    let current = self
+                        .contract_state
+                        .get(&(manifest.namespace, *key_hash))
+                        .map(|value| value.0.clone());
+                    working.insert(*key_hash, current);
+                }
+                let mut ctx = ContractContext::new(
+                    manifest.namespace,
+                    &manifest.footprint,
+                    working,
+                    &mut access,
+                    &mut meter,
+                    self.current_epoch,
+                );
+                let handler = builtin_contract(manifest.builtin);
+                let output = handler.call(&mut ctx, input)?;
+                let writes = ctx.into_writes()?;
+                let gas_consumed = meter.consumed();
+                // Commit the contract's declared writes back to committed state.
+                for (key_hash, value) in writes {
+                    let key = (manifest.namespace, key_hash);
+                    match value {
+                        Some(bytes) => {
+                            self.contract_state.insert(key, ContractStateValue(bytes));
+                        }
+                        None => {
+                            self.contract_state.remove(&key);
+                        }
+                    }
+                }
+                events.push(Event::ContractInvoked {
+                    code_id: *code_id,
+                    namespace: *namespace,
+                    caller: tx.sender,
+                    gas_consumed,
+                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
                 });
             }
         }
