@@ -36,12 +36,20 @@ import type {
   SignedTransactionJson,
   StateAccessListJson,
   StateKeyJson,
+  TokenAuthorityKindJson,
+  TokenMetadataJson,
   WebcAddress,
 } from "./types.js";
 import type { WebcWallet } from "./wallet.js";
 import { signWithWallet } from "./wallet.js";
-import { addressFromBytes } from "./address.js";
-import { bytesToHex, concatBytes, hexToBytes, toArrayBuffer } from "./hex.js";
+import { addressFromBytes, addressToBytes } from "./address.js";
+import {
+  bytesToHex,
+  concatBytes,
+  hexToBytes,
+  toArrayBuffer,
+  u64ToBytes,
+} from "./hex.js";
 import { canonicalJsonBytes } from "./canonical.js";
 import { bridgeMessageHashHex } from "./protocol-hash.js";
 
@@ -411,6 +419,64 @@ function requireLowercaseHex(value: string, label: string): void {
   hexToBytes(value); // throws on any non-hex character
 }
 
+/**
+ * Rejects a value that is not a 32-byte lowercase-hex string. Every id newtype
+ * (`TokenId`, `NftCollectionId`, `FeedId`, `MandateId`, …) and every `Hash256`
+ * field (namespaces, interface/metadata commitments) serializes to Rust's
+ * `hex::encode` form: exactly 64 lowercase hex characters.
+ */
+function requireHash256Hex(value: string, label: string): void {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) {
+    throw new Error(`invalid 32-byte lowercase hex for ${label}`);
+  }
+}
+
+/**
+ * Rejects a bounded lowercase-hex byte string Rust's `bounded_hex` codec would
+ * refuse: non-lowercase-hex, empty when `nonEmpty`, or longer than `maxBytes`.
+ */
+function requireBoundedHex(
+  value: string,
+  label: string,
+  maxBytes: number,
+  nonEmpty: boolean,
+): void {
+  requireLowercaseHex(value, label);
+  const byteLength = value.length / 2;
+  if (nonEmpty && byteLength === 0) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (byteLength > maxBytes) {
+    throw new Error(`${label} exceeds ${maxBytes} bytes`);
+  }
+}
+
+/** Rejects a small unsigned integer outside `[0, max]` (bps, decimals, u16/u8). */
+function requireBoundedU(value: number, label: string, max: number): void {
+  if (!Number.isSafeInteger(value) || value < 0 || value > max) {
+    throw new Error(`invalid ${label} (expected integer in [0, ${max}])`);
+  }
+}
+
+/** Rejects a non-negative integer that is not a safe u64-range JS integer. */
+function requireCountU64(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`invalid ${label} (expected non-negative safe integer)`);
+  }
+}
+
+/**
+ * Validates bounded token metadata, mirroring Rust `TokenMetadata::validate`
+ * plus the `bounded_*_hex` wire codec: name ≤ 32 bytes (non-empty), symbol ≤ 12
+ * bytes (non-empty), decimals ≤ 18, 32-byte hex commitment.
+ */
+function requireTokenMetadata(metadata: TokenMetadataJson): void {
+  requireBoundedHex(metadata.name, "token name", 32, true);
+  requireBoundedHex(metadata.symbol, "token symbol", 12, true);
+  requireBoundedU(metadata.decimals, "token decimals", 18);
+  requireHash256Hex(metadata.metadata_hash, "token metadata hash");
+}
+
 /** Largest value Rust's `u128` amount encoding can represent. */
 const AMOUNT_U128_MAX = (1n << 128n) - 1n;
 
@@ -539,6 +605,123 @@ export function rotatePostQuantumRoot(args: {
 }
 
 // ---------------------------------------------------------------------------
+// Native token operations (Phase 13a, §15).
+//
+// Field names, order-independent (canonical JSON sorts keys), and value encodings
+// mirror the Rust `Operation` serde output pinned by
+// `token_operations_have_stable_wire_vectors`. Ids/hashes are 32-byte lowercase
+// hex; amounts are canonical decimal strings; addresses are `webc1...`; an absent
+// authority is JSON `null`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a native token. `metadata.name`/`metadata.symbol` are the LOWERCASE HEX
+ * of their UTF-8 bytes (use `bytesToHex(new TextEncoder().encode(text))`). The
+ * token id is derived on-chain from `(namespace, creator, createNonce)`; use
+ * `deriveTokenIdHex` to precompute it for follow-up operations.
+ */
+export function createToken(args: {
+  namespace: HexString;
+  createNonce: number;
+  metadata: TokenMetadataJson;
+  mintAuthority: WebcAddress | null;
+  freezeAuthority: WebcAddress | null;
+  initialSupply: string;
+  initialRecipient: WebcAddress;
+}): OperationJson {
+  requireHash256Hex(args.namespace, "token namespace");
+  requireCountU64(args.createNonce, "token create nonce");
+  requireTokenMetadata(args.metadata);
+  requireCanonicalAmount(args.initialSupply, "token initial supply");
+  return {
+    CreateToken: {
+      namespace: args.namespace,
+      create_nonce: args.createNonce,
+      metadata: args.metadata,
+      mint_authority: args.mintAuthority,
+      freeze_authority: args.freezeAuthority,
+      initial_supply: args.initialSupply,
+      initial_recipient: args.initialRecipient,
+    },
+  };
+}
+
+/** Mints `amount` units of a token to `recipient`. */
+export function mintToken(
+  tokenId: HexString,
+  recipient: WebcAddress,
+  amount: string,
+): OperationJson {
+  requireHash256Hex(tokenId, "token id");
+  requireCanonicalAmount(amount, "mint token amount");
+  return { MintToken: { token_id: tokenId, recipient, amount } };
+}
+
+/** Burns `amount` units of a token from the signer's balance. */
+export function burnToken(tokenId: HexString, amount: string): OperationJson {
+  requireHash256Hex(tokenId, "token id");
+  requireCanonicalAmount(amount, "burn token amount");
+  return { BurnToken: { token_id: tokenId, amount } };
+}
+
+/** Transfers `amount` token units from the signer to `recipient`. */
+export function transferToken(
+  tokenId: HexString,
+  recipient: WebcAddress,
+  amount: string,
+): OperationJson {
+  requireHash256Hex(tokenId, "token id");
+  requireCanonicalAmount(amount, "transfer token amount");
+  return { TransferToken: { token_id: tokenId, recipient, amount } };
+}
+
+/** Pauses or unpauses all transfers of a token (mint-authority controlled). */
+export function setTokenPaused(
+  tokenId: HexString,
+  paused: boolean,
+): OperationJson {
+  requireHash256Hex(tokenId, "token id");
+  return { SetTokenPaused: { token_id: tokenId, paused } };
+}
+
+/** Freezes one account's balance of a token (freeze-authority controlled). */
+export function freezeTokenAccount(
+  tokenId: HexString,
+  account: WebcAddress,
+): OperationJson {
+  requireHash256Hex(tokenId, "token id");
+  return { FreezeTokenAccount: { token_id: tokenId, account } };
+}
+
+/** Thaws (unfreezes) one account's balance of a token. */
+export function thawTokenAccount(
+  tokenId: HexString,
+  account: WebcAddress,
+): OperationJson {
+  requireHash256Hex(tokenId, "token id");
+  return { ThawTokenAccount: { token_id: tokenId, account } };
+}
+
+/**
+ * Transfers (`newAuthority` = address) or permanently renounces (`newAuthority`
+ * = `null`) one of a token's authorities.
+ */
+export function setTokenAuthority(
+  tokenId: HexString,
+  authorityKind: TokenAuthorityKindJson,
+  newAuthority: WebcAddress | null,
+): OperationJson {
+  requireHash256Hex(tokenId, "token id");
+  return {
+    SetTokenAuthority: {
+      token_id: tokenId,
+      authority_kind: authorityKind,
+      new_authority: newAuthority,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -556,17 +739,63 @@ export function defaultAccessList(
     ? [accountKey(sender)]
     : [authorizationLaneKey(sender, authorizationLane)];
   for (const key of extraReadWriteKeys(sender, operation)) {
-    if (!readWrite.some((candidate) => canonicalKey(candidate) === canonicalKey(key))) {
-      readWrite.push(key);
-    }
+    pushUniqueKey(readWrite, key);
   }
-  readWrite.push(feeAccumulatorKey(sender, authorizationLane));
-  return {
-    read_only: writesAuthorizationPolicy(operation)
-      ? [protocolKey("BaseFee")]
-      : [protocolKey("BaseFee"), authorizationPolicyKey(sender)],
-    read_write: readWrite,
-  };
+  // Base fee is always read; op-specific read-only keys (e.g. a token record or
+  // freeze marker consulted but not mutated) are pushed in the same arm order as
+  // Rust; the authorization policy is read last unless the op writes it. This
+  // matches Rust `default_access_list_for_lane`'s insertion order, which the
+  // access list preserves (it is NOT re-sorted before signing).
+  const readOnly: StateKeyJson[] = [protocolKey("BaseFee")];
+  for (const key of extraReadOnlyKeys(sender, operation)) {
+    pushUniqueKey(readOnly, key);
+  }
+  if (!writesAuthorizationPolicy(operation)) {
+    pushUniqueKey(readOnly, authorizationPolicyKey(sender));
+  }
+  pushUniqueKey(readWrite, feeAccumulatorKey(sender, authorizationLane));
+  return { read_only: readOnly, read_write: readWrite };
+}
+
+/** Pushes `key` onto `keys` only if no structurally equal key is present. */
+function pushUniqueKey(keys: StateKeyJson[], key: StateKeyJson): void {
+  if (!keys.some((candidate) => canonicalKey(candidate) === canonicalKey(key))) {
+    keys.push(key);
+  }
+}
+
+/**
+ * Op-specific READ-ONLY access-list keys, mirroring the read-only pushes inside
+ * the Rust `default_access_list_for_lane` arms. Existing operations declare no
+ * op-specific read-only key (the authorization policy is added by the caller), so
+ * this returns an empty list for them, keeping their signed bytes unchanged.
+ */
+function extraReadOnlyKeys(
+  sender: WebcAddress,
+  operation: OperationJson,
+): StateKeyJson[] {
+  if (typeof operation !== "object" || operation === null) {
+    return [];
+  }
+  // --- Native tokens ------------------------------------------------------
+  if ("TransferToken" in operation) {
+    const { token_id, recipient } = operation.TransferToken;
+    // Both parties' freeze markers are declared READS so the parallel scheduler
+    // serializes this transfer against a Freeze/Thaw of either account. Omitting
+    // them was a real Rust bug; do not drop them.
+    return [
+      tokenKey(token_id),
+      tokenFreezeKey(token_id, sender),
+      tokenFreezeKey(token_id, recipient),
+    ];
+  }
+  if ("FreezeTokenAccount" in operation) {
+    return [tokenKey(operation.FreezeTokenAccount.token_id)];
+  }
+  if ("ThawTokenAccount" in operation) {
+    return [tokenKey(operation.ThawTokenAccount.token_id)];
+  }
+  return [];
 }
 
 /**
@@ -629,8 +858,53 @@ export async function defaultAccessListAsync(
         "slashing evidence requires an explicit state-derived access list",
       );
     }
+    if ("CreateToken" in operation) {
+      const { namespace, create_nonce, initial_supply, initial_recipient } =
+        operation.CreateToken;
+      const tokenId = await deriveTokenIdHex(namespace, sender, create_nonce);
+      const extra: StateKeyJson[] = [accountKey(sender), tokenKey(tokenId)];
+      // The initial mint writes the recipient's per-account balance only when the
+      // supply is non-zero, exactly like the Rust arm.
+      if (initial_supply !== "0") {
+        extra.push(tokenBalanceKey(tokenId, initial_recipient));
+      }
+      return assembleAccessList(sender, authorizationLane, extra);
+    }
+    if (STATE_DERIVED_ACCESS_LIST_OPS.some((variant) => variant in operation)) {
+      throw new Error(
+        stateDerivedAccessListMessage(operation),
+      );
+    }
   }
   return defaultAccessList(sender, operation, authorizationLane);
+}
+
+/**
+ * Operations whose complete access list needs a key derived from ON-CHAIN state
+ * the SDK cannot see (a service owner, a weight token, a proposal payout). Their
+ * base list is signable but INCOMPLETE, so `defaultAccessListAsync` refuses to
+ * auto-build one; callers use the dedicated `accessListFor*` helper, passing the
+ * resolved value, exactly like the Rust `Transaction::for_*` constructors.
+ */
+const STATE_DERIVED_ACCESS_LIST_OPS = [
+  "SpendUnderMandateToService",
+  "OpenProposal",
+  "CastVote",
+  "ResolveProposal",
+  "ExecuteProposal",
+  "ReclaimVote",
+] as const;
+
+function stateDerivedAccessListMessage(operation: OperationJson): string {
+  const variant = STATE_DERIVED_ACCESS_LIST_OPS.find(
+    (candidate) =>
+      typeof operation === "object" && operation !== null && candidate in operation,
+  );
+  return (
+    `${variant ?? "operation"} needs a state-derived access-list key; use the ` +
+    `accessListFor${variant ?? "Operation"} helper with the resolved key(s) and ` +
+    `pass the result as an explicit access list`
+  );
 }
 
 /**
@@ -849,8 +1123,42 @@ function extraReadWriteKeys(
     keys.push(protocolKey("BridgeNonce"));
     return keys;
   }
+  // --- Native tokens (Phase 13a, §15) -------------------------------------
+  if ("MintToken" in operation) {
+    const { token_id, recipient } = operation.MintToken;
+    return [tokenKey(token_id), tokenBalanceKey(token_id, recipient)];
+  }
+  if ("BurnToken" in operation) {
+    const { token_id } = operation.BurnToken;
+    return [tokenKey(token_id), tokenBalanceKey(token_id, sender)];
+  }
+  if ("TransferToken" in operation) {
+    const { token_id, recipient } = operation.TransferToken;
+    // The token record itself is READ-ONLY (see extraReadOnlyKeys); only the two
+    // per-account balance keys are written, so an ordinary transfer never writes a
+    // global per-token object.
+    return [
+      tokenBalanceKey(token_id, sender),
+      tokenBalanceKey(token_id, recipient),
+    ];
+  }
+  if ("SetTokenPaused" in operation) {
+    return [tokenKey(operation.SetTokenPaused.token_id)];
+  }
+  if ("SetTokenAuthority" in operation) {
+    return [tokenKey(operation.SetTokenAuthority.token_id)];
+  }
+  if ("FreezeTokenAccount" in operation) {
+    const { token_id, account } = operation.FreezeTokenAccount;
+    return [tokenFreezeKey(token_id, account)];
+  }
+  if ("ThawTokenAccount" in operation) {
+    const { token_id, account } = operation.ThawTokenAccount;
+    return [tokenFreezeKey(token_id, account)];
+  }
   // Incoming bridge messages need an asynchronous replay hash. Slashing also
   // needs live delegation/cooling owners, so the synchronous builder fails.
+  // `CreateToken` needs an async token-id derivation, so it also lands here.
   throw new Error(
     "this operation requires defaultAccessListAsync or an explicit access list",
   );
@@ -910,6 +1218,71 @@ export async function deriveSessionKeyIdHex(
     await crypto.subtle.digest("SHA-256", toArrayBuffer(payload)),
   );
   return bytesToHex(digest);
+}
+
+/** Domains for id derivations — must match the Rust `*_ID_DOMAIN` constants. */
+const TOKEN_ID_DOMAIN = new TextEncoder().encode("WEBC_TOKEN_ID_V1");
+const NFT_COLLECTION_ID_DOMAIN = new TextEncoder().encode(
+  "WEBC_NFT_COLLECTION_ID_V1",
+);
+const GOVERNANCE_INSTANCE_ID_DOMAIN = new TextEncoder().encode(
+  "WEBC_GOV_INSTANCE_ID_V1",
+);
+const GOV_VOTE_ESCROW_DOMAIN = new TextEncoder().encode(
+  "WEBC_GOV_VOTE_ESCROW_V1",
+);
+const MANDATE_ID_DOMAIN = new TextEncoder().encode("WEBC_MANDATE_ID_V1");
+const SERVICE_ID_DOMAIN = new TextEncoder().encode("WEBC_SERVICE_ID_V1");
+
+/** SHA-256 of concatenated byte parts, lowercase hex (Rust `Hash256::digest_many`). */
+async function digestManyHex(parts: Uint8Array[]): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", toArrayBuffer(concatBytes(parts))),
+  );
+  return bytesToHex(digest);
+}
+
+/**
+ * Big-endian 8-byte encoding of a u64 nonce, matching Rust `u64::to_be_bytes`.
+ * Rejects a nonce outside the JS safe-integer range before encoding.
+ */
+function nonceBe(nonce: number, label: string): Uint8Array {
+  requireCountU64(nonce, label);
+  return u64ToBytes(BigInt(nonce));
+}
+
+/**
+ * Derives a `(namespace, creator, create_nonce)` id, mirroring the Rust
+ * `TokenId`/`NftCollectionId`/`GovernanceInstanceId`/`ServiceId::derive`:
+ * `SHA-256(domain || namespace || creator || create_nonce_be)`, lowercase hex.
+ */
+async function deriveNamespaceCreatorId(
+  domain: Uint8Array,
+  namespace: HexString,
+  creator: WebcAddress,
+  createNonce: number,
+): Promise<string> {
+  requireHash256Hex(namespace, "namespace");
+  return digestManyHex([
+    domain,
+    hexToBytes(namespace),
+    addressToBytes(creator),
+    nonceBe(createNonce, "create nonce"),
+  ]);
+}
+
+/** Derives a token id from `(namespace, creator, createNonce)`. */
+export function deriveTokenIdHex(
+  namespace: HexString,
+  creator: WebcAddress,
+  createNonce: number,
+): Promise<string> {
+  return deriveNamespaceCreatorId(
+    TOKEN_ID_DOMAIN,
+    namespace,
+    creator,
+    createNonce,
+  );
 }
 
 /**
@@ -1031,6 +1404,29 @@ export function applicationKey(namespace: string, keyHash: string): StateKeyJson
     version: 1,
     kind: { Application: { namespace, key_hash: keyHash } },
   };
+}
+
+// --- Native token state keys (Phase 13a, §15) ------------------------------
+
+/** Returns the authority/supply record key for one token. */
+export function tokenKey(tokenId: HexString): StateKeyJson {
+  return { version: 1, kind: { Token: { token_id: tokenId } } };
+}
+
+/** Returns the per-`(token, owner)` balance key. */
+export function tokenBalanceKey(
+  tokenId: HexString,
+  owner: WebcAddress,
+): StateKeyJson {
+  return { version: 1, kind: { TokenBalance: { token_id: tokenId, owner } } };
+}
+
+/** Returns the per-`(token, account)` freeze marker key. */
+export function tokenFreezeKey(
+  tokenId: HexString,
+  account: WebcAddress,
+): StateKeyJson {
+  return { version: 1, kind: { TokenFreeze: { token_id: tokenId, account } } };
 }
 
 /** Returns a protocol singleton key in schema version 1. */

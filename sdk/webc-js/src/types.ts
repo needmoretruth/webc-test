@@ -242,6 +242,10 @@ export type StateKeyKindJson =
   | { Object: { object_id: HexString } }
   | { Module: { module_id: HexString } }
   | { Application: { namespace: HexString; key_hash: HexString } }
+  // --- Native tokens (Phase 13a, §15) -------------------------------------
+  | { Token: { token_id: HexString } }
+  | { TokenBalance: { token_id: HexString; owner: WebcAddress } }
+  | { TokenFreeze: { token_id: HexString; account: WebcAddress } }
   | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
@@ -351,7 +355,57 @@ export type OperationJson =
         new_post_quantum_root: PostQuantumRootJson;
         post_quantum_root_reveal: PostQuantumRootRevealJson;
       };
+    }
+  // --- Native tokens (Phase 13a, §15) -------------------------------------
+  | {
+      CreateToken: {
+        namespace: HexString;
+        create_nonce: number;
+        metadata: TokenMetadataJson;
+        mint_authority: WebcAddress | null;
+        freeze_authority: WebcAddress | null;
+        initial_supply: string;
+        initial_recipient: WebcAddress;
+      };
+    }
+  | { MintToken: { token_id: HexString; recipient: WebcAddress; amount: string } }
+  | { BurnToken: { token_id: HexString; amount: string } }
+  | {
+      TransferToken: {
+        token_id: HexString;
+        recipient: WebcAddress;
+        amount: string;
+      };
+    }
+  | { SetTokenPaused: { token_id: HexString; paused: boolean } }
+  | { FreezeTokenAccount: { token_id: HexString; account: WebcAddress } }
+  | { ThawTokenAccount: { token_id: HexString; account: WebcAddress } }
+  | {
+      SetTokenAuthority: {
+        token_id: HexString;
+        authority_kind: TokenAuthorityKindJson;
+        new_authority: WebcAddress | null;
+      };
     };
+
+/** Which of a token's two authorities `SetTokenAuthority` targets. */
+export type TokenAuthorityKindJson = "Mint" | "Freeze";
+
+/**
+ * Bounded token metadata mirroring Rust `TokenMetadata`. `name` and `symbol` are
+ * the LOWERCASE HEX of their UTF-8 bytes on the wire (Rust `bounded_*_hex`), not
+ * plain text; `metadata_hash` is a 32-byte lowercase-hex content commitment.
+ */
+export interface TokenMetadataJson {
+  /** Lowercase hex of the UTF-8 name bytes (non-empty, ≤ 32 bytes). */
+  name: HexString;
+  /** Lowercase hex of the UTF-8 symbol bytes (non-empty, ≤ 12 bytes). */
+  symbol: HexString;
+  /** Fractional decimal places (≤ 18). */
+  decimals: number;
+  /** 32-byte lowercase-hex commitment to off-chain metadata. */
+  metadata_hash: HexString;
+}
 
 /** External chain identifier; matches the Rust `ExternalChain` enum. */
 export type ExternalChainJson = "Webc" | "Ethereum" | "Solana";
