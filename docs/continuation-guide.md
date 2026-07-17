@@ -354,14 +354,30 @@ then restricted WASM as the general engine, with the Weft machine manifest (§15
 as the ABI sidecar; the (c)→(a) migration is state-free via the versioned ABI.
 Owner-owned decisions flagged in the ADR (do not decide alone): the final engine
 (restricted WASM vs bespoke bytecode) and the manifest trust/verification model.
-A subagent is now implementing the **interim framework** — `contract` module,
-`ContractManifest` registry, `RegisterContract`/`InvokeContract` ops, a `Contract`
-trait routing all state access through `StateAccessRecorder` against the manifest's
-declared `StateKey::application` footprint (declared-access enforced + parallel-
-schedulable), deterministic gas metering with atomic over-gas rollback, and one
-built-in example contract; state-commitment domain V12→V13. NO WASM / untrusted-code
-loading yet (deferred ADR-0014 steps). After the interim framework, the WASM engine
-and Weft (7b) follow.
+The **interim framework is DONE** — `contract` module, `ContractManifest` registry,
+`RegisterContract`/`InvokeContract` ops, a `Contract` trait routing all state access
+through `StateAccessRecorder` against the manifest's declared `StateKey::application`
+footprint (declared-access enforced + parallel-schedulable), deterministic gas
+metering (admission + metered execution) with atomic over-gas rollback, and a
+`KeyValueContract` example; registration fee burned (supply-neutral);
+state-commitment domain V12→V13. NO WASM / untrusted-code loading (deferred).
+
+**Phase 7a WASM engine — OWNER-GATED, do NOT build yet.** ADR-0014 explicitly
+defers the final engine choice (restricted WASM vs bespoke bytecode) and the
+manifest trust/verification model to the owner at the ADR-0006 evidence gate. The
+interim ABI is versioned so the (c)→(a) migration is state-free once the owner
+decides. **Phase 7b (Weft language)** is a separate large project whose name is
+owner-renamable (owner-deferred) — not autonomous work here.
+
+### Autonomous continuation: Phase 8 — native DEX batch settlement (§15.37)
+
+With the WASM engine owner-gated, the next autonomously-buildable decided feature
+is the **mandatory per-block batch-settlement DEX** (`docs/dex-batch-settlement.md`,
+§15.13/15.18/15.37; owner-confirmed: mandatory batch + chain-native retry-by-default
+with per-order user control). Buildable as native state logic like the oracle. The
+delegated mechanics (limit/slippage semantics, multi-hop routing, shared-pool
+pricing) are design-within-§15.37. Then Phase 9 (agent commerce §15.5/§15.32:
+mandates, service registry, HTTP-402 flows) is likewise native and buildable.
 
 ### Original Phase 7 plan summary — contract runtime, native oracle, then Weft
 
