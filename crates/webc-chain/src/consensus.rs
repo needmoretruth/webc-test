@@ -167,7 +167,7 @@ impl ValidatorSet {
     ///
     /// BFT finality generally requires more than two thirds, not merely equal to
     /// two thirds, to preserve safety under Byzantine faults. A zero-power set
-    /// can never reach quorum. See [`strictly_exceeds_fraction`] for the
+    /// can never reach quorum. See `strictly_exceeds_fraction` for the
     /// overflow-safe threshold arithmetic (finding C8).
     pub fn has_two_thirds_power(&self, power: Amount) -> bool {
         if self.total_power.is_zero() {
