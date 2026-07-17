@@ -55,7 +55,7 @@ pub use consensus::{
 };
 pub use fees::{split_fee, FeeBreakdown, FeePolicy};
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
-pub use inflation::InflationSchedule;
+pub use inflation::{BootstrapIssuance, InflationSchedule};
 pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_DATA_BYTES};
 pub use protocol::{
     AuthorizationLaneId, BaseUnits, BlockHeight, ChainId, ChainIdError, Epoch, Nonce,

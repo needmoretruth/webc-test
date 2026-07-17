@@ -28,8 +28,8 @@ use crate::state_key::StateAccessRecorder;
 use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
 use crate::{
-    Amount, AuthorizationLaneId, ChainError, ChainId, Epoch, InflationSchedule, ObjectId,
-    ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, StateKey,
+    Amount, AuthorizationLaneId, BootstrapIssuance, ChainError, ChainId, Epoch, InflationSchedule,
+    ObjectId, ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, StateKey,
     CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
 };
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,11 @@ pub struct ChainConfig {
     /// [`GENESIS_TOTAL_SUPPLY`]: crate::GENESIS_TOTAL_SUPPLY
     #[serde(default)]
     pub expected_total_supply: Option<Amount>,
+    /// Opt-in bootstrap-phase issuance (§15.2). `None` (default) uses only the
+    /// base [`InflationSchedule`]; `Some` keys issuance to staked amount, capped
+    /// by the base per-period budget, until [`BootstrapIssuance::sunset_epoch`].
+    #[serde(default)]
+    pub bootstrap_issuance: Option<BootstrapIssuance>,
 }
 
 impl Default for ChainConfig {
@@ -80,6 +85,7 @@ impl Default for ChainConfig {
             bridge: BridgeConfig::default(),
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
+            bootstrap_issuance: None,
         }
     }
 }
@@ -735,17 +741,9 @@ impl ChainState {
         if self.current_epoch.is_multiple_of(periods_per_year) {
             self.inflation_year_start_supply = self.minted_supply;
         }
-        let inflation = config
-            .inflation
-            .reward_for_period(self.inflation_year_start_supply, self.current_epoch)?;
-        let total_reward = inflation
-            .checked_add(self.validator_fee_pool)
-            .ok_or(ChainError::ArithmeticOverflow)?;
 
-        if total_reward.is_zero() {
-            return self.finish_epoch(config, Amount::ZERO);
-        }
-
+        // Total active stake is needed both for reward weighting and to size the
+        // stake-keyed bootstrap budget, so it is computed before the issuance.
         let total_active_stake = self
             .validators
             .values()
@@ -754,6 +752,29 @@ impl ChainState {
                 sum.checked_add(validator.total_stake()?)
                     .ok_or(ChainError::ArithmeticOverflow)
             })?;
+
+        // Base schedule budget for this period. During a configured, not-yet-sunset
+        // bootstrap phase (§15.2), issuance is instead keyed to staked amount and
+        // capped by this base budget, so a thin early staking base cannot capture
+        // the full base issuance. Supply conservation is unaffected: whatever the
+        // issued `inflation` is, `minted_supply` grows by exactly it and the F1
+        // distribution accounts for exactly it (see below).
+        let base_budget = config
+            .inflation
+            .reward_for_period(self.inflation_year_start_supply, self.current_epoch)?;
+        let inflation = match &config.bootstrap_issuance {
+            Some(bootstrap) if bootstrap.is_active(self.current_epoch) => {
+                bootstrap.budget_for_period(total_active_stake, periods_per_year, base_budget)?
+            }
+            _ => base_budget,
+        };
+        let total_reward = inflation
+            .checked_add(self.validator_fee_pool)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+
+        if total_reward.is_zero() {
+            return self.finish_epoch(config, Amount::ZERO);
+        }
 
         if total_active_stake.is_zero() {
             // If no one is eligible, avoid minting rewards into nowhere. Fees stay
@@ -2759,6 +2780,68 @@ mod tests {
         );
         // The remainder that was previously dropped now carries forward.
         assert_eq!(state.validator_fee_pool, Amount::from_units(1));
+    }
+
+    #[test]
+    fn bootstrap_issuance_keys_to_stake_caps_at_base_and_conserves_supply() {
+        // Task 12 (§15.2): during the bootstrap phase issuance is keyed to the
+        // staked amount and capped by the base per-period budget, and supply must
+        // still reconcile exactly. Here the staking base is thin relative to the
+        // circulating supply, so the (small) stake-keyed budget binds, not the
+        // (large) base budget — the whole point of §15.2.
+        let config = ChainConfig {
+            bootstrap_issuance: Some(BootstrapIssuance {
+                annual_rate_bps: 1_000,
+                sunset_epoch: 1_000_000,
+            }),
+            ..ChainConfig::default()
+        };
+        let mut state = ChainState::new(&config).expect("empty state");
+        let stake = Amount::from_webc(100);
+        for seed in [31u8, 32u8] {
+            let address = Keypair::from_seed([seed; 32]).address();
+            let mut account = Account::with_balance(Amount::ZERO);
+            account.staked = stake;
+            state.accounts.insert(address, account);
+            state.validators.insert(
+                address,
+                Validator {
+                    operator: address,
+                    consensus_key: PublicKeyBytes([seed; 32]),
+                    self_stake: stake,
+                    delegated_stake: Amount::ZERO,
+                    commission_bps: 0,
+                    status: ValidatorStatus::Active,
+                    bootstrap: false,
+                    accumulated_rewards: Amount::ZERO,
+                },
+            );
+        }
+        // A large liquid holder makes the base schedule budget far exceed the
+        // stake-keyed budget, so the stake-keying (not the cap) binds.
+        let holder = Keypair::from_seed([33u8; 32]).address();
+        let extra = Amount::from_webc(1_000_000);
+        state.accounts.insert(holder, Account::with_balance(extra));
+        state.minted_supply = Amount::from_units(2 * stake.0 + extra.0);
+        state.inflation_year_start_supply = state.minted_supply;
+        state.current_epoch = 1;
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let minted_before = state.minted_supply;
+        state
+            .distribute_epoch_rewards(&config)
+            .expect("bootstrap epoch reward distribution");
+
+        assert!(
+            state.supply_invariant_report().unwrap().balanced,
+            "supply must reconcile after bootstrap issuance"
+        );
+        // Minted grew by exactly the stake-keyed budget (below the base cap):
+        // 200 WEBC * 1000 bps / (10_000 * 365) base units.
+        let minted_growth = state.minted_supply.0 - minted_before.0;
+        let expected_stake_keyed = (2 * stake.0) * 1_000 / (10_000 * 365);
+        assert_eq!(minted_growth, expected_stake_keyed);
+        assert!(minted_growth > 0);
     }
 
     #[test]
