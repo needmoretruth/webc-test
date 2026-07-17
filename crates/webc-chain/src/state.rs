@@ -23,6 +23,9 @@ use crate::session_key::{
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
 };
+use crate::sponsorship::{
+    sponsor_state_key_hash, AppSponsor, SponsorshipConfig, SPONSOR_LEAF_DOMAIN,
+};
 use crate::staking::{Delegation, StakingConfig, Validator, ValidatorStatus};
 use crate::state_key::StateAccessRecorder;
 use crate::transaction::{Operation, Transaction};
@@ -60,6 +63,13 @@ pub struct ChainConfig {
     /// and refunds 90% on delete (burning 10% as the occupancy fee).
     #[serde(default)]
     pub storage_pricing: StoragePricing,
+    /// Hard, deterministic caps for application fee sponsorship (§15.35).
+    ///
+    /// `#[serde(default)]` keeps a genesis written before sponsorship decodable;
+    /// the launch values are measurement-tuned placeholders (per-user /
+    /// per-operation / per-app-per-day bounds, simple operations only).
+    #[serde(default)]
+    pub sponsorship: SponsorshipConfig,
     /// Constrained session-key lifetime and per-account count limits.
     #[serde(default)]
     pub session_keys: SessionKeyConfig,
@@ -98,6 +108,7 @@ impl Default for ChainConfig {
             inflation: InflationSchedule::default(),
             bridge: BridgeConfig::default(),
             storage_pricing: StoragePricing::default(),
+            sponsorship: SponsorshipConfig::default(),
             session_keys: SessionKeyConfig::default(),
             expected_total_supply: None,
             bootstrap_issuance: None,
@@ -116,6 +127,40 @@ pub enum Event {
     FeePaid {
         payer: Address,
         breakdown: FeeBreakdown,
+    },
+    /// An application sponsor's budget covered a transaction's fee (§15.35).
+    FeeSponsored {
+        /// Application namespace whose sponsor budget paid the fee.
+        application: Hash256,
+        /// User whose transaction fee was sponsored.
+        beneficiary: Address,
+        /// The burn + validator-reward split drawn from the sponsor budget.
+        breakdown: FeeBreakdown,
+    },
+    /// A new application fee sponsor was registered and initially funded (§15.35).
+    AppSponsorRegistered {
+        /// Application namespace this sponsor underwrites.
+        application: Hash256,
+        /// Account that controls (funds/withdraws) the sponsor.
+        owner: Address,
+        /// App-chosen per-day-window sponsored-fee spend cap.
+        daily_budget_cap: Amount,
+        /// Native base units moved into the budget at registration.
+        funded: Amount,
+    },
+    /// An application fee sponsor's budget was topped up (§15.35).
+    AppSponsorFunded {
+        /// Application namespace whose budget grew.
+        application: Hash256,
+        /// Native base units added to the budget.
+        amount: Amount,
+    },
+    /// Unspent budget was withdrawn from an application fee sponsor (§15.35).
+    AppSponsorWithdrawn {
+        /// Application namespace whose budget shrank.
+        application: Hash256,
+        /// Native base units returned to the owner's liquid balance.
+        amount: Amount,
     },
     ValidatorRegistered {
         operator: Address,
@@ -348,6 +393,25 @@ pub struct ChainState {
     /// other locked buckets, and committed by the state root as a scalar.
     #[serde(default)]
     pub storage_deposits: Amount,
+    /// Registered application fee sponsors, keyed by application namespace (§15.35).
+    ///
+    /// Each [`AppSponsor`] holds a pre-funded budget and the hard per-user /
+    /// per-app-per-day counters. Committed by the state root through a dedicated
+    /// Merkle sub-root (`SPONSOR_LEAF_DOMAIN`), so any change to a sponsor's
+    /// budget or counters changes the state root. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub sponsors: BTreeMap<Hash256, AppSponsor>,
+    /// Refundable native units locked across every application sponsor budget (§15.35).
+    ///
+    /// Sum of every live [`AppSponsor::budget`]. Registering/funding a sponsor
+    /// moves units here from the owner's liquid balance; a sponsored fee moves
+    /// them out as the same burn + validator-reward split a normal fee uses;
+    /// withdrawing moves them back to the owner. Reconciled by
+    /// [`SupplyInvariantReport`] as a locked bucket and committed by the state
+    /// root as a scalar (mirroring `storage_deposits`).
+    #[serde(default)]
+    pub sponsor_budgets: Amount,
     pub validator_fee_pool: Amount,
     pub minted_supply: Amount,
     /// Gross issued supply captured at the start of the current inflation year.
@@ -389,6 +453,8 @@ pub struct SupplyInvariantReport {
     pub fee_reward_pool: Amount,
     /// Refundable native units locked as object storage deposits (§15.22).
     pub storage_deposits: Amount,
+    /// Native units locked across every application fee-sponsor budget (§15.35).
+    pub sponsor_budgets: Amount,
     /// Native units permanently removed by base-fee burning.
     pub burned: Amount,
     /// Native units permanently removed by objective slashing.
@@ -459,6 +525,8 @@ impl Default for ChainState {
             burned_fees: Amount::ZERO,
             slashed_units: Amount::ZERO,
             storage_deposits: Amount::ZERO,
+            sponsors: BTreeMap::new(),
+            sponsor_budgets: Amount::ZERO,
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
             inflation_year_start_supply: Amount::ZERO,
@@ -497,6 +565,9 @@ impl ChainState {
     /// supply reconciliation and prevents stake from being counted twice.
     pub fn from_genesis(genesis: &GenesisConfig) -> Result<Self, ChainError> {
         let mut state = Self::new(&genesis.chain)?;
+        // Reject a malformed sponsorship window (zero epochs) before any state
+        // exists, so a chain never runs with an undefined "per day" boundary.
+        genesis.chain.sponsorship.validate()?;
 
         for account in &genesis.accounts {
             if state.accounts.contains_key(&account.address) {
@@ -636,6 +707,7 @@ impl ChainState {
             .and_then(|amount| amount.checked_add(pending_rewards))
             .and_then(|amount| amount.checked_add(self.validator_fee_pool))
             .and_then(|amount| amount.checked_add(self.storage_deposits))
+            .and_then(|amount| amount.checked_add(self.sponsor_budgets))
             .and_then(|amount| amount.checked_add(self.burned_fees))
             .and_then(|amount| amount.checked_add(self.slashed_units))
             .ok_or(ChainError::ArithmeticOverflow)?;
@@ -650,6 +722,7 @@ impl ChainState {
             pending_rewards,
             fee_reward_pool: self.validator_fee_pool,
             storage_deposits: self.storage_deposits,
+            sponsor_budgets: self.sponsor_budgets,
             burned: self.burned_fees,
             slashed: self.slashed_units,
             accounted,
@@ -1092,9 +1165,11 @@ impl ChainState {
             processed_bridge_root: Hash256,
             processed_slashing_root: Hash256,
             unbonding_root: Hash256,
+            sponsor_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
             storage_deposits: Amount,
+            sponsor_budgets: Amount,
             validator_fee_pool: Amount,
             minted_supply: Amount,
             inflation_year_start_supply: Amount,
@@ -1105,12 +1180,15 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            // V8 adds the `storage_deposits` scalar (§15.22 storage deposit +
-            // deletion rebate). The per-object deposit rides inside the object
-            // sub-root (it is a `StateObject` field). The domain bump is a
-            // deliberate consensus-format change; no external fixture pins the
-            // prior V7 root. V7 added `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V8",
+            // V9 adds the fee-sponsorship state (§15.35): the `sponsor_root`
+            // sub-root commits every per-app sponsor record (budget, caps, and
+            // per-user/day counters), and the `sponsor_budgets` scalar commits the
+            // aggregate locked bucket (mirroring how `storage_deposits` pairs with
+            // the object sub-root). The domain bump is a deliberate consensus-format
+            // change; no external fixture pins the prior V8 root. V8 added the
+            // `storage_deposits` scalar (§15.22); V7 added `last_block_timestamp_ms`
+            // (finding E2).
+            domain: "WEBC_STATE_COMMITMENT_V9",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1151,9 +1229,14 @@ impl ChainState {
                 self.processed_slashing_evidence.iter(),
             )?,
             unbonding_root: leaf_hash(b"WEBC_UNBONDING_QUEUE_V1", &self.unbonding)?,
+            // Per-map bucket committed by its own ordered sub-root (§15.35): a
+            // change to any sponsor's budget, caps, or per-user/day counters
+            // changes this root and therefore the state root.
+            sponsor_root: ordered_value_root(SPONSOR_LEAF_DOMAIN, self.sponsors.iter())?,
             burned_fees: self.burned_fees,
             slashed_units: self.slashed_units,
             storage_deposits: self.storage_deposits,
+            sponsor_budgets: self.sponsor_budgets,
             validator_fee_pool: self.validator_fee_pool,
             minted_supply: self.minted_supply,
             inflation_year_start_supply: self.inflation_year_start_supply,
@@ -1247,6 +1330,13 @@ impl ChainState {
         tx_hash: Hash256,
         authorization: TransactionAuthorization,
     ) -> Result<Receipt, ChainError> {
+        // Fee sponsorship is a default-lane-only feature (a prepaid lane already
+        // funds its own fees). Reject a sponsor named on a non-default lane up
+        // front — before any lane/nonce lookup — so the combination fails fast
+        // with a precise error regardless of whether the named lane exists.
+        if tx.sponsor.is_some() && !tx.authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
         let mut access =
             StateAccessRecorder::new(&tx.access_list.read_only, &tx.access_list.read_write)?;
         // Authorization policy is consensus state even though it is consulted
@@ -1304,8 +1394,34 @@ impl ChainState {
         );
         let fee = split_fee(total_fee);
 
+        // Choose the fee source. On the default lane a transaction may opt into
+        // application fee sponsorship (§15.35): when it names a sponsor, the
+        // operation is sponsorable, and the app's hard per-user / per-operation /
+        // per-app-per-day caps and funded budget permit it, the fee is drawn from
+        // the app's sponsor budget instead of the sender's liquid balance.
+        // Best-effort (fail-open): an unavailable, non-sponsorable, or exhausted
+        // sponsor never fails the transaction — the sender pays exactly as a
+        // non-sponsored transaction would, never more than `fee` already
+        // authorized. The burn + validator-reward split below is identical
+        // whichever source pays, so supply is conserved either way.
+        let mut sponsored_by: Option<Hash256> = None;
         if tx.authorization_lane.is_default() {
-            self.debit_native(tx.sender, total_fee)?;
+            let mut paid_by_sponsor = false;
+            if let Some(namespace) = tx.sponsor {
+                // The sponsor record is consensus state this transaction touches
+                // whether or not it ultimately pays, so record the declared write
+                // up front (the recorder requires every declared key be used).
+                access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+                if tx.operation.is_sponsorable()
+                    && self.try_charge_sponsor(namespace, tx.sender, total_fee, config)?
+                {
+                    paid_by_sponsor = true;
+                    sponsored_by = Some(namespace);
+                }
+            }
+            if !paid_by_sponsor {
+                self.debit_native(tx.sender, total_fee)?;
+            }
         } else {
             let lane = self
                 .authorization_lanes
@@ -1359,6 +1475,16 @@ impl ChainState {
             payer: tx.sender,
             breakdown: fee,
         }];
+        // When an application sponsor covered the fee, additionally record which
+        // application paid and for whom, so wallets/indexers can attribute the
+        // subsidy. `FeePaid` above still records the burn + reward split.
+        if let Some(application) = sponsored_by {
+            events.push(Event::FeeSponsored {
+                application,
+                beneficiary: tx.sender,
+                breakdown: fee,
+            });
+        }
 
         // A session key authorizes only within its fixed constraints. This runs
         // before the operation mutates balances; any failure rolls back the
@@ -2348,6 +2474,123 @@ impl ChainState {
                     },
                 });
             }
+            Operation::RegisterAppSponsor {
+                namespace,
+                daily_budget_cap,
+                initial_funding,
+            } => {
+                // Owner financial action: default lane only (the account balance
+                // is the funding source). The sender account key is already
+                // recorded by the default-lane path; declare the sponsor state key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SponsorshipRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                // The app-chosen per-day cap must stay within the protocol ceiling
+                // (§15.35 "within hard protocol caps").
+                if *daily_budget_cap > config.sponsorship.max_app_daily_budget {
+                    return Err(ChainError::AppSponsorDailyCapTooHigh);
+                }
+                if self.sponsors.contains_key(namespace) {
+                    return Err(ChainError::AppSponsorAlreadyExists);
+                }
+                // Lock the initial funding: liquid -> sponsor_budgets. `debit_native`
+                // fails closed if the owner cannot afford it, rolling back the tx.
+                self.debit_native(tx.sender, *initial_funding)?;
+                self.sponsor_budgets = self
+                    .sponsor_budgets
+                    .checked_add(*initial_funding)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let mut sponsor = AppSponsor::new(tx.sender, *daily_budget_cap);
+                sponsor.budget = *initial_funding;
+                self.sponsors.insert(*namespace, sponsor);
+                events.push(Event::AppSponsorRegistered {
+                    application: *namespace,
+                    owner: tx.sender,
+                    daily_budget_cap: *daily_budget_cap,
+                    funded: *initial_funding,
+                });
+            }
+            Operation::FundAppSponsor { namespace, amount } => {
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SponsorshipRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                // Validate existence and ownership before touching balances; only
+                // the owner may fund. Read-only borrow is dropped before `debit`.
+                {
+                    let sponsor = self
+                        .sponsors
+                        .get(namespace)
+                        .ok_or(ChainError::AppSponsorNotFound)?;
+                    if sponsor.owner != tx.sender {
+                        return Err(ChainError::AppSponsorNotOwner);
+                    }
+                }
+                self.debit_native(tx.sender, *amount)?;
+                self.sponsor_budgets = self
+                    .sponsor_budgets
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                let sponsor = self
+                    .sponsors
+                    .get_mut(namespace)
+                    .ok_or(ChainError::AppSponsorNotFound)?;
+                sponsor.budget = sponsor
+                    .budget
+                    .checked_add(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                events.push(Event::AppSponsorFunded {
+                    application: *namespace,
+                    amount: *amount,
+                });
+            }
+            Operation::WithdrawAppSponsor { namespace, amount } => {
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::SponsorshipRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                // Validate ownership and sufficient budget before moving units.
+                {
+                    let sponsor = self
+                        .sponsors
+                        .get(namespace)
+                        .ok_or(ChainError::AppSponsorNotFound)?;
+                    if sponsor.owner != tx.sender {
+                        return Err(ChainError::AppSponsorNotOwner);
+                    }
+                    if sponsor.budget < *amount {
+                        return Err(ChainError::AppSponsorBudgetInsufficient {
+                            needed: *amount,
+                            available: sponsor.budget,
+                        });
+                    }
+                }
+                // Move sponsor_budgets -> owner liquid, keeping the per-app budget
+                // and the aggregate bucket in lockstep (no mint, no loss).
+                {
+                    let sponsor = self
+                        .sponsors
+                        .get_mut(namespace)
+                        .ok_or(ChainError::AppSponsorNotFound)?;
+                    sponsor.budget = sponsor
+                        .budget
+                        .checked_sub(*amount)
+                        .ok_or(ChainError::ArithmeticOverflow)?;
+                }
+                self.sponsor_budgets = self
+                    .sponsor_budgets
+                    .checked_sub(*amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.credit_native(tx.sender, *amount)?;
+                events.push(Event::AppSponsorWithdrawn {
+                    application: *namespace,
+                    amount: *amount,
+                });
+            }
         }
 
         access.finish()?;
@@ -2740,6 +2983,40 @@ impl ChainState {
             .checked_add(amount)
             .ok_or(ChainError::ArithmeticOverflow)?;
         Ok(())
+    }
+
+    /// Attempts to draw `total_fee` from application `namespace`'s sponsor budget.
+    ///
+    /// Returns `true` and relocates the fee out of the aggregate `sponsor_budgets`
+    /// bucket (the caller then applies the identical burn + validator-reward split
+    /// a normal fee uses) iff the app is a registered sponsor and its hard
+    /// per-user / per-operation / per-app-per-day caps and funded budget all
+    /// permit charging `user` in the current day-window. Returns `false` with no
+    /// mutation of the aggregate bucket otherwise, so the caller self-pays.
+    /// Deterministic (the day-window comes from `current_epoch`, never a clock);
+    /// checked arithmetic; never panics.
+    fn try_charge_sponsor(
+        &mut self,
+        namespace: Hash256,
+        user: Address,
+        total_fee: Amount,
+        config: &ChainConfig,
+    ) -> Result<bool, ChainError> {
+        let window = config.sponsorship.window_index(self.current_epoch);
+        let Some(sponsor) = self.sponsors.get_mut(&namespace) else {
+            return Ok(false);
+        };
+        if !sponsor.try_charge(user, total_fee, window, &config.sponsorship)? {
+            return Ok(false);
+        }
+        // The per-app budget already decremented inside `try_charge`; keep the
+        // aggregate locked bucket in lockstep so the supply invariant reconciles
+        // (issued == liquid + … + sponsor_budgets + burned + slashed).
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_sub(total_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        Ok(true)
     }
 
     fn debit_asset_or_native(
@@ -3334,6 +3611,9 @@ mod tests {
             }),
             ("storage_deposits", |s| {
                 s.storage_deposits = Amount::from_units(s.storage_deposits.0 + 1)
+            }),
+            ("sponsor_budgets", |s| {
+                s.sponsor_budgets = Amount::from_units(s.sponsor_budgets.0 + 1)
             }),
             ("validator_fee_pool", |s| {
                 s.validator_fee_pool = Amount::from_units(s.validator_fee_pool.0 + 1)
@@ -7960,5 +8240,619 @@ mod tests {
             small_fee(),
         );
         state.execute_transaction(&transfer, &config).unwrap();
+    }
+
+    // ----- §15.35 fee sponsorship (paymaster) -----
+
+    /// Devnet-style state whose sponsorship caps are small enough to exhaust in
+    /// a test. Alice (seed 1) is funded with 1,000 WEBC; Bob (seed 2) has nothing.
+    fn sponsored_setup() -> (ChainConfig, ChainState, Keypair, Keypair, Hash256) {
+        let config = ChainConfig {
+            sponsorship: SponsorshipConfig {
+                enabled: true,
+                max_ops_per_user_per_app_per_day: 2,
+                max_sponsored_fee_per_op: Amount::from_units(1_000),
+                max_app_daily_budget: Amount::from_units(1_000_000),
+                day_window_epochs: 10,
+            },
+            ..ChainConfig::default()
+        };
+        let alice = Keypair::from_seed([1u8; 32]);
+        let bob = Keypair::from_seed([2u8; 32]);
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: Vec::new(),
+        };
+        let state = ChainState::from_genesis(&genesis).expect("genesis builds");
+        (
+            config,
+            state,
+            alice,
+            bob,
+            Hash256::digest(b"demo-app-namespace"),
+        )
+    }
+
+    /// Fee bid whose effective per-unit price is exactly 1, so a `Transfer`'s fee
+    /// is exactly 500 base units (its 500 execution units × 1).
+    fn unit_fee(gas_limit: u64) -> FeeBid {
+        FeeBid {
+            gas_limit,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        }
+    }
+
+    /// Registers `owner` as the sponsor of `namespace`, funding `funding` and
+    /// setting a `daily_cap`, at `nonce`; asserts the transaction succeeds.
+    fn register_sponsor(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        owner: &Keypair,
+        namespace: Hash256,
+        daily_cap: u128,
+        funding: u128,
+        nonce: u64,
+    ) {
+        let tx = Transaction::for_operation(
+            owner,
+            nonce,
+            Operation::RegisterAppSponsor {
+                namespace,
+                daily_budget_cap: Amount::from_units(daily_cap),
+                initial_funding: Amount::from_units(funding),
+            },
+            unit_fee(20_000),
+        )
+        .expect("register signs");
+        state
+            .execute_transaction(&tx, config)
+            .expect("sponsor registered");
+    }
+
+    /// Transfers `amount` base units from `from` to `to` at `nonce` (self-paid).
+    fn seed_balance(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        from: &Keypair,
+        to: Address,
+        amount: u128,
+        nonce: u64,
+    ) {
+        let tx = Transaction::for_operation(
+            from,
+            nonce,
+            Operation::Transfer {
+                to,
+                amount: Amount::from_units(amount),
+            },
+            unit_fee(1_000),
+        )
+        .expect("seed signs");
+        state.execute_transaction(&tx, config).expect("seeded");
+    }
+
+    /// Builds a sponsored `Transfer` of `amount` from `from` to `to` at `nonce`,
+    /// opting into fee sponsorship by `namespace`. The transfer fee is 500.
+    fn sponsored_transfer(
+        from: &Keypair,
+        to: Address,
+        amount: u128,
+        nonce: u64,
+        namespace: Hash256,
+    ) -> Transaction {
+        Transaction::for_sponsored_operation(
+            from,
+            nonce,
+            Operation::Transfer {
+                to,
+                amount: Amount::from_units(amount),
+            },
+            unit_fee(1_000),
+            namespace,
+        )
+        .expect("sponsored transfer signs")
+    }
+
+    #[test]
+    fn register_and_fund_app_sponsor_locks_budget_and_conserves_supply() {
+        let (config, mut state, alice, _bob, namespace) = sponsored_setup();
+        let issued = state.minted_supply;
+
+        register_sponsor(&mut state, &config, &alice, namespace, 50_000, 100_000, 0);
+        let sponsor = &state.sponsors[&namespace];
+        assert_eq!(sponsor.owner, alice.address());
+        assert_eq!(sponsor.budget, Amount::from_units(100_000));
+        assert_eq!(sponsor.daily_budget_cap, Amount::from_units(50_000));
+        assert_eq!(state.sponsor_budgets, Amount::from_units(100_000));
+        assert_eq!(
+            state.minted_supply, issued,
+            "registering a sponsor mints no supply"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Top up the same sponsor; the aggregate bucket tracks the per-app budget.
+        let fund = Transaction::for_operation(
+            &alice,
+            1,
+            Operation::FundAppSponsor {
+                namespace,
+                amount: Amount::from_units(50_000),
+            },
+            unit_fee(20_000),
+        )
+        .expect("fund signs");
+        let receipt = state.execute_transaction(&fund, &config).expect("funded");
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(150_000)
+        );
+        assert_eq!(state.sponsor_budgets, Amount::from_units(150_000));
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::AppSponsorFunded { application, amount }
+                if *application == namespace && *amount == Amount::from_units(50_000)
+        )));
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Only the owner may fund; a stranger's fund is rejected and rolls back.
+        let stranger = Keypair::from_seed([9u8; 32]);
+        seed_balance(&mut state, &config, &alice, stranger.address(), 100_000, 2);
+        let bad = Transaction::for_operation(
+            &stranger,
+            0,
+            Operation::FundAppSponsor {
+                namespace,
+                amount: Amount::from_units(10),
+            },
+            unit_fee(20_000),
+        )
+        .expect("stranger fund signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&bad, &config),
+            Err(ChainError::AppSponsorNotOwner)
+        ));
+        assert_eq!(state, before, "rejected fund leaves state unchanged");
+    }
+
+    #[test]
+    fn sponsored_transfer_draws_fee_from_sponsor_leaving_sender_fee_untouched() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 200_000, 0,
+        );
+
+        // Fund Bob with EXACTLY one transfer principal and no fee headroom: a
+        // self-paid transfer would fail, so success proves the sponsor paid.
+        let principal = 100u128;
+        seed_balance(&mut state, &config, &alice, bob.address(), principal, 1);
+        assert_eq!(
+            state.accounts[&bob.address()].balance,
+            Amount::from_units(principal)
+        );
+
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let issued = state.minted_supply;
+        let burned_before = state.burned_fees;
+        let pool_before = state.validator_fee_pool;
+
+        let tx = sponsored_transfer(&bob, carol, principal, 0, namespace);
+        let receipt = state
+            .execute_transaction(&tx, &config)
+            .expect("sponsored transfer succeeds despite zero fee headroom");
+
+        // Bob's balance fell by the principal only — the 500 fee never touched it.
+        assert_eq!(state.accounts[&bob.address()].balance, Amount::ZERO);
+        assert_eq!(
+            state.accounts[&carol].balance,
+            Amount::from_units(principal)
+        );
+        // The fee came out of the sponsor budget and split into burn + reward.
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(199_500)
+        );
+        assert_eq!(state.sponsor_budgets, Amount::from_units(199_500));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            1
+        );
+        assert_eq!(
+            state.burned_fees,
+            burned_before.checked_add(Amount::from_units(250)).unwrap()
+        );
+        assert_eq!(
+            state.validator_fee_pool,
+            pool_before.checked_add(Amount::from_units(250)).unwrap()
+        );
+        assert!(receipt.events.iter().any(|e| matches!(
+            e,
+            Event::FeeSponsored { application, beneficiary, .. }
+                if *application == namespace && *beneficiary == bob.address()
+        )));
+        assert_eq!(
+            state.minted_supply, issued,
+            "a sponsored fee mints no supply"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_user_daily_cap_exhausts_then_falls_back_to_self_pay() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        // per-user cap is 2. Fund Bob for 3 principals + exactly one self-paid fee.
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        seed_balance(&mut state, &config, &alice, bob.address(), 3 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        // First two sponsored operations are covered by the sponsor.
+        for nonce in 0..2 {
+            let tx = sponsored_transfer(&bob, carol, 10, nonce, namespace);
+            let receipt = state.execute_transaction(&tx, &config).expect("sponsored");
+            assert!(receipt
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        }
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_000)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
+
+        // The third exceeds the per-user daily cap and falls back to self-pay.
+        let bob_before = state.accounts[&bob.address()].balance;
+        let tx = sponsored_transfer(&bob, carol, 10, 2, namespace);
+        let receipt = state
+            .execute_transaction(&tx, &config)
+            .expect("third op still succeeds via self-pay");
+        assert!(
+            !receipt
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::FeeSponsored { .. })),
+            "over-cap op is not sponsored"
+        );
+        // Bob paid the 500 fee himself plus the 10 principal; sponsor unchanged.
+        assert_eq!(
+            state.accounts[&bob.address()].balance,
+            bob_before.checked_sub(Amount::from_units(510)).unwrap()
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_000),
+            "the sponsor budget did not move for the self-paid op"
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_app_budget_exhaustion_falls_back_to_self_pay() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        // Fund the sponsor with only enough for a single 500-unit fee.
+        register_sponsor(&mut state, &config, &alice, namespace, 1_000_000, 600, 0);
+        seed_balance(&mut state, &config, &alice, bob.address(), 2 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        let first = sponsored_transfer(&bob, carol, 10, 0, namespace);
+        let receipt = state.execute_transaction(&first, &config).expect("first");
+        assert!(receipt
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(100));
+
+        // Budget (100) can no longer cover the 500 fee -> self-pay.
+        let bob_before = state.accounts[&bob.address()].balance;
+        let second = sponsored_transfer(&bob, carol, 10, 1, namespace);
+        let receipt = state.execute_transaction(&second, &config).expect("second");
+        assert!(!receipt
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.accounts[&bob.address()].balance,
+            bob_before.checked_sub(Amount::from_units(510)).unwrap()
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(100),
+            "an underfunded sponsor is never overdrawn"
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn per_app_daily_spend_cap_binds_then_self_pays() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        // Well-funded, but the app's per-day spend cap only covers one 500 fee.
+        register_sponsor(&mut state, &config, &alice, namespace, 700, 100_000, 0);
+        seed_balance(&mut state, &config, &alice, bob.address(), 2 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        let first = sponsored_transfer(&bob, carol, 10, 0, namespace);
+        assert!(state
+            .execute_transaction(&first, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+
+        // 500 + 500 > 700 day cap -> self-pay; the daily spend counter stays put.
+        let second = sponsored_transfer(&bob, carol, 10, 1, namespace);
+        assert!(!state
+            .execute_transaction(&second, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(99_500)
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn a_non_simple_operation_is_never_sponsored() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        // CreateObject costs a 20,000 fee + a 1,000 storage deposit (1 byte).
+        seed_balance(&mut state, &config, &alice, bob.address(), 21_000, 1);
+        let sponsor_before = state.sponsors[&namespace].clone();
+
+        let object_id = ObjectId::new(Hash256::digest(b"sponsor-nonsimple-obj"));
+        let tx = Transaction::for_sponsored_operation(
+            &bob,
+            0,
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![0u8; 1],
+            },
+            unit_fee(20_000),
+            namespace,
+        )
+        .expect("sponsored non-simple op signs");
+        let receipt = state
+            .execute_transaction(&tx, &config)
+            .expect("CreateObject self-pays and succeeds");
+
+        assert!(
+            !receipt
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::FeeSponsored { .. })),
+            "a non-sponsorable operation must never draw from a sponsor"
+        );
+        assert_eq!(
+            state.sponsors[&namespace], sponsor_before,
+            "the sponsor budget and counters are untouched by a non-simple op"
+        );
+        assert!(state.objects.contains_key(&object_id));
+        // Bob self-paid the 20,000 fee and the 1,000 deposit out of 21,000.
+        assert_eq!(state.accounts[&bob.address()].balance, Amount::ZERO);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn day_window_counter_resets_deterministically_across_windows() {
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        // window 0: two sponsored + one self-paid (per-user cap 2); window 1: one more.
+        seed_balance(&mut state, &config, &alice, bob.address(), 4 * 10 + 500, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+
+        for nonce in 0..2 {
+            let tx = sponsored_transfer(&bob, carol, 10, nonce, namespace);
+            state
+                .execute_transaction(&tx, &config)
+                .expect("window-0 sponsored");
+        }
+        // Third in window 0 hits the per-user cap and self-pays.
+        let capped = sponsored_transfer(&bob, carol, 10, 2, namespace);
+        assert!(!state
+            .execute_transaction(&capped, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            2
+        );
+        let budget_after_window0 = state.sponsors[&namespace].budget;
+        assert_eq!(budget_after_window0, Amount::from_units(99_000));
+
+        // Advance the consensus epoch into the next day-window (10 epochs/window).
+        state.current_epoch = 10;
+
+        // The per-user and per-app daily counters reset, so Bob can be sponsored again.
+        let next_window = sponsored_transfer(&bob, carol, 10, 3, namespace);
+        assert!(state
+            .execute_transaction(&next_window, &config)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::FeeSponsored { .. })));
+        assert_eq!(state.sponsors[&namespace].window_index, 1);
+        assert_eq!(
+            state.sponsors[&namespace].spent_in_window,
+            Amount::from_units(500)
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 1),
+            1
+        );
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            0,
+            "the previous window reads as zero after rollover"
+        );
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            budget_after_window0
+                .checked_sub(Amount::from_units(500))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn withdraw_returns_unspent_budget_and_conserves_supply() {
+        let (config, mut state, alice, _bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        let liquid_before = state.accounts[&alice.address()].balance;
+
+        let withdraw = Transaction::for_operation(
+            &alice,
+            1,
+            Operation::WithdrawAppSponsor {
+                namespace,
+                amount: Amount::from_units(40_000),
+            },
+            unit_fee(20_000),
+        )
+        .expect("withdraw signs");
+        let withdraw_fee = Amount::from_units(u128::from(withdraw.required_units()));
+        state
+            .execute_transaction(&withdraw, &config)
+            .expect("withdrew");
+
+        assert_eq!(
+            state.sponsors[&namespace].budget,
+            Amount::from_units(60_000)
+        );
+        assert_eq!(state.sponsor_budgets, Amount::from_units(60_000));
+        // Alice regained the withdrawal minus the withdrawal transaction's own fee.
+        assert_eq!(
+            state.accounts[&alice.address()].balance,
+            liquid_before
+                .checked_add(Amount::from_units(40_000))
+                .and_then(|b| b.checked_sub(withdraw_fee))
+                .unwrap()
+        );
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // Over-withdrawing the remaining budget is rejected and rolls back.
+        let over = Transaction::for_operation(
+            &alice,
+            2,
+            Operation::WithdrawAppSponsor {
+                namespace,
+                amount: Amount::from_units(60_001),
+            },
+            unit_fee(20_000),
+        )
+        .expect("over-withdraw signs");
+        let before = state.clone();
+        assert!(matches!(
+            state.execute_transaction(&over, &config),
+            Err(ChainError::AppSponsorBudgetInsufficient { .. })
+        ));
+        assert_eq!(state, before, "rejected withdraw leaves state unchanged");
+    }
+
+    #[test]
+    fn sponsorship_on_a_non_default_lane_is_rejected() {
+        let (config, mut state, alice, _bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        // Hand-craft a transfer that names a sponsor but selects a non-default lane.
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let lane = AuthorizationLaneId::new(Hash256([0x42; 32]));
+        let mut tx = Transaction::new_unsigned_in_lane(
+            alice.address(),
+            alice.public_key(),
+            lane,
+            0,
+            Operation::Transfer {
+                to: carol,
+                amount: Amount::from_units(1),
+            },
+            Operation::Transfer {
+                to: carol,
+                amount: Amount::from_units(1),
+            }
+            .default_access_list_for_lane(alice.address(), lane)
+            .unwrap(),
+            unit_fee(1_000),
+        );
+        tx.sponsor = Some(namespace);
+        tx.sign(&alice).expect("signs");
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::SponsorshipRequiresDefaultLane)
+        ));
+    }
+
+    #[test]
+    fn sponsor_registry_and_counters_survive_bincode_restart_with_stable_state_root() {
+        // A crash-restart (bincode round-trip of the whole state) must preserve
+        // the sponsor registry, per-user/day counters, the sponsor_budgets bucket,
+        // and the committed state root, so a node cannot silently diverge on the
+        // new sponsorship state after reloading from disk.
+        let (config, mut state, alice, bob, namespace) = sponsored_setup();
+        register_sponsor(
+            &mut state, &config, &alice, namespace, 1_000_000, 100_000, 0,
+        );
+        seed_balance(&mut state, &config, &alice, bob.address(), 100, 1);
+        let carol = Keypair::from_seed([3u8; 32]).address();
+        let tx = sponsored_transfer(&bob, carol, 100, 0, namespace);
+        state
+            .execute_transaction(&tx, &config)
+            .expect("sponsored transfer");
+        assert_eq!(
+            state.sponsors[&namespace].user_ops_in_window(&bob.address(), 0),
+            1
+        );
+        assert!(!state.sponsor_budgets.is_zero());
+
+        let bytes = bincode::serialize(&state).expect("state serializes");
+        let restored: ChainState = bincode::deserialize(&bytes).expect("state deserializes");
+        assert_eq!(
+            restored.sponsors, state.sponsors,
+            "restart preserves the sponsor registry and its per-user/day counters"
+        );
+        assert_eq!(restored.sponsor_budgets, state.sponsor_budgets);
+        assert_eq!(restored, state, "restart preserves full state");
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "sponsor state is committed by the state root across a restart"
+        );
     }
 }

@@ -87,13 +87,13 @@ pub struct CertifiedBlock {
 /// Encodes one message into its exact frame bytes.
 ///
 /// Frame layout: `magic (4) ++ version_le (2) ++ body`, where `body` is the
-/// transparent compression envelope produced by [`compress_payload`] over the
+/// transparent compression envelope produced by `compress_payload` over the
 /// bincode of the message — a 1-byte tag (`0x00` raw / `0x01` zstd) followed by
 /// the raw bytes or a zstd frame, whichever is smaller (WEBC §15.19/§15.24). The
 /// magic and version stay in the clear so a peer can reject an incompatible frame
 /// before touching the payload. Compression is on by default and applies only to
 /// this post-handshake message envelope; the handshake frames are left raw (see
-/// [`compress_payload`]).
+/// `compress_payload`).
 pub fn encode_message(message: &NetMessage) -> Result<Vec<u8>, NetError> {
     // Serialize the payload (bincode, itself capped at MAX_FRAME_BYTES by the
     // shared codec), then wrap it in the compression envelope.
