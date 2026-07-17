@@ -289,10 +289,30 @@ execution; shared resource ⇒ serialized). Swaps and shared-session contention 
 asserted at the scheduler level only (no native DEX / cross-owner object write yet
 — later phases).
 
-**Phase 6 remaining:** localized base/priority pricing + network-wide minimum +
-per-resource congestion measurement + fair block packing (IN PROGRESS — subagent);
-then varint amount encoding (§15.14, a wire-version bump — invasive/breaking, do
-carefully). TPS benchmarks need real hardware (deferred non-finding).
+**Localized (per-namespace) fee pricing + fair block packing — DONE, wired
+(§8/§7).** Object operations are priced by their namespace's own EIP-1559 base
+fee, adjusted each block from only that namespace's usage vs a per-namespace
+target (`FeePolicy::per_namespace_target_units`), so one app's congestion never
+raises another's price; account-scoped ops keep the global base fee. Every
+localized fee is floored at the network-wide `min_base_fee_per_unit`, and a
+namespace back at the floor sheds its committed record (bounded `namespace_fees`
+map). Fair packing caps a single namespace at
+`FeePolicy::namespace_block_share_bps` of `max_block_units` — a hard
+`build_block`/`apply_block` validity rule plus mempool `select_block` shaping, so
+one hot app cannot monopolize a block. New config knobs are serde-defaulted
+testnet placeholders (§15.35). **State-commitment domain V10→V11** (added
+`namespace_fee_root`); the map locks no native units so the supply invariant is
+unchanged; new `NamespaceBlockShareExceeded` error. Acceptance tests: A's
+congestion not raising B's price, the floor, fair packing admitting other
+namespaces, unaffected account transfers, supply reconciliation, bincode
+crash-restart of the fee state with a stable root, and cross-run determinism.
+Full workspace gate green (fmt/clippy -D warnings/test/doc/demo).
+
+**Phase 6 remaining:** per-resource (multi-dimensional) congestion measurement
+beyond the single execution-unit dimension is still a single scalar per
+namespace today; then varint amount encoding (§15.14, a wire-version bump —
+invasive/breaking, do carefully). TPS benchmarks need real hardware (deferred
+non-finding).
 
 **Note on commit signing:** this environment's ssh signing key
 (`/home/claude/.ssh/commit_signing_key.pub`) is a 0-byte placeholder, so no commit
