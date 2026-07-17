@@ -260,6 +260,8 @@ export type StateKeyKindJson =
   // --- Native oracle (Phase 7, §15.17) ------------------------------------
   | { OracleFeed: { feed_id: HexString } }
   | { OracleReporter: { feed_id: HexString; reporter: WebcAddress } }
+  // --- Native DEX (§15.37) ------------------------------------------------
+  | { DexOrder: { order_id: HexString } }
   | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
@@ -517,7 +519,31 @@ export type OperationJson =
   | { RegisterReporter: { feed_id: HexString } }
   | { DeregisterReporter: { feed_id: HexString } }
   | { SubmitReport: { feed_id: HexString; value: string } }
-  | { PayFeedRead: { feed_id: HexString; amount: string } };
+  | { PayFeedRead: { feed_id: HexString; amount: string } }
+  // --- Native DEX (§15.13/§15.18/§15.37) ----------------------------------
+  | {
+      SubmitOrder: {
+        order_id: HexString;
+        pair: TradingPairJson;
+        side: OrderSideJson;
+        amount: string;
+        limit_price: string;
+        deadline_height: number;
+        fill_or_cancel: boolean;
+      };
+    }
+  | { CancelOrder: { order_id: HexString } };
+
+/** Oriented trading pair, mirroring Rust `TradingPair`. */
+export interface TradingPairJson {
+  /** Base asset; `amount` is denominated in this asset's base units. */
+  base: AssetIdJson;
+  /** Quote asset; the limit price is in quote base-units per base base-unit. */
+  quote: AssetIdJson;
+}
+
+/** Order direction, mirroring Rust `OrderSide`. */
+export type OrderSideJson = "Buy" | "Sell";
 
 /** Lifecycle status of a registered service, mirroring Rust `ServiceStatus`. */
 export type ServiceStatusJson = "Active" | "Paused";

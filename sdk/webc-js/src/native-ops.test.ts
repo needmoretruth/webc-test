@@ -25,16 +25,20 @@ import {
   burnNft,
   burnToken,
   castVote,
+  assetBalanceKey,
+  cancelOrder,
   createFeed,
   createGovernanceInstance,
   createNftCollection,
   createToken,
   defaultAccessList,
   deregisterReporter,
+  dexOrderKey,
   oracleFeedKey,
   oracleReporterKey,
   payFeedRead,
   registerReporter,
+  submitOrder,
   submitReport,
   defaultAccessListAsync,
   deriveGovernanceInstanceIdHex,
@@ -84,6 +88,7 @@ import {
   transferToken,
 } from "./transaction";
 import type {
+  AssetIdJson,
   GovernanceConfigJson,
   NftMetadataJson,
   ServicePriceJson,
@@ -897,6 +902,88 @@ describe("native oracle state keys and access lists", () => {
     expect(list.read_write).toEqual([
       accountKey(sender),
       oracleReporterKey(ID_88, sender),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+  });
+});
+
+describe("native DEX operation wire vectors", () => {
+  // No dedicated Rust wire-vector test exists for DEX; these fixtures are derived
+  // from the serde type definitions. `amount` and `limit_price` are decimal
+  // strings (Amount and the u128 Price); `deadline_height` is a JSON number; the
+  // `pair` reuses the AssetId encoding already frozen by the state-key vector.
+  const USDC: AssetIdJson = {
+    External: {
+      origin_chain: "Ethereum",
+      symbol: "USDC",
+      contract_or_mint: "0x1234",
+    },
+  };
+
+  it("pins SubmitOrder canonical JSON (native/external pair, Sell)", () => {
+    const op = submitOrder({
+      orderId: ID_88,
+      pair: { base: "NativeWebc", quote: USDC },
+      side: "Sell",
+      amount: "1000",
+      limitPrice: "5",
+      deadlineHeight: 0,
+      fillOrCancel: false,
+    });
+    expect(canonicalJson(op)).toBe(
+      `{"SubmitOrder":{"amount":"1000","deadline_height":0,"fill_or_cancel":false,"limit_price":"5",` +
+        `"order_id":"${ID_88}","pair":{"base":"NativeWebc","quote":{"External":{"contract_or_mint":"0x1234",` +
+        `"origin_chain":"Ethereum","symbol":"USDC"}}},"side":"Sell"}}`,
+    );
+  });
+
+  it("pins CancelOrder and the DexOrder state key", () => {
+    expect(canonicalJson(cancelOrder(ID_88))).toBe(
+      `{"CancelOrder":{"order_id":"${ID_88}"}}`,
+    );
+    expect(canonicalJson(dexOrderKey(ID_88))).toBe(
+      `{"kind":{"DexOrder":{"order_id":"${ID_88}"}},"version":1}`,
+    );
+  });
+
+  it("locks the non-native leg (quote on Buy, base on Sell)", async () => {
+    const sender = await addressFromSeedByte(1);
+    const usdc = USDC;
+    // Sell locks the base leg; base is native here, so no asset-balance key.
+    const sell = defaultAccessList(
+      sender,
+      submitOrder({
+        orderId: ID_88,
+        pair: { base: "NativeWebc", quote: usdc },
+        side: "Sell",
+        amount: "1000",
+        limitPrice: "5",
+        deadlineHeight: 0,
+        fillOrCancel: false,
+      }),
+    );
+    expect(sell.read_write).toEqual([
+      accountKey(sender),
+      dexOrderKey(ID_88),
+      feeAccumulatorKey(sender, DEFAULT_LANE),
+    ]);
+    // Buy locks the quote leg; quote is USDC (non-native), so it is declared.
+    const buy = defaultAccessList(
+      sender,
+      submitOrder({
+        orderId: ID_88,
+        pair: { base: "NativeWebc", quote: usdc },
+        side: "Buy",
+        amount: "1000",
+        limitPrice: "5",
+        deadlineHeight: 0,
+        fillOrCancel: true,
+      }),
+    );
+    expect(buy.read_write).toEqual([
+      accountKey(sender),
+      dexOrderKey(ID_88),
+      assetBalanceKey(usdc, sender),
       feeAccumulatorKey(sender, DEFAULT_LANE),
     ]);
   });

@@ -38,9 +38,11 @@ import type {
   MandateCounterpartyPolicyJson,
   NftAuthorityKindJson,
   NftMetadataJson,
+  OrderSideJson,
   ServicePaymentFlagsJson,
   ServicePriceJson,
   ServiceStatusJson,
+  TradingPairJson,
   SlashingEvidenceJson,
   SignedTransactionJson,
   StateAccessListJson,
@@ -1369,6 +1371,55 @@ export function payFeedRead(feedId: HexString, amount: string): OperationJson {
 }
 
 // ---------------------------------------------------------------------------
+// Native DEX operations (§15.13/§15.18/§15.37).
+//
+// Field names and value encodings mirror the Rust `Operation` serde output.
+// (There is no dedicated Rust wire-vector test for these, so the parity fixtures
+// are derived directly from the serde type definitions: `amount` and
+// `limit_price` are decimal strings — Rust `Amount` and the u128 `Price` both
+// serialize as strings — `deadline_height` is a plain JSON number, `side` tags by
+// variant name, and `pair` reuses the already-validated `AssetId` encoding.)
+// ---------------------------------------------------------------------------
+
+/**
+ * Submits a DEX order intent for per-block batch settlement. `orderId` is a
+ * caller-chosen collision-resistant id known at signing time (so the access list
+ * can name the order's state key); `limitPrice` is a decimal string in quote
+ * base-units per base base-unit; `deadlineHeight` `0` uses the default window.
+ */
+export function submitOrder(args: {
+  orderId: HexString;
+  pair: TradingPairJson;
+  side: OrderSideJson;
+  amount: string;
+  limitPrice: string;
+  deadlineHeight: number;
+  fillOrCancel: boolean;
+}): OperationJson {
+  requireHash256Hex(args.orderId, "order id");
+  requireCanonicalAmount(args.amount, "order amount");
+  requireCanonicalAmount(args.limitPrice, "order limit price");
+  requireCountU64(args.deadlineHeight, "order deadline height");
+  return {
+    SubmitOrder: {
+      order_id: args.orderId,
+      pair: args.pair,
+      side: args.side,
+      amount: args.amount,
+      limit_price: args.limitPrice,
+      deadline_height: args.deadlineHeight,
+      fill_or_cancel: args.fillOrCancel,
+    },
+  };
+}
+
+/** Cancels a live DEX order and refunds its remaining locked input (owner-only). */
+export function cancelOrder(orderId: HexString): OperationJson {
+  requireHash256Hex(orderId, "order id");
+  return { CancelOrder: { order_id: orderId } };
+}
+
+// ---------------------------------------------------------------------------
 // Service registry operations (Phase 9b, §15.5).
 //
 // Field names and value encodings mirror the Rust `Operation` serde output pinned
@@ -2103,6 +2154,21 @@ function extraReadWriteKeys(
   if ("PayFeedRead" in operation) {
     return [accountKey(sender), oracleFeedKey(operation.PayFeedRead.feed_id)];
   }
+  // --- Native DEX (§15.37) ------------------------------------------------
+  if ("SubmitOrder" in operation) {
+    const { order_id, pair, side } = operation.SubmitOrder;
+    const keys: StateKeyJson[] = [accountKey(sender), dexOrderKey(order_id)];
+    // The lock debits a NON-native asset balance; the locked leg is the quote for
+    // a buy and the base for a sell (mirrors the Rust arm).
+    const lockedAsset = side === "Buy" ? pair.quote : pair.base;
+    if (lockedAsset !== "NativeWebc") {
+      keys.push(assetBalanceKey(lockedAsset, sender));
+    }
+    return keys;
+  }
+  if ("CancelOrder" in operation) {
+    return [accountKey(sender), dexOrderKey(operation.CancelOrder.order_id)];
+  }
   // Incoming bridge messages need an asynchronous replay hash. Slashing also
   // needs live delegation/cooling owners, so the synchronous builder fails.
   // `CreateToken` needs an async token-id derivation, so it also lands here.
@@ -2538,6 +2604,13 @@ export function oracleReporterKey(
     version: 1,
     kind: { OracleReporter: { feed_id: feedId, reporter } },
   };
+}
+
+// --- Native DEX state key (§15.37) -----------------------------------------
+
+/** Returns the order-intent record key for one DEX order. */
+export function dexOrderKey(orderId: HexString): StateKeyJson {
+  return { version: 1, kind: { DexOrder: { order_id: orderId } } };
 }
 
 /** Returns a protocol singleton key in schema version 1. */
