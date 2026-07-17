@@ -369,15 +369,37 @@ interim ABI is versioned so the (c)→(a) migration is state-free once the owner
 decides. **Phase 7b (Weft language)** is a separate large project whose name is
 owner-renamable (owner-deferred) — not autonomous work here.
 
-### Autonomous continuation: Phase 8 — native DEX batch settlement (§15.37)
+### Phase 8 — native DEX batch settlement (§15.37) — CORE DONE
 
-With the WASM engine owner-gated, the next autonomously-buildable decided feature
-is the **mandatory per-block batch-settlement DEX** (`docs/dex-batch-settlement.md`,
-§15.13/15.18/15.37; owner-confirmed: mandatory batch + chain-native retry-by-default
-with per-order user control). Buildable as native state logic like the oracle. The
-delegated mechanics (limit/slippage semantics, multi-hop routing, shared-pool
-pricing) are design-within-§15.37. Then Phase 9 (agent commerce §15.5/§15.32:
-mandates, service registry, HTTP-402 flows) is likewise native and buildable.
+Mandatory per-block **uniform-price batch settlement** (MEV-resistant) is
+implemented (`dex` module): `SubmitOrder`/`CancelOrder`, orders lock input into a
+`dex_escrow` bucket, `settle_dex_batch` runs in `build_block`/`apply_block` at one
+deterministic clearing price per pair (two-pointer crossing, integer-midpoint
+tie-rule so no fill breaches its limit), long side rationed dust-free by
+cumulative-rounding pro-rata; chain-native retry until `deadline_height`/cancel;
+`fill_or_cancel`. New `current_height` scalar; state-commitment domain V13→V14;
+supply invariant reconciles; build==import deterministic. **Deferred delegated
+mechanics** (§15.13/15.18/15.37): AMM/shared-pool curve pricing, multi-hop
+routing, finer tick sizes, complex slippage — later refinements.
+
+### Autonomous continuation: Phase 9 — agent commerce (§15.5/§15.32)
+
+Native and buildable. **First assess the "mandate":** §15.5's agent mandate (an
+instantly-revocable authorization carrying total budget, expiry, counterparty
+allowlist, per-transaction limits) is very close to the EXISTING constrained
+session-key system (`session_key.rs`: `SessionKeyConstraints` with amount budget,
+expiry, allowed operations, per-tx limits, instant revoke). So the mandate is
+largely already implemented — the fresh Phase 9 work is (1) documenting/closing any
+mandate gap (e.g. an explicit counterparty allowlist if session keys lack it), and
+(2) the **service registry** (§15.5b: an on-chain registry where services publish
+machine-readable prices/interfaces for agent discovery — a bounded native registry
+like the oracle-feed / namespace registries). HTTP-402 payment flows (§15.5c) are
+SDK/integration-level and can follow. Then the remaining phases (10 proofs/PQ, 11
+fast-path+benchmarks, 12 web platform, 13 tokens/NFTs, 14 bridges, 15 validator
+ops, 16 testnet/distribution, 17 mainnet gates, 18 production bridges, 19 phase-2)
+are increasingly owner-gated (bridge trust model, mainnet) or need external
+resources (real-hardware benchmarks, independent audits, live bridges) — surface
+those to the owner rather than deciding alone.
 
 ### Original Phase 7 plan summary — contract runtime, native oracle, then Weft
 
