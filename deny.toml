@@ -1,0 +1,78 @@
+# cargo-deny configuration — the supply-chain gate for the Rust workspace.
+#
+# Enforces in CI what AGENTS.md's "reuse over reinvention" rule requires by hand:
+# no known-vulnerable or yanked dependencies, only Apache-2.0-compatible
+# permissive licenses (never a copyleft/source-available crate that would
+# relicense WEBC), and no dependency pulled from anywhere but crates.io.
+#
+# Run locally with: cargo deny check
+
+[graph]
+# Check every target so a platform-specific dependency cannot smuggle in a bad
+# license or advisory that the host build would not surface.
+all-features = true
+
+[advisories]
+version = 2
+# RUSTSEC advisory database. A known vulnerability fails the build; a yanked
+# crate fails too, since a yanked release is unfit to ship.
+yanked = "deny"
+ignore = [
+    # bincode 1.3.3 is UNMAINTAINED (the 1.x line is frozen, not vulnerable —
+    # its authors declared 1.3.3 complete). WEBC pins it deliberately behind the
+    # codec/storage seam because its byte format is consensus-critical and must
+    # stay stable; a 2.x migration is tracked as finding D4 and happens behind
+    # that boundary, not as an emergency. This is an unmaintained advisory, not a
+    # security vulnerability. Remove this entry when D4 lands.
+    "RUSTSEC-2025-0141",
+]
+
+[licenses]
+version = 2
+# Permissive licenses only (AGENTS.md "License constraint"). Every entry is a
+# non-copyleft license that does not restrict or relicense WEBC's Apache-2.0
+# code. Crates offering "X OR LGPL/GPL" resolve to the permissive side listed
+# here (e.g. r-efi is "Apache-2.0 OR LGPL-2.1-or-later" → Apache-2.0).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+]
+# Require high confidence in each license identification; an ambiguous license
+# file must be resolved deliberately, not guessed.
+confidence-threshold = 0.9
+# ISC/Zlib are not in the tree today but are kept in the permissive allow-list
+# so a future dependency under them does not fail the gate spuriously; do not
+# warn that they are currently unused.
+unused-allowed-license = "allow"
+
+[bans]
+# Duplicate major versions (finding D3). The one duplicate we directly
+# controlled — a webc-node dev-dependency on tokio-tungstenite 0.24 while axum
+# pulls 0.29 — is now aligned to 0.29, so the WebSocket stack is single-version.
+# The remaining duplicates (getrandom, rand/rand_core, thiserror 1/2) are purely
+# transitive through crypto and error-handling crates we do not control; they
+# will collapse as those ecosystems finish moving to the new majors. Warn so
+# they stay visible without blocking the merge gate on skew we cannot yet fix.
+multiple-versions = "warn"
+# A wildcard ("*") version requirement pins nothing and lets an unexpected
+# release in silently; forbid it in shipped crates.
+wildcards = "deny"
+# Allow a wildcard only for path/workspace-internal crates (our own).
+allow-wildcard-paths = true
+
+[sources]
+# Every crate must come from crates.io. An unknown registry or a git dependency
+# (which can move under a tag) is refused, closing the dependency-substitution
+# vector that finding D5 examined by hand.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/webc-crypto",
+    "crates/webc-chain",
+    "crates/webc-storage",
+    "crates/webc-net",
+    "crates/webc-node",
+]
+# The fuzz crate builds only under nightly + cargo-fuzz (libFuzzer), so it is
+# not a workspace member: `cargo build/test --workspace` on stable must not try
+# to compile it. CI's fuzz-smoke job builds it separately.
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+authors = ["WEBC contributors"]
+description = "WEBC, a lightweight Rust Layer-1 blockchain prototype for browser-native web payments."
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bincode = "1.3"
+bs58 = "0.5"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# ML-DSA-65 (FIPS 204) candidate verifier for the post-quantum recovery root.
+# Pinned and kept behind a replaceable crypto boundary (webc-crypto::mldsa).
+# Naming and using it is a devnet experiment, not a post-quantum-security claim.
+# `default-rng` is used only by wallet/test key generation and signing; root
+# signature *verification* is deterministic and consumes no randomness, so
+# consensus stays deterministic.
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65", "default-rng"] }
+hex = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"

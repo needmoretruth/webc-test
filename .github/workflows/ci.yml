@@ -1,0 +1,90 @@
+name: CI
+
+# Runs on pull requests and on pushes to the default branch only. Intermediate
+# pushes to feature/working branches do NOT trigger CI, which keeps the merge
+# gate useful while avoiding a run (and a failure email) on every work-in-progress
+# push. Merges are still gated because every PR runs the full matrix.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo doc --workspace --no-deps
+
+  typescript-and-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+
+  # Supply-chain gate: known-vulnerable/yanked crates, non-permissive licenses,
+  # wildcard versions, and non-crates.io sources all fail the merge. Config in
+  # deny.toml. (AGENTS.md "reuse over reinvention" license constraint, enforced.)
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # JavaScript dependency advisory scan (findings D2). Scoped to PRODUCTION
+  # dependencies — the shipped SDK crypto deps (@noble/*, @scure/*,
+  # micro-key-producer) — because those are what ship to browsers. Dev-only
+  # tooling advisories (e.g. the vitest/esbuild dev-server issue) do not reach
+  # shipped code and must not block the merge gate; audit them out of band.
+  pnpm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high --prod
+
+  # Fuzz targets build (and run a short smoke pass) so the harnesses cannot rot.
+  # Deep fuzzing runs out-of-band; CI only proves the targets compile and each
+  # survives a brief run on the current corpus. Requires nightly + cargo-fuzz.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Smoke-run each fuzz target
+        run: |
+          cd fuzz
+          for target in $(cargo fuzz list); do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
