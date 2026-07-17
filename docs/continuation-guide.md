@@ -346,13 +346,22 @@ decision) — outliers simply earn zero revenue. Deferred oracle refinements (la
 `oracle-economics.md` steps): first-party publisher class, cold-start seeding, app
 subscriptions, once-per-block pull gating, freshness-gating the displayed aggregate.
 
-**Contract runtime (Phase 7a) — NEXT, design-first.** This is a major
-architectural step (sandboxed execution, deterministic gas metering, declared-access
-integration, the interim Rust-authoring path, and how it relates to the
-compiler-emitted machine manifest of Weft §15.41 and ADR-0006's off-chain-compile
-gate). A design **ADR-0014** should land before implementation — IN PROGRESS
-(subagent). It records the sandboxing model options and the one(s) recommended; the
-implementation is a large multi-cycle effort that follows the ADR.
+**Contract runtime (Phase 7a) — design landed; interim framework IN PROGRESS.**
+**ADR-0014** (docs/adr/0014-contract-runtime.md) records the design: ship the
+interim native/Rust-authored path first (a contract is a Rust handler behind the
+same declared-access + gas discipline as native ops, with an on-chain manifest),
+then restricted WASM as the general engine, with the Weft machine manifest (§15.41)
+as the ABI sidecar; the (c)→(a) migration is state-free via the versioned ABI.
+Owner-owned decisions flagged in the ADR (do not decide alone): the final engine
+(restricted WASM vs bespoke bytecode) and the manifest trust/verification model.
+A subagent is now implementing the **interim framework** — `contract` module,
+`ContractManifest` registry, `RegisterContract`/`InvokeContract` ops, a `Contract`
+trait routing all state access through `StateAccessRecorder` against the manifest's
+declared `StateKey::application` footprint (declared-access enforced + parallel-
+schedulable), deterministic gas metering with atomic over-gas rollback, and one
+built-in example contract; state-commitment domain V12→V13. NO WASM / untrusted-code
+loading yet (deferred ADR-0014 steps). After the interim framework, the WASM engine
+and Weft (7b) follow.
 
 ### Original Phase 7 plan summary — contract runtime, native oracle, then Weft
 
