@@ -417,8 +417,15 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 ### Fund arithmetic (dedicated pass — completed)
 
-- **F1 — HIGH — epoch reward distribution silently drops the cross-validator
-  division remainder, breaking supply conservation.** `state.rs:740-818`
+- **F1 — HIGH — RESOLVED (commit `33ea4dc`) — epoch reward distribution silently
+  drops the cross-validator division remainder, breaking supply conservation.**
+  **Fix:** `apply_epoch_rewards` now sums the floored per-validator shares and
+  retains `total_reward − Σ share` in `validator_fee_pool` (carried to the next
+  epoch) instead of zeroing it, so `accounted == minted_supply` holds after
+  distribution. Reproduced first by
+  `epoch_rewards_conserve_supply_across_multiple_validators` (a balanced
+  two-validator state with an odd fee pool stays balanced only with the remainder
+  retained). Original analysis: `state.rs:740-818`
   `apply_epoch_rewards`: `total_reward = inflation + validator_fee_pool`; each
   validator gets `floor(total_reward * validator_stake / total_active_stake)`. The
   **inner** dust (within a validator's own stakers) is recaptured to the validator
@@ -568,18 +575,17 @@ propagates errors, so an invalid tx cannot be cheaply block-included.
 
 These were surfaced but not fully audited; several are latent-but-serious.
 
-- **E1 — HIGH (latent) — epoch advancement is not wired into the real block path.**
-  `current_epoch` only advances inside `finish_epoch`/`distribute_epoch_rewards`
-  (`state.rs` ~685-932), whose ONLY caller in the node tree is the demo
-  (`main.rs:355`). `produce_block`, `import_validated`, and the consensus commit
-  path never advance the epoch; `apply_block`/`build_block` copy `epoch` from state
-  without advancing it. So on a running node, rewards, `unbonding.advance_epoch`,
-  slashable-window maturation, and session-key expiry never fire. Worse, whatever
-  eventually triggers the rollover MUST be a deterministic height-derived function
-  executed identically inside `apply_block` on every node — if it is out-of-band or
-  clock-driven, honest nodes diverge on the state root at the boundary (a fork).
-  Fix: derive epoch from height deterministically and run reward+unbonding+expiry
-  inside the state transition, ordered identically everywhere.
+- **E1 — HIGH (latent) — RESOLVED (commit `33ea4dc`) — epoch advancement is not
+  wired into the real block path.** `current_epoch` only advanced inside
+  `finish_epoch`/`distribute_epoch_rewards`, whose only node-tree caller was the
+  demo, so a running node never advanced the epoch (rewards, unbonding maturation,
+  slashable-window maturation, session-key expiry never fired). **Fix:**
+  `build_block` (re-run identically by `apply_block`) now runs the rollover
+  deterministically when `height.is_multiple_of(StakingConfig.blocks_per_epoch)`
+  (default 60) — a pure function of the committed height, so honest nodes cannot
+  diverge at the boundary. Couples with F1 (the now-live reward path conserves
+  supply). Reproduced first by
+  `epoch_advances_deterministically_at_height_boundaries`.
 - **E2 — MEDIUM (latent) — RESOLVED (commit `392018d`) — block timestamp is
   unvalidated.** `timestamp_ms` was proposer-supplied, copied verbatim
   (`block_builder.rs:112`), and `apply_block`/`import_validated` never checked
