@@ -1,0 +1,27 @@
+[package]
+name = "webc-vm"
+version = "0.1.0"
+# Not published to crates.io: an internal workspace prototype crate.
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic, gas-metered WebAssembly execution engine for WEBC contracts."
+
+[lints]
+workspace = true
+
+[dependencies]
+webc-crypto = { path = "../webc-crypto" }
+# Pure-Rust WebAssembly interpreter: deterministic by construction, with
+# fuel metering. Pinned to the stable 0.31 line (NOT the 2.0 beta).
+wasmi = "0.31.2"
+# Streaming binary reader used only to enforce static limits (module size,
+# linear-memory pages, single non-shared memory) before compilation.
+wasmparser = { version = "0.253", default-features = false, features = ["validate"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+# Compiles WAT text fixtures to wasm bytes inside tests.
+wat = "1.253"
