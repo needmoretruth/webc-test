@@ -5,6 +5,7 @@ members = [
     "crates/webc-proof",
     "crates/webc-chain",
     "crates/webc-vm",
+    "crates/webc-weft",
     "crates/webc-storage",
     "crates/webc-net",
     "crates/webc-node",
