@@ -1,12 +1,15 @@
 # WEBC continuation guide
 
-Last updated: 2026-07-17 (Phases 5–13 done on `main`; owner direction is now
-"practical L1 완성" — finish all decided non-owner implementation, Weft excluded.
+Last updated: 2026-07-18 (Phases 5–13 done on `main`; owner direction is
+"practical L1 완성" plus, now owner-approved, an **earliest-skeleton Weft**
+front end for future flexibility.
 **START AT the "SESSION HANDOFF" block in the "Exact next work" section below** —
-it has the live state: WASM contract runtime (`webc-vm`) in flight, the Codex
-decision, the swappable-engine design, and the remaining roadmap). Separately
-assigned feature goals use their own branches and do not replace this pointer
-until merged.
+it has the live state: the WASM contract runtime is now **wired end-to-end**
+(`webc-vm` engine bridged into `webc-chain`; commit `4ca3483`), and the current
+in-flight item is the **Weft skeleton compiler** (`webc-weft`: front end →
+WAT/WASM over the host ABI). The Codex decision and swappable-engine design still
+apply.) Separately assigned feature goals use their own branches and do not
+replace this pointer until merged.
 This file is the live pointer to the **exact next task**. Detailed "what the code
 implements" facts live in `implementation-status.md`; do not duplicate them
 here.
@@ -123,38 +126,53 @@ parallel foundation (2000+ lines) that would need real completion (not a light
 fix) + conflicts (fees.rs, an ADR-0012 number collision). Owner MAY later ask to
 complete V5 as a formal task; do not merge it wholesale.
 
-**CURRENT IN-FLIGHT — Phase 7b: real WASM contract runtime (the flagship item).**
-Design principle the owner endorsed: **SWAPPABLE / MODULAR ENGINE.** A new
-`webc-vm` crate sits behind a boundary; **`wasmi` (deterministic interpreter)**
-for the prototype, with **`wasmtime` (JIT) swappable later**; the gas model and
-contract ABI stay stable across engines. The production engine choice is
-owner-deferred. (Perf note for the owner: an interpreter does NOT raise user fees
-— fees are protocol gas-metering, independent of node exec speed; swap to a JIT
-later only for heavy-compute throughput.)
-- **`webc-vm` crate is DONE and MERGED into `main` (commit `2742201`).** It is
-  the deterministic `wasmi` 0.31 interpreter + fuel metering + host ABI (module
-  `webc`: `webc_input_len/webc_input_read/webc_get/webc_set/webc_epoch/
-  webc_output`; guest exports `memory` + `webc_call`), a `VmHost` trait
-  (`get/set/epoch/charge_gas`) that maps 1:1 onto `ContractContext`+`GasMeter`,
-  `validate_module` that fail-closed rejects floats/SIMD/threads/bulk-memory/
-  reference-types/foreign-imports/oversized, `VmLimits` (256 KiB module, 16 pages,
-  4 KiB in/val/out, fuel 1e8, fuel_per_gas 1000, gas costs mirroring contract.rs),
-  and 22 tests covering determinism + every fail-closed path. Engine is behind the
-  crate boundary → swappable to wasmtime later without touching gas model or ABI.
-- The seam it plugs into (already exists in `crates/webc-chain/src/contract.rs`):
-  the `Contract` trait (`fn call(&self, ctx: &mut ContractContext, input) ->
-  Result<Vec<u8>, ContractError>`), `ContractContext` (`epoch()`, footprint-
-  bounded `get()`/`set()`), and `GasMeter` (`charge()`/`consumed()`).
-  `state.rs::Operation::InvokeContract` (~line 5718) ALREADY builds the ctx,
-  meters gas, persists writes, and rolls back atomically (tests cover
-  undeclared-key + over-gas rollback).
-- **WIRING (do this after `webc-vm` merges):** implement the webc-vm `VmHost`
-  trait over `ContractContext`+`GasMeter`; add a `WasmContract` implementing
-  `Contract` via `webc_vm::execute(...)`; add `RegisterWasmContract` (upload +
-  validate bytecode) and a wasm branch in the invoke path (ADDITIVE to
-  transaction.rs/state.rs — Codex is paused, so safe); add a WAT end-to-end test
-  (register + invoke a real module: deterministic, gas-metered, footprint-
-  bounded, atomic rollback). Keep the engine swappable behind the boundary.
+**DONE — Phase 7b: real WASM contract runtime, wired end-to-end.** Owner-endorsed
+principle held throughout: **SWAPPABLE / MODULAR ENGINE.** `webc-vm` (deterministic
+`wasmi` 0.31 interpreter + fuel metering) sits behind its crate boundary; the gas
+model and contract ABI are engine-independent, so `wasmtime` (JIT) can replace it
+later without touching the chain. Production engine choice stays owner-deferred.
+(Perf note: an interpreter does NOT raise user fees — fees are protocol
+gas-metering, independent of node exec speed.)
+- **`webc-vm` engine — DONE and MERGED (`2742201`).** Deterministic interpreter +
+  host ABI (module `webc`: `webc_input_len/webc_input_read/webc_get/webc_set/
+  webc_epoch/webc_output`; guest exports `memory` + `webc_call`), `VmHost` trait
+  (`get/set/epoch/charge_gas`), `validate_module` (fail-closed on floats/SIMD/
+  threads/bulk-memory/reference-types/foreign-imports/oversized), `VmLimits`, 22
+  tests.
+- **Chain wiring — DONE and MERGED (`4ca3483`).** `crates/webc-chain/src/
+  wasm_contract.rs`: a thin adapter — `ContractVmHost` maps `VmHost` 1:1 onto
+  `ContractContext`+`GasMeter`; `WasmContract` implements the existing `Contract`
+  trait via `webc_vm::execute`; `WasmContractManifest` + content-hashed
+  `WasmBytecode`; `wasm_vm_limits()` routes STATE gas through `ContractContext`
+  (single meter, no double count) and compute/io through the engine. Operations
+  `RegisterWasmContract` (upload+validate bytecode) / `InvokeWasmContract` are
+  additive (transaction.rs required_units + access list). `state.rs`: `wasm_contracts`
+  + `wasm_code` maps committed by two new state-root sub-roots (commitment domain
+  **V19 → V20**); a shared `run_contract_call` core both native + wasm invoke paths
+  go through; `WasmContract{Registered,Invoked}` events; a `code_id` is unique
+  across BOTH contract paths (shared `StateKey::module`). Typed, text-free wasm
+  error variants keep receipt errors byte-identical across nodes. Real end-to-end
+  WAT tests (store/echo + a stateful counter exercising `webc_get`): register+invoke,
+  state commit, determinism, over-gas atomic rollback, undeclared-key fail-closed,
+  invalid-module + code-hash rejection, state-root commitment across restart. **Full
+  workspace test suite green** (V19→V20 bump broke nothing).
+- Adversarial multi-dimension review of the wiring was run via a workflow
+  (determinism / gas / footprint / rollback / additive-safety / bytecode-validation);
+  resolve any confirmed findings before treating 7b as closed.
+
+**CURRENT IN-FLIGHT — Weft skeleton (owner-approved earliest version).** Owner:
+"weft을 아주 극초기버전이라도… 틀이라도… 나중에 유연성 좋게" — build even a
+skeleton Weft, for future flexibility. Weft is a **DECIDED** language
+(`docs/weft-language-plan.md`, `architecture.md`, ADR-0014): a front end that
+compiles **off-chain to deterministic WASM** targeting the frozen host ABI — never
+a second VM. The skeleton = a new `webc-weft` crate with a REAL (tiny) pipeline
+lexer→parser→AST→sema→WAT codegen over the host ABI, emitting the machine-readable
+interface manifest, with the flagship proof being a `.weft` counter that compiles
+and **runs as a real on-chain contract** (register+invoke on `webc-chain`, state
+accumulates). Skeleton codegen emits WAT and assembles via the `wat` crate; the
+production backend (lowering via the audited Rust framework) is a documented
+extension point. Being built with workflows (design synthesis + adversarial review)
+per owner direction.
 
 **Remaining practical-L1 roadmap after the WASM runtime (value order, all
 additive so Codex-safe):** distribution program (airdrop claim / expiring
