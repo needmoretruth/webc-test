@@ -368,3 +368,139 @@ fn epoch_is_visible_to_guest() {
     let output = execute(&module, b"", &mut host, &limits).expect("epoch run");
     assert_eq!(output, host.epoch.to_le_bytes().to_vec());
 }
+
+/// A genuine counter: `webc_get` the current u32 (0 if absent, i.e. the `-1`
+/// return path), increment it, `webc_set` it back, and `webc_output` the new
+/// value as little-endian bytes.
+fn increment_counter_module() -> Vec<u8> {
+    wat::parse_str(
+        r#"
+        (module
+          (import "webc" "webc_get" (func $get (param i32 i32 i32 i32) (result i32)))
+          (import "webc" "webc_set" (func $set (param i32 i32 i32 i32) (result i32)))
+          (import "webc" "webc_output" (func $output (param i32 i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0)
+            "\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11")
+          (func (export "webc_call")
+            (local $glen i32)
+            (local $cur i32)
+            (local.set $glen
+              (call $get (i32.const 0) (i32.const 32) (i32.const 512) (i32.const 4)))
+            (local.set $cur
+              (if (result i32) (i32.ge_s (local.get $glen) (i32.const 0))
+                (then (i32.load (i32.const 512)))
+                (else (i32.const 0))))
+            (i32.store (i32.const 256) (i32.add (local.get $cur) (i32.const 1)))
+            (drop (call $set (i32.const 0) (i32.const 32) (i32.const 256) (i32.const 4)))
+            (call $output (i32.const 256) (i32.const 4))))
+        "#,
+    )
+    .expect("counter fixture is valid wat")
+}
+
+#[test]
+fn counter_increments_across_invocations_with_persistent_state() {
+    let module = increment_counter_module();
+    let limits = VmLimits::default();
+    let mut host = MockHost::new();
+
+    for expected in 1u32..=3 {
+        let output = execute(&module, b"", &mut host, &limits).expect("counter run");
+        assert_eq!(
+            output,
+            expected.to_le_bytes().to_vec(),
+            "invocation {expected} returns the incremented value"
+        );
+    }
+
+    let stored = host.store.get(&FIXTURE_KEY).expect("counter persisted");
+    assert_eq!(stored.as_slice(), 3u32.to_le_bytes().as_slice());
+}
+
+#[test]
+fn webc_get_returns_negative_one_when_absent() {
+    // Guest gets a never-written key and outputs the (negative) return code as
+    // 4 little-endian bytes.
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "webc" "webc_get" (func $get (param i32 i32 i32 i32) (result i32)))
+          (import "webc" "webc_output" (func $output (param i32 i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0)
+            "\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22\22")
+          (func (export "webc_call")
+            (i32.store (i32.const 64)
+              (call $get (i32.const 0) (i32.const 32) (i32.const 128) (i32.const 32)))
+            (call $output (i32.const 64) (i32.const 4))))
+        "#,
+    )
+    .expect("absent-get fixture is valid wat");
+
+    let limits = VmLimits::default();
+    let mut host = MockHost::new();
+    let output = execute(&module, b"", &mut host, &limits).expect("absent get run");
+    assert_eq!(
+        i32::from_le_bytes(output.try_into().expect("4 bytes")),
+        -1,
+        "absent key returns -1"
+    );
+}
+
+#[test]
+fn webc_get_returns_negative_two_when_buffer_too_small() {
+    // Pre-populate a 32-byte value, then get it with an 8-byte output buffer.
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "webc" "webc_get" (func $get (param i32 i32 i32 i32) (result i32)))
+          (import "webc" "webc_output" (func $output (param i32 i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0)
+            "\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11\11")
+          (func (export "webc_call")
+            (i32.store (i32.const 64)
+              (call $get (i32.const 0) (i32.const 32) (i32.const 128) (i32.const 8)))
+            (call $output (i32.const 64) (i32.const 4))))
+        "#,
+    )
+    .expect("small-buffer fixture is valid wat");
+
+    let limits = VmLimits::default();
+    let mut host = MockHost::new();
+    host.store.insert(FIXTURE_KEY, vec![0xAB; 32]);
+    let output = execute(&module, b"", &mut host, &limits).expect("small buffer run");
+    assert_eq!(
+        i32::from_le_bytes(output.try_into().expect("4 bytes")),
+        -2,
+        "too-small buffer returns -2"
+    );
+}
+
+#[test]
+fn compute_only_module_still_charges_gas_via_fuel_reconciliation() {
+    // No host ops at all: a bounded loop, then return. Gas must still be > 0,
+    // proving consumed fuel is reconciled into the gas meter.
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "webc_call")
+            (local $i i32)
+            (local.set $i (i32.const 1000))
+            (block $done
+              (loop $loop
+                (br_if $done (i32.eqz (local.get $i)))
+                (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+                (br $loop)))))
+        "#,
+    )
+    .expect("loop fixture is valid wat");
+
+    let limits = VmLimits::default();
+    let mut host = MockHost::new();
+    let output = execute(&module, b"", &mut host, &limits).expect("loop run");
+    assert!(output.is_empty(), "no output submitted");
+    assert!(host.gas_used > 0, "fuel reconciled into gas");
+}
