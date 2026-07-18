@@ -55,6 +55,9 @@ pub const MAX_TRANSACTION_VALIDITY_BLOCKS: u64 = 4_096;
 /// Fixed deterministic units reserved for an included cancellation transaction.
 pub const CANCEL_V1_REQUIRED_UNITS: u64 = 50;
 
+/// Fixed deterministic units for revoking one scoped sponsor grant.
+pub const REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS: u64 = 5_000;
+
 /// Stable typed failures from stateless V5 decoding and verification.
 ///
 /// These codes are safe to map to node/API validation errors. Stateful failures
@@ -265,27 +268,53 @@ pub enum ActionV1 {
     /// Existing deterministic native operation with unchanged execution semantics.
     Native {
         /// Native operation executed at this ordered action position.
-        operation: Operation,
+        operation: Box<Operation>,
+    },
+    /// Permanently prevents later uses of one grant issued by the sender.
+    RevokeSponsorGrant {
+        /// Wallet-generated identity of the grant being revoked.
+        grant_id: SponsorGrantId,
     },
 }
 
 impl ActionV1 {
     /// Wraps an existing native operation as a V1 action.
     pub fn native(operation: Operation) -> Self {
-        Self::Native { operation }
+        Self::Native {
+            operation: Box::new(operation),
+        }
+    }
+
+    /// Constructs a protocol-2 sponsor-grant revocation action.
+    pub const fn revoke_sponsor_grant(grant_id: SponsorGrantId) -> Self {
+        Self::RevokeSponsorGrant { grant_id }
     }
 
     /// Returns the deterministic units statically assigned to this action.
     pub fn required_units(&self) -> u64 {
         match self {
             Self::Native { operation } => operation.required_units(),
+            Self::RevokeSponsorGrant { .. } => REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS,
         }
     }
 
-    /// Borrows the wrapped native operation.
-    pub fn operation(&self) -> &Operation {
+    /// Builds the exact sender/action access for this action.
+    fn default_access_list_for_lane(
+        &self,
+        sender: Address,
+        lane: AuthorizationLaneId,
+    ) -> Result<AccessList, TransactionValidationErrorV1> {
         match self {
-            Self::Native { operation } => operation,
+            Self::Native { operation } => operation
+                .default_access_list_for_lane(sender, lane)
+                .map_err(|_| TransactionValidationErrorV1::InvalidAccessList),
+            Self::RevokeSponsorGrant { grant_id } => {
+                let mut access = cancel_access_list(sender, lane);
+                access
+                    .read_write
+                    .push(StateKey::sponsor_grant(sender, grant_id.digest()));
+                Ok(access)
+            }
         }
     }
 }
@@ -339,10 +368,7 @@ impl ActionProgramV1 {
         let mut read_only = BTreeSet::new();
         let mut read_write = BTreeSet::new();
         for action in &self.actions {
-            let access = action
-                .operation()
-                .default_access_list_for_lane(sender, lane)
-                .map_err(|_| TransactionValidationErrorV1::InvalidAccessList)?;
+            let access = action.default_access_list_for_lane(sender, lane)?;
             for key in access.read_write {
                 read_only.remove(&key);
                 read_write.insert(key);
@@ -1308,6 +1334,32 @@ mod tests {
         assert_eq!(
             ActionProgramV1::new(actions).validate(),
             Err(TransactionValidationErrorV1::TooManyActions)
+        );
+    }
+
+    #[test]
+    fn sponsor_revocation_action_has_frozen_digest_and_exact_access() {
+        let sender = Keypair::from_seed([3; 32]);
+        let grant_id = SponsorGrantId::new(Hash256([0x44; 32]));
+        let kind =
+            TransactionKindV1::Actions(ActionProgramV1::new(vec![ActionV1::revoke_sponsor_grant(
+                grant_id,
+            )]));
+
+        assert_eq!(
+            kind.required_units(),
+            Ok(REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS)
+        );
+        let access = kind
+            .default_access_list_for_lane(sender.address(), AuthorizationLaneId::DEFAULT)
+            .expect("revocation access");
+        assert!(access.read_write.contains(&StateKey::sponsor_grant(
+            sender.address(),
+            grant_id.digest()
+        )));
+        assert_eq!(
+            kind.digest().expect("revocation digest").to_string(),
+            "9ee7f737d552bfc49ba6351b0c8954c70a83b989175a0892b106e95c36846de8"
         );
     }
 

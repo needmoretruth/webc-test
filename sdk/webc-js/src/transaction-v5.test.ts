@@ -17,6 +17,7 @@ import { canonicalJson } from "./canonical";
 import {
   createSponsorUseV1,
   feeBidV1DigestHex,
+  revokeSponsorGrantActionV1,
   sponsorGrantSigningBytes,
   sponsorGrantV1DigestHex,
   sponsorUseV1DigestHex,
@@ -30,6 +31,7 @@ import type {
   SignedTransactionV5Json,
   SponsorGrantV1Json,
   SponsorUseV1Json,
+  TransactionKindV1Json,
 } from "./transaction-v5";
 
 const SENDER = "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3";
@@ -148,6 +150,16 @@ function decode(bytes: Uint8Array): string {
 }
 
 describe("V5 cross-language transaction fixtures", () => {
+  it("matches the Rust sponsor-grant revocation action digest", async () => {
+    const kind: TransactionKindV1Json = {
+      Actions: { actions: [revokeSponsorGrantActionV1("44".repeat(32))] },
+    };
+    expect(await transactionKindV1DigestHex(kind)).toBe(
+      "9ee7f737d552bfc49ba6351b0c8954c70a83b989175a0892b106e95c36846de8",
+    );
+    expect(() => revokeSponsorGrantActionV1("00".repeat(32))).toThrow();
+  });
+
   it("reproduces the Rust sender-paid transfer wire byte-for-byte", async () => {
     const transaction = senderPaidFixture();
 

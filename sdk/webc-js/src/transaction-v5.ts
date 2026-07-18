@@ -82,7 +82,9 @@ export interface TransactionAuthorizationV1Json {
 }
 
 /** One ordered V1 action wrapping an existing native operation. */
-export type ActionV1Json = { Native: { operation: OperationJson } };
+export type ActionV1Json =
+  | { Native: { operation: OperationJson } }
+  | { RevokeSponsorGrant: { grant_id: string } };
 
 /** Non-empty bounded ordered action program. */
 export interface ActionProgramV1Json {
@@ -215,6 +217,12 @@ export function actionProgramV1(operations: OperationJson[]): TransactionKindV1J
       actions: operations.map((operation) => ({ Native: { operation } })),
     },
   };
+}
+
+/** Constructs a protocol-2 action that permanently revokes one sponsor grant. */
+export function revokeSponsorGrantActionV1(grantId: string): ActionV1Json {
+  requireHex(grantId, 32, "sponsor grant id", true);
+  return { RevokeSponsorGrant: { grant_id: grantId } };
 }
 
 /** Constructs the signed no-effect cancellation form. */
@@ -554,11 +562,20 @@ function validateKind(value: unknown): asserts value is TransactionKindV1Json {
     }
     for (const action of value.Actions.actions) {
       requireRecord(action, "V5 action");
-      requireExactKeys(action, ["Native"], "V5 action");
-      requireRecord(action.Native, "V5 native action");
-      requireExactKeys(action.Native, ["operation"], "V5 native action");
-      if (action.Native.operation === null || action.Native.operation === undefined) {
-        throw new Error("V5 native action is missing its operation");
+      if ("Native" in action) {
+        requireExactKeys(action, ["Native"], "V5 action");
+        requireRecord(action.Native, "V5 native action");
+        requireExactKeys(action.Native, ["operation"], "V5 native action");
+        if (action.Native.operation === null || action.Native.operation === undefined) {
+          throw new Error("V5 native action is missing its operation");
+        }
+      } else if ("RevokeSponsorGrant" in action) {
+        requireExactKeys(action, ["RevokeSponsorGrant"], "V5 action");
+        requireRecord(action.RevokeSponsorGrant, "V5 sponsor revocation action");
+        requireExactKeys(action.RevokeSponsorGrant, ["grant_id"], "V5 sponsor revocation action");
+        requireHex(action.RevokeSponsorGrant.grant_id, 32, "sponsor grant id", true);
+      } else {
+        throw new Error("unsupported V5 action");
       }
     }
     return;
