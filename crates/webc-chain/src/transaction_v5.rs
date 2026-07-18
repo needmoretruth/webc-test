@@ -405,7 +405,10 @@ impl TransactionKindV1 {
         })
     }
 
-    #[cfg(test)]
+    /// Builds the exact sender-lane access baseline for this transaction form.
+    ///
+    /// Sponsorship later replaces only the fee-payer portion; sender nonce,
+    /// authorization, and action access remain bound to this list.
     fn default_access_list_for_lane(
         &self,
         sender: Address,
@@ -413,9 +416,31 @@ impl TransactionKindV1 {
     ) -> Result<AccessList, TransactionValidationErrorV1> {
         match self {
             Self::Actions(program) => program.default_access_list_for_lane(sender, lane),
-            Self::Cancel(_) => Ok(AccessList::new(Vec::new(), Vec::new())),
+            Self::Cancel(_) => Ok(cancel_access_list(sender, lane)),
         }
     }
+}
+
+/// Exact state touched by a sender-paid cancellation.
+///
+/// A cancellation has no action state, but inclusion still reads sender
+/// authorization/base-fee state, advances the selected nonce, and accounts for
+/// fees. Keeping those keys explicit prevents cancellation from becoming an
+/// undeclared state mutation when V5 execution activates.
+fn cancel_access_list(sender: Address, lane: AuthorizationLaneId) -> AccessList {
+    let read_only = vec![
+        StateKey::protocol(crate::ProtocolStateKey::BaseFee),
+        StateKey::authorization_policy(sender),
+    ];
+    let nonce_key = if lane.is_default() {
+        StateKey::account(sender)
+    } else {
+        StateKey::authorization_lane(sender, lane)
+    };
+    AccessList::new(
+        read_only,
+        vec![nonce_key, StateKey::fee_accumulator_for_lane(sender, lane)],
+    )
 }
 
 /// Exact action scope authorized by a version-1 sponsor grant.
@@ -732,6 +757,7 @@ impl TransactionV5 {
         fee_bid: FeeBid,
         fee_payment: FeePaymentV1,
     ) -> Self {
+        let access_list = cancel_access_list(sender, authorization.lane);
         Self::new_unsigned(
             chain_id,
             sender,
@@ -739,7 +765,7 @@ impl TransactionV5 {
             authorization,
             validity,
             TransactionKindV1::Cancel(CancelV1 {}),
-            AccessList::default(),
+            access_list,
             fee_bid,
             fee_payment,
         )
@@ -767,6 +793,14 @@ impl TransactionV5 {
         self.kind.validate()?;
         validate_fee_bid(self.fee_bid)?;
         validate_access_list(&self.access_list)?;
+        if matches!(self.fee_payment, FeePaymentV1::SenderLane)
+            && self.access_list
+                != self
+                    .kind
+                    .default_access_list_for_lane(self.sender, self.authorization.lane)?
+        {
+            return Err(TransactionValidationErrorV1::InvalidAccessList);
+        }
         self.validate_fee_payment()?;
         if canonical_bytes(self)?.len() > MAX_TRANSACTION_V5_CANONICAL_BYTES {
             return Err(TransactionValidationErrorV1::TransactionTooLarge);
@@ -1156,11 +1190,41 @@ mod tests {
         cancel
             .verify_for_chain(&ChainId::devnet())
             .expect("cancel verifies");
+        assert_eq!(
+            cancel.access_list,
+            AccessList::new(
+                vec![
+                    StateKey::protocol(crate::ProtocolStateKey::BaseFee),
+                    StateKey::authorization_policy(sender.address()),
+                ],
+                vec![
+                    StateKey::account(sender.address()),
+                    StateKey::fee_accumulator(sender.address()),
+                ],
+            )
+        );
         assert_ne!(
             action.transaction_id().expect("action id"),
             cancel.transaction_id().expect("cancel id")
         );
         assert_eq!(cancel.required_units(), Ok(CANCEL_V1_REQUIRED_UNITS));
+
+        let mut missing_action_key = action;
+        missing_action_key.access_list.read_write.pop();
+        assert_eq!(
+            missing_action_key.validate_structure(),
+            Err(TransactionValidationErrorV1::InvalidAccessList)
+        );
+
+        let mut extra_cancel_key = cancel;
+        extra_cancel_key
+            .access_list
+            .read_only
+            .push(StateKey::protocol(crate::ProtocolStateKey::BridgeNonce));
+        assert_eq!(
+            extra_cancel_key.validate_structure(),
+            Err(TransactionValidationErrorV1::InvalidAccessList)
+        );
     }
 
     #[test]
