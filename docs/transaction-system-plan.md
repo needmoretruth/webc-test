@@ -554,6 +554,101 @@ modules in `webc-chain` (continuation step 3) — fee reconciliation, position/I
 binding, the failed-event prohibition, equal transaction/receipt counts, and
 frozen Rust/TypeScript vectors — before any node lifecycle consumer.
 
+### Step 3 implementation brief (2026-07-18 pre-implementation handoff)
+
+Step 3 was scoped and researched but not started (working tree clean at
+`d48f930`). This brief captures the ADR-0012 spec and the exact current-code
+reuse map so the next session implements it directly without re-exploring. Do not
+duplicate any listed foundation; extend/reuse it.
+
+Target: new `crates/webc-chain/src/receipt_v1.rs`, registered in `lib.rs`
+(`pub mod receipt_v1;` plus focused `pub use` re-exports). Mirror afterwards in a
+new `sdk/webc-js/src/receipt-v1.ts` (+ `receipt-v1.test.ts`). Receipts are not
+signed, so no keypair is needed to harvest vectors.
+
+Reuse (with file:line) — do not re-implement:
+- Fee accounting: `crate::fees::{FeeSummaryV1, calculate_fee_summary_v1,
+  FeePayerV1, GasUnits, FeeRate}` (`fees.rs:87-242`). The receipt carries
+  `FeeSummaryV1` (already documented "committed by a V1 receipt"), NOT the legacy
+  `FeeBreakdown`. `FeeSummaryV1::validate()` IS the required fee reconciliation.
+  `GasUnits`/`FeeRate` serialize as decimal strings; `FeePayerV1 { address, lane }`
+  is the payer/lane single source of truth.
+- Event body: reuse the existing flat `crate::state::Event` enum
+  (`state.rs:87-231`), which nests `bridge::BridgeEvent` (`bridge.rs:160-190`).
+- Identity/wire: `crate::transaction_v5::{TransactionId, TransactionV5}`
+  (`transaction_v5.rs:124-139`, `818-830`). Copy its digest style verbatim:
+  `canonical_bytes`/`canonical_hash` + a `#[derive(Serialize)] struct Payload {
+  domain: &'static str, ... }` wrapper (`transaction_v5.rs:940-947`).
+- Merkle: `webc_crypto::merkle_root` (`crates/webc-crypto/src/merkle.rs:64`;
+  internal node domain `WEBC_MERKLE_V1`; empty tree -> `Hash256::ZERO`; odd layer
+  duplicates the last node). Position/inclusion proofs reuse
+  `webc_proof::{build_indexed_merkle_proof, verify_indexed_merkle_proof,
+  IndexedMerkleProofV1, MerkleLeafIndex, MerkleLeafCount}`
+  (`crates/webc-proof/src/indexed_merkle.rs`). Do not write a new tree.
+- V4 precedent to diverge from deliberately: V4 tx/receipt leaves are UNDOMAINED
+  `digest(canonical_json)` (`block_builder.rs:212-243`). V5 leaves ARE
+  domain-separated (ADR-0012 §"Frozen domains"); document the asymmetry.
+
+Types to add (ADR-0012 §Receipt/event/block, §Frozen domains):
+- Consts: `RECEIPT_V1: u16 = 1`, `EVENT_V1: u16 = 1`; domains `WEBC_RECEIPT_V1`,
+  `WEBC_RECEIPT_LEAF_V1`, `WEBC_EVENT_V1`, `WEBC_TRANSACTION_LEAF_V1`.
+- Bounded index wrappers `ActionIndex(u32)`, `EventIndex(u32)`,
+  `TransactionIndex(u32)` — JSON numbers (`#[serde(transparent)]`), per ADR
+  "bounded action/event indexes remain JSON numbers".
+- `BlockPositionV1 { height: BlockHeight (decimal-string serde — copy V5's
+  `block_height_decimal`), transaction_index: TransactionIndex }`.
+- `ExecutionFailureCodeV1` = `InsufficientBalance | ObjectNotFound |
+  ObjectOwnerMismatch | ObjectVersionMismatch | Precondition` (chargeable
+  post-admission failures; Step 4 maps concrete native failures to these; adding
+  a code is a version bump, acceptable while protocol v2 is inactive).
+- `ReceiptStatusV1` = `Succeeded | Failed { code: ExecutionFailureCodeV1,
+  failed_action_index: Option<ActionIndex> }`.
+- `EventV1 { version, transaction_id, action_index, event_index, body: Event }`.
+- `ReceiptV1 { version, position: BlockPositionV1, transaction_id, sender:
+  Address, status: ReceiptStatusV1, fee_summary: FeeSummaryV1, events:
+  Vec<EventV1> }`.
+- `ReceiptError` typed enum; every check fails closed, no panics on hostile input.
+
+Functions:
+- `ReceiptV1::validate()`: version == RECEIPT_V1; `fee_summary.validate()`;
+  Failed => `events` empty (failed-event prohibition); each event
+  `version == EVENT_V1` and `transaction_id == receipt.transaction_id`.
+- `ReceiptV1::digest()` under `WEBC_RECEIPT_V1` (content identity, for the later
+  `FinalizedReceiptIndex`); `ReceiptV1::leaf()` under `WEBC_RECEIPT_LEAF_V1` (over
+  the complete receipt). `EventV1::digest()` under `WEBC_EVENT_V1`.
+- `transaction_leaf_v1(position, transaction_id)` under `WEBC_TRANSACTION_LEAF_V1`
+  — commits `(position, transaction_id)`, not the full transaction (the ID already
+  commits it).
+- `receipt_root_v1(&[ReceiptV1])` and `transaction_root_v1(height,
+  &[TransactionV5])` build domained leaves then call `merkle_root`.
+- `verify_transaction_receipt_binding(height, &[TransactionV5], &[ReceiptV1])`:
+  equal counts; for each i `position == (height, i)` and `transaction_id ==
+  txs[i].transaction_id()`; no duplicate transaction IDs; `receipt.validate()`.
+
+Serialization: heights/amounts/gas/rates/nonces -> canonical decimal strings;
+bounded indexes/versions -> JSON numbers. Harvest frozen vectors with a temporary
+Rust dump test (same technique as the Step 2 commit `d48f930`), then bake them in:
+a Succeeded receipt and a Failed receipt (canonical JSON + digest + leaf), the
+`transaction_leaf_v1` for the sender-paid fixture (`transaction_id`
+`c268d7d3...b143f50f`) at a fixed position, and a two-leaf `receipt_root_v1` +
+`transaction_root_v1` whose binding check passes.
+
+Step 3b (next commit): mirror in `sdk/webc-js` (`receipt-v1.ts` +
+`receipt-v1.test.ts`) reproducing every digest/leaf/root byte-for-byte, reusing
+the existing SDK `Event`/`FeeSummaryV1` JSON shapes. Gate each commit with
+`cargo fmt --check`, `cargo clippy -p webc-chain --all-targets -- -D warnings`,
+`cargo test -p webc-chain`, and `pnpm check`, then push to
+`codex/transaction-system`.
+
+After step 3: continuation step 4 (reusable action executor + two-level
+parent-fee/nonce/sponsor and child-action/event execution overlay with success,
+chargeable-failure, rollback, cancel, and sponsor replay/budget/revocation
+coverage), then step 5 (storage schema 2 + migration and V5 mempool/runtime/V2
+APIs; in parallel where files are disjoint, the V4 header/authority/checkpoint/
+finalized-proof chain and browser verifier), then step 6 (fetch/merge latest
+`main`, full gates, reconcile the global `implementation-status.md` and
+`continuation-guide.md`, and integrate without force).
+
 ## Partial blockers and owner-reserved decisions
 
 A policy conflict or missing owner decision does not stop the whole goal by
