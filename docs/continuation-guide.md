@@ -131,11 +131,16 @@ contract ABI stay stable across engines. The production engine choice is
 owner-deferred. (Perf note for the owner: an interpreter does NOT raise user fees
 — fees are protocol gas-metering, independent of node exec speed; swap to a JIT
 later only for heavy-compute throughput.)
-- Built by a subagent on branch **`claude/p7b-webc-vm`** (worktree
-  `/home/user/wt-vm`), pushing per milestone. **ON RESUME: check
-  `git ls-remote origin claude/p7b-webc-vm`**; if it landed, merge + gate
-  (`cargo fmt/clippy/test -p webc-vm` + `cargo build --workspace`) into `main`;
-  if the subagent died (idle-reclaim), salvage the worktree or re-dispatch.
+- **`webc-vm` crate is DONE and MERGED into `main` (commit `2742201`).** It is
+  the deterministic `wasmi` 0.31 interpreter + fuel metering + host ABI (module
+  `webc`: `webc_input_len/webc_input_read/webc_get/webc_set/webc_epoch/
+  webc_output`; guest exports `memory` + `webc_call`), a `VmHost` trait
+  (`get/set/epoch/charge_gas`) that maps 1:1 onto `ContractContext`+`GasMeter`,
+  `validate_module` that fail-closed rejects floats/SIMD/threads/bulk-memory/
+  reference-types/foreign-imports/oversized, `VmLimits` (256 KiB module, 16 pages,
+  4 KiB in/val/out, fuel 1e8, fuel_per_gas 1000, gas costs mirroring contract.rs),
+  and 22 tests covering determinism + every fail-closed path. Engine is behind the
+  crate boundary → swappable to wasmtime later without touching gas model or ABI.
 - The seam it plugs into (already exists in `crates/webc-chain/src/contract.rs`):
   the `Contract` trait (`fn call(&self, ctx: &mut ContractContext, input) ->
   Result<Vec<u8>, ContractError>`), `ContractContext` (`epoch()`, footprint-
