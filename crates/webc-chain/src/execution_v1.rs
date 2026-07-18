@@ -71,6 +71,9 @@ pub enum TransactionPreparationErrorV1 {
     /// The signed sender nonce is not the next nonce in its lane.
     #[error("V5 sender nonce does not match current state")]
     SenderNonceMismatch,
+    /// Access names account-key or session-key state inconsistent with authority.
+    #[error("V5 authorization access does not match the selected sender authority")]
+    AuthorizationAccessMismatch,
     /// The selected payer account or prepaid lane does not exist.
     #[error("V5 fee payer or payer lane was not found")]
     FeePayerStateNotFound,
@@ -218,9 +221,6 @@ pub enum BlockExecutionErrorV1 {
     /// This incremental executor has not yet extracted this V4 transition.
     #[error("V5 action uses a native operation not integrated with the action executor")]
     UnsupportedNativeAction,
-    /// Session-key cumulative accounting is not yet integrated in this executor.
-    #[error("V5 session-key execution is not yet integrated")]
-    UnsupportedAuthorization,
     /// A bounded action/event position did not fit its wire index.
     #[error("V5 action or event index overflowed")]
     IndexOverflow,
@@ -248,7 +248,9 @@ impl ValidatedTransactionV1 {
         expected_chain: &ChainId,
     ) -> Result<Self, TransactionValidationErrorV1> {
         transaction.verify_for_chain(expected_chain)?;
-        if transaction.access_list != transaction.expected_access_list()? {
+        let expected = transaction.expected_access_list()?;
+        let expected_session = transaction.expected_session_access_list()?;
+        if transaction.access_list != expected && transaction.access_list != expected_session {
             return Err(TransactionValidationErrorV1::InvalidAccessList);
         }
         Ok(Self { transaction })
@@ -301,6 +303,14 @@ impl ChainState {
         );
 
         let authorization = prepare_sender_authorization(self, transaction, fee_reserve)?;
+        let expected_access = match authorization {
+            PreparedAuthorizationV1::AccountKey => transaction.expected_access_list(),
+            PreparedAuthorizationV1::SessionKey(_) => transaction.expected_session_access_list(),
+        }
+        .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+        if transaction.access_list != expected_access {
+            return Err(TransactionPreparationErrorV1::AuthorizationAccessMismatch);
+        }
         let expected_nonce =
             sender_nonce(self, transaction.sender, transaction.authorization.lane)?;
         if expected_nonce != transaction.authorization.nonce {
@@ -358,13 +368,6 @@ impl ChainState {
         if refreshed != prepared {
             return Err(BlockExecutionErrorV1::StalePreparation);
         }
-        if matches!(
-            prepared.authorization,
-            PreparedAuthorizationV1::SessionKey(_)
-        ) {
-            return Err(BlockExecutionErrorV1::UnsupportedAuthorization);
-        }
-
         let transaction = prepared.validated.transaction().clone();
         preflight_supported_actions(&transaction.kind)?;
         let mut access = StateAccessRecorder::new(
@@ -372,7 +375,12 @@ impl ChainState {
             &transaction.access_list.read_write,
         )
         .map_err(map_block_chain_error)?;
-        record_parent_access(&transaction, prepared.fee_payer, &mut access)?;
+        record_parent_access(
+            &transaction,
+            prepared.fee_payer,
+            prepared.authorization,
+            &mut access,
+        )?;
 
         let mut parent = self.clone();
         debit_fee_reserve(&mut parent, prepared.fee_payer, prepared.fee_reserve)?;
@@ -407,6 +415,13 @@ impl ChainState {
         )?;
         finalize_fee_accounting(&mut selected, &fee_summary)?;
         finalize_sponsor_use(&mut selected, &transaction, fee_summary.charged)?;
+        finalize_session_use(
+            &mut selected,
+            &transaction,
+            prepared.authorization,
+            status,
+            fee_summary.charged,
+        )?;
 
         let receipt = ReceiptV1 {
             version: RECEIPT_V1,
@@ -444,6 +459,7 @@ fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExec
 fn record_parent_access(
     transaction: &TransactionV5,
     payer: FeePayerV1,
+    authorization: PreparedAuthorizationV1,
     access: &mut StateAccessRecorder,
 ) -> Result<(), BlockExecutionErrorV1> {
     access
@@ -458,6 +474,11 @@ fn record_parent_access(
             transaction.authorization.lane,
         ))
         .map_err(map_block_chain_error)?;
+    if let PreparedAuthorizationV1::SessionKey(session_key) = authorization {
+        access
+            .write(StateKey::session_key(transaction.sender, session_key))
+            .map_err(map_block_chain_error)?;
+    }
 
     if let FeePaymentV1::Sponsored(sponsor_use) = &transaction.fee_payment {
         access
@@ -739,6 +760,58 @@ fn finalize_sponsor_use(
     Ok(())
 }
 
+fn finalize_session_use(
+    state: &mut ChainState,
+    transaction: &TransactionV5,
+    authorization: PreparedAuthorizationV1,
+    status: ReceiptStatusV1,
+    actual_charge: Amount,
+) -> Result<(), BlockExecutionErrorV1> {
+    let PreparedAuthorizationV1::SessionKey(session_key) = authorization else {
+        return Ok(());
+    };
+    let principal = if status == ReceiptStatusV1::Succeeded {
+        session_principal(&transaction.kind)?
+    } else {
+        Amount::ZERO
+    };
+    let record = state
+        .session_keys
+        .get_mut(&(transaction.sender, session_key))
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    record.spent_amount = record
+        .spent_amount
+        .checked_add(principal)
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    record.spent_fees = record
+        .spent_fees
+        .checked_add(actual_charge)
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    record
+        .validate()
+        .map_err(|_| BlockExecutionErrorV1::InvalidState)
+}
+
+fn session_principal(kind: &TransactionKindV1) -> Result<Amount, BlockExecutionErrorV1> {
+    let TransactionKindV1::Actions(program) = kind else {
+        return Err(BlockExecutionErrorV1::InvalidState);
+    };
+    program
+        .actions
+        .iter()
+        .try_fold(Amount::ZERO, |total, action| {
+            let ActionV1::Native { operation } = action else {
+                return Err(BlockExecutionErrorV1::InvalidState);
+            };
+            let Operation::Transfer { amount, .. } = operation.as_ref() else {
+                return Err(BlockExecutionErrorV1::InvalidState);
+            };
+            total
+                .checked_add(*amount)
+                .ok_or(BlockExecutionErrorV1::InvalidState)
+        })
+}
+
 fn prepare_sender_authorization(
     state: &ChainState,
     transaction: &TransactionV5,
@@ -938,10 +1011,12 @@ fn account_key_is_current(
 mod tests {
     use super::*;
     use crate::{
-        Account, ActionScopeV1, ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision,
-        BlockHeight, ChainState, FeeBid, FeePaymentV1, Nonce, Operation, SponsorGrantId,
-        SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
-        TransactionIndex, ValidityWindowV1, TRANSACTION_V5_PROTOCOL_VERSION,
+        Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLaneId,
+        AuthorizationPolicyRevision, BlockHeight, ChainState, Epoch, FeeBid, FeePaymentV1, Nonce,
+        Operation, PostQuantumRoot, PostQuantumScheme, SessionAllowedOperations,
+        SessionKeyConstraints, SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce,
+        SponsorUseV1, TransactionAuthorizationV1, TransactionIndex, ValidityWindowV1,
+        INITIAL_AUTHORIZATION_POLICY_REVISION, TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
 
@@ -1068,6 +1143,68 @@ mod tests {
                 BlockHeight::new(10),
             )
             .expect("fixture prepares")
+    }
+
+    fn session_state(owner: &Keypair, session: &Keypair) -> ChainState {
+        let mut state = funded_state(owner, None);
+        let root = PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([0x88; 32]))
+            .expect("nonzero test root");
+        state.authorization_policies.insert(
+            owner.address(),
+            AccountAuthorizationPolicy::new_v1(owner.public_key(), root).expect("test policy"),
+        );
+        let constraints = SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_units(30_000),
+            total_amount_budget: Amount::from_units(30_000),
+            max_fee_per_use: Amount::from_units(5_000),
+            total_fee_budget: Amount::from_units(10_000),
+            lifetime_epochs: 10,
+        };
+        let record = SessionKey::new(
+            owner.address(),
+            session.public_key(),
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            constraints,
+            Epoch::new(10),
+        )
+        .expect("test session record");
+        state
+            .session_keys
+            .insert((owner.address(), record.id), record);
+        state
+    }
+
+    fn session_transaction(
+        owner: &Keypair,
+        session: &Keypair,
+        actions: Vec<ActionV1>,
+        gas_limit: u64,
+    ) -> TransactionV5 {
+        let mut transaction = TransactionV5::for_session_actions_unsigned(
+            ChainId::devnet(),
+            owner.address(),
+            session.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: INITIAL_AUTHORIZATION_POLICY_REVISION,
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            actions,
+            FeeBid {
+                gas_limit,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("session transaction builds");
+        transaction
+            .sign_with_policy_key(session)
+            .expect("session transaction signs");
+        transaction
     }
 
     #[test]
@@ -1590,5 +1727,113 @@ mod tests {
             Err(BlockExecutionErrorV1::UnsupportedNativeAction)
         );
         assert_eq!(state, before_unsupported);
+    }
+
+    #[test]
+    fn session_access_shape_is_statefully_bound_to_session_authority() {
+        let owner = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let session = Keypair::from_seed([5; 32]);
+        let transaction = session_transaction(
+            &owner,
+            &session,
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(100),
+            })],
+            1_000,
+        );
+        let session_id = SessionKeyId::derive(&session.public_key());
+        assert!(transaction
+            .access_list
+            .read_write
+            .contains(&StateKey::session_key(owner.address(), session_id)));
+        let state = session_state(&owner, &session);
+        assert_eq!(
+            prepared(&state, transaction).authorization(),
+            PreparedAuthorizationV1::SessionKey(session_id)
+        );
+
+        let mut account_shaped_as_session = sender_paid_fixture(&owner, &recipient);
+        account_shaped_as_session.access_list = account_shaped_as_session
+            .expected_session_access_list()
+            .expect("session access derives");
+        account_shaped_as_session.sender_signature = None;
+        account_shaped_as_session
+            .sign(&owner)
+            .expect("active key signs session-shaped access");
+        let legacy_state = funded_state(&owner, None);
+        assert_eq!(
+            legacy_state.prepare_transaction_v1(
+                ValidatedTransactionV1::validate(account_shaped_as_session, &ChainId::devnet(),)
+                    .expect("both static authorization shapes validate"),
+                BlockHeight::new(10),
+            ),
+            Err(TransactionPreparationErrorV1::AuthorizationAccessMismatch)
+        );
+    }
+
+    #[test]
+    fn session_execution_charges_actual_fee_and_only_committed_principal() {
+        let owner = Keypair::from_seed([1; 32]);
+        let first = Keypair::from_seed([2; 32]);
+        let second = Keypair::from_seed([4; 32]);
+        let session = Keypair::from_seed([5; 32]);
+        let session_id = SessionKeyId::derive(&session.public_key());
+
+        let successful = session_transaction(
+            &owner,
+            &session,
+            vec![ActionV1::native(Operation::Transfer {
+                to: first.address(),
+                amount: Amount::from_units(100),
+            })],
+            1_000,
+        );
+        let mut success_state = session_state(&owner, &session);
+        let prepared_success = prepared(&success_state, successful);
+        success_state
+            .execute_prepared_transaction_v1(
+                prepared_success,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("session transfer executes");
+        let success_record = &success_state.session_keys[&(owner.address(), session_id)];
+        assert_eq!(success_record.spent_amount, Amount::from_units(100));
+        assert_eq!(success_record.spent_fees, Amount::from_units(1_500));
+
+        let failing = session_transaction(
+            &owner,
+            &session,
+            vec![
+                ActionV1::native(Operation::Transfer {
+                    to: first.address(),
+                    amount: Amount::from_units(15_000),
+                }),
+                ActionV1::native(Operation::Transfer {
+                    to: second.address(),
+                    amount: Amount::from_units(10_000),
+                }),
+            ],
+            1_000,
+        );
+        let mut failure_state = session_state(&owner, &session);
+        let prepared_failure = prepared(&failure_state, failing);
+        let failed_receipt = failure_state
+            .execute_prepared_transaction_v1(
+                prepared_failure,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("session action failure is chargeable")
+            .into_receipt();
+        assert!(matches!(
+            failed_receipt.status,
+            ReceiptStatusV1::Failed { .. }
+        ));
+        let failure_record = &failure_state.session_keys[&(owner.address(), session_id)];
+        assert_eq!(failure_record.spent_amount, Amount::ZERO);
+        assert_eq!(failure_record.spent_fees, Amount::from_units(3_000));
+        assert!(!failure_state.accounts.contains_key(&first.address()));
+        assert!(!failure_state.accounts.contains_key(&second.address()));
     }
 }

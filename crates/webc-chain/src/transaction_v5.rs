@@ -16,7 +16,7 @@
 
 use crate::{
     AccessList, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainId,
-    FeeBid, Nonce, Operation, ProtocolVersion, StateKey, MAX_TRANSACTION_STATE_KEYS,
+    FeeBid, Nonce, Operation, ProtocolVersion, SessionKeyId, StateKey, MAX_TRANSACTION_STATE_KEYS,
 };
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::BTreeSet, fmt};
@@ -817,6 +817,40 @@ impl TransactionV5 {
         ))
     }
 
+    /// Builds an unsigned action transaction authorized by a constrained session key.
+    ///
+    /// This is a distinct constructor because session execution mutates the
+    /// cumulative session budget and must therefore sign that derived state key.
+    /// The wire schema is unchanged; only the exact access declaration differs
+    /// from an active-account-key transaction.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "builder keeps chain, session policy, lane, validity, actions, and fees explicit"
+    )]
+    pub fn for_session_actions_unsigned(
+        chain_id: ChainId,
+        sender: Address,
+        session_public_key: PublicKeyBytes,
+        authorization: TransactionAuthorizationV1,
+        validity: ValidityWindowV1,
+        actions: Vec<ActionV1>,
+        fee_bid: FeeBid,
+        fee_payment: FeePaymentV1,
+    ) -> Result<Self, TransactionValidationErrorV1> {
+        let mut transaction = Self::for_actions_unsigned(
+            chain_id,
+            sender,
+            session_public_key,
+            authorization,
+            validity,
+            actions,
+            fee_bid,
+            fee_payment,
+        )?;
+        transaction.access_list = transaction.expected_session_access_list()?;
+        Ok(transaction)
+    }
+
     /// Builds an unsigned no-effect cancellation for a sender slot.
     pub fn for_cancel_unsigned(
         chain_id: ChainId,
@@ -863,13 +897,12 @@ impl TransactionV5 {
         self.kind.validate()?;
         validate_fee_bid(self.fee_bid)?;
         validate_access_list(&self.access_list)?;
-        if matches!(self.fee_payment, FeePaymentV1::SenderLane)
-            && self.access_list
-                != self
-                    .kind
-                    .default_access_list_for_lane(self.sender, self.authorization.lane)?
-        {
-            return Err(TransactionValidationErrorV1::InvalidAccessList);
+        if matches!(self.fee_payment, FeePaymentV1::SenderLane) {
+            let expected = self.expected_access_list()?;
+            let expected_session = self.expected_session_access_list()?;
+            if self.access_list != expected && self.access_list != expected_session {
+                return Err(TransactionValidationErrorV1::InvalidAccessList);
+            }
         }
         self.validate_fee_payment()?;
         if canonical_bytes(self)?.len() > MAX_TRANSACTION_V5_CANONICAL_BYTES {
@@ -962,6 +995,26 @@ impl TransactionV5 {
             grant.payer_lane,
         ));
 
+        Ok(AccessList::new(
+            read_only.into_iter().collect(),
+            read_write.into_iter().collect(),
+        ))
+    }
+
+    /// Recomputes exact access for the session key named by `sender_public_key`.
+    ///
+    /// Session execution has the same action, nonce, payer, and sponsor access
+    /// as active-key execution, plus one writable cumulative-budget record. The
+    /// stateful preparation layer later rejects this shape unless the signing
+    /// key is actually the installed current-revision session key.
+    pub fn expected_session_access_list(&self) -> Result<AccessList, TransactionValidationErrorV1> {
+        let baseline = self.expected_access_list()?;
+        let mut read_only = baseline.read_only.into_iter().collect::<BTreeSet<_>>();
+        let mut read_write = baseline.read_write.into_iter().collect::<BTreeSet<_>>();
+        let session_key =
+            StateKey::session_key(self.sender, SessionKeyId::derive(&self.sender_public_key));
+        read_only.remove(&session_key);
+        read_write.insert(session_key);
         Ok(AccessList::new(
             read_only.into_iter().collect(),
             read_write.into_iter().collect(),
