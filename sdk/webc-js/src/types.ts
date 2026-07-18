@@ -233,7 +233,8 @@ export type StateKeyKindJson =
   | { Object: { object_id: HexString } }
   | { Module: { module_id: HexString } }
   | { Application: { namespace: HexString; key_hash: HexString } }
-  | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
+  | { Protocol: { field: "BaseFee" | "BridgeNonce" } }
+  | { SponsorGrant: { sponsor: WebcAddress; grant_id: HexString } };
 
 /**
  * Operation variant union. IMPORTANT: Rust's `serde` serializes enums in the

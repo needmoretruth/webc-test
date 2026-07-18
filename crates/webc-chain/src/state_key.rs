@@ -83,6 +83,17 @@ pub enum StateKeyKind {
     },
     /// Protocol singleton state that cannot be attributed to one account/object.
     Protocol { field: ProtocolStateKey },
+    /// Durable replay, budget, and revocation state for one scoped sponsor grant.
+    ///
+    /// This variant is appended so every existing enum discriminant and stored
+    /// schema-1 key remains byte-compatible. Protocol-2 V5 execution is the
+    /// first consumer; protocol-1 transactions never construct this key.
+    SponsorGrant {
+        /// Account that signed and funds the immutable grant.
+        sponsor: Address,
+        /// Domain-separated digest of the immutable grant identifier.
+        grant_id: Hash256,
+    },
 }
 
 /// One versioned key in the unified consensus state space.
@@ -187,6 +198,11 @@ impl StateKey {
     /// Returns a current protocol-singleton key.
     pub const fn protocol(field: ProtocolStateKey) -> Self {
         Self::current(StateKeyKind::Protocol { field })
+    }
+
+    /// Returns the durable state key for one scoped sponsor grant.
+    pub const fn sponsor_grant(sponsor: Address, grant_id: Hash256) -> Self {
+        Self::current(StateKeyKind::SponsorGrant { sponsor, grant_id })
     }
 
     /// Rejects keys whose schema is not supported by this executable.
@@ -355,12 +371,13 @@ mod tests {
             StateKey::application(Hash256([0x55; 32]), Hash256([0x66; 32])),
             StateKey::protocol(ProtocolStateKey::BaseFee),
             StateKey::protocol(ProtocolStateKey::BridgeNonce),
+            StateKey::sponsor_grant(owner, Hash256([0x77; 32])),
         ];
         let bytes =
             crate::canonical::canonical_json_bytes(&keys).expect("state-key vector serializes");
         assert_eq!(
             Hash256::digest(bytes).to_hex(),
-            "86b42dee5ac735a7435d64b12b3f6f958e90c03ac03173ef6f98ec88169c9e20"
+            "ce844cddc2979f04aacc81550845f574da2bbc1eeef9aa0f6bf2710a64dc68f4"
         );
     }
 }
