@@ -1300,6 +1300,186 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // Frozen protocol-version-2 cross-language wire vectors.
+    //
+    // The TypeScript test `sdk/webc-js/src/transaction-v5.test.ts` reproduces
+    // every value below byte-for-byte and verifies these exact Rust signatures.
+    // Ed25519 (RFC 8032) signatures are deterministic, so re-signing the same
+    // canonical payload must reproduce the frozen signature; the transaction ID
+    // is a domain-separated hash over the complete signed JSON, so freezing it
+    // also freezes that JSON. Changing any value here is a wire-compatibility
+    // break: it requires a coordinated protocol-version bump and a matching
+    // TypeScript update. Never edit a frozen vector to make a test pass.
+    // ----------------------------------------------------------------------
+
+    /// Deterministic seed for the fixture sender (`Keypair::from_seed([1; 32])`).
+    const SENDER_PUBLIC_KEY_HEX: &str =
+        "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
+    /// Deterministic seed for the fixture sponsor (`Keypair::from_seed([3; 32])`).
+    const SPONSOR_PUBLIC_KEY_HEX: &str =
+        "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1";
+    /// Sender-paid transfer: exact ordered-action/cancellation program digest.
+    const SENDER_PAID_ACTION_DIGEST_HEX: &str =
+        "bb25a54623accd384abc84091335e289a9d3cfca5728b7f775f0329c6fa3e0a0";
+    /// Sender-paid transfer: sender Ed25519 signature over the signing bytes.
+    const SENDER_PAID_SIGNATURE_HEX: &str =
+        "fae71eef9827891d2bc4362ef49ccb9559a7e91fed98f041d0f56d690a120e05f6d3af6396bcd92cd66d63c0af144fdbf654fb2b4cd59162637dbe76592d050a";
+    /// Sender-paid transfer: complete-signed-transaction identity.
+    const SENDER_PAID_TRANSACTION_ID_HEX: &str =
+        "c268d7d32a67ddbe985e18f881bcbd93bcfafcae5fbb6e7145276941b143f50f";
+    /// Sponsor grant: exact fee-bid digest bound by the grant use.
+    const SPONSORED_FEE_BID_DIGEST_HEX: &str =
+        "3b304bcd83127294f126ab796e0614bed9472e888420b0bcbcbabc4ca6004c0c";
+    /// Sponsor grant: sponsor Ed25519 signature over the immutable grant.
+    const SPONSOR_GRANT_SIGNATURE_HEX: &str =
+        "8114099820bc2d1cdfd7be9a9180fe848c98dad6b9a1b54cbfa3a5dbb61f73b82bbe9ba37f2f0370ed73d3d460bed9a3faebee629c7743fa4d53bd554650820d";
+    /// Sponsor grant: domain-separated digest of the complete signed grant.
+    const SPONSOR_GRANT_DIGEST_HEX: &str =
+        "4bae024a7f9c82f7218cbdda309a7734d4e8c02b2c2a530376ac7531a499eb57";
+    /// Sponsor use: domain-separated identity of the replay-bounded use.
+    const SPONSOR_USE_DIGEST_HEX: &str =
+        "4d929bbcb2e2e6bb8b827b3a584de213cca91aca95ce9e6e838c16b4da29fc83";
+    /// Sponsored transfer: sender Ed25519 signature over the sponsored payload.
+    const SPONSORED_SIGNATURE_HEX: &str =
+        "eb06340360bf3147dff476900edbe65e1f9c90fb4ca2196056ef5a22ce46bcc665d432dbef9585ef42ef6aba5031574a42efae1ffed743f8ca3895ce258a1904";
+    /// Sponsored transfer: complete-signed-transaction identity.
+    const SPONSORED_TRANSACTION_ID_HEX: &str =
+        "b44978261941c3bb0f6f42722d9671330ba9c7d307ee5e3e697906fcc16b89bd";
+
+    /// Canonical sender-signing JSON (domain-wrapped) for the sender-paid vector.
+    const SENDER_PAID_SIGNING_JSON: &str = "{\"access_list\":{\"read_only\":[{\"kind\":{\"AuthorizationPolicy\":{\"owner\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1},{\"kind\":{\"Protocol\":{\"field\":\"BaseFee\"}},\"version\":1}],\"read_write\":[{\"kind\":{\"Account\":{\"address\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1},{\"kind\":{\"Account\":{\"address\":\"webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem\"}},\"version\":1},{\"kind\":{\"FeeAccumulator\":{\"lane\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"payer\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1}]},\"authorization\":{\"lane\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"nonce\":\"7\",\"policy_revision\":\"0\"},\"chain_id\":\"webc-devnet-1\",\"domain\":\"WEBC_SIGNED_TRANSACTION_V5\",\"fee_bid\":{\"gas_limit\":\"1000\",\"max_fee_per_unit\":\"5\",\"priority_fee_per_unit\":\"1\"},\"fee_payment\":\"SenderLane\",\"kind\":{\"Actions\":{\"actions\":[{\"Native\":{\"operation\":{\"Transfer\":{\"amount\":\"123456\",\"to\":\"webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem\"}}}}]}},\"protocol_version\":2,\"sender\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\",\"sender_public_key\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"validity\":{\"valid_from_height\":\"10\",\"valid_until_height\":\"20\"}}";
+
+    /// Complete signed sender-paid transfer wire (no domain, signature present).
+    const SENDER_PAID_FULL_JSON: &str = "{\"access_list\":{\"read_only\":[{\"kind\":{\"AuthorizationPolicy\":{\"owner\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1},{\"kind\":{\"Protocol\":{\"field\":\"BaseFee\"}},\"version\":1}],\"read_write\":[{\"kind\":{\"Account\":{\"address\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1},{\"kind\":{\"Account\":{\"address\":\"webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem\"}},\"version\":1},{\"kind\":{\"FeeAccumulator\":{\"lane\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"payer\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1}]},\"authorization\":{\"lane\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"nonce\":\"7\",\"policy_revision\":\"0\"},\"chain_id\":\"webc-devnet-1\",\"fee_bid\":{\"gas_limit\":\"1000\",\"max_fee_per_unit\":\"5\",\"priority_fee_per_unit\":\"1\"},\"fee_payment\":\"SenderLane\",\"kind\":{\"Actions\":{\"actions\":[{\"Native\":{\"operation\":{\"Transfer\":{\"amount\":\"123456\",\"to\":\"webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem\"}}}}]}},\"protocol_version\":2,\"sender\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\",\"sender_public_key\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"sender_signature\":\"fae71eef9827891d2bc4362ef49ccb9559a7e91fed98f041d0f56d690a120e05f6d3af6396bcd92cd66d63c0af144fdbf654fb2b4cd59162637dbe76592d050a\",\"validity\":{\"valid_from_height\":\"10\",\"valid_until_height\":\"20\"}}";
+
+    /// Canonical sponsor-grant signing JSON (domain-wrapped, no signature).
+    const SPONSOR_GRANT_SIGNING_JSON: &str = "{\"action_scope\":{\"exact_action_digest\":\"bb25a54623accd384abc84091335e289a9d3cfca5728b7f775f0329c6fa3e0a0\"},\"application_namespace\":null,\"chain_id\":\"webc-devnet-1\",\"domain\":\"WEBC_SPONSOR_GRANT_V1\",\"grant_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"max_cumulative_fee\":\"100000\",\"max_fee_per_transaction\":\"10000\",\"max_uses\":\"10\",\"payer_lane\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"protocol_version\":2,\"sender\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\",\"site_namespace\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"sponsor\":\"webc121uVaRnHeoTdcumRjrvYZuEaBBiHn4wito3PKSpNzjAf\",\"sponsor_public_key\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"validity\":{\"valid_from_height\":\"10\",\"valid_until_height\":\"20\"}}";
+
+    /// Complete signed sponsored transfer wire (no domain, signature present).
+    const SPONSORED_FULL_JSON: &str = "{\"access_list\":{\"read_only\":[{\"kind\":{\"AuthorizationPolicy\":{\"owner\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1},{\"kind\":{\"Protocol\":{\"field\":\"BaseFee\"}},\"version\":1}],\"read_write\":[{\"kind\":{\"Account\":{\"address\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1},{\"kind\":{\"Account\":{\"address\":\"webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem\"}},\"version\":1},{\"kind\":{\"FeeAccumulator\":{\"lane\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"payer\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\"}},\"version\":1}]},\"authorization\":{\"lane\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"nonce\":\"7\",\"policy_revision\":\"0\"},\"chain_id\":\"webc-devnet-1\",\"fee_bid\":{\"gas_limit\":\"1000\",\"max_fee_per_unit\":\"5\",\"priority_fee_per_unit\":\"1\"},\"fee_payment\":{\"Sponsored\":{\"action_digest\":\"bb25a54623accd384abc84091335e289a9d3cfca5728b7f775f0329c6fa3e0a0\",\"fee_bid_digest\":\"3b304bcd83127294f126ab796e0614bed9472e888420b0bcbcbabc4ca6004c0c\",\"grant\":{\"action_scope\":{\"exact_action_digest\":\"bb25a54623accd384abc84091335e289a9d3cfca5728b7f775f0329c6fa3e0a0\"},\"application_namespace\":null,\"chain_id\":\"webc-devnet-1\",\"grant_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"max_cumulative_fee\":\"100000\",\"max_fee_per_transaction\":\"10000\",\"max_uses\":\"10\",\"payer_lane\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"protocol_version\":2,\"sender\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\",\"site_namespace\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"sponsor\":\"webc121uVaRnHeoTdcumRjrvYZuEaBBiHn4wito3PKSpNzjAf\",\"sponsor_public_key\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"sponsor_signature\":\"8114099820bc2d1cdfd7be9a9180fe848c98dad6b9a1b54cbfa3a5dbb61f73b82bbe9ba37f2f0370ed73d3d460bed9a3faebee629c7743fa4d53bd554650820d\",\"validity\":{\"valid_from_height\":\"10\",\"valid_until_height\":\"20\"}},\"grant_digest\":\"4bae024a7f9c82f7218cbdda309a7734d4e8c02b2c2a530376ac7531a499eb57\",\"use_nonce\":\"0\"}},\"kind\":{\"Actions\":{\"actions\":[{\"Native\":{\"operation\":{\"Transfer\":{\"amount\":\"123456\",\"to\":\"webc1Di3JaqnPgMD4EtG2EJkdEf1joUBx7uQgziZxZWevqvem\"}}}}]}},\"protocol_version\":2,\"sender\":\"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3\",\"sender_public_key\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"sender_signature\":\"eb06340360bf3147dff476900edbe65e1f9c90fb4ca2196056ef5a22ce46bcc665d432dbef9585ef42ef6aba5031574a42efae1ffed743f8ca3895ce258a1904\",\"validity\":{\"valid_from_height\":\"10\",\"valid_until_height\":\"20\"}}";
+
+    #[test]
+    fn sender_paid_transfer_has_frozen_cross_language_v5_vector() {
+        use crate::canonical::canonical_json_string;
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let validity = ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20));
+
+        let mut tx = unsigned_sender_paid(&sender, recipient.address(), validity);
+        let action_digest = tx.kind.digest().expect("action digest");
+        tx.sign(&sender).expect("transaction signs");
+        tx.verify_for_chain(&ChainId::devnet())
+            .expect("transaction verifies");
+
+        assert_eq!(sender.public_key().to_hex(), SENDER_PUBLIC_KEY_HEX);
+        assert_eq!(
+            String::from_utf8(tx.signing_bytes().expect("signing bytes"))
+                .expect("signing bytes are canonical UTF-8 JSON"),
+            SENDER_PAID_SIGNING_JSON
+        );
+        assert_eq!(
+            tx.sender_signature
+                .as_ref()
+                .expect("signature present")
+                .to_hex(),
+            SENDER_PAID_SIGNATURE_HEX
+        );
+        assert_eq!(action_digest.to_string(), SENDER_PAID_ACTION_DIGEST_HEX);
+        assert_eq!(
+            tx.transaction_id().expect("transaction id").to_string(),
+            SENDER_PAID_TRANSACTION_ID_HEX
+        );
+        assert_eq!(
+            canonical_json_string(&tx).expect("canonical json"),
+            SENDER_PAID_FULL_JSON
+        );
+    }
+
+    #[test]
+    fn scoped_sponsor_has_frozen_cross_language_v5_vector() {
+        use crate::canonical::canonical_json_string;
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let sponsor = Keypair::from_seed([3; 32]);
+        let validity = ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20));
+
+        let mut tx = unsigned_sender_paid(&sender, recipient.address(), validity);
+        let action_digest = tx.kind.digest().expect("action digest");
+        let mut grant = SponsorGrantV1 {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            grant_id: SponsorGrantId::new(Hash256([0x44; 32])),
+            sponsor: sponsor.address(),
+            sponsor_public_key: sponsor.public_key(),
+            payer_lane: AuthorizationLaneId::new(Hash256([0x55; 32])),
+            sender: sender.address(),
+            site_namespace: Some(Hash256([0x66; 32])),
+            application_namespace: None,
+            action_scope: ActionScopeV1::exact(action_digest),
+            validity,
+            max_fee_per_transaction: Amount::from_units(10_000),
+            max_cumulative_fee: Amount::from_units(100_000),
+            max_uses: 10,
+            sponsor_signature: None,
+        };
+        grant.sign(&sponsor).expect("grant signs");
+
+        assert_eq!(sponsor.public_key().to_hex(), SPONSOR_PUBLIC_KEY_HEX);
+        assert_eq!(
+            String::from_utf8(grant.signing_bytes().expect("grant signing bytes"))
+                .expect("grant signing bytes are canonical UTF-8 JSON"),
+            SPONSOR_GRANT_SIGNING_JSON
+        );
+        assert_eq!(
+            grant
+                .sponsor_signature
+                .as_ref()
+                .expect("grant signature present")
+                .to_hex(),
+            SPONSOR_GRANT_SIGNATURE_HEX
+        );
+        let grant_digest = grant.digest().expect("grant digest");
+        assert_eq!(grant_digest.to_string(), SPONSOR_GRANT_DIGEST_HEX);
+        assert_eq!(
+            fee_bid_digest(tx.fee_bid)
+                .expect("fee bid digest")
+                .to_string(),
+            SPONSORED_FEE_BID_DIGEST_HEX
+        );
+
+        let sponsor_use =
+            SponsorUseV1::for_transaction(grant, SponsorUseNonce::new(0), &tx.kind, tx.fee_bid)
+                .expect("sponsor use builds");
+        assert_eq!(
+            sponsor_use
+                .digest()
+                .expect("sponsor use digest")
+                .to_string(),
+            SPONSOR_USE_DIGEST_HEX
+        );
+        tx.fee_payment = FeePaymentV1::Sponsored(Box::new(sponsor_use));
+        tx.sign(&sender).expect("sponsored transaction signs");
+        tx.verify_for_chain(&ChainId::devnet())
+            .expect("sponsored transaction verifies");
+
+        assert_eq!(
+            tx.sender_signature
+                .as_ref()
+                .expect("signature present")
+                .to_hex(),
+            SPONSORED_SIGNATURE_HEX
+        );
+        assert_eq!(
+            tx.transaction_id().expect("transaction id").to_string(),
+            SPONSORED_TRANSACTION_ID_HEX
+        );
+        assert_eq!(
+            canonical_json_string(&tx).expect("canonical json"),
+            SPONSORED_FULL_JSON
+        );
+    }
+
     #[test]
     fn signature_tamper_and_wrong_chain_fail_closed() {
         let sender = Keypair::from_seed([1; 32]);

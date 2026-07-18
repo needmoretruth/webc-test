@@ -515,7 +515,12 @@ async function digestEquals(expected: string, actual: Promise<string>): Promise<
 function validateAuthorization(value: unknown): asserts value is TransactionAuthorizationV1Json {
   requireRecord(value, "V5 authorization");
   requireExactKeys(value, ["lane", "policy_revision", "nonce"], "V5 authorization");
-  requireHex(value.lane, 32, "authorization lane", true);
+  // The all-zero lane is the legitimate DEFAULT lane (Rust
+  // `AuthorizationLaneId::DEFAULT = Hash256::ZERO`), backed directly by the
+  // account balance and nonce; Rust's V5 structure validation accepts it, so a
+  // faithful verifier must too. Rejecting zero here would refuse the most common
+  // (default-lane) transaction and diverge from the Rust reference verifier.
+  requireHex(value.lane, 32, "authorization lane", false);
   requireU64(value.policy_revision, "authorization policy revision");
   requireU64(value.nonce, "authorization nonce");
 }

@@ -362,6 +362,57 @@ commit.
 Review status: accepted implementation direction; subject to adversarial tests
 and independent external review before production use.
 
+### 2026-07-18 — frozen V5 cross-language vectors and default-lane parity fix
+
+Changed: added immutable Rust inline vectors
+(`sender_paid_transfer_has_frozen_cross_language_v5_vector`,
+`scoped_sponsor_has_frozen_cross_language_v5_vector`) and a new TypeScript test
+(`sdk/webc-js/src/transaction-v5.test.ts`) that freeze the canonical sender and
+sponsor signing bytes, the deterministic Ed25519 signatures, the complete signed
+JSON, the transaction ID, the action-program digest, the fee-bid digest, the
+sponsor-grant digest, and the sponsor-use digest for a sender-paid transfer and a
+scoped-sponsor transfer. Rust is the reference generator; TypeScript reproduces
+every byte and verifies the exact Rust signatures. Also fixed a TypeScript-only
+V5 validation divergence: `validateAuthorization` rejected the all-zero DEFAULT
+authorization lane that Rust (`AuthorizationLaneId::DEFAULT = Hash256::ZERO`) and
+V4 both accept.
+
+Why: without a frozen cross-language fixture the Rust node and the browser SDK
+could silently diverge on the signed wire, so a transaction would verify in one
+language and fail in the other. The default-lane divergence would have made the
+browser SDK reject the most common (default-lane) transaction; freezing the
+vector is what exposed it. The transaction ID is a domain-separated hash over the
+complete JSON and the signature covers the canonical signing bytes, so freezing
+those two values cryptographically freezes the whole wire.
+
+Reused: existing `webc_chain::transaction_v5`, `webc-crypto` Ed25519
+(deterministic per RFC 8032), the shared canonical JSON encoder, and the browser
+`canonical`/`transaction-v5` modules. No new dependency or crypto primitive.
+
+Rejected: choosing a non-default authorization lane for the fixture to dodge the
+TypeScript bug (would hide a real parity defect); freezing only a hash instead of
+the human-readable canonical JSON (less debuggable); re-signing in TypeScript
+(the V4 pattern verifies the Rust signature instead, which also proves byte
+parity).
+
+Compatibility: additive and test-only in Rust; no protocol-version bump.
+`CURRENT_PROTOCOL_VERSION` stays 1 and every V4 vector is byte-unchanged. The
+TypeScript change only widens acceptance to match Rust; it rejects nothing Rust
+accepts.
+
+Proof: `cargo fmt --check`, `cargo clippy -p webc-chain --all-targets -- -D
+warnings`, `cargo test -p webc-chain` (185 passed), and `pnpm check` (84 webc-js
++ 3 webc-widget tests, builds, and documentation links) all passed on 2026-07-18.
+
+Review status: accepted implementation direction; the frozen vectors are
+consensus-critical and immutable without a coordinated protocol-version bump.
+
+Known follow-up (same class, not yet exercised): TypeScript `validateSponsorGrant`
+still requires a non-zero `payer_lane`, while Rust imposes no such bound and a
+sponsor paying from its own default lane is legitimate. No current caller
+exercises a zero payer lane, so this is recorded here to be fixed with a test
+when the sponsor lifecycle lands rather than changed without coverage now.
+
 ## Goal progress checkpoint
 
 Implementation checkpoint on 2026-07-18: the isolated branch contains code
@@ -475,6 +526,33 @@ Exact continuation sequence:
 
 No owner decision is pending for these steps. Technical choices remain delegated
 and must be recorded in this decision log or a superseding ADR rather than chat.
+
+### Resumed milestone (2026-07-18): frozen V5 cross-language vectors
+
+The owner resumed the goal on the same `codex/transaction-system` branch.
+Completed continuation step 2: the immutable Rust/TypeScript V5 canonical
+signing-bytes, deterministic signature, complete JSON, transaction ID,
+action-program digest, fee-bid digest, and scoped-sponsor grant/use vectors are
+frozen and pass in both languages, and the browser SDK's default-lane parity bug
+is fixed (see the 2026-07-18 decision-log entry above). The focused gate passed:
+`cargo fmt --check`, `cargo clippy -p webc-chain --all-targets -- -D warnings`,
+`cargo test -p webc-chain` (185 passed), and `pnpm check` (84 webc-js + 3
+webc-widget tests, builds, and documentation links).
+
+Still not implemented and still material: the typed receipt/event/index wrapper
+and leaf-hashing modules; the reusable action executor and the two-level
+(parent fee/nonce/sponsor plus child action/event) V5 execution overlay with
+success, chargeable-failure, rollback, cancel, and sponsor replay/budget/
+revocation coverage; storage schema 2 and its resumable migration; the V5
+mempool/runtime/V2 HTTP/WebSocket consumers; finalized checkpoint proofs and the
+browser verifier; and the restart, three-validator, fuzz, dependency, and full
+workspace/main integration gates. The real STARK backend remains correctly
+deferred until Phase 5.5.
+
+Exact next item: add the focused V1 receipt/event/index wrapper and leaf-hashing
+modules in `webc-chain` (continuation step 3) — fee reconciliation, position/ID
+binding, the failed-event prohibition, equal transaction/receipt counts, and
+frozen Rust/TypeScript vectors — before any node lifecycle consumer.
 
 ## Partial blockers and owner-reserved decisions
 
