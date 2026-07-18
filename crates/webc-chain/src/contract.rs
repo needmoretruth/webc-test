@@ -528,6 +528,21 @@ pub enum ContractError {
     /// A checked arithmetic operation inside the handler overflowed.
     #[error("contract arithmetic overflowed")]
     ArithmeticOverflow,
+    /// A WASM contract trapped or faulted at run time — an `unreachable`, a
+    /// divide-by-zero, an out-of-bounds guest memory access, a missing required
+    /// export, or an explicit guest abort. Deliberately carries no engine text so
+    /// the resulting receipt error stays byte-identical across nodes (consensus
+    /// determinism); the distinct cause is legible only in the typed variant.
+    #[error("wasm contract trapped during execution")]
+    WasmTrap,
+    /// A stored WASM module failed the deterministic-engine validator at
+    /// invocation (a forbidden feature or malformed bytes). Registration already
+    /// rejects such modules, so this is a defensive fail-closed path.
+    #[error("wasm contract module is invalid")]
+    WasmInvalidModule,
+    /// A WASM contract submitted more output than the per-invocation cap allows.
+    #[error("wasm contract output exceeds the maximum size")]
+    WasmOutputTooLarge,
 }
 
 impl From<ContractError> for ChainError {
@@ -540,6 +555,9 @@ impl From<ContractError> for ChainError {
             }
             ContractError::InvalidInput => ChainError::ContractInvalidInput,
             ContractError::ArithmeticOverflow => ChainError::ArithmeticOverflow,
+            ContractError::WasmTrap => ChainError::ContractWasmTrap,
+            ContractError::WasmInvalidModule => ChainError::ContractWasmInvalidModule,
+            ContractError::WasmOutputTooLarge => ChainError::ContractWasmOutputTooLarge,
         }
     }
 }

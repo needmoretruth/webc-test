@@ -39,6 +39,7 @@ pub mod state_key;
 pub mod token;
 pub mod transaction;
 pub mod unbonding;
+pub mod wasm_contract;
 
 pub use account::Account;
 pub use amount::{Amount, GENESIS_TOTAL_SUPPLY, WEBC_DECIMALS, WEBC_UNIT};
@@ -144,6 +145,11 @@ pub use transaction::{AccessList, FeeBid, Operation, Transaction};
 pub use unbonding::{
     CoolingTranche, UnbondingKind, UnbondingQueue, UnbondingRequest, UnbondingRequestId,
     UnbondingSlashOutcome, UnbondingStatus, UnbondingTransition,
+};
+pub use wasm_contract::{
+    wasm_vm_limits, WasmBytecode, WasmContract, WasmContractManifest, MAX_WASM_MODULE_BYTES,
+    WASM_CODE_LEAF_DOMAIN, WASM_CONTRACT_ABI_VERSION, WASM_CONTRACT_LEAF_DOMAIN,
+    WASM_GAS_SCHEDULE_VERSION,
 };
 
 /// Stable cross-language domain tag embedded in every signing payload.
@@ -536,6 +542,18 @@ pub enum ChainError {
     ContractStateValueTooLarge { actual: usize, maximum: usize },
     #[error("contract input is malformed")]
     ContractInvalidInput,
+    #[error("wasm contract module failed validation (a forbidden feature or malformed bytes)")]
+    InvalidWasmModule,
+    #[error("wasm contract module is {actual} bytes, above the maximum of {maximum}")]
+    WasmModuleTooLarge { actual: usize, maximum: usize },
+    #[error("wasm contract manifest code hash does not match the uploaded bytecode")]
+    WasmCodeHashMismatch,
+    #[error("wasm contract trapped during execution")]
+    ContractWasmTrap,
+    #[error("wasm contract module is invalid")]
+    ContractWasmInvalidModule,
+    #[error("wasm contract output exceeds the maximum size")]
+    ContractWasmOutputTooLarge,
     #[error("object already exists")]
     ObjectAlreadyExists,
     #[error("object was not found")]

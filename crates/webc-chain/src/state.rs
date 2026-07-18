@@ -14,9 +14,9 @@ use crate::authorization_policy::{
 };
 use crate::bridge::{AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain};
 use crate::contract::{
-    builtin_contract, BuiltinContract, ContractContext, ContractManifest, ContractRuntimeConfig,
-    ContractStateValue, GasMeter, CONTRACT_LEAF_DOMAIN, CONTRACT_STATE_LEAF_DOMAIN,
-    MAX_CONTRACT_INPUT_BYTES,
+    builtin_contract, BuiltinContract, Contract, ContractContext, ContractManifest,
+    ContractRuntimeConfig, ContractStateValue, GasMeter, CONTRACT_LEAF_DOMAIN,
+    CONTRACT_STATE_LEAF_DOMAIN, MAX_CONTRACT_INPUT_BYTES,
 };
 use crate::dex::{
     prorata_fills, uniform_clearing_price, DexConfig, Order, OrderId, OrderSide, Price,
@@ -65,6 +65,10 @@ use crate::token::{
 };
 use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
+use crate::wasm_contract::{
+    WasmBytecode, WasmContract, WasmContractManifest, WASM_CODE_LEAF_DOMAIN,
+    WASM_CONTRACT_LEAF_DOMAIN,
+};
 use crate::{
     Amount, AuthorizationLaneId, BootstrapIssuance, ChainError, ChainId, Epoch,
     InactivityLeakConfig, InflationSchedule, ObjectId, ObjectVersion, ProtocolStateKey,
@@ -425,6 +429,35 @@ pub enum Event {
         /// per-host-op consumption), within the sender's authorized `gas_limit`.
         gas_consumed: u64,
         /// Length in bytes of the handler's returned output.
+        output_len: u64,
+    },
+    /// A deployer-supplied WASM contract was registered (Phase 7b, ADR-0014 (a)).
+    WasmContractRegistered {
+        /// Registered contract identity (the manifest / module key).
+        code_id: Hash256,
+        /// Application namespace the contract's state is isolated under.
+        namespace: Hash256,
+        /// Account that registered and owns the contract.
+        owner: Address,
+        /// Content hash binding the manifest to the uploaded module bytes.
+        code_hash: Hash256,
+        /// Size in bytes of the uploaded module.
+        code_len: u64,
+        /// Registration fee burned from the owner's liquid balance.
+        fee_burned: Amount,
+    },
+    /// A registered WASM contract's module was invoked (Phase 7b, ADR-0014 (a)).
+    WasmContractInvoked {
+        /// Registered contract identity that ran.
+        code_id: Hash256,
+        /// Application namespace whose state the call touched.
+        namespace: Hash256,
+        /// Account that invoked the contract.
+        caller: Address,
+        /// Total execution units the call consumed (admission plus metered compute
+        /// and per-host-op consumption), within the sender's authorized `gas_limit`.
+        gas_consumed: u64,
+        /// Length in bytes of the module's returned output.
         output_len: u64,
     },
     ValidatorRegistered {
@@ -1253,6 +1286,31 @@ pub struct ChainState {
     /// deterministic in the hashed/consensus path.
     #[serde(default)]
     pub contract_state: BTreeMap<(Hash256, Hash256), ContractStateValue>,
+    /// WASM contract registry, keyed by `code_id` (Phase 7b, ADR-0014 path (a)).
+    ///
+    /// Each [`WasmContractManifest`] describes one registered deployer-supplied
+    /// WASM contract (identity, namespace, declared footprint, ABI/gas-schedule
+    /// versions, and the code-hash binding to its bytecode). Addressed for declared
+    /// access by `StateKey::module(code_id)` — the SAME reserved keyspace as native
+    /// contracts, so a `code_id` is unique across both paths. Committed by the state
+    /// root through a dedicated Merkle sub-root (`WASM_CONTRACT_LEAF_DOMAIN`), so
+    /// registering a wasm contract changes the state root. Its application state
+    /// shares the `contract_state` map above (namespaces are collision-resistant, so
+    /// the two paths never alias). Holds no native units — the registration fee is
+    /// burned — so it does not enter supply reconciliation. A `BTreeMap` keeps
+    /// iteration deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub wasm_contracts: BTreeMap<Hash256, WasmContractManifest>,
+    /// WASM contract bytecode, keyed by the owning contract's `code_id` (Phase 7b).
+    ///
+    /// Each contract owns its own immutable module bytes under `code_id`, committed
+    /// by the state root through a dedicated Merkle sub-root (`WASM_CODE_LEAF_DOMAIN`)
+    /// so uploading bytecode changes the state root. Bound to its manifest by
+    /// `manifest.code_hash`. Holds only opaque module bytes, never native units, so
+    /// it does not enter supply reconciliation. A `BTreeMap` keeps iteration
+    /// deterministic in the hashed/consensus path.
+    #[serde(default)]
+    pub wasm_code: BTreeMap<Hash256, WasmBytecode>,
     /// Localized (per-application-namespace) base-fee state (Phase 6, §8 isolation).
     ///
     /// Maps a currently-congested application namespace to its [`NamespaceFeeState`]
@@ -1469,6 +1527,8 @@ impl Default for ChainState {
             governance_treasury: Amount::ZERO,
             contracts: BTreeMap::new(),
             contract_state: BTreeMap::new(),
+            wasm_contracts: BTreeMap::new(),
+            wasm_code: BTreeMap::new(),
             namespace_fees: BTreeMap::new(),
             validator_fee_pool: Amount::ZERO,
             minted_supply: Amount::ZERO,
@@ -1480,6 +1540,29 @@ impl Default for ChainState {
             last_block_timestamp_ms: 0,
         }
     }
+}
+
+/// The resolved specification of one contract invocation handed to
+/// [`ChainState::run_contract_call`].
+///
+/// Groups the per-call parameters the native and wasm invoke paths each compute,
+/// so the shared execution core takes one named descriptor instead of a long,
+/// error-prone positional argument list. Everything here is borrowed for the
+/// duration of the single call.
+struct ContractCall<'a> {
+    /// Application namespace the call's state lives under.
+    namespace: Hash256,
+    /// The contract's declared footprint keys (equal to the committed manifest's).
+    footprint: &'a [Hash256],
+    /// The resolved handler — an audited built-in, or a [`WasmContract`] over
+    /// uploaded bytecode. The core is engine-agnostic; it only calls `Contract`.
+    handler: &'a dyn Contract,
+    /// Bounded opaque input forwarded verbatim to the handler.
+    input: &'a [u8],
+    /// Admission units already priced into the fee, seeding the gas meter.
+    admission_units: u64,
+    /// The sender's authorized gas cap for the whole call.
+    gas_limit: u64,
 }
 
 impl ChainState {
@@ -2238,6 +2321,8 @@ impl ChainState {
             governance_vote_root: Hash256,
             contract_root: Hash256,
             contract_state_root: Hash256,
+            wasm_contract_root: Hash256,
+            wasm_code_root: Hash256,
             namespace_fee_root: Hash256,
             burned_fees: Amount,
             slashed_units: Amount,
@@ -2371,7 +2456,17 @@ impl ChainState {
             // (mirroring how `storage_deposits` pairs with the object sub-root). V8
             // added the `storage_deposits` scalar (§15.22); V7 added
             // `last_block_timestamp_ms` (finding E2).
-            domain: "WEBC_STATE_COMMITMENT_V19",
+            // V20 adds the untrusted-bytecode WASM contract runtime (Phase 7b,
+            // ADR-0014 path (a)): the `wasm_contract_root` sub-root commits every
+            // registered wasm manifest (identity, namespace, footprint, versions,
+            // code-hash binding) and the `wasm_code_root` sub-root commits every
+            // uploaded module's bytes, so a wasm registration always changes the
+            // state root; a wasm contract's state writes reuse the existing
+            // `contract_state_root`. It adds no new scalar and locks no native units
+            // (the registration fee is burned into the existing `burned_fees`
+            // scalar). The domain bump is a deliberate consensus-format change; no
+            // external fixture pins a prior root.
+            domain: "WEBC_STATE_COMMITMENT_V20",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -2501,6 +2596,16 @@ impl ChainState {
                 CONTRACT_STATE_LEAF_DOMAIN,
                 self.contract_state.iter(),
             )?,
+            // WASM contract runtime committed by its own ordered sub-roots (Phase 7b,
+            // ADR-0014 path (a)): registering a wasm contract changes both
+            // `wasm_contract_root` (the manifest) and `wasm_code_root` (its bytecode);
+            // any wasm contract state write changes `contract_state_root` (shared with
+            // the native path); any of them changes the state root.
+            wasm_contract_root: ordered_value_root(
+                WASM_CONTRACT_LEAF_DOMAIN,
+                self.wasm_contracts.iter(),
+            )?,
+            wasm_code_root: ordered_value_root(WASM_CODE_LEAF_DOMAIN, self.wasm_code.iter())?,
             // Localized per-namespace fee state committed by its own ordered sub-root
             // (Phase 6, §8 isolation): a change to any namespace's localized base fee
             // changes this root and therefore the state root.
@@ -2605,6 +2710,72 @@ impl ChainState {
             .iter()
             .map(|(address, account)| Ok((*address, Self::account_leaf_hash(*address, account)?)))
             .collect()
+    }
+
+    /// Runs a resolved contract handler over its declared footprint under the
+    /// shared contract-call discipline, and returns `(output, gas_consumed)`.
+    ///
+    /// This is the single execution core the native ([`Operation::InvokeContract`])
+    /// and wasm ([`Operation::InvokeWasmContract`]) paths both go through, so both
+    /// enforce byte-for-byte the same rules: a fresh [`GasMeter`] seeded with the
+    /// admission units and capped at the gas limit; the contract's whole declared
+    /// footprint loaded into a working set (every footprint key recorded through the
+    /// shared `access` recorder by [`ContractContext`], so an omitted or padded
+    /// access list fails closed); the handler run over only that footprint; and its
+    /// declared writes committed back to `contract_state`. Any handler error
+    /// (`OutOfGas`, an undeclared access, a guest trap) propagates as a
+    /// [`ChainError`] and rolls the whole transaction back atomically — no partial
+    /// contract state survives — because the caller applies this to a cloned overlay.
+    ///
+    /// The paths differ ONLY in how the caller resolves the handler (an audited
+    /// built-in vs. a [`WasmContract`] over uploaded bytecode); everything about
+    /// metering, access enforcement, and rollback lives here, once.
+    fn run_contract_call(
+        &mut self,
+        call: ContractCall<'_>,
+        access: &mut StateAccessRecorder,
+    ) -> Result<(Vec<u8>, u64), ChainError> {
+        let ContractCall {
+            namespace,
+            footprint,
+            handler,
+            input,
+            admission_units,
+            gas_limit,
+        } = call;
+        let mut meter = GasMeter::new(gas_limit, admission_units)?;
+        let mut working = BTreeMap::new();
+        for key_hash in footprint {
+            let current = self
+                .contract_state
+                .get(&(namespace, *key_hash))
+                .map(|value| value.0.clone());
+            working.insert(*key_hash, current);
+        }
+        let mut ctx = ContractContext::new(
+            namespace,
+            footprint,
+            working,
+            access,
+            &mut meter,
+            self.current_epoch,
+        );
+        let output = handler.call(&mut ctx, input)?;
+        let writes = ctx.into_writes()?;
+        let gas_consumed = meter.consumed();
+        // Commit the contract's declared writes back to committed state.
+        for (key_hash, value) in writes {
+            let key = (namespace, key_hash);
+            match value {
+                Some(bytes) => {
+                    self.contract_state.insert(key, ContractStateValue(bytes));
+                }
+                None => {
+                    self.contract_state.remove(&key);
+                }
+            }
+        }
+        Ok((output, gas_consumed))
     }
 
     fn apply_verified_transaction(
@@ -5744,48 +5915,120 @@ impl ChainState {
                 if declared_keys.as_slice() != manifest.footprint.as_slice() {
                     return Err(ChainError::ContractFootprintMismatch);
                 }
-                // Seed the meter with the admission cost already priced into the fee
-                // (`units`), and cap it at the sender's authorized `gas_limit`; the
-                // handler's per-host-op consumption is metered on top and hard-stops
-                // on over-gas (fail-closed atomic rollback of the whole transaction).
-                let mut meter = GasMeter::new(tx.fee.gas_limit, units)?;
-                // Load the contract's whole declared footprint from committed state
-                // into a working set. Every footprint key is recorded/enforced
-                // through the shared recorder by `ContractContext`, so an omitted or
-                // padded access list fails closed exactly like a native op.
-                let mut working = BTreeMap::new();
-                for key_hash in &manifest.footprint {
-                    let current = self
-                        .contract_state
-                        .get(&(manifest.namespace, *key_hash))
-                        .map(|value| value.0.clone());
-                    working.insert(*key_hash, current);
-                }
-                let mut ctx = ContractContext::new(
-                    manifest.namespace,
-                    &manifest.footprint,
-                    working,
-                    &mut access,
-                    &mut meter,
-                    self.current_epoch,
-                );
+                // Run the audited built-in handler over its declared footprint under
+                // the shared contract-call discipline (fresh gas meter seeded with
+                // the admission `units` and capped at `gas_limit`, working-set load,
+                // atomic write-back). The native and wasm paths differ ONLY in how the
+                // handler is resolved; the metering, access enforcement, and rollback
+                // are identical because both go through `run_contract_call`.
                 let handler = builtin_contract(manifest.builtin);
-                let output = handler.call(&mut ctx, input)?;
-                let writes = ctx.into_writes()?;
-                let gas_consumed = meter.consumed();
-                // Commit the contract's declared writes back to committed state.
-                for (key_hash, value) in writes {
-                    let key = (manifest.namespace, key_hash);
-                    match value {
-                        Some(bytes) => {
-                            self.contract_state.insert(key, ContractStateValue(bytes));
-                        }
-                        None => {
-                            self.contract_state.remove(&key);
-                        }
-                    }
-                }
+                let (output, gas_consumed) = self.run_contract_call(
+                    ContractCall {
+                        namespace: manifest.namespace,
+                        footprint: &manifest.footprint,
+                        handler,
+                        input,
+                        admission_units: units,
+                        gas_limit: tx.fee.gas_limit,
+                    },
+                    &mut access,
+                )?;
                 events.push(Event::ContractInvoked {
+                    code_id: *code_id,
+                    namespace: *namespace,
+                    caller: tx.sender,
+                    gas_consumed,
+                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
+                });
+            }
+            Operation::RegisterWasmContract { manifest, code } => {
+                // Default lane only, like the native registration: the fee draws from
+                // and burns liquid (supply-neutral). The manifest and its bytecode are
+                // committed under the reserved module key.
+                if !tx.authorization_lane.is_default() {
+                    return Err(ChainError::ContractRequiresDefaultLane);
+                }
+                access.write(StateKey::account(tx.sender))?;
+                access.write(StateKey::module(manifest.code_id))?;
+                // Validate the hostile manifest AND its module bytes (size cap,
+                // code-hash binding, deterministic-engine acceptance) before touching
+                // supply or state — an invalid module is never stored.
+                manifest.validate(tx.sender, code)?;
+                // A `code_id` is unique across BOTH contract paths, since both address
+                // their record by `StateKey::module(code_id)`.
+                if self.contracts.contains_key(&manifest.code_id)
+                    || self.wasm_contracts.contains_key(&manifest.code_id)
+                {
+                    return Err(ChainError::ContractAlreadyExists);
+                }
+                let fee = config.contracts.registration_fee;
+                self.debit_native(tx.sender, fee)?;
+                self.burned_fees = self
+                    .burned_fees
+                    .checked_add(fee)
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+                self.wasm_contracts
+                    .insert(manifest.code_id, manifest.clone());
+                self.wasm_code.insert(manifest.code_id, code.clone());
+                events.push(Event::WasmContractRegistered {
+                    code_id: manifest.code_id,
+                    namespace: manifest.namespace,
+                    owner: tx.sender,
+                    code_hash: manifest.code_hash,
+                    code_len: u64::try_from(code.len()).unwrap_or(u64::MAX),
+                    fee_burned: fee,
+                });
+            }
+            Operation::InvokeWasmContract {
+                code_id,
+                namespace,
+                declared_keys,
+                input,
+            } => {
+                // Bound the hostile input before any work.
+                if input.len() > MAX_CONTRACT_INPUT_BYTES {
+                    return Err(ChainError::ContractInputTooLarge {
+                        actual: input.len(),
+                        maximum: MAX_CONTRACT_INPUT_BYTES,
+                    });
+                }
+                // Resolve the manifest through the declared (read-only) module key.
+                access.read(StateKey::module(*code_id))?;
+                let manifest = self
+                    .wasm_contracts
+                    .get(code_id)
+                    .ok_or(ChainError::ContractNotFound)?
+                    .clone();
+                // Bind the signed operation to the committed manifest (identical
+                // discipline to the native invoke): a call cannot under- or
+                // mis-declare what it touches.
+                if *namespace != manifest.namespace {
+                    return Err(ChainError::ContractNamespaceMismatch);
+                }
+                if declared_keys.as_slice() != manifest.footprint.as_slice() {
+                    return Err(ChainError::ContractFootprintMismatch);
+                }
+                // Load the immutable module bytes (committed under the same module
+                // key) and run them on the deterministic engine through the SAME
+                // shared discipline as the native path.
+                let code = self
+                    .wasm_code
+                    .get(code_id)
+                    .ok_or(ChainError::ContractNotFound)?
+                    .clone();
+                let handler = WasmContract::new(&code.0);
+                let (output, gas_consumed) = self.run_contract_call(
+                    ContractCall {
+                        namespace: manifest.namespace,
+                        footprint: &manifest.footprint,
+                        handler: &handler,
+                        input,
+                        admission_units: units,
+                        gas_limit: tx.fee.gas_limit,
+                    },
+                    &mut access,
+                )?;
+                events.push(Event::WasmContractInvoked {
                     code_id: *code_id,
                     namespace: *namespace,
                     caller: tx.sender,
@@ -15990,6 +16233,404 @@ mod tests {
             build(),
             build(),
             "identical inputs produce an identical root"
+        );
+    }
+
+    // ----- untrusted-bytecode WASM contract runtime (Phase 7b, ADR-0014 (a)) -----
+    //
+    // These tests drive REAL WebAssembly modules (compiled from WAT at test time)
+    // end-to-end through register -> invoke on the deterministic engine, proving the
+    // whole stack: input delivery, host state get/set over the declared footprint,
+    // gas metering against the sender's limit, atomic rollback, state-root
+    // commitment, and cross-node determinism.
+
+    /// The 32-byte declared key both WASM fixtures operate on, as WAT `\xx` data
+    /// escapes for a `(data ...)` segment.
+    fn wasm_key() -> Hash256 {
+        Hash256([0xa1; 32])
+    }
+
+    fn wasm_key_escapes(k: Hash256) -> String {
+        k.0.iter().map(|b| format!("\\{b:02x}")).collect()
+    }
+
+    /// A real WASM contract: copies the call `input` into the declared key and
+    /// echoes it back. Exercises `webc_input_read`, `webc_set`, `webc_output`.
+    fn store_and_echo_module() -> WasmBytecode {
+        let wat = format!(
+            r#"(module
+              (import "webc" "webc_input_len" (func $input_len (result i32)))
+              (import "webc" "webc_input_read" (func $input_read (param i32)))
+              (import "webc" "webc_set" (func $set (param i32 i32 i32 i32) (result i32)))
+              (import "webc" "webc_output" (func $output (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "{key}")
+              (func (export "webc_call")
+                (local $len i32)
+                (local.set $len (call $input_len))
+                (call $input_read (i32.const 64))
+                (drop (call $set (i32.const 0) (i32.const 32) (i32.const 64) (local.get $len)))
+                (call $output (i32.const 64) (local.get $len))))"#,
+            key = wasm_key_escapes(wasm_key())
+        );
+        WasmBytecode(wat::parse_str(&wat).expect("valid store/echo WAT"))
+    }
+
+    /// A real, STATEFUL WASM contract: an 8-byte little-endian counter persisted in
+    /// the declared key, incremented by one each call. Exercises `webc_get`
+    /// (including the absent `-1` path), integer arithmetic, `webc_set`, and
+    /// persistence across separate transactions.
+    fn counter_module() -> WasmBytecode {
+        let wat = format!(
+            r#"(module
+              (import "webc" "webc_get" (func $get (param i32 i32 i32 i32) (result i32)))
+              (import "webc" "webc_set" (func $set (param i32 i32 i32 i32) (result i32)))
+              (import "webc" "webc_output" (func $output (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "{key}")
+              (func (export "webc_call")
+                (local $rc i32)
+                (local.set $rc
+                  (call $get (i32.const 0) (i32.const 32) (i32.const 64) (i32.const 8)))
+                (if (i32.eq (local.get $rc) (i32.const -1))
+                  (then (i64.store (i32.const 64) (i64.const 0))))
+                (i64.store (i32.const 64)
+                  (i64.add (i64.load (i32.const 64)) (i64.const 1)))
+                (drop (call $set (i32.const 0) (i32.const 32) (i32.const 64) (i32.const 8)))
+                (call $output (i32.const 64) (i32.const 8))))"#,
+            key = wasm_key_escapes(wasm_key())
+        );
+        WasmBytecode(wat::parse_str(&wat).expect("valid counter WAT"))
+    }
+
+    fn wasm_manifest(
+        code_id: Hash256,
+        namespace: Hash256,
+        owner: Address,
+        code: &WasmBytecode,
+    ) -> WasmContractManifest {
+        WasmContractManifest::new(code_id, namespace, code.code_hash(), [wasm_key()], owner)
+    }
+
+    fn register_wasm(
+        state: &mut ChainState,
+        config: &ChainConfig,
+        keypair: &Keypair,
+        nonce: u64,
+        manifest: WasmContractManifest,
+        code: WasmBytecode,
+    ) -> Result<Receipt, ChainError> {
+        let tx = Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::RegisterWasmContract { manifest, code },
+            FeeBid {
+                gas_limit: 500_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("register-wasm tx signs");
+        state.execute_transaction(&tx, config)
+    }
+
+    fn invoke_wasm_tx(
+        keypair: &Keypair,
+        nonce: u64,
+        manifest: &WasmContractManifest,
+        input: Vec<u8>,
+        gas_limit: u64,
+    ) -> Transaction {
+        Transaction::for_operation(
+            keypair,
+            nonce,
+            Operation::InvokeWasmContract {
+                code_id: manifest.code_id,
+                namespace: manifest.namespace,
+                declared_keys: manifest.footprint.clone(),
+                input,
+            },
+            FeeBid {
+                gas_limit,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("invoke-wasm tx signs")
+    }
+
+    #[test]
+    fn register_wasm_contract_charges_fee_and_rejects_duplicate() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let code = store_and_echo_module();
+        let manifest = wasm_manifest(code_id, namespace, alice.address(), &code);
+        let burned_before = state.burned_fees.0;
+
+        register_wasm(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            manifest.clone(),
+            code.clone(),
+        )
+        .expect("register wasm");
+        assert_eq!(state.wasm_contracts.get(&code_id), Some(&manifest));
+        assert_eq!(state.wasm_code.get(&code_id), Some(&code));
+        // The registration fee (plus half the tx fee) was burned.
+        assert!(state.burned_fees.0 >= burned_before + config.contracts.registration_fee.0);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        // A duplicate code id is rejected and leaves state unchanged.
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_wasm(&mut state, &config, &alice, 1, manifest, code),
+            Err(ChainError::ContractAlreadyExists)
+        ));
+        assert_eq!(state, snapshot, "rejected duplicate leaves state unchanged");
+    }
+
+    #[test]
+    fn register_wasm_and_native_share_one_code_id_namespace() {
+        // Native and wasm contracts address their record by the SAME
+        // StateKey::module(code_id), so a code_id must be unique across both paths.
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let code = store_and_echo_module();
+
+        // Register a native contract first, then a wasm contract reusing its id.
+        register_kv(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            kv_manifest(code_id, namespace, alice.address()),
+        )
+        .expect("register native");
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_wasm(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                wasm_manifest(code_id, namespace, alice.address(), &code),
+                code.clone(),
+            ),
+            Err(ChainError::ContractAlreadyExists)
+        ));
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn register_wasm_contract_rejects_bad_manifest_and_module() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let code = store_and_echo_module();
+
+        // A module the deterministic engine refuses (not wasm at all).
+        let garbage = WasmBytecode(vec![1, 2, 3, 4, 5]);
+        let garbage_manifest = wasm_manifest(code_id, namespace, alice.address(), &garbage);
+        assert!(matches!(
+            register_wasm(&mut state, &config, &alice, 0, garbage_manifest, garbage),
+            Err(ChainError::InvalidWasmModule)
+        ));
+
+        // A manifest whose code_hash does not match the uploaded bytes.
+        let mut mismatched = wasm_manifest(code_id, namespace, alice.address(), &code);
+        mismatched.code_hash = Hash256([0xff; 32]);
+        assert!(matches!(
+            register_wasm(&mut state, &config, &alice, 0, mismatched, code.clone()),
+            Err(ChainError::WasmCodeHashMismatch)
+        ));
+
+        // A manifest whose owner is not the registrant.
+        let bob = Keypair::from_seed([2u8; 32]);
+        let wrong_owner = wasm_manifest(code_id, namespace, bob.address(), &code);
+        assert!(matches!(
+            register_wasm(&mut state, &config, &alice, 0, wrong_owner, code),
+            Err(ChainError::InvalidContractManifest)
+        ));
+        // Every rejection left the registry empty.
+        assert!(state.wasm_contracts.is_empty());
+        assert!(state.wasm_code.is_empty());
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn invoke_wasm_contract_runs_module_and_commits_state() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let code = store_and_echo_module();
+        let manifest = wasm_manifest(code_id, namespace, alice.address(), &code);
+        register_wasm(&mut state, &config, &alice, 0, manifest.clone(), code).expect("register");
+
+        let tx = invoke_wasm_tx(&alice, 1, &manifest, b"hello wasm".to_vec(), 10_000_000);
+        let receipt = state
+            .execute_transaction(&tx, &config)
+            .expect("invoke wasm");
+
+        // The module stored its input under the declared key.
+        assert_eq!(
+            state.contract_state.get(&(namespace, wasm_key())),
+            Some(&ContractStateValue(b"hello wasm".to_vec()))
+        );
+        // A WasmContractInvoked event reports the echoed output length and real gas.
+        let invoked = receipt
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::WasmContractInvoked {
+                    code_id: c,
+                    gas_consumed,
+                    output_len,
+                    ..
+                } if *c == code_id => Some((*gas_consumed, *output_len)),
+                _ => None,
+            })
+            .expect("WasmContractInvoked event");
+        assert_eq!(invoked.1, 10, "echoed output is the 10-byte input");
+        assert!(invoked.0 > 0, "the call metered real gas");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn invoke_wasm_counter_accumulates_state_across_calls() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc7; 32]);
+        let namespace = Hash256([0x33; 32]);
+        let code = counter_module();
+        let manifest = wasm_manifest(code_id, namespace, alice.address(), &code);
+        register_wasm(&mut state, &config, &alice, 0, manifest.clone(), code).expect("register");
+
+        // Three calls increment a persistent little-endian u64 counter 1 -> 2 -> 3.
+        for (nonce, expected) in [(1u64, 1u64), (2, 2), (3, 3)] {
+            let tx = invoke_wasm_tx(&alice, nonce, &manifest, Vec::new(), 10_000_000);
+            state
+                .execute_transaction(&tx, &config)
+                .expect("invoke counter");
+            assert_eq!(
+                state.contract_state.get(&(namespace, wasm_key())),
+                Some(&ContractStateValue(expected.to_le_bytes().to_vec())),
+                "counter persisted across calls"
+            );
+        }
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn invoke_wasm_contract_over_gas_rolls_back_atomically() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let code = store_and_echo_module();
+        let manifest = wasm_manifest(code_id, namespace, alice.address(), &code);
+        register_wasm(&mut state, &config, &alice, 0, manifest.clone(), code).expect("register");
+        let snapshot = state.clone();
+
+        // A gas limit just above the admission cost cannot cover the module's
+        // metered compute + state write, so the call fails closed and the whole
+        // transaction (including its fee) rolls back — state is unchanged.
+        let op = Operation::InvokeWasmContract {
+            code_id,
+            namespace,
+            declared_keys: manifest.footprint.clone(),
+            input: b"data".to_vec(),
+        };
+        let admission = op.required_units();
+        let tx = invoke_wasm_tx(&alice, 1, &manifest, b"data".to_vec(), admission + 100);
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractOutOfGas)
+        ));
+        assert_eq!(state, snapshot, "over-gas wasm call leaves state unchanged");
+        assert!(state.supply_invariant_report().unwrap().balanced);
+    }
+
+    #[test]
+    fn invoke_wasm_contract_fails_closed_on_undeclared_key() {
+        // The module hard-codes a write to wasm_key(); declaring a DIFFERENT
+        // footprint makes that write undeclared, so the ContractContext rejects it
+        // and the whole transaction rolls back atomically.
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let code = store_and_echo_module();
+        let manifest = WasmContractManifest::new(
+            code_id,
+            namespace,
+            code.code_hash(),
+            [Hash256([0xb2; 32])],
+            alice.address(),
+        );
+        register_wasm(&mut state, &config, &alice, 0, manifest.clone(), code).expect("register");
+        let snapshot = state.clone();
+
+        let tx = invoke_wasm_tx(&alice, 1, &manifest, b"x".to_vec(), 10_000_000);
+        assert!(matches!(
+            state.execute_transaction(&tx, &config),
+            Err(ChainError::ContractUndeclaredKey)
+        ));
+        assert_eq!(
+            state, snapshot,
+            "undeclared wasm access leaves state unchanged"
+        );
+    }
+
+    #[test]
+    fn wasm_registry_is_committed_by_the_state_root() {
+        // The wasm registry and bytecode maps are committed consensus fields (via the
+        // wasm_contract_root / wasm_code_root sub-roots), so registering a wasm
+        // contract must change the state root.
+        let (config, mut state, alice, ..) = contract_fixture();
+        let root_before = state.state_root().unwrap();
+        let code_id = Hash256([0xc0; 32]);
+        let namespace = Hash256([0x11; 32]);
+        let code = store_and_echo_module();
+        let manifest = wasm_manifest(code_id, namespace, alice.address(), &code);
+        register_wasm(&mut state, &config, &alice, 0, manifest, code).expect("register");
+        assert_ne!(
+            state.state_root().unwrap(),
+            root_before,
+            "registering a wasm contract must change the state root"
+        );
+
+        // A bincode restart preserves the wasm registry, bytecode, and root.
+        let restored = bincode_restart(&state);
+        assert_eq!(restored.wasm_contracts, state.wasm_contracts);
+        assert_eq!(restored.wasm_code, state.wasm_code);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("root"),
+            "the wasm registry and bytecode are committed across a restart"
+        );
+    }
+
+    #[test]
+    fn wasm_contract_execution_is_deterministic_across_runs() {
+        let build = || {
+            let (config, mut state, alice, ..) = contract_fixture();
+            let code_id = Hash256([0xc7; 32]);
+            let namespace = Hash256([0x33; 32]);
+            let code = counter_module();
+            let manifest = wasm_manifest(code_id, namespace, alice.address(), &code);
+            register_wasm(&mut state, &config, &alice, 0, manifest.clone(), code)
+                .expect("register");
+            for nonce in 1..=3u64 {
+                let tx = invoke_wasm_tx(&alice, nonce, &manifest, Vec::new(), 10_000_000);
+                state.execute_transaction(&tx, &config).expect("invoke");
+            }
+            state.state_root().expect("root")
+        };
+        assert_eq!(
+            build(),
+            build(),
+            "identical wasm inputs produce an identical root across nodes"
         );
     }
 

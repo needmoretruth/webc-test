@@ -1436,7 +1436,9 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "wat",
  "webc-crypto",
+ "webc-vm",
 ]
 
 [[package]]

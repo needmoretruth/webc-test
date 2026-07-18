@@ -11,6 +11,7 @@ use crate::contract::{
 };
 use crate::namespace::namespace_state_key_hash;
 use crate::sponsorship::sponsor_state_key_hash;
+use crate::wasm_contract::{WASM_CODE_BYTE_UNITS, WASM_REGISTER_BASE_UNITS};
 use crate::{
     Amount, AssetId, AuthorizationLaneId, AuthorizationPolicyRevision, BridgeMessage, ChainError,
     ChainId, Epoch, ExternalChain, GovernanceAction, GovernanceConfig, GovernanceInstanceId,
@@ -18,8 +19,8 @@ use crate::{
     ObjectVersion, PostQuantumRoot, PostQuantumRootReveal, ProposalId, ProtocolStateKey,
     ProtocolVersion, ServiceId, ServicePaymentFlags, ServicePrice, ServiceStatus,
     SessionKeyConstraints, SessionKeyId, SlashingEvidence, StateKey, TokenAuthorityKind, TokenId,
-    TokenMetadata, UnbondingRequestId, VoteChoice, CURRENT_PROTOCOL_VERSION,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
+    TokenMetadata, UnbondingRequestId, VoteChoice, WasmBytecode, WasmContractManifest,
+    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION, SIGNING_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -507,6 +508,48 @@ pub enum Operation {
         /// read_write in the access list.
         declared_keys: Vec<Hash256>,
         /// Bounded opaque input forwarded verbatim to the handler.
+        #[serde(with = "crate::hex_bytes")]
+        input: Vec<u8>,
+    },
+    /// Registers a deployer-supplied WASM contract, uploading and validating its
+    /// bytecode for a flat, burned fee (Phase 7b, ADR-0014 path (a)).
+    ///
+    /// Commits the signed [`WasmContractManifest`] under `StateKey::module(code_id)`
+    /// together with its [`WasmBytecode`], after checking the manifest, the
+    /// code-hash binding, the size cap, and deterministic-engine acceptance of the
+    /// module. Charges the configured registration fee (burned, supply-neutral).
+    /// Fails if `code_id` is already registered (native OR wasm) or anything is
+    /// malformed. Registers real untrusted bytecode — the engine sandbox and the
+    /// declared-footprint discipline are what bound it. Default lane only.
+    RegisterWasmContract {
+        /// The contract's committed interface record (identity, namespace, declared
+        /// footprint, ABI/gas-schedule versions, and code-hash binding).
+        manifest: WasmContractManifest,
+        /// The WASM module bytes, stored under the same `code_id` and bound to the
+        /// manifest by `manifest.code_hash`.
+        code: WasmBytecode,
+    },
+    /// Invokes a registered WASM contract's module behind the SAME declared-access
+    /// and gas discipline as the native path (Phase 7b, ADR-0014 path (a)).
+    ///
+    /// Looks up the wasm manifest by `code_id`, binds this signed operation to it
+    /// (`namespace` and `declared_keys` must match exactly), meters the call
+    /// against the sender's `gas_limit`, runs the module on the deterministic
+    /// engine over only its declared footprint, and commits its state writes. An
+    /// over-gas call, a guest trap, or an undeclared access rolls the whole
+    /// transaction back atomically.
+    InvokeWasmContract {
+        /// Registered wasm-contract identity (the manifest / `StateKey::module` key).
+        code_id: Hash256,
+        /// Application namespace the contract's state lives under; must equal the
+        /// manifest's `namespace`. Carried in the signed operation so the access
+        /// list is self-contained and the scheduler needs no manifest lookup.
+        namespace: Hash256,
+        /// The application key-hashes this call declares; must equal the manifest
+        /// `footprint`. Each becomes a `StateKey::application(namespace, key_hash)`
+        /// read_write in the access list.
+        declared_keys: Vec<Hash256>,
+        /// Bounded opaque input forwarded verbatim to the module's `webc_call`.
         #[serde(with = "crate::hex_bytes")]
         input: Vec<u8>,
     },
@@ -1170,6 +1213,35 @@ impl Operation {
                     .saturating_add(input_units)
                     .saturating_add(key_units)
             }
+            // Registration additionally validates and stores the uploaded module,
+            // so it is priced by a base plus a per-byte upload term. Saturating
+            // arithmetic keeps this panic-free on hostile lengths; the real size
+            // bound is enforced at execution.
+            Self::RegisterWasmContract { code, .. } => {
+                let code_units = u64::try_from(code.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(WASM_CODE_BYTE_UNITS);
+                WASM_REGISTER_BASE_UNITS.saturating_add(code_units)
+            }
+            // A wasm invocation's admission cost mirrors the native invoke: a base
+            // plus the declared footprint size and input length. Per-host-op and
+            // compute consumption are metered against `gas_limit` at execution and
+            // hard-stop (fail-closed rollback) if exceeded.
+            Self::InvokeWasmContract {
+                input,
+                declared_keys,
+                ..
+            } => {
+                let input_units = u64::try_from(input.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(CONTRACT_INPUT_BYTE_UNITS);
+                let key_units = u64::try_from(declared_keys.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(CONTRACT_DECLARED_KEY_UNITS);
+                CONTRACT_INVOKE_BASE_UNITS
+                    .saturating_add(input_units)
+                    .saturating_add(key_units)
+            }
         }
     }
 
@@ -1502,6 +1574,13 @@ impl Operation {
                 push_unique_key(&mut read_write, StateKey::account(sender));
                 push_unique_key(&mut read_write, StateKey::module(manifest.code_id));
             }
+            Self::RegisterWasmContract { manifest, .. } => {
+                // Identical shape to the native registration: burn the fee and write
+                // the module record. Both the wasm manifest and its bytecode are
+                // committed under this single reserved module key.
+                push_unique_key(&mut read_write, StateKey::account(sender));
+                push_unique_key(&mut read_write, StateKey::module(manifest.code_id));
+            }
             Self::GrantMandate {
                 agent_key,
                 grant_nonce,
@@ -1827,6 +1906,25 @@ impl Operation {
                 // signed access list and the scheduler agree with the manifest.
                 // The example contract moves no native value, so no extra account
                 // key beyond the default-lane fee source is required.
+                push_unique_key(&mut read_only, StateKey::module(*code_id));
+                for key_hash in declared_keys {
+                    push_unique_key(
+                        &mut read_write,
+                        StateKey::application(*namespace, *key_hash),
+                    );
+                }
+            }
+            Self::InvokeWasmContract {
+                code_id,
+                namespace,
+                declared_keys,
+                ..
+            } => {
+                // Same access shape as the native invoke: read the module record to
+                // resolve the contract, and declare its footprint keys read_write so
+                // the signed access list and the scheduler agree with the manifest.
+                // The module bytecode is committed under the same module key and is
+                // immutable, so it needs no separate declared key.
                 push_unique_key(&mut read_only, StateKey::module(*code_id));
                 for key_hash in declared_keys {
                     push_unique_key(
