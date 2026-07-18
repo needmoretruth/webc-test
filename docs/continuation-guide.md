@@ -1,10 +1,12 @@
 # WEBC continuation guide
 
-Last updated: 2026-07-17 (Phases 5–13 complete and integrated into `main`; the
-app-facing surface is complete end-to-end — see "Boundary reached" below — and
-the remaining roadmap is owner-gated). Separately assigned feature goals use
-their own branches and task documents and do not replace this pointer until
-merged.
+Last updated: 2026-07-17 (Phases 5–13 done on `main`; owner direction is now
+"practical L1 완성" — finish all decided non-owner implementation, Weft excluded.
+**START AT the "SESSION HANDOFF" block in the "Exact next work" section below** —
+it has the live state: WASM contract runtime (`webc-vm`) in flight, the Codex
+decision, the swappable-engine design, and the remaining roadmap). Separately
+assigned feature goals use their own branches and do not replace this pointer
+until merged.
 This file is the live pointer to the **exact next task**. Detailed "what the code
 implements" facts live in `implementation-status.md`; do not duplicate them
 here.
@@ -100,20 +102,79 @@ detailed per-phase record is deeper in this file; the current status and the
 owner-gated remainder are in the **"Boundary reached — app-facing surface
 complete; remainder is owner-gated"** section below.
 
-The one actionable autonomous item still open is **node discovery/list endpoints**
-(paginated, DoS-bounded: services by category per agent-commerce §3.3, collection
-items, proposals by status, an address's token balances / mandates). Everything
-past that needs the owner or external resources — do NOT decide those
-autonomously (slashing numbers, weak-subjectivity anchor, WASM engine, bridge
-trust model, mainnet gates, independent audit). A separately assigned
-transaction-system goal runs on its own `codex/transaction-system` branch and is
-not merged here.
+### SESSION HANDOFF (2026-07-17, updated before a context compaction)
 
-NOTE ON THE EPHEMERAL ENVIRONMENT: the container can be reclaimed mid-run, which
-kills in-flight background subagents WITHOUT a completion notification and drops
-any un-pushed worktree. Subagents must commit+push after their first unit of work
-and frequently thereafter; if a subagent runs unusually long with no completion,
-check for a restart (worktree/branch gone) rather than waiting.
+**Owner-set direction: "practical L1 완성" (feature-complete WEBC).** Complete all
+DECIDED, non-owner-gated implementation so only refinement + owner decisions +
+audit remain. **Weft language is EXCLUDED** (later separate project). Work on
+`main` (owner directed). `implementation-status.md` is STALE (predates Phase
+5–13) — trust THIS guide + the code, not that file.
+
+**Landed on `main` since Phase 13 (this session):** node read + discovery/list
+endpoints; the full SDK high-level client layer (Agent-commerce / Governance /
+Token / Nft clients); and the **`webc-proof` crate** (transparent indexed Merkle
+proofs — the **Phase 10** foundation), adopted from the paused
+`codex/transaction-system` branch (commit `b21a525`).
+
+**Codex decision (owner-delegated):** `codex/transaction-system` is PAUSED and
+self-declared incomplete. Adopted ONLY its clean, complete `webc-proof` crate.
+Its centerpiece **V5 transaction wire** was SKIPPED — it is an unintegrated
+parallel foundation (2000+ lines) that would need real completion (not a light
+fix) + conflicts (fees.rs, an ADR-0012 number collision). Owner MAY later ask to
+complete V5 as a formal task; do not merge it wholesale.
+
+**CURRENT IN-FLIGHT — Phase 7b: real WASM contract runtime (the flagship item).**
+Design principle the owner endorsed: **SWAPPABLE / MODULAR ENGINE.** A new
+`webc-vm` crate sits behind a boundary; **`wasmi` (deterministic interpreter)**
+for the prototype, with **`wasmtime` (JIT) swappable later**; the gas model and
+contract ABI stay stable across engines. The production engine choice is
+owner-deferred. (Perf note for the owner: an interpreter does NOT raise user fees
+— fees are protocol gas-metering, independent of node exec speed; swap to a JIT
+later only for heavy-compute throughput.)
+- Built by a subagent on branch **`claude/p7b-webc-vm`** (worktree
+  `/home/user/wt-vm`), pushing per milestone. **ON RESUME: check
+  `git ls-remote origin claude/p7b-webc-vm`**; if it landed, merge + gate
+  (`cargo fmt/clippy/test -p webc-vm` + `cargo build --workspace`) into `main`;
+  if the subagent died (idle-reclaim), salvage the worktree or re-dispatch.
+- The seam it plugs into (already exists in `crates/webc-chain/src/contract.rs`):
+  the `Contract` trait (`fn call(&self, ctx: &mut ContractContext, input) ->
+  Result<Vec<u8>, ContractError>`), `ContractContext` (`epoch()`, footprint-
+  bounded `get()`/`set()`), and `GasMeter` (`charge()`/`consumed()`).
+  `state.rs::Operation::InvokeContract` (~line 5718) ALREADY builds the ctx,
+  meters gas, persists writes, and rolls back atomically (tests cover
+  undeclared-key + over-gas rollback).
+- **WIRING (do this after `webc-vm` merges):** implement the webc-vm `VmHost`
+  trait over `ContractContext`+`GasMeter`; add a `WasmContract` implementing
+  `Contract` via `webc_vm::execute(...)`; add `RegisterWasmContract` (upload +
+  validate bytecode) and a wasm branch in the invoke path (ADDITIVE to
+  transaction.rs/state.rs — Codex is paused, so safe); add a WAT end-to-end test
+  (register + invoke a real module: deterministic, gas-metered, footprint-
+  bounded, atomic rollback). Keep the engine swappable behind the boundary.
+
+**Remaining practical-L1 roadmap after the WASM runtime (value order, all
+additive so Codex-safe):** distribution program (airdrop claim / expiring
+fee-credits / stake-locked vesting) · bridge prototype (provisional trust) ·
+validator operations stack (keystore per ADR-0009 / monitoring `/metrics` /
+Dockerfile) · DEX delegated mechanics (AMM / multi-hop) · flagship demo apps.
+Optional: complete Codex's V5 transaction system as a formal task.
+
+**Owner-deferred — do NOT decide autonomously:** slashing severity numbers +
+inactivity-leak params (ADR-0012), WASM production engine + manifest trust
+(ADR-0014), production bridge trust model, PQ transaction policy, mainnet
+governance emergency powers, fast-path hardware trade-offs. **External:**
+real-hardware benchmarks, independent security audit (Phase 5.5), testnet/mainnet
+launch. Weak-subjectivity anchor (ADR-0011) is already owner-confirmed.
+
+NOTE ON THE EPHEMERAL ENVIRONMENT: the container is reclaimed on idle, which
+SILENTLY kills in-flight background subagents (no completion notification) and
+may drop an un-pushed worktree. Mitigations that WORK: keep the main session
+active with real foreground work while a subagent runs (this reliably keeps the
+container alive); make subagents commit+push after their first unit and often;
+set a `send_later` self-check-in to recover if the container reclaims; salvage
+uncommitted work from the (often-persistent) worktree — that is how
+AgentCommerceClient was recovered. If a subagent runs long with no completion,
+check for a restart (worktree/branch gone, fresh process start-times) rather than
+waiting indefinitely.
 
 ## Completed Phase 4 findings checkpoint (historical)
 
