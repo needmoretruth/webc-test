@@ -15,6 +15,7 @@ export * from "./keystore.js";
 export * from "./node-client.js";
 export * from "./permission-store.js";
 export * from "./protocol-hash.js";
+export * from "./receipt-v1.js";
 export * from "./session-key.js";
 export * from "./transaction.js";
 export * from "./transaction-v5.js";

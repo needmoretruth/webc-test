@@ -19,6 +19,7 @@ pub mod hex_bytes;
 pub mod inflation;
 pub mod object;
 pub mod protocol;
+pub mod receipt_v1;
 pub mod round;
 pub mod scheduler;
 pub mod session_key;
@@ -64,6 +65,12 @@ pub use object::{ObjectId, ObjectOwner, ObjectVersion, StateObject, MAX_OBJECT_D
 pub use protocol::{
     AuthorizationLaneId, BaseUnits, BlockHeight, ChainId, ChainIdError, Epoch, Nonce,
     ProtocolVersion, ValidatorId, CURRENT_PROTOCOL_VERSION,
+};
+pub use receipt_v1::{
+    receipt_root_v1, transaction_leaf_v1, transaction_root_v1, verify_transaction_receipt_binding,
+    ActionIndex, BlockPositionV1, EventIndex, EventV1, ExecutionFailureCodeV1, ReceiptError,
+    ReceiptStatusV1, ReceiptV1, TransactionIndex, EVENT_V1, EVENT_V1_DOMAIN,
+    RECEIPT_LEAF_V1_DOMAIN, RECEIPT_V1, RECEIPT_V1_DOMAIN, TRANSACTION_LEAF_V1_DOMAIN,
 };
 pub use round::{
     ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage, ConsensusWalRecord, Step,

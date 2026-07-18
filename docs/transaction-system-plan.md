@@ -413,6 +413,42 @@ sponsor paying from its own default lane is legitimate. No current caller
 exercises a zero payer lane, so this is recorded here to be fixed with a test
 when the sponsor lifecycle lands rather than changed without coverage now.
 
+### 2026-07-19 —position-bound V1 receipts and transaction roots
+
+Changed: added Rust and browser V1 receipt/event/index types, exact fee-summary
+reconciliation, ordered event checks, domain-separated receipt/event/transaction
+leaves, shared Merkle roots, and one-to-one binding to the signed V5 sender,
+fee payer/lane, fee bid, action count, transaction identity, height, and index.
+
+Why: a receipt root is only evidence of execution when every leaf is tied to
+the exact signed transaction and ordered block slot. Local receipt validation
+alone would allow a structurally valid result to be paired with another sender,
+sponsor, fee bid, or action program.
+
+Reused: `FeeSummaryV1`, `TransactionV5`/browser V5 wire validation, canonical
+JSON, address/hex codecs, and `webc_crypto::merkle_root`/`WEBC_MERKLE_V1`. No
+dependency or cryptographic primitive was added.
+
+Rejected: hashing transaction IDs without positions (does not commit the block
+slot); trusting derived fee fields (permits tampered charge/refund splits);
+publishing partial events on failure (breaks action-overlay rollback); and a
+browser-only Merkle convention (would make node roots unverifiable by clients).
+
+Compatibility: additive while protocol version 2 remains inactive. V4 receipt
+and header bytes are unchanged. The browser rejects unsafe numeric values inside
+legacy native event bodies because JavaScript cannot reproduce such Rust JSON
+exactly; future event schemas should replace remaining raw `u64` fields with
+decimal-string wrappers.
+
+Proof: frozen sender-paid canonical receipt, event digest, receipt digest,
+receipt leaf, and transaction leaf match in Rust and TypeScript. Rust receipt
+tests (6), strict `webc-chain` clippy, full `webc-chain` tests (191), and exact
+pnpm 11.7.0 `pnpm check` (89 SDK + 3 widget tests, builds, and documentation
+links) pass.
+
+Review status: accepted implementation direction; frozen values require a
+coordinated receipt-schema change to modify.
+
 ## Goal progress checkpoint
 
 Implementation checkpoint on 2026-07-18: the isolated branch contains code
@@ -554,7 +590,26 @@ modules in `webc-chain` (continuation step 3) — fee reconciliation, position/I
 binding, the failed-event prohibition, equal transaction/receipt counts, and
 frozen Rust/TypeScript vectors — before any node lifecycle consumer.
 
-### Step 3 implementation brief (2026-07-18 pre-implementation handoff)
+### Resumed milestone (2026-07-19): typed V1 receipts and ordered roots
+
+Completed continuation step 3 in Rust and TypeScript: strict receipt/event/index
+wrappers, fee reconciliation, sender/payer/signed-bid/action/position/identity
+binding, domain-separated leaves, ordered roots, and the frozen sender-paid
+cross-language vector. The gate passed 6 focused Rust receipt tests, strict
+`webc-chain` clippy, all 191 `webc-chain` tests, and exact pnpm 11.7.0
+`pnpm check` (89 SDK + 3 widget tests, builds, and documentation links).
+
+Still material: the reusable action executor and two-level execution overlay;
+storage schema 2 and migration; lifecycle/mempool/runtime/V2 API consumers;
+finalized checkpoint proofs and browser verifier; restart, multi-validator,
+fuzz, dependency, full workspace, and final-main integration gates.
+
+Exact next item: continuation step 4 —refactor the existing native transition
+behind one reusable action executor, then implement the parent fee/nonce/sponsor
+and child action/event overlay with atomic success, chargeable failure,
+rollback, cancellation, and sponsor lifecycle coverage.
+
+### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
 `d48f930`). This brief captures the ADR-0012 spec and the exact current-code
