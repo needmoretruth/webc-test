@@ -1670,19 +1670,7 @@ impl ChainState {
                 });
             }
             Operation::Transfer { to, amount } => {
-                // The sender account is debited for the principal. On the default
-                // lane the fee step already recorded this write, but on a
-                // non-default lane fees come from the lane, so record it here or
-                // the signed access list's sender-account entry stays unused.
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::account(*to))?;
-                self.debit_native(tx.sender, *amount)?;
-                self.credit_native(*to, *amount)?;
-                events.push(Event::Transfer {
-                    from: tx.sender,
-                    to: *to,
-                    amount: *amount,
-                });
+                self.apply_native_transfer(tx.sender, *to, *amount, &mut access, &mut events)?;
             }
             Operation::RegisterValidator {
                 consensus_key,
@@ -2463,6 +2451,35 @@ impl ChainState {
             .balance
             .checked_sub(amount)
             .ok_or(ChainError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// Applies one native transfer under a caller-owned transaction overlay.
+    ///
+    /// Both V4 single-operation execution and V5 ordered action execution use
+    /// this exact transition. The caller owns fee/nonce handling and rollback;
+    /// this helper only records action access, moves principal, and emits the
+    /// native event. Any error leaves the caller's cloned overlay disposable.
+    pub(crate) fn apply_native_transfer(
+        &mut self,
+        sender: Address,
+        recipient: Address,
+        amount: Amount,
+        access: &mut StateAccessRecorder,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
+        // On the default lane the parent fee step already records the sender
+        // account write. Non-default lanes pay fees elsewhere, so recording it
+        // here is required to consume the signed action declaration.
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::account(recipient))?;
+        self.debit_native(sender, amount)?;
+        self.credit_native(recipient, amount)?;
+        events.push(Event::Transfer {
+            from: sender,
+            to: recipient,
+            amount,
+        });
         Ok(())
     }
 
