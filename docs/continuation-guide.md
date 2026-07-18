@@ -1,15 +1,16 @@
 # WEBC continuation guide
 
 Last updated: 2026-07-18 (Phases 5–13 done on `main`; owner direction is
-"practical L1 완성" plus, now owner-approved, an **earliest-skeleton Weft**
-front end for future flexibility.
+"practical L1 완성" plus an owner-approved **earliest-skeleton Weft** front end.
+Owner is **pausing here to resume later** — this session wrapped up at a clean,
+all-green, fully-pushed state; `main` HEAD is the memory-cap fix `a162bfe`.
 **START AT the "SESSION HANDOFF" block in the "Exact next work" section below** —
-it has the live state: the WASM contract runtime is now **wired end-to-end**
-(`webc-vm` engine bridged into `webc-chain`; commit `4ca3483`), and the current
-in-flight item is the **Weft skeleton compiler** (`webc-weft`: front end →
-WAT/WASM over the host ABI). The Codex decision and swappable-engine design still
-apply.) Separately assigned feature goals use their own branches and do not
-replace this pointer until merged.
+it has the live state: the WASM contract runtime is **wired end-to-end**
+(`webc-vm` bridged into `webc-chain`, `4ca3483`) and **adversarially reviewed** (one
+HIGH finding fixed in `a162bfe`); the **Weft skeleton compiler** (`webc-weft`) is
+**built and runs on-chain end-to-end** (its own review is an open follow-up). The
+Codex decision and swappable-engine design still apply.) Separately assigned
+feature goals use their own branches and do not replace this pointer until merged.
 This file is the live pointer to the **exact next task**. Detailed "what the code
 implements" facts live in `implementation-status.md`; do not duplicate them
 here.
@@ -156,9 +157,20 @@ gas-metering, independent of node exec speed.)
   state commit, determinism, over-gas atomic rollback, undeclared-key fail-closed,
   invalid-module + code-hash rejection, state-root commitment across restart. **Full
   workspace test suite green** (V19→V20 bump broke nothing).
-- Adversarial multi-dimension review of the wiring was run via a workflow
-  (determinism / gas / footprint / rollback / additive-safety / bytecode-validation);
-  resolve any confirmed findings before treating 7b as closed.
+- **Reviewed (adversarial, 6 dimensions, skeptic-verified).** One HIGH finding
+  CONFIRMED and **FIXED** (commit `a162bfe`): the linear-memory page cap was
+  enforced only on a module's *declared* memory, so a `(memory 1)` with no maximum
+  could `memory.grow` toward 4 GiB within the fuel budget — a per-invocation
+  memory-exhaustion DoS + a liveness split between differently-provisioned
+  validators. Fix: a wasmi `StoreLimits` limiter on the exec Store caps growth at
+  `max_memory_pages * 64 KiB` at RUN TIME regardless of declaration (grow past the
+  cap returns -1, deterministically; regression tests added). Four findings were
+  dismissed by the skeptics (footprint/rollback clean; a native/wasm code_id
+  cross-uniqueness asymmetry judged harmless). **One dismissed item is a real
+  owner-deferred DECISION, recorded below: wasm compute gas-pricing** (a wasm call
+  runs a fixed 100M-fuel budget not derived from `gas_limit`, and `required_units`
+  carries no compute term — deterministic, so NOT a consensus bug, but compute is
+  under-priced vs admission; needs a pricing decision, ADR-0014 territory).
 
 **DONE — Weft skeleton (owner-approved earliest version).** Owner: "weft을 아주
 극초기버전이라도… 틀이라도… 나중에 유연성 좋게" — build even a skeleton Weft, for
@@ -175,14 +187,28 @@ emits WAT (assembled via `wat`); the production backend (lowering via the audite
 Rust framework, behind `trait Backend`) is a documented extension point, as are
 more types/exprs/control-flow, linear `Amount<T>` (a no-op `sema` pass today),
 events codegen, generics, and editions — every deferred construct has a named seam
-(`#[non_exhaustive]` nodes, the stable `ir::Module` boundary). Built via workflows
-(design synthesis done; adversarial review = the remaining sub-step of Phase 7b).
-Edition-1 limits (documented, not silent): one entry/component, `u64`+`bytes` only,
-wrapping arithmetic, `emit`/`event` manifested but codegen-deferred.
+(`#[non_exhaustive]` nodes, the stable `ir::Module` boundary). Edition-1 limits
+(documented, not silent): one entry/component, `u64`+`bytes` only, wrapping
+arithmetic, `emit`/`event` manifested but codegen-deferred.
 
-**NEXT after the two adversarial reviews resolve:** resume the practical-L1 roadmap
-below. Owner may also later ask to grow Weft (more types, control flow, linearity,
-the Rust-framework backend) — all additive on the seams above.
+**Weft follow-ups (open, for "continue later"):**
+- **Adversarial review of the skeleton NOT yet completed** — the design-synthesis
+  workflow ran and drove the build; a skeleton *review* pass is still owed. When
+  resuming, review `crates/webc-weft/src/*` (do it inline/orthodox — the owner
+  asked to stop using workflows) for: codegen correctness/host-ABI conformance,
+  determinism, and lexer/parser/sema robustness on hostile input.
+- **Known robustness item to check first:** the recursive-descent parser
+  (`parse_add`/`parse_mul`/`parse_primary`) and `codegen::u64_expr` recurse on
+  nested expressions, so a pathological deeply-nested `(((…)))` source could
+  overflow the stack (violating the "never panics" invariant). Add a parse
+  recursion-depth guard returning a typed `WeftError::Parse`.
+- Growth (all additive on the seams above; owner may request): more types, control
+  flow (`if`/`match`), linear `Amount<T>` (turn on `sema`'s no-op pass),
+  multi-entry dispatch, events codegen, the Rust-framework `Backend`, `weft
+  fmt/test` + LSP.
+
+**NEXT (owner is pausing here; resume later):** finish the Weft follow-ups above,
+then resume the practical-L1 roadmap below.
 
 **Remaining practical-L1 roadmap after the WASM runtime (value order, all
 additive so Codex-safe):** distribution program (airdrop claim / expiring
@@ -193,8 +219,12 @@ Optional: complete Codex's V5 transaction system as a formal task.
 
 **Owner-deferred — do NOT decide autonomously:** slashing severity numbers +
 inactivity-leak params (ADR-0012), WASM production engine + manifest trust
-(ADR-0014), production bridge trust model, PQ transaction policy, mainnet
-governance emergency powers, fast-path hardware trade-offs. **External:**
+(ADR-0014), **wasm contract compute gas-pricing** (add a compute term to
+`InvokeWasmContract::required_units` and/or settle reconciled compute gas as a
+non-refunded fee, and derive the VM fuel budget from `gas_limit` — a pricing/DoS
+call surfaced by the Phase 7b review; ADR-0014), production bridge trust model, PQ
+transaction policy, mainnet governance emergency powers, fast-path hardware
+trade-offs. **External:**
 real-hardware benchmarks, independent security audit (Phase 5.5), testnet/mainnet
 launch. Weak-subjectivity anchor (ADR-0011) is already owner-confirmed.
 
