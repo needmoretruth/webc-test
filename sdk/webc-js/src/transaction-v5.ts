@@ -724,7 +724,9 @@ function validateSponsorGrant(value: unknown, requireSignature: boolean): assert
   requireHex(value.grant_id, 32, "sponsor grant id", true);
   requireAddress(value.sponsor, "sponsor");
   requireHex(value.sponsor_public_key, 32, "sponsor public key", false);
-  requireHex(value.payer_lane, 32, "sponsor payer lane", true);
+  // The all-zero lane is the sponsor's legitimate default account lane, just
+  // as it is for sender-paid V5 transactions and the Rust reference validator.
+  requireHex(value.payer_lane, 32, "sponsor payer lane", false);
   requireAddress(value.sender, "sponsor-bound sender");
   requireOptionalHash(value.site_namespace, "site namespace");
   requireOptionalHash(value.application_namespace, "application namespace");

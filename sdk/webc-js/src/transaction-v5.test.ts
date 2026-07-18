@@ -19,6 +19,7 @@ import {
   feeBidV1DigestHex,
   revokeSponsorGrantActionV1,
   sessionAuthorizationAccessListV1,
+  signSponsorGrantV1,
   sponsorGrantSigningBytes,
   sponsorGrantV1DigestHex,
   sponsorUseV1DigestHex,
@@ -28,6 +29,7 @@ import {
   verifySignedTransactionV5,
   verifySponsorGrantV1,
 } from "./transaction-v5";
+import { createWalletFromSeed } from "./wallet";
 import type {
   SignedTransactionV5Json,
   SponsorGrantV1Json,
@@ -151,6 +153,26 @@ function decode(bytes: Uint8Array): string {
 }
 
 describe("V5 cross-language transaction fixtures", () => {
+  it("accepts a sponsor paying from its default account lane like Rust", async () => {
+    const sponsor = await createWalletFromSeed(new Uint8Array(32).fill(3));
+    const grant = await signSponsorGrantV1(sponsor, {
+      chain_id: "webc-devnet-1",
+      grant_id: "77".repeat(32),
+      payer_lane: DEFAULT_LANE,
+      sender: SENDER,
+      site_namespace: null,
+      application_namespace: null,
+      action_scope: { exact_action_digest: ACTION_DIGEST },
+      validity: { valid_from_height: "10", valid_until_height: "20" },
+      max_fee_per_transaction: "10000",
+      max_cumulative_fee: "100000",
+      max_uses: "10",
+    });
+    expect(grant.sponsor).toBe(SPONSOR);
+    expect(grant.payer_lane).toBe(DEFAULT_LANE);
+    expect(await verifySponsorGrantV1(grant)).toBe(true);
+  });
+
   it("inserts the Rust-derived session budget key in consensus order", async () => {
     const access = await sessionAuthorizationAccessListV1(
       senderPaidFixture().access_list,
