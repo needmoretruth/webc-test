@@ -19,8 +19,10 @@ import type {
   FeeBid,
   OperationJson,
   StateAccessListJson,
+  StateKeyJson,
   WebcAddress,
 } from "./types.js";
+import { deriveSessionKeyIdHex, sessionKeyKey } from "./transaction.js";
 import type { WebcWallet } from "./wallet.js";
 import { signWithWallet, verifyEd25519 } from "./wallet.js";
 
@@ -244,6 +246,41 @@ export function feeBidV5(fee: FeeBid): FeeBidV5Json {
   };
   validateFeeBid(wire);
   return wire;
+}
+
+/** Adds the writable cumulative-budget key required by V5 session authorization.
+ *
+ * `baseAccess` must already be the exact account-key or sponsored action union
+ * for a transfer-only action program. The helper preserves its reviewed Rust
+ * ordering and inserts `SessionKey` between fee-accumulator and later protocol
+ * variants, matching Rust `StateKeyKind` discriminants. Supplying an existing
+ * session key fails closed instead of silently signing ambiguous authority.
+ */
+export async function sessionAuthorizationAccessListV1(
+  baseAccess: StateAccessListJson,
+  sender: WebcAddress,
+  sessionPublicKey: string,
+): Promise<StateAccessListJson> {
+  validateAccessList(baseAccess);
+  requireAddress(sender, "session owner");
+  requireHex(sessionPublicKey, 32, "session public key", false);
+  const sessionId = await deriveSessionKeyIdHex(sessionPublicKey);
+  const sessionState = sessionKeyKey(sender, sessionId);
+  const allKeys = [...baseAccess.read_only, ...baseAccess.read_write];
+  if (allKeys.some((key) => stateKeyVariantName(key) === "SessionKey")) {
+    throw new Error("V5 base access already contains session-key state");
+  }
+
+  const readWrite = [...baseAccess.read_write];
+  const sessionRank = stateKeyVariantRank(sessionState);
+  const insertion = readWrite.findIndex(
+    (key) => stateKeyVariantRank(key) > sessionRank,
+  );
+  if (insertion === -1) readWrite.push(sessionState);
+  else readWrite.splice(insertion, 0, sessionState);
+  const result = { read_only: [...baseAccess.read_only], read_write: readWrite };
+  validateAccessList(result);
+  return result;
 }
 
 /** Builds an unsigned V5 transaction and validates every stateless bound. */
@@ -603,6 +640,45 @@ function validateAccessList(value: unknown): asserts value is StateAccessListJso
     if (identities.has(identity)) throw new Error("duplicate V5 state access key");
     identities.add(identity);
   }
+}
+
+const STATE_KEY_VARIANTS = [
+  "Account",
+  "AuthorizationPolicy",
+  "AssetBalance",
+  "Validator",
+  "Delegation",
+  "AuthorizationLane",
+  "FeeAccumulator",
+  "SessionKey",
+  "BridgeMessage",
+  "BridgeEscrow",
+  "SlashingEvidence",
+  "UnbondingQueue",
+  "Object",
+  "Module",
+  "Application",
+  "Protocol",
+  "SponsorGrant",
+] as const;
+
+function stateKeyVariantName(key: StateKeyJson): string {
+  if (key.version !== 1 || typeof key.kind !== "object" || key.kind === null) {
+    throw new Error("unsupported V5 state-key version or shape");
+  }
+  const variants = Object.keys(key.kind);
+  if (variants.length !== 1 || !STATE_KEY_VARIANTS.includes(
+    variants[0] as (typeof STATE_KEY_VARIANTS)[number],
+  )) {
+    throw new Error("unsupported V5 state-key variant");
+  }
+  return variants[0] as string;
+}
+
+function stateKeyVariantRank(key: StateKeyJson): number {
+  return STATE_KEY_VARIANTS.indexOf(
+    stateKeyVariantName(key) as (typeof STATE_KEY_VARIANTS)[number],
+  );
 }
 
 function validateFeeBid(value: unknown): asserts value is FeeBidV5Json {

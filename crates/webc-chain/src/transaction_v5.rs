@@ -1400,6 +1400,49 @@ mod tests {
     }
 
     #[test]
+    fn session_builder_adds_exact_budget_access_in_consensus_order() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let session_public_key = PublicKeyBytes([0x11; 32]);
+        let transaction = TransactionV5::for_session_actions_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            session_public_key,
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(1),
+                nonce: Nonce::new(7),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(123_456),
+            })],
+            FeeBid {
+                gas_limit: 1_000,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("session transaction builds");
+
+        assert_eq!(
+            transaction.access_list.read_write,
+            vec![
+                StateKey::account(sender.address()),
+                StateKey::account(recipient.address()),
+                StateKey::fee_accumulator(sender.address()),
+                StateKey::session_key(sender.address(), SessionKeyId::derive(&session_public_key),),
+            ]
+        );
+        assert_eq!(
+            SessionKeyId::derive(&session_public_key).hash().to_hex(),
+            "0ccf7ce5d50b1e08cb4b7d2f7c5b7af9eb094dce0c9d1668a2e270de7fb40c74"
+        );
+    }
+
+    #[test]
     fn validity_range_is_inclusive_and_bounded() {
         let one = ValidityWindowV1::new(BlockHeight::new(9), BlockHeight::new(9));
         assert_eq!(one.validate(), Ok(()));

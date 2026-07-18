@@ -18,6 +18,7 @@ import {
   createSponsorUseV1,
   feeBidV1DigestHex,
   revokeSponsorGrantActionV1,
+  sessionAuthorizationAccessListV1,
   sponsorGrantSigningBytes,
   sponsorGrantV1DigestHex,
   sponsorUseV1DigestHex,
@@ -150,6 +151,35 @@ function decode(bytes: Uint8Array): string {
 }
 
 describe("V5 cross-language transaction fixtures", () => {
+  it("inserts the Rust-derived session budget key in consensus order", async () => {
+    const access = await sessionAuthorizationAccessListV1(
+      senderPaidFixture().access_list,
+      SENDER,
+      "11".repeat(32),
+    );
+    expect(access.read_write).toEqual([
+      { version: 1, kind: { Account: { address: SENDER } } },
+      { version: 1, kind: { Account: { address: RECIPIENT } } },
+      {
+        version: 1,
+        kind: { FeeAccumulator: { lane: DEFAULT_LANE, payer: SENDER } },
+      },
+      {
+        version: 1,
+        kind: {
+          SessionKey: {
+            owner: SENDER,
+            session_key:
+              "0ccf7ce5d50b1e08cb4b7d2f7c5b7af9eb094dce0c9d1668a2e270de7fb40c74",
+          },
+        },
+      },
+    ]);
+    await expect(
+      sessionAuthorizationAccessListV1(access, SENDER, "11".repeat(32)),
+    ).rejects.toThrow("already contains session-key state");
+  });
+
   it("matches the Rust sponsor-grant revocation action digest", async () => {
     const kind: TransactionKindV1Json = {
       Actions: { actions: [revokeSponsorGrantActionV1("44".repeat(32))] },
