@@ -1,0 +1,15 @@
+/// Store the call input verbatim and echo it back.
+component echo v1 {
+  /// The single stored value slot.
+  state slot: bytes
+
+  /// Store the call input and return it.
+  entry put()
+    reads slot
+    writes slot
+    -> bytes
+  {
+    slot = input;
+    return slot;
+  }
+}
