@@ -57,8 +57,8 @@ pub use consensus::{
     CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
 pub use execution_v1::{
-    PreparedAuthorizationV1, PreparedTransactionV1, SponsorGrantStateV1,
-    TransactionPreparationErrorV1, ValidatedTransactionV1,
+    BlockExecutionErrorV1, ExecutedTransactionV1, PreparedAuthorizationV1, PreparedTransactionV1,
+    SponsorGrantStateV1, TransactionPreparationErrorV1, ValidatedTransactionV1,
 };
 pub use fees::{
     calculate_fee_summary_v1, split_fee, FeeBreakdown, FeeComputationError, FeePayerV1, FeePolicy,

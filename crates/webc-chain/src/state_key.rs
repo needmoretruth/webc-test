@@ -283,7 +283,7 @@ impl StateAccessRecorder {
     }
 
     /// Requires a successful transaction to use every key it declared.
-    pub(crate) fn finish(self) -> Result<(), ChainError> {
+    pub(crate) fn finish(&self) -> Result<(), ChainError> {
         if self.observed_reads != self.declared_reads
             || self.observed_writes != self.declared_writes
         {

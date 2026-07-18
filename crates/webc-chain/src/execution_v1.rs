@@ -1,22 +1,27 @@
 //! Protocol-version-2 transaction admission and execution boundaries.
 //!
 //! Purpose: turn a hostile signed V5 wire value into progressively stronger
-//! typed states before any consensus mutation. This module currently owns the
-//! stateless [`ValidatedTransactionV1`] boundary; state/height/fee preparation
-//! and two-level execution follow in the same module. It does not decode HTTP,
-//! choose mempool policy, build blocks, or persist lifecycle records.
+//! typed states before any consensus mutation. This module owns stateless
+//! validation, snapshot preparation, and the two-level inclusion/action
+//! overlay. It does not decode HTTP, choose mempool policy, build blocks, or
+//! persist lifecycle records.
 //!
 //! Data flows from `TransactionV5` through signature/chain/structure checks and
-//! an exact access-list recomputation. Only the opaque validated wrapper may
-//! enter preparation. Security boundary: callers cannot construct the wrapper
-//! with struct syntax, so a sponsored transaction that omits payer or grant
-//! state cannot accidentally reach fee reservation.
+//! an exact access-list recomputation. Preparation proves inclusion against a
+//! state snapshot. Execution rechecks that snapshot, reserves fees and advances
+//! replay state in a parent overlay, then commits or discards a child action
+//! overlay. Security boundary: chargeable action failures commit only the
+//! parent; undeclared access, arithmetic faults, and unsupported actions discard
+//! everything as block errors.
 
+use crate::state_key::StateAccessRecorder;
 use crate::{
-    ActionV1, Amount, AuthorizationLaneId, BlockHeight, ChainId, ChainState, FeePayerV1,
-    FeePaymentV1, FeeRate, GasUnits, Nonce, Operation, SessionKey, SessionKeyId, SponsorUseCount,
-    SponsorUseNonce, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
-    LEGACY_AUTHORIZATION_POLICY_REVISION,
+    calculate_fee_summary_v1, ActionIndex, ActionV1, Amount, AuthorizationLaneId, BlockHeight,
+    BlockPositionV1, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
+    ExecutionFailureCodeV1, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate, GasUnits,
+    Nonce, Operation, ProtocolStateKey, ReceiptError, ReceiptStatusV1, ReceiptV1, SessionKey,
+    SessionKeyId, SponsorUseCount, SponsorUseNonce, StateKey, TransactionKindV1, TransactionV5,
+    TransactionValidationErrorV1, EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION, RECEIPT_V1,
 };
 use serde::{Deserialize, Serialize};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
@@ -163,6 +168,64 @@ impl PreparedTransactionV1 {
     }
 }
 
+/// A V5 transaction result whose parent/child overlays have been resolved.
+///
+/// Chargeable action failure is represented inside the receipt, never as a
+/// Rust error. The wrapper can therefore be passed to block/root/storage layers
+/// without losing the distinction between an invalid block and a failed user
+/// action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutedTransactionV1 {
+    receipt: ReceiptV1,
+}
+
+impl ExecutedTransactionV1 {
+    /// Borrows the complete deterministic receipt.
+    pub const fn receipt(&self) -> &ReceiptV1 {
+        &self.receipt
+    }
+
+    /// Returns ownership for block/root/storage integration.
+    pub fn into_receipt(self) -> ReceiptV1 {
+        self.receipt
+    }
+}
+
+/// Block-invalidating V5 execution failure for which no state may commit.
+///
+/// These errors are implementation/invariant failures, not chargeable user
+/// outcomes. They deliberately contain no free-form consensus text.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BlockExecutionErrorV1 {
+    /// The prepared value is no longer includable at its claimed position.
+    #[error("V5 prepared transaction is stale: {0}")]
+    Preparation(#[from] TransactionPreparationErrorV1),
+    /// Re-preparation succeeded but produced different snapshot-dependent data.
+    #[error("V5 prepared transaction no longer matches current state")]
+    StalePreparation,
+    /// A signed access declaration or observed access violated its invariant.
+    #[error("V5 execution violated its signed state-access invariant")]
+    StateAccessInvariant,
+    /// Checked state arithmetic or another internal invariant failed.
+    #[error("V5 execution encountered an invalid internal state")]
+    InvalidState,
+    /// The fee summary could not be reconciled from checked inputs.
+    #[error("V5 execution fee accounting failed: {0}")]
+    FeeAccounting(#[from] FeeComputationError),
+    /// A locally constructed receipt did not satisfy its own schema invariants.
+    #[error("V5 execution constructed an invalid receipt")]
+    ReceiptInvariant,
+    /// This incremental executor has not yet extracted this V4 transition.
+    #[error("V5 action uses a native operation not integrated with the action executor")]
+    UnsupportedNativeAction,
+    /// Session-key cumulative accounting is not yet integrated in this executor.
+    #[error("V5 session-key execution is not yet integrated")]
+    UnsupportedAuthorization,
+    /// A bounded action/event position did not fit its wire index.
+    #[error("V5 action or event index overflowed")]
+    IndexOverflow,
+}
+
 /// A signed V5 transaction whose stateless admission checks have passed.
 ///
 /// Invariants: the schema and chain are supported, sender/sponsor signatures
@@ -276,6 +339,404 @@ impl ChainState {
             validated,
         })
     }
+
+    /// Executes one prepared V5 transaction with parent/child rollback semantics.
+    ///
+    /// The method first re-prepares against the current logical state, so a stale
+    /// value cannot reserve fees. The parent overlay reserves the payer's signed
+    /// maximum, advances the sender nonce, and later records exact fee/sponsor
+    /// accounting. Ordered actions run in a child clone. Success merges that
+    /// clone and all typed events; a chargeable action failure discards the child
+    /// while committing the parent nonce and measured fee. Any returned error
+    /// leaves `self` byte-for-byte unchanged.
+    pub fn execute_prepared_transaction_v1(
+        &mut self,
+        prepared: PreparedTransactionV1,
+        position: BlockPositionV1,
+    ) -> Result<ExecutedTransactionV1, BlockExecutionErrorV1> {
+        let refreshed = self.prepare_transaction_v1(prepared.validated.clone(), position.height)?;
+        if refreshed != prepared {
+            return Err(BlockExecutionErrorV1::StalePreparation);
+        }
+        if matches!(
+            prepared.authorization,
+            PreparedAuthorizationV1::SessionKey(_)
+        ) {
+            return Err(BlockExecutionErrorV1::UnsupportedAuthorization);
+        }
+
+        let transaction = prepared.validated.transaction().clone();
+        preflight_supported_actions(&transaction.kind)?;
+        let mut access = StateAccessRecorder::new(
+            &transaction.access_list.read_only,
+            &transaction.access_list.read_write,
+        )
+        .map_err(map_block_chain_error)?;
+        record_parent_access(&transaction, prepared.fee_payer, &mut access)?;
+
+        let mut parent = self.clone();
+        debit_fee_reserve(&mut parent, prepared.fee_payer, prepared.fee_reserve)?;
+        advance_sender_nonce(
+            &mut parent,
+            transaction.sender,
+            transaction.authorization.lane,
+        )?;
+
+        let (mut selected, status, attempted_units, typed_events) = match &transaction.kind {
+            TransactionKindV1::Cancel(_) => {
+                access.finish().map_err(map_block_chain_error)?;
+                (
+                    parent,
+                    ReceiptStatusV1::Succeeded,
+                    prepared.required_units,
+                    Vec::new(),
+                )
+            }
+            TransactionKindV1::Actions(program) => {
+                execute_action_program_v1(parent, &transaction, program, &mut access)?
+            }
+        };
+
+        let fee_summary = calculate_fee_summary_v1(
+            prepared.fee_payer,
+            GasUnits::new(transaction.fee_bid.gas_limit),
+            attempted_units,
+            prepared.base_fee_per_unit,
+            FeeRate::new(transaction.fee_bid.max_fee_per_unit),
+            FeeRate::new(transaction.fee_bid.priority_fee_per_unit),
+        )?;
+        finalize_fee_accounting(&mut selected, &fee_summary)?;
+        finalize_sponsor_use(&mut selected, &transaction, fee_summary.charged)?;
+
+        let receipt = ReceiptV1 {
+            version: RECEIPT_V1,
+            position,
+            transaction_id: prepared.transaction_id,
+            sender: transaction.sender,
+            status,
+            fee_summary,
+            events: typed_events,
+        };
+        receipt
+            .validate()
+            .map_err(|_error: ReceiptError| BlockExecutionErrorV1::ReceiptInvariant)?;
+        *self = selected;
+        Ok(ExecutedTransactionV1 { receipt })
+    }
+}
+
+fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExecutionErrorV1> {
+    let TransactionKindV1::Actions(program) = kind else {
+        return Ok(());
+    };
+    for action in &program.actions {
+        if matches!(
+            action,
+            ActionV1::Native { operation }
+                if !matches!(operation.as_ref(), Operation::Transfer { .. })
+        ) {
+            return Err(BlockExecutionErrorV1::UnsupportedNativeAction);
+        }
+    }
+    Ok(())
+}
+
+fn record_parent_access(
+    transaction: &TransactionV5,
+    payer: FeePayerV1,
+    access: &mut StateAccessRecorder,
+) -> Result<(), BlockExecutionErrorV1> {
+    access
+        .read(StateKey::authorization_policy(transaction.sender))
+        .map_err(map_block_chain_error)?;
+    access
+        .read(StateKey::protocol(ProtocolStateKey::BaseFee))
+        .map_err(map_block_chain_error)?;
+    access
+        .write(lane_state_key(
+            transaction.sender,
+            transaction.authorization.lane,
+        ))
+        .map_err(map_block_chain_error)?;
+
+    if let FeePaymentV1::Sponsored(sponsor_use) = &transaction.fee_payment {
+        access
+            .read(StateKey::authorization_policy(sponsor_use.grant.sponsor))
+            .map_err(map_block_chain_error)?;
+        access
+            .write(StateKey::sponsor_grant(
+                sponsor_use.grant.sponsor,
+                sponsor_use.grant.grant_id.digest(),
+            ))
+            .map_err(map_block_chain_error)?;
+    }
+    access
+        .write(lane_state_key(payer.address, payer.lane))
+        .map_err(map_block_chain_error)?;
+    access
+        .write(StateKey::fee_accumulator_for_lane(
+            payer.address,
+            payer.lane,
+        ))
+        .map_err(map_block_chain_error)
+}
+
+fn lane_state_key(owner: Address, lane: AuthorizationLaneId) -> StateKey {
+    if lane.is_default() {
+        StateKey::account(owner)
+    } else {
+        StateKey::authorization_lane(owner, lane)
+    }
+}
+
+fn debit_fee_reserve(
+    state: &mut ChainState,
+    payer: FeePayerV1,
+    reserve: Amount,
+) -> Result<(), BlockExecutionErrorV1> {
+    let balance = if payer.lane.is_default() {
+        &mut state
+            .accounts
+            .get_mut(&payer.address)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?
+            .balance
+    } else {
+        &mut state
+            .authorization_lanes
+            .get_mut(&(payer.address, payer.lane))
+            .ok_or(BlockExecutionErrorV1::InvalidState)?
+            .fee_balance
+    };
+    *balance = balance
+        .checked_sub(reserve)
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    Ok(())
+}
+
+fn credit_fee_refund(
+    state: &mut ChainState,
+    payer: FeePayerV1,
+    refund: Amount,
+) -> Result<(), BlockExecutionErrorV1> {
+    let balance = if payer.lane.is_default() {
+        &mut state
+            .accounts
+            .get_mut(&payer.address)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?
+            .balance
+    } else {
+        &mut state
+            .authorization_lanes
+            .get_mut(&(payer.address, payer.lane))
+            .ok_or(BlockExecutionErrorV1::InvalidState)?
+            .fee_balance
+    };
+    *balance = balance
+        .checked_add(refund)
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    Ok(())
+}
+
+fn advance_sender_nonce(
+    state: &mut ChainState,
+    sender: Address,
+    lane: AuthorizationLaneId,
+) -> Result<(), BlockExecutionErrorV1> {
+    if lane.is_default() {
+        let account = state
+            .accounts
+            .get_mut(&sender)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        account.nonce = account
+            .nonce
+            .checked_add(1)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    } else {
+        let lane_state = state
+            .authorization_lanes
+            .get_mut(&(sender, lane))
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        lane_state.next_nonce = lane_state
+            .next_nonce
+            .checked_next()
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    }
+    Ok(())
+}
+
+fn execute_action_program_v1(
+    parent: ChainState,
+    transaction: &TransactionV5,
+    program: &crate::ActionProgramV1,
+    access: &mut StateAccessRecorder,
+) -> Result<(ChainState, ReceiptStatusV1, GasUnits, Vec<EventV1>), BlockExecutionErrorV1> {
+    let mut child = parent.clone();
+    let mut attempted_units = 0_u64;
+    let mut events = Vec::new();
+
+    for (ordinal, action) in program.actions.iter().enumerate() {
+        attempted_units = attempted_units
+            .checked_add(action.required_units())
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        let action_index = u32::try_from(ordinal)
+            .map(ActionIndex::new)
+            .map_err(|_| BlockExecutionErrorV1::IndexOverflow)?;
+        let mut action_events = Vec::new();
+        let result = match action {
+            ActionV1::Native { operation } => match operation.as_ref() {
+                Operation::Transfer { to, amount } => child.apply_native_transfer(
+                    transaction.sender,
+                    *to,
+                    *amount,
+                    access,
+                    &mut action_events,
+                ),
+                _ => return Err(BlockExecutionErrorV1::UnsupportedNativeAction),
+            },
+            ActionV1::RevokeSponsorGrant { grant_id } => {
+                access
+                    .write(StateKey::sponsor_grant(
+                        transaction.sender,
+                        grant_id.digest(),
+                    ))
+                    .map_err(map_block_chain_error)?;
+                child
+                    .sponsor_grants
+                    .entry((transaction.sender, *grant_id))
+                    .or_default()
+                    .revoked = true;
+                action_events.push(Event::SponsorGrantRevoked {
+                    sponsor: transaction.sender,
+                    grant_id: *grant_id,
+                });
+                Ok(())
+            }
+        };
+
+        if let Err(error) = result {
+            let code = classify_action_failure(error)?;
+            return Ok((
+                parent,
+                ReceiptStatusV1::Failed {
+                    code,
+                    failed_action_index: Some(action_index),
+                },
+                GasUnits::new(attempted_units),
+                Vec::new(),
+            ));
+        }
+        append_typed_events(
+            &mut events,
+            transaction
+                .transaction_id()
+                .map_err(|_| BlockExecutionErrorV1::InvalidState)?,
+            action_index,
+            action_events,
+        )?;
+    }
+
+    access.finish().map_err(map_block_chain_error)?;
+    Ok((
+        child,
+        ReceiptStatusV1::Succeeded,
+        GasUnits::new(attempted_units),
+        events,
+    ))
+}
+
+fn append_typed_events(
+    target: &mut Vec<EventV1>,
+    transaction_id: crate::TransactionId,
+    action_index: ActionIndex,
+    action_events: Vec<Event>,
+) -> Result<(), BlockExecutionErrorV1> {
+    for body in action_events {
+        let ordinal =
+            u32::try_from(target.len()).map_err(|_| BlockExecutionErrorV1::IndexOverflow)?;
+        target.push(EventV1 {
+            version: EVENT_V1,
+            transaction_id,
+            action_index,
+            event_index: EventIndex::new(ordinal),
+            body,
+        });
+    }
+    Ok(())
+}
+
+fn classify_action_failure(
+    error: ChainError,
+) -> Result<ExecutionFailureCodeV1, BlockExecutionErrorV1> {
+    match error {
+        ChainError::InsufficientBalance { .. } => Ok(ExecutionFailureCodeV1::InsufficientBalance),
+        ChainError::AccountNotFound(_) => Ok(ExecutionFailureCodeV1::Precondition),
+        other => Err(map_block_chain_error(other)),
+    }
+}
+
+fn map_block_chain_error(error: ChainError) -> BlockExecutionErrorV1 {
+    match error {
+        ChainError::UndeclaredStateRead { .. }
+        | ChainError::UndeclaredStateWrite { .. }
+        | ChainError::UnusedDeclaredStateAccess
+        | ChainError::InvalidAccessList
+        | ChainError::TooManyStateKeys { .. }
+        | ChainError::UnsupportedStateKeyVersion { .. } => {
+            BlockExecutionErrorV1::StateAccessInvariant
+        }
+        _ => BlockExecutionErrorV1::InvalidState,
+    }
+}
+
+fn finalize_fee_accounting(
+    state: &mut ChainState,
+    summary: &crate::FeeSummaryV1,
+) -> Result<(), BlockExecutionErrorV1> {
+    credit_fee_refund(state, summary.payer, summary.refund)?;
+    state.burned_fees = state
+        .burned_fees
+        .checked_add(summary.burned)
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    state.validator_fee_pool = state
+        .validator_fee_pool
+        .checked_add(summary.validator_reward)
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    Ok(())
+}
+
+fn finalize_sponsor_use(
+    state: &mut ChainState,
+    transaction: &TransactionV5,
+    actual_charge: Amount,
+) -> Result<(), BlockExecutionErrorV1> {
+    let FeePaymentV1::Sponsored(sponsor_use) = &transaction.fee_payment else {
+        return Ok(());
+    };
+    let grant = &sponsor_use.grant;
+    let record = state
+        .sponsor_grants
+        .entry((grant.sponsor, grant.grant_id))
+        .or_default();
+    if record
+        .grant_digest
+        .is_some_and(|digest| digest != sponsor_use.grant_digest)
+    {
+        return Err(BlockExecutionErrorV1::InvalidState);
+    }
+    record.grant_digest = Some(sponsor_use.grant_digest);
+    record.next_use_nonce = record
+        .next_use_nonce
+        .checked_next()
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    record.uses = record
+        .uses
+        .checked_next()
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    record.total_charged = record
+        .total_charged
+        .checked_add(actual_charge)
+        .ok_or(BlockExecutionErrorV1::InvalidState)?;
+    Ok(())
 }
 
 fn prepare_sender_authorization(
@@ -480,11 +941,26 @@ mod tests {
         Account, ActionScopeV1, ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision,
         BlockHeight, ChainState, FeeBid, FeePaymentV1, Nonce, Operation, SponsorGrantId,
         SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
-        ValidityWindowV1, TRANSACTION_V5_PROTOCOL_VERSION,
+        TransactionIndex, ValidityWindowV1, TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
 
     fn sender_paid_fixture(sender: &Keypair, recipient: &Keypair) -> TransactionV5 {
+        sender_actions_fixture(
+            sender,
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(100),
+            })],
+            1_000,
+        )
+    }
+
+    fn sender_actions_fixture(
+        sender: &Keypair,
+        actions: Vec<ActionV1>,
+        gas_limit: u64,
+    ) -> TransactionV5 {
         let mut transaction = TransactionV5::for_actions_unsigned(
             ChainId::devnet(),
             sender.address(),
@@ -495,12 +971,9 @@ mod tests {
                 nonce: Nonce::new(0),
             },
             ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
-            vec![ActionV1::native(Operation::Transfer {
-                to: recipient.address(),
-                amount: Amount::from_units(100),
-            })],
+            actions,
             FeeBid {
-                gas_limit: 1_000,
+                gas_limit,
                 max_fee_per_unit: 5,
                 priority_fee_per_unit: 1,
             },
@@ -511,13 +984,11 @@ mod tests {
         transaction
     }
 
-    fn sponsored_fixture(
+    fn sponsor_transaction(
+        mut transaction: TransactionV5,
         sender: &Keypair,
-        recipient: &Keypair,
         sponsor: &Keypair,
-        exact_access: bool,
     ) -> TransactionV5 {
-        let mut transaction = sender_paid_fixture(sender, recipient);
         transaction.sender_signature = None;
         let validity = transaction.validity;
         let mut grant = SponsorGrantV1 {
@@ -527,12 +998,12 @@ mod tests {
             sponsor: sponsor.address(),
             sponsor_public_key: sponsor.public_key(),
             payer_lane: AuthorizationLaneId::DEFAULT,
-            sender: sender.address(),
+            sender: transaction.sender,
             site_namespace: None,
             application_namespace: None,
             action_scope: ActionScopeV1::exact(transaction.kind.digest().expect("action digest")),
             validity,
-            max_fee_per_transaction: Amount::from_units(5_000),
+            max_fee_per_transaction: Amount::from_units(10_000),
             max_cumulative_fee: Amount::from_units(50_000),
             max_uses: 10,
             sponsor_signature: None,
@@ -547,10 +1018,27 @@ mod tests {
             )
             .expect("sponsor use"),
         ));
-        if exact_access {
-            transaction.access_list = transaction.expected_access_list().expect("exact access");
-        }
+        transaction.access_list = transaction.expected_access_list().expect("exact access");
         transaction.sign(sender).expect("sponsored fixture signs");
+        transaction
+    }
+
+    fn sponsored_fixture(
+        sender: &Keypair,
+        recipient: &Keypair,
+        sponsor: &Keypair,
+        exact_access: bool,
+    ) -> TransactionV5 {
+        let sender_paid = sender_paid_fixture(sender, recipient);
+        let sender_access = sender_paid.access_list.clone();
+        let mut transaction = sponsor_transaction(sender_paid, sender, sponsor);
+        if !exact_access {
+            transaction.sender_signature = None;
+            transaction.access_list = sender_access;
+            transaction
+                .sign(sender)
+                .expect("sender-shaped sponsor fixture signs");
+        }
         transaction
     }
 
@@ -570,6 +1058,16 @@ mod tests {
             );
         }
         state
+    }
+
+    fn prepared(state: &ChainState, transaction: TransactionV5) -> PreparedTransactionV1 {
+        state
+            .prepare_transaction_v1(
+                ValidatedTransactionV1::validate(transaction, &ChainId::devnet())
+                    .expect("fixture validates"),
+                BlockHeight::new(10),
+            )
+            .expect("fixture prepares")
     }
 
     #[test]
@@ -783,5 +1281,314 @@ mod tests {
             ),
             Err(TransactionPreparationErrorV1::SponsorBudgetExceeded)
         );
+    }
+
+    #[test]
+    fn action_program_commits_ordered_transfers_events_and_exact_fee() {
+        let sender = Keypair::from_seed([1; 32]);
+        let first = Keypair::from_seed([2; 32]);
+        let second = Keypair::from_seed([4; 32]);
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::Transfer {
+                    to: first.address(),
+                    amount: Amount::from_units(100),
+                }),
+                ActionV1::native(Operation::Transfer {
+                    to: second.address(),
+                    amount: Amount::from_units(200),
+                }),
+            ],
+            1_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state.minted_supply = Amount::from_units(20_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let executed = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("two transfers execute");
+        let receipt = executed.receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.fee_summary.units_consumed, GasUnits::new(1_000));
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(3_000));
+        assert_eq!(receipt.fee_summary.refund, Amount::from_units(2_000));
+        assert_eq!(receipt.fee_summary.burned, Amount::from_units(1_000));
+        assert_eq!(
+            receipt.fee_summary.validator_reward,
+            Amount::from_units(2_000)
+        );
+        assert_eq!(receipt.events.len(), 2);
+        assert_eq!(receipt.events[0].action_index, ActionIndex::new(0));
+        assert_eq!(receipt.events[1].action_index, ActionIndex::new(1));
+        assert_eq!(receipt.events[0].event_index, EventIndex::new(0));
+        assert_eq!(receipt.events[1].event_index, EventIndex::new(1));
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(16_700)
+        );
+        assert_eq!(
+            state.accounts[&first.address()].balance,
+            Amount::from_units(100)
+        );
+        assert_eq!(
+            state.accounts[&second.address()].balance,
+            Amount::from_units(200)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn failed_action_rolls_back_principal_but_commits_nonce_and_fee() {
+        let sender = Keypair::from_seed([1; 32]);
+        let first = Keypair::from_seed([2; 32]);
+        let second = Keypair::from_seed([4; 32]);
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::Transfer {
+                    to: first.address(),
+                    amount: Amount::from_units(10_000),
+                }),
+                ActionV1::native(Operation::Transfer {
+                    to: second.address(),
+                    amount: Amount::from_units(10_000),
+                }),
+            ],
+            1_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state.minted_supply = Amount::from_units(20_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let executed = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("chargeable failure is an executed result");
+
+        assert_eq!(
+            executed.receipt().status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::InsufficientBalance,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(executed.receipt().events.is_empty());
+        assert_eq!(
+            executed.receipt().fee_summary.units_consumed,
+            GasUnits::new(1_000)
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(17_000)
+        );
+        assert!(!state.accounts.contains_key(&first.address()));
+        assert!(!state.accounts.contains_key(&second.address()));
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn cancellation_consumes_nonce_and_fee_without_action_events() {
+        let sender = Keypair::from_seed([1; 32]);
+        let mut transaction = TransactionV5::for_cancel_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            FeeBid {
+                gas_limit: 100,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        );
+        transaction.sign(&sender).expect("cancel signs");
+        let mut state = funded_state(&sender, None);
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("cancel executes")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.fee_summary.units_consumed, GasUnits::new(50));
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(150));
+        assert!(receipt.events.is_empty());
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(19_850)
+        );
+    }
+
+    #[test]
+    fn sponsored_failure_charges_sponsor_and_advances_grant() {
+        let sender = Keypair::from_seed([1; 32]);
+        let first = Keypair::from_seed([2; 32]);
+        let second = Keypair::from_seed([4; 32]);
+        let sponsor = Keypair::from_seed([3; 32]);
+        let sender_paid = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::Transfer {
+                    to: first.address(),
+                    amount: Amount::from_units(15_000),
+                }),
+                ActionV1::native(Operation::Transfer {
+                    to: second.address(),
+                    amount: Amount::from_units(10_000),
+                }),
+            ],
+            1_000,
+        );
+        let transaction = sponsor_transaction(sender_paid, &sender, &sponsor);
+        let FeePaymentV1::Sponsored(sponsor_use) = &transaction.fee_payment else {
+            panic!("sponsored fixture")
+        };
+        let grant_key = (sponsor.address(), sponsor_use.grant.grant_id);
+        let mut state = funded_state(&sender, Some(&sponsor));
+        state.minted_supply = Amount::from_units(40_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("sponsored failure executes")
+            .into_receipt();
+
+        assert!(matches!(receipt.status, ReceiptStatusV1::Failed { .. }));
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(20_000)
+        );
+        assert_eq!(state.accounts[&sponsor.address()].nonce, 0);
+        assert_eq!(
+            state.accounts[&sponsor.address()].balance,
+            Amount::from_units(17_000)
+        );
+        assert!(!state.accounts.contains_key(&first.address()));
+        let grant = state.sponsor_grants[&grant_key];
+        assert_eq!(grant.next_use_nonce, SponsorUseNonce::new(1));
+        assert_eq!(grant.uses, SponsorUseCount::new(1));
+        assert_eq!(grant.total_charged, Amount::from_units(3_000));
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn revocation_blocks_later_sponsored_preparation() {
+        let sponsor = Keypair::from_seed([3; 32]);
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let grant_id = SponsorGrantId::new(Hash256([0x44; 32]));
+        let revoke = sender_actions_fixture(
+            &sponsor,
+            vec![ActionV1::revoke_sponsor_grant(grant_id)],
+            5_000,
+        );
+        let mut state = funded_state(&sender, Some(&sponsor));
+        state
+            .accounts
+            .get_mut(&sponsor.address())
+            .expect("sponsor account")
+            .balance = Amount::from_units(30_000);
+        let prepared_revoke = prepared(&state, revoke);
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_revoke,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("revocation executes")
+            .into_receipt();
+        assert_eq!(receipt.events.len(), 1);
+        assert!(state.sponsor_grants[&(sponsor.address(), grant_id)].revoked);
+
+        let sponsored = sponsored_fixture(&sender, &recipient, &sponsor, true);
+        assert_eq!(
+            state.prepare_transaction_v1(
+                ValidatedTransactionV1::validate(sponsored, &ChainId::devnet())
+                    .expect("sponsored wire validates"),
+                BlockHeight::new(10),
+            ),
+            Err(TransactionPreparationErrorV1::SponsorGrantRevoked)
+        );
+    }
+
+    #[test]
+    fn stale_and_unsupported_execution_leave_state_unchanged() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let mut state = funded_state(&sender, None);
+        let prepared_transfer = prepared(&state, sender_paid_fixture(&sender, &recipient));
+        state.current_base_fee_per_unit = 3;
+        let before_stale = state.clone();
+        assert_eq!(
+            state.execute_prepared_transaction_v1(
+                prepared_transfer,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            ),
+            Err(BlockExecutionErrorV1::StalePreparation)
+        );
+        assert_eq!(state, before_stale);
+
+        state.current_base_fee_per_unit = 2;
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(50_000);
+        let unsupported = sender_actions_fixture(
+            &sender,
+            vec![ActionV1::native(Operation::ClaimValidatorRewards)],
+            10_000,
+        );
+        let prepared_unsupported = prepared(&state, unsupported);
+        let before_unsupported = state.clone();
+        assert_eq!(
+            state.execute_prepared_transaction_v1(
+                prepared_unsupported,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(1)),
+            ),
+            Err(BlockExecutionErrorV1::UnsupportedNativeAction)
+        );
+        assert_eq!(state, before_unsupported);
     }
 }

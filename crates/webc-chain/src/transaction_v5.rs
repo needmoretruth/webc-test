@@ -178,6 +178,11 @@ impl SponsorUseNonce {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// Advances the replay counter without wrapping.
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
 }
 
 impl Serialize for SponsorUseNonce {

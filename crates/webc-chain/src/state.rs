@@ -228,6 +228,16 @@ pub enum Event {
         to: Address,
         version: ObjectVersion,
     },
+    /// One protocol-2 sponsor grant was permanently revoked by its owner.
+    ///
+    /// Appended to preserve every existing bincode enum discriminant used by
+    /// protocol-1 receipts and stored blocks.
+    SponsorGrantRevoked {
+        /// Account that originally signed and now revoked the grant.
+        sponsor: Address,
+        /// Wallet-generated identity of the revoked grant.
+        grant_id: SponsorGrantId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
