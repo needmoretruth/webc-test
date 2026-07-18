@@ -56,7 +56,7 @@ pub use consensus::{
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
     CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
-pub use execution_v1::ValidatedTransactionV1;
+pub use execution_v1::{SponsorGrantStateV1, ValidatedTransactionV1};
 pub use fees::{
     calculate_fee_summary_v1, split_fee, FeeBreakdown, FeeComputationError, FeePayerV1, FeePolicy,
     FeeRate, FeeSummaryV1, GasUnits, FEE_SUMMARY_V1,
@@ -95,10 +95,10 @@ pub use state_key::{ProtocolStateKey, StateKey, StateKeyKind, MAX_TRANSACTION_ST
 pub use transaction::{AccessList, FeeBid, Operation, Transaction};
 pub use transaction_v5::{
     ActionProgramV1, ActionScopeV1, ActionV1, CancelV1, FeePaymentV1, SponsorGrantId,
-    SponsorGrantV1, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1, TransactionId,
-    TransactionKindV1, TransactionV5, TransactionValidationErrorV1, ValidityWindowV1,
-    ACTION_PROGRAM_V1_DOMAIN, CANCEL_V1_REQUIRED_UNITS, FEE_BID_V1_DOMAIN, MAX_ACTIONS_V1,
-    MAX_TRANSACTION_V5_CANONICAL_BYTES, MAX_TRANSACTION_VALIDITY_BLOCKS,
+    SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
+    TransactionId, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
+    ValidityWindowV1, ACTION_PROGRAM_V1_DOMAIN, CANCEL_V1_REQUIRED_UNITS, FEE_BID_V1_DOMAIN,
+    MAX_ACTIONS_V1, MAX_TRANSACTION_V5_CANONICAL_BYTES, MAX_TRANSACTION_VALIDITY_BLOCKS,
     REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS, SPONSOR_GRANT_V1_DOMAIN, SPONSOR_USE_V1_DOMAIN,
     TRANSACTION_ID_V1_DOMAIN, TRANSACTION_V5_PROTOCOL_VERSION, TRANSACTION_V5_SIGNING_DOMAIN,
 };

@@ -29,8 +29,8 @@ use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
 use crate::{
     Amount, AuthorizationLaneId, ChainError, ChainId, Epoch, InflationSchedule, ObjectId,
-    ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, StateKey,
-    CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, SponsorGrantId,
+    SponsorGrantStateV1, StateKey, CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -285,6 +285,12 @@ pub struct ChainState {
     /// cumulative spend, never funds, so they do not enter supply reconciliation.
     #[serde(default)]
     pub session_keys: BTreeMap<(Address, SessionKeyId), SessionKey>,
+    /// Replay, cumulative fee/use, and permanent revocation state for V5 grants.
+    ///
+    /// The map holds no funds; the payer account or authorization lane remains
+    /// the single supply-accounted fee source.
+    #[serde(default)]
+    pub sponsor_grants: BTreeMap<(Address, SponsorGrantId), SponsorGrantStateV1>,
     /// Persistent versioned application/NFT objects keyed by stable identity.
     pub objects: BTreeMap<ObjectId, StateObject>,
     pub validators: BTreeMap<Address, Validator>,
@@ -397,6 +403,7 @@ impl Default for ChainState {
             authorization_policies: BTreeMap::new(),
             authorization_lanes: BTreeMap::new(),
             session_keys: BTreeMap::new(),
+            sponsor_grants: BTreeMap::new(),
             objects: BTreeMap::new(),
             validators: BTreeMap::new(),
             delegations: BTreeMap::new(),
@@ -1015,6 +1022,7 @@ impl ChainState {
             authorization_policy_root: Hash256,
             authorization_lane_root: Hash256,
             session_key_root: Hash256,
+            sponsor_grant_root: Hash256,
             object_root: Hash256,
             validator_root: Hash256,
             delegation_root: Hash256,
@@ -1035,10 +1043,11 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            // V7 adds `last_block_timestamp_ms` (finding E2). The domain bump is a
-            // deliberate consensus-format change; no external fixture pins the
-            // prior V6 root.
-            domain: "WEBC_STATE_COMMITMENT_V7",
+            // V8 adds durable sponsor-grant replay/budget/revocation state. The
+            // protocol-2 transaction path is inactive, so no finalized V7 block
+            // can contain this subtree; existing account and state-key leaves
+            // remain byte-identical.
+            domain: "WEBC_STATE_COMMITMENT_V8",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1053,6 +1062,10 @@ impl ChainState {
             session_key_root: ordered_value_root(
                 b"WEBC_SESSION_KEY_LEAF_V1",
                 self.session_keys.iter(),
+            )?,
+            sponsor_grant_root: ordered_value_root(
+                b"WEBC_SPONSOR_GRANT_STATE_LEAF_V1",
+                self.sponsor_grants.iter(),
             )?,
             object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V1", self.objects.iter())?,
             validator_root: ordered_value_root(b"WEBC_VALIDATOR_LEAF_V1", self.validators.iter())?,

@@ -12,7 +12,31 @@
 //! with struct syntax, so a sponsored transaction that omits payer or grant
 //! state cannot accidentally reach fee reservation.
 
-use crate::{ChainId, TransactionV5, TransactionValidationErrorV1};
+use crate::{
+    Amount, ChainId, SponsorUseCount, SponsorUseNonce, TransactionV5, TransactionValidationErrorV1,
+};
+use serde::{Deserialize, Serialize};
+use webc_crypto::Hash256;
+
+/// Durable replay, fee-budget, use-count, and revocation state for one grant.
+///
+/// A grant may be revoked before its first use, so `grant_digest` is optional.
+/// Once a use records the digest it never changes; presenting another immutable
+/// grant under the same `(sponsor, grant_id)` is rejected during preparation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SponsorGrantStateV1 {
+    /// Digest of the first complete signed grant observed, or none before use.
+    pub grant_digest: Option<Hash256>,
+    /// Exact use nonce required by the next includable sponsored transaction.
+    pub next_use_nonce: SponsorUseNonce,
+    /// Actual native base units charged across all included uses.
+    pub total_charged: Amount,
+    /// Number of included uses, including chargeable action failures.
+    pub uses: SponsorUseCount,
+    /// Permanent owner-authorized revocation marker.
+    pub revoked: bool,
+}
 
 /// A signed V5 transaction whose stateless admission checks have passed.
 ///
@@ -58,9 +82,9 @@ mod tests {
     use super::*;
     use crate::{
         ActionScopeV1, ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision,
-        BlockHeight, FeeBid, FeePaymentV1, Nonce, Operation, SponsorGrantId, SponsorGrantV1,
-        SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1, ValidityWindowV1,
-        TRANSACTION_V5_PROTOCOL_VERSION,
+        BlockHeight, ChainState, FeeBid, FeePaymentV1, Nonce, Operation, SponsorGrantId,
+        SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
+        ValidityWindowV1, TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
 
@@ -172,5 +196,34 @@ mod tests {
             ),
             Err(TransactionValidationErrorV1::WrongChain)
         );
+    }
+
+    #[test]
+    fn sponsor_grant_state_is_exact_and_committed_by_the_state_root() {
+        let sponsor = Keypair::from_seed([3; 32]);
+        let grant_id = SponsorGrantId::new(Hash256([0x44; 32]));
+        let record = SponsorGrantStateV1 {
+            grant_digest: Some(Hash256([0x55; 32])),
+            next_use_nonce: SponsorUseNonce::new(7),
+            total_charged: Amount::from_units(123),
+            uses: SponsorUseCount::new(3),
+            revoked: false,
+        };
+        let value = serde_json::to_value(record).expect("grant state serializes");
+        assert_eq!(value["next_use_nonce"], "7");
+        assert_eq!(value["uses"], "3");
+        assert_eq!(value["total_charged"], "123");
+
+        let state = ChainState::default();
+        let before = state.state_root().expect("empty state root");
+        let mut with_grant = state;
+        with_grant
+            .sponsor_grants
+            .insert((sponsor.address(), grant_id), record);
+        assert_ne!(with_grant.state_root().expect("grant state root"), before);
+        let restored: ChainState =
+            bincode::deserialize(&bincode::serialize(&with_grant).expect("state serializes"))
+                .expect("state restores");
+        assert_eq!(restored, with_grant);
     }
 }

@@ -198,6 +198,45 @@ impl<'de> Deserialize<'de> for SponsorUseNonce {
     }
 }
 
+/// Count of fee-paying inclusions consumed by one sponsor grant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SponsorUseCount(u64);
+
+impl SponsorUseCount {
+    /// Constructs a use count from its unsigned consensus unit.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the unsigned consensus unit.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Advances the count without wrapping.
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl Serialize for SponsorUseCount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for SponsorUseCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_decimal_u64(deserializer).map(Self)
+    }
+}
+
 /// Inclusive consensus-height validity window signed by a wallet or sponsor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
