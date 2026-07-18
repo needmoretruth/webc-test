@@ -24,13 +24,16 @@
 //! effects — is bounded by the caller's gas limit.
 
 use wasmi::core::{Trap, TrapCode};
-use wasmi::{Caller, Extern, Linker, Memory, Store};
+use wasmi::{Caller, Extern, Linker, Memory, Store, StoreLimits, StoreLimitsBuilder};
 use webc_crypto::Hash256;
 
 use crate::error::VmError;
 use crate::host::VmHost;
 use crate::limits::{VmLimits, KEY_LEN};
 use crate::validate::{compile_checked, HOST_MODULE};
+
+/// The wasm linear-memory page size, in bytes (fixed by the wasm spec).
+const WASM_PAGE_BYTES: usize = 64 * 1024;
 
 /// Mutable per-invocation state owned by the wasm [`Store`] and reachable from
 /// every host function via [`Caller`].
@@ -43,6 +46,26 @@ struct VmState<'a, H: VmHost> {
     /// A typed reason recorded when a host function aborts the guest, so the
     /// outer trap can be mapped back to a precise [`VmError`].
     trap_reason: Option<VmError>,
+    /// Caps linear-memory growth at RUN TIME (see [`memory_limiter`]). Held in the
+    /// store's data so the [`Store::limiter`] hook can borrow it each grow.
+    limiter: StoreLimits,
+}
+
+/// Builds a store resource limiter that caps linear-memory growth at
+/// `max_memory_pages`, enforced by the engine at run time regardless of what the
+/// module declares.
+///
+/// [`validate_module`](crate::validate_module) only bounds a memory's *declared*
+/// initial/maximum pages; a module may legally declare a small initial memory
+/// with **no maximum** and then `memory.grow` toward the wasm32 4 GiB ceiling for
+/// a single instruction's fuel. This limiter closes that at the source: a grow
+/// that would exceed the cap fails (`memory.grow` returns `-1`) before any
+/// allocation, so the 16-page / 1 MiB budget documented in [`VmLimits`] actually
+/// holds. It is deterministic — every node denies the same grow identically —
+/// with no trap, matching the wasm spec's grow-failure value.
+fn memory_limiter(limits: &VmLimits) -> StoreLimits {
+    let max_bytes = (limits.max_memory_pages as usize).saturating_mul(WASM_PAGE_BYTES);
+    StoreLimitsBuilder::new().memory_size(max_bytes).build()
 }
 
 /// Executes a WEBC contract module and returns its submitted output bytes.
@@ -74,8 +97,12 @@ pub fn execute<H: VmHost>(
         input,
         output: None,
         trap_reason: None,
+        limiter: memory_limiter(limits),
     };
     let mut store = Store::new(&engine, state);
+    // Enforce the linear-memory page budget at run time, not just at validation:
+    // a module with no declared memory maximum cannot grow past the cap.
+    store.limiter(|state| &mut state.limiter);
     // Fuel metering is enabled in the engine config; seed the budget.
     store
         .add_fuel(limits.fuel)

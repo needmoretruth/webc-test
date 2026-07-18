@@ -317,6 +317,57 @@ fn validate_rejects_excess_memory_pages() {
 }
 
 #[test]
+fn runtime_memory_growth_is_capped_without_a_declared_maximum() {
+    // A module declaring memory with NO maximum (so validation checks only the
+    // initial page) then growing far past the 16-page cap. The run-time limiter
+    // must DENY the grow (memory.grow returns -1) rather than allocating ~4 GiB —
+    // otherwise one invocation is a memory-exhaustion DoS and RAM-constrained
+    // validators diverge from well-provisioned ones.
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "webc" "webc_output" (func $output (param i32 i32)))
+          (memory (export "memory") 1)
+          (func (export "webc_call")
+            (i32.store (i32.const 0) (memory.grow (i32.const 100)))
+            (call $output (i32.const 0) (i32.const 4))))
+        "#,
+    )
+    .expect("grow fixture is valid wat");
+    // The no-maximum module still validates (only the declared initial is bounded).
+    validate_module(&module, &VmLimits::default()).expect("no-maximum module validates");
+    let mut host = MockHost::new();
+    let output = execute(&module, b"", &mut host, &VmLimits::default()).expect("runs");
+    // memory.grow failed -> -1 (0xffffffff little-endian), NOT the old page count.
+    assert_eq!(
+        output,
+        vec![0xff, 0xff, 0xff, 0xff],
+        "grow past the page cap is denied at run time"
+    );
+}
+
+#[test]
+fn runtime_memory_growth_within_cap_succeeds() {
+    // A grow that stays within the 16-page cap succeeds (returns the previous size
+    // in pages), so the limiter does not over-restrict legitimate growth.
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "webc" "webc_output" (func $output (param i32 i32)))
+          (memory (export "memory") 1)
+          (func (export "webc_call")
+            (i32.store (i32.const 0) (memory.grow (i32.const 4)))
+            (call $output (i32.const 0) (i32.const 4))))
+        "#,
+    )
+    .expect("grow fixture is valid wat");
+    let mut host = MockHost::new();
+    let output = execute(&module, b"", &mut host, &VmLimits::default()).expect("runs");
+    // 1 -> 5 pages (within 16) returns the old size, 1.
+    assert_eq!(output, vec![1, 0, 0, 0], "grow within the cap succeeds");
+}
+
+#[test]
 fn validate_rejects_foreign_imports() {
     // Imports from a module other than `webc`.
     let module = wat::parse_str(
