@@ -1011,12 +1011,13 @@ fn account_key_is_current(
 mod tests {
     use super::*;
     use crate::{
-        Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLaneId,
-        AuthorizationPolicyRevision, BlockHeight, ChainState, Epoch, FeeBid, FeePaymentV1, Nonce,
-        Operation, PostQuantumRoot, PostQuantumScheme, SessionAllowedOperations,
-        SessionKeyConstraints, SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce,
-        SponsorUseV1, TransactionAuthorizationV1, TransactionIndex, ValidityWindowV1,
-        INITIAL_AUTHORIZATION_POLICY_REVISION, TRANSACTION_V5_PROTOCOL_VERSION,
+        Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
+        AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Epoch, FeeBid,
+        FeePaymentV1, Nonce, Operation, PostQuantumRoot, PostQuantumScheme,
+        SessionAllowedOperations, SessionKeyConstraints, SponsorGrantId, SponsorGrantV1,
+        SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
+        TransactionIndex, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
+        TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
 
@@ -1442,11 +1443,11 @@ mod tests {
         let mut state = funded_state(&sender, None);
         state.minted_supply = Amount::from_units(20_000);
         state.inflation_year_start_supply = state.minted_supply;
-        let prepared = prepared(&state, transaction);
+        let success_prepared = prepared(&state, transaction);
 
         let executed = state
             .execute_prepared_transaction_v1(
-                prepared,
+                success_prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
             )
             .expect("two transfers execute");
@@ -1492,6 +1493,9 @@ mod tests {
         let sender = Keypair::from_seed([1; 32]);
         let first = Keypair::from_seed([2; 32]);
         let second = Keypair::from_seed([4; 32]);
+        let never_attempted = Keypair::from_seed([6; 32]);
+        let unrelated = Keypair::from_seed([7; 32]);
+        let unrelated_recipient = Keypair::from_seed([8; 32]);
         let transaction = sender_actions_fixture(
             &sender,
             vec![
@@ -1503,17 +1507,25 @@ mod tests {
                     to: second.address(),
                     amount: Amount::from_units(10_000),
                 }),
+                ActionV1::native(Operation::Transfer {
+                    to: never_attempted.address(),
+                    amount: Amount::from_units(1),
+                }),
             ],
-            1_000,
+            1_500,
         );
         let mut state = funded_state(&sender, None);
-        state.minted_supply = Amount::from_units(20_000);
+        state.accounts.insert(
+            unrelated.address(),
+            Account::with_balance(Amount::from_units(10_000)),
+        );
+        state.minted_supply = Amount::from_units(30_000);
         state.inflation_year_start_supply = state.minted_supply;
-        let prepared = prepared(&state, transaction);
+        let failed_prepared = prepared(&state, transaction);
 
         let executed = state
             .execute_prepared_transaction_v1(
-                prepared,
+                failed_prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
             )
             .expect("chargeable failure is an executed result");
@@ -1537,10 +1549,40 @@ mod tests {
         );
         assert!(!state.accounts.contains_key(&first.address()));
         assert!(!state.accounts.contains_key(&second.address()));
+        assert!(!state.accounts.contains_key(&never_attempted.address()));
         assert!(
             state
                 .supply_invariant_report()
                 .expect("supply report")
+                .balanced
+        );
+
+        let unrelated_transaction = sender_actions_fixture(
+            &unrelated,
+            vec![ActionV1::native(Operation::Transfer {
+                to: unrelated_recipient.address(),
+                amount: Amount::from_units(100),
+            })],
+            1_000,
+        );
+        let unrelated_prepared = prepared(&state, unrelated_transaction);
+        let unrelated_receipt = state
+            .execute_prepared_transaction_v1(
+                unrelated_prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(1)),
+            )
+            .expect("unrelated transaction still executes")
+            .into_receipt();
+        assert_eq!(unrelated_receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(state.accounts[&unrelated.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&unrelated_recipient.address()].balance,
+            Amount::from_units(100)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("post-unrelated supply report")
                 .balanced
         );
     }
@@ -1585,6 +1627,66 @@ mod tests {
         assert_eq!(
             state.accounts[&sender.address()].balance,
             Amount::from_units(19_850)
+        );
+    }
+
+    #[test]
+    fn non_default_sender_lane_keeps_principal_and_fee_replay_separate() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let lane = AuthorizationLaneId::new(Hash256([0x55; 32]));
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(100),
+            })],
+            FeeBid {
+                gas_limit: 1_000,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("lane transaction builds");
+        transaction.sign(&sender).expect("lane transaction signs");
+        let mut state = funded_state(&sender, None);
+        state.authorization_lanes.insert(
+            (sender.address(), lane),
+            AuthorizationLane::new(sender.address(), lane, Amount::from_units(10_000)),
+        );
+        state.minted_supply = Amount::from_units(30_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("lane transaction executes");
+
+        assert_eq!(state.accounts[&sender.address()].nonce, 0);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(19_900)
+        );
+        let lane_state = &state.authorization_lanes[&(sender.address(), lane)];
+        assert_eq!(lane_state.next_nonce, Nonce::new(1));
+        assert_eq!(lane_state.fee_balance, Amount::from_units(8_500));
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("lane supply report")
+                .balanced
         );
     }
 
