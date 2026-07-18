@@ -849,6 +849,55 @@ impl TransactionV5 {
         self.kind.required_units()
     }
 
+    /// Recomputes the exact logical state declaration required for inclusion.
+    ///
+    /// Sender authority, nonce, and every action are always retained. Sponsored
+    /// payment removes the sender fee accumulator and adds the sponsor policy,
+    /// payer balance/lane, grant replay/budget state, and payer fee accumulator.
+    /// The result is sorted so construction is independent of action order while
+    /// the signed action program remains ordered separately.
+    pub fn expected_access_list(&self) -> Result<AccessList, TransactionValidationErrorV1> {
+        let baseline = self
+            .kind
+            .default_access_list_for_lane(self.sender, self.authorization.lane)?;
+        let FeePaymentV1::Sponsored(sponsor_use) = &self.fee_payment else {
+            return Ok(baseline);
+        };
+
+        let mut read_only = baseline.read_only.into_iter().collect::<BTreeSet<_>>();
+        let mut read_write = baseline.read_write.into_iter().collect::<BTreeSet<_>>();
+        read_write.remove(&StateKey::fee_accumulator_for_lane(
+            self.sender,
+            self.authorization.lane,
+        ));
+
+        let grant = &sponsor_use.grant;
+        let sponsor_policy = StateKey::authorization_policy(grant.sponsor);
+        if !read_write.contains(&sponsor_policy) {
+            read_only.insert(sponsor_policy);
+        }
+        let payer_state = if grant.payer_lane.is_default() {
+            StateKey::account(grant.sponsor)
+        } else {
+            StateKey::authorization_lane(grant.sponsor, grant.payer_lane)
+        };
+        read_only.remove(&payer_state);
+        read_write.insert(payer_state);
+        read_write.insert(StateKey::sponsor_grant(
+            grant.sponsor,
+            grant.grant_id.digest(),
+        ));
+        read_write.insert(StateKey::fee_accumulator_for_lane(
+            grant.sponsor,
+            grant.payer_lane,
+        ));
+
+        Ok(AccessList::new(
+            read_only.into_iter().collect(),
+            read_write.into_iter().collect(),
+        ))
+    }
+
     /// Returns the domain-separated stable identity of the complete signed wire.
     pub fn transaction_id(&self) -> Result<TransactionId, TransactionValidationErrorV1> {
         #[derive(Serialize)]

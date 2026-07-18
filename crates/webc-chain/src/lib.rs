@@ -13,6 +13,7 @@ pub mod block_builder;
 pub mod bridge;
 pub mod canonical;
 pub mod consensus;
+pub mod execution_v1;
 pub mod fees;
 pub mod genesis;
 pub mod hex_bytes;
@@ -55,6 +56,7 @@ pub use consensus::{
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
     CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
 };
+pub use execution_v1::ValidatedTransactionV1;
 pub use fees::{
     calculate_fee_summary_v1, split_fee, FeeBreakdown, FeeComputationError, FeePayerV1, FeePolicy,
     FeeRate, FeeSummaryV1, GasUnits, FEE_SUMMARY_V1,
