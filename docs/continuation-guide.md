@@ -160,19 +160,29 @@ gas-metering, independent of node exec speed.)
   (determinism / gas / footprint / rollback / additive-safety / bytecode-validation);
   resolve any confirmed findings before treating 7b as closed.
 
-**CURRENT IN-FLIGHT — Weft skeleton (owner-approved earliest version).** Owner:
-"weft을 아주 극초기버전이라도… 틀이라도… 나중에 유연성 좋게" — build even a
-skeleton Weft, for future flexibility. Weft is a **DECIDED** language
-(`docs/weft-language-plan.md`, `architecture.md`, ADR-0014): a front end that
-compiles **off-chain to deterministic WASM** targeting the frozen host ABI — never
-a second VM. The skeleton = a new `webc-weft` crate with a REAL (tiny) pipeline
-lexer→parser→AST→sema→WAT codegen over the host ABI, emitting the machine-readable
-interface manifest, with the flagship proof being a `.weft` counter that compiles
-and **runs as a real on-chain contract** (register+invoke on `webc-chain`, state
-accumulates). Skeleton codegen emits WAT and assembles via the `wat` crate; the
-production backend (lowering via the audited Rust framework) is a documented
-extension point. Being built with workflows (design synthesis + adversarial review)
-per owner direction.
+**DONE — Weft skeleton (owner-approved earliest version).** Owner: "weft을 아주
+극초기버전이라도… 틀이라도… 나중에 유연성 좋게" — build even a skeleton Weft, for
+future flexibility. Delivered as the new **`webc-weft` crate** (ADR-0015): a REAL
+(tiny) front end lexer→parser→AST→sema→IR→WAT codegen over the host ABI, emitting
+the `weft.interface/v1` machine-readable manifest, behind `compile(&str) ->
+Compiled{ wasm, wat, manifest, footprint, abi_version }` + a `weft check|build|wat`
+CLI. Flagship proof PASSES: a `.weft` counter compiles and **runs as a real
+on-chain contract** — registered + invoked on a live `ChainState`, its persistent
+counter climbs 1→2→3 across transactions (behaviorally identical to the audited WAT
+fixture); `echo` round-trips input; the manifest footprint equals the on-chain
+declared access. 16 unit + 3 end-to-end tests green; full workspace green. Codegen
+emits WAT (assembled via `wat`); the production backend (lowering via the audited
+Rust framework, behind `trait Backend`) is a documented extension point, as are
+more types/exprs/control-flow, linear `Amount<T>` (a no-op `sema` pass today),
+events codegen, generics, and editions — every deferred construct has a named seam
+(`#[non_exhaustive]` nodes, the stable `ir::Module` boundary). Built via workflows
+(design synthesis done; adversarial review = the remaining sub-step of Phase 7b).
+Edition-1 limits (documented, not silent): one entry/component, `u64`+`bytes` only,
+wrapping arithmetic, `emit`/`event` manifested but codegen-deferred.
+
+**NEXT after the two adversarial reviews resolve:** resume the practical-L1 roadmap
+below. Owner may also later ask to grow Weft (more types, control flow, linearity,
+the Rust-framework backend) — all additive on the seams above.
 
 **Remaining practical-L1 roadmap after the WASM runtime (value order, all
 additive so Codex-safe):** distribution program (airdrop claim / expiring
