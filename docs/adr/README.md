@@ -21,6 +21,7 @@ code depends on it. Every replacement states compatibility and migration rules.
 - [ADR-0012: inactivity leak and slashing posture](0012-inactivity-leak-and-slashing.md)
 - [ADR-0013: hot/cold storage tiering boundary](0013-hot-cold-storage-tiering.md)
 - [ADR-0014: contract runtime](0014-contract-runtime.md)
+- [ADR-0015: Weft authoring front end — earliest skeleton](0015-weft-skeleton.md)
 
 ## Planned ADRs (from the 2026-07-16 plan review)
 
