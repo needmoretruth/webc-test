@@ -456,6 +456,7 @@ fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExec
                         | Operation::FundAuthorizationLane { .. }
                         | Operation::ClaimValidatorRewards
                         | Operation::ClaimDelegatorRewards { .. }
+                        | Operation::ClaimUnbonded { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
                         | Operation::TransferObject { .. }
@@ -520,6 +521,10 @@ fn execute_native_action_v1(
         Operation::ClaimDelegatorRewards { validator } => {
             state.apply_native_claim_delegator_rewards(context.sender, *validator, effects)
         }
+        Operation::ClaimUnbonded {
+            validator,
+            request_id,
+        } => state.apply_native_claim_unbonded(context.sender, *validator, *request_id, effects),
         Operation::CreateObject {
             object_id,
             namespace,
@@ -810,7 +815,10 @@ fn classify_action_failure(
         | ChainError::AuthorizationLaneExists
         | ChainError::AuthorizationLaneNotFound
         | ChainError::ValidatorNotFound(_)
-        | ChainError::DelegationNotFound => Ok(ExecutionFailureCodeV1::Precondition),
+        | ChainError::DelegationNotFound
+        | ChainError::UnbondingRequestNotFound
+        | ChainError::UnbondingOwnerMismatch
+        | ChainError::UnbondingNotWithdrawable => Ok(ExecutionFailureCodeV1::Precondition),
         ChainError::AccountNotFound(_) => Ok(ExecutionFailureCodeV1::Precondition),
         other => Err(map_block_chain_error(other)),
     }
@@ -1137,8 +1145,9 @@ mod tests {
         Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectOwner, ObjectVersion, Operation,
         PostQuantumRoot, PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
         SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
-        TransactionAuthorizationV1, TransactionIndex, Validator, ValidatorStatus, ValidityWindowV1,
-        INITIAL_AUTHORIZATION_POLICY_REVISION, TRANSACTION_V5_PROTOCOL_VERSION,
+        TransactionAuthorizationV1, TransactionIndex, UnbondingKind, UnbondingRequestId, Validator,
+        ValidatorStatus, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
+        TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
 
@@ -1327,6 +1336,43 @@ mod tests {
             .sign_with_policy_key(session)
             .expect("session transaction signs");
         transaction
+    }
+
+    fn matured_unbonding_state(
+        owner: &Keypair,
+        validator: &Keypair,
+    ) -> (ChainState, UnbondingRequestId) {
+        let mut state = funded_state(owner, None);
+        let amount = Amount::from_units(100);
+        let account = state
+            .accounts
+            .get_mut(&owner.address())
+            .expect("owner account");
+        account.balance = Amount::from_units(500_000);
+        account.unbonding = amount;
+        let request_id = state
+            .unbonding
+            .request(
+                owner.address(),
+                validator.address(),
+                UnbondingKind::Delegation,
+                amount,
+                Epoch::new(0),
+                Amount::ZERO,
+            )
+            .expect("unbonding request");
+        state
+            .unbonding
+            .advance_epoch(Epoch::new(1), amount, 1, 1)
+            .expect("unbonding admission");
+        state
+            .unbonding
+            .advance_epoch(Epoch::new(3), Amount::ZERO, 1, 1)
+            .expect("unbonding maturity");
+        state.current_epoch = 3;
+        state.minted_supply = Amount::from_units(500_100);
+        state.inflation_year_start_supply = state.minted_supply;
+        (state, request_id)
     }
 
     #[test]
@@ -1933,6 +1979,97 @@ mod tests {
             state
                 .supply_invariant_report()
                 .expect("failed reward claim supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn matured_unbonding_claim_commits_principal_and_event() {
+        let sender = Keypair::from_seed([1; 32]);
+        let validator = Keypair::from_seed([2; 32]);
+        let (mut state, request_id) = matured_unbonding_state(&sender, &validator);
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![ActionV1::native(Operation::ClaimUnbonded {
+                validator: validator.address(),
+                request_id,
+            })],
+            10_000,
+        );
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("matured unbonding claim executes")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 1);
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(30_000));
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(470_100)
+        );
+        assert_eq!(state.accounts[&sender.address()].unbonding, Amount::ZERO);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("unbonding claim supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn duplicate_unbonding_claim_discards_first_child_claim() {
+        let sender = Keypair::from_seed([1; 32]);
+        let validator = Keypair::from_seed([2; 32]);
+        let (mut state, request_id) = matured_unbonding_state(&sender, &validator);
+        let claim = ActionV1::native(Operation::ClaimUnbonded {
+            validator: validator.address(),
+            request_id,
+        });
+        let transaction = sender_actions_fixture(&sender, vec![claim.clone(), claim], 20_000);
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("duplicate claim is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(receipt.events.is_empty());
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(440_000)
+        );
+        assert_eq!(
+            state.accounts[&sender.address()].unbonding,
+            Amount::from_units(100)
+        );
+        assert_eq!(
+            state
+                .unbonding
+                .get(request_id)
+                .expect("request remains")
+                .withdrawable,
+            Amount::from_units(100)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed unbonding claim supply report")
                 .balanced
         );
     }

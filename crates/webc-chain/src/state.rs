@@ -1889,28 +1889,12 @@ impl ChainState {
                 validator,
                 request_id,
             } => {
-                access.write(StateKey::unbonding_queue(*validator))?;
-                let request = self
-                    .unbonding
-                    .get(*request_id)
-                    .ok_or(ChainError::UnbondingRequestNotFound)?;
-                if request.validator != *validator {
-                    return Err(ChainError::UnbondingRequestNotFound);
-                }
-                let kind = request.kind;
-                let amount = self.unbonding.claim(*request_id, tx.sender)?;
-                let account = self.account_mut(tx.sender)?;
-                account.unbonding = account
-                    .unbonding
-                    .checked_sub(amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.credit_native(tx.sender, amount)?;
-                events.push(Event::UnbondingClaimed {
-                    request_id: *request_id,
-                    delegator: tx.sender,
-                    kind,
-                    amount,
-                });
+                self.apply_native_claim_unbonded(
+                    tx.sender,
+                    *validator,
+                    *request_id,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::ClaimValidatorRewards => {
                 self.apply_native_claim_validator_rewards(
@@ -2538,6 +2522,40 @@ impl ChainState {
             delegator: sender,
             validator,
             amount: reward,
+        });
+        Ok(())
+    }
+
+    /// Claims matured unbonding principal inside the caller's action overlay.
+    pub(crate) fn apply_native_claim_unbonded(
+        &mut self,
+        sender: Address,
+        validator: Address,
+        request_id: UnbondingRequestId,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::unbonding_queue(validator))?;
+        let request = self
+            .unbonding
+            .get(request_id)
+            .ok_or(ChainError::UnbondingRequestNotFound)?;
+        if request.validator != validator {
+            return Err(ChainError::UnbondingRequestNotFound);
+        }
+        let kind = request.kind;
+        let amount = self.unbonding.claim(request_id, sender)?;
+        let account = self.account_mut(sender)?;
+        account.unbonding = account
+            .unbonding
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.credit_native(sender, amount)?;
+        events.push(Event::UnbondingClaimed {
+            request_id,
+            delegator: sender,
+            kind,
+            amount,
         });
         Ok(())
     }
