@@ -122,6 +122,16 @@ pub enum PreparedAuthorizationV1 {
 pub struct PreparedTransactionV1 {
     validated: ValidatedTransactionV1,
     transaction_id: crate::TransactionId,
+    snapshot: PreparationSnapshotV1,
+}
+
+/// Small state-dependent preparation result used for stale-value detection.
+///
+/// The signed transaction and its identifier are immutable once admitted, so
+/// re-execution only needs to recompute these state-derived scalar fields. This
+/// avoids cloning and canonically hashing the complete signed envelope again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparationSnapshotV1 {
     fee_payer: FeePayerV1,
     fee_reserve: Amount,
     required_units: GasUnits,
@@ -143,32 +153,32 @@ impl PreparedTransactionV1 {
 
     /// Returns the exact account/lane that must reserve the fee.
     pub const fn fee_payer(&self) -> FeePayerV1 {
-        self.fee_payer
+        self.snapshot.fee_payer
     }
 
     /// Returns `gas_limit * max_fee_per_unit` in native base units.
     pub const fn fee_reserve(&self) -> Amount {
-        self.fee_reserve
+        self.snapshot.fee_reserve
     }
 
     /// Returns checked static units for every action or cancellation.
     pub const fn required_units(&self) -> GasUnits {
-        self.required_units
+        self.snapshot.required_units
     }
 
     /// Returns the current block base rate captured during preparation.
     pub const fn base_fee_per_unit(&self) -> FeeRate {
-        self.base_fee_per_unit
+        self.snapshot.base_fee_per_unit
     }
 
     /// Returns the signed priority rate capped by maximum-minus-base room.
     pub const fn effective_priority_fee_per_unit(&self) -> FeeRate {
-        self.effective_priority_fee_per_unit
+        self.snapshot.effective_priority_fee_per_unit
     }
 
     /// Returns the state authority selected for later budget accounting.
     pub const fn authorization(&self) -> PreparedAuthorizationV1 {
-        self.authorization
+        self.snapshot.authorization
     }
 }
 
@@ -281,6 +291,24 @@ impl ChainState {
         validated: ValidatedTransactionV1,
         height: BlockHeight,
     ) -> Result<PreparedTransactionV1, TransactionPreparationErrorV1> {
+        let snapshot = self.prepare_snapshot_v1(&validated, height)?;
+        let transaction_id = validated
+            .transaction()
+            .transaction_id()
+            .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+        Ok(PreparedTransactionV1 {
+            validated,
+            transaction_id,
+            snapshot,
+        })
+    }
+
+    /// Recomputes only state-derived preparation fields for stale-value checks.
+    fn prepare_snapshot_v1(
+        &self,
+        validated: &ValidatedTransactionV1,
+        height: BlockHeight,
+    ) -> Result<PreparationSnapshotV1, TransactionPreparationErrorV1> {
         let transaction = validated.transaction();
         if !transaction.validity.contains(height) {
             return Err(TransactionPreparationErrorV1::HeightOutsideValidity);
@@ -335,10 +363,7 @@ impl ChainState {
             return Err(TransactionPreparationErrorV1::InsufficientFeeReserve);
         }
 
-        Ok(PreparedTransactionV1 {
-            transaction_id: transaction
-                .transaction_id()
-                .map_err(|_| TransactionPreparationErrorV1::InvalidState)?,
+        Ok(PreparationSnapshotV1 {
             fee_payer,
             fee_reserve,
             required_units: GasUnits::new(required_units),
@@ -347,7 +372,6 @@ impl ChainState {
                 transaction.fee_bid.priority_fee_per_unit.min(priority_room),
             ),
             authorization,
-            validated,
         })
     }
 
@@ -365,11 +389,16 @@ impl ChainState {
         prepared: PreparedTransactionV1,
         position: BlockPositionV1,
     ) -> Result<ExecutedTransactionV1, BlockExecutionErrorV1> {
-        let refreshed = self.prepare_transaction_v1(prepared.validated.clone(), position.height)?;
-        if refreshed != prepared {
+        let refreshed = self.prepare_snapshot_v1(&prepared.validated, position.height)?;
+        if refreshed != prepared.snapshot {
             return Err(BlockExecutionErrorV1::StalePreparation);
         }
-        let transaction = prepared.validated.transaction().clone();
+        let PreparedTransactionV1 {
+            validated,
+            transaction_id,
+            snapshot,
+        } = prepared;
+        let transaction = validated.into_transaction();
         preflight_supported_actions(&transaction.kind)?;
         let mut access = StateAccessRecorder::new(
             &transaction.access_list.read_only,
@@ -378,13 +407,13 @@ impl ChainState {
         .map_err(map_block_chain_error)?;
         record_parent_access(
             &transaction,
-            prepared.fee_payer,
-            prepared.authorization,
+            snapshot.fee_payer,
+            snapshot.authorization,
             &mut access,
         )?;
 
         let mut parent = self.clone();
-        debit_fee_reserve(&mut parent, prepared.fee_payer, prepared.fee_reserve)?;
+        debit_fee_reserve(&mut parent, snapshot.fee_payer, snapshot.fee_reserve)?;
         advance_sender_nonce(
             &mut parent,
             transaction.sender,
@@ -397,24 +426,24 @@ impl ChainState {
                 (
                     parent,
                     ReceiptStatusV1::Succeeded,
-                    prepared.required_units,
+                    snapshot.required_units,
                     Vec::new(),
                 )
             }
             TransactionKindV1::Actions(program) => execute_action_program_v1(
                 parent,
                 &transaction,
-                prepared.transaction_id,
+                transaction_id,
                 program,
                 &mut access,
             )?,
         };
 
         let fee_summary = calculate_fee_summary_v1(
-            prepared.fee_payer,
+            snapshot.fee_payer,
             GasUnits::new(transaction.fee_bid.gas_limit),
             attempted_units,
-            prepared.base_fee_per_unit,
+            snapshot.base_fee_per_unit,
             FeeRate::new(transaction.fee_bid.max_fee_per_unit),
             FeeRate::new(transaction.fee_bid.priority_fee_per_unit),
         )?;
@@ -423,7 +452,7 @@ impl ChainState {
         finalize_session_use(
             &mut selected,
             &transaction,
-            prepared.authorization,
+            snapshot.authorization,
             status,
             fee_summary.charged,
         )?;
@@ -431,7 +460,7 @@ impl ChainState {
         let receipt = ReceiptV1 {
             version: RECEIPT_V1,
             position,
-            transaction_id: prepared.transaction_id,
+            transaction_id,
             sender: transaction.sender,
             status,
             fee_summary,
@@ -2542,6 +2571,55 @@ mod tests {
             Err(BlockExecutionErrorV1::StalePreparation)
         );
         assert_eq!(state, before_stale);
+    }
+
+    #[test]
+    fn invalidated_preparation_returns_typed_error_without_execution_mutation() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let mut state = funded_state(&sender, None);
+        let prepared_transfer = prepared(&state, sender_paid_fixture(&sender, &recipient));
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("funded sender")
+            .nonce = 1;
+        let before_execution = state.clone();
+
+        assert_eq!(
+            state.execute_prepared_transaction_v1(
+                prepared_transfer,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            ),
+            Err(BlockExecutionErrorV1::Preparation(
+                TransactionPreparationErrorV1::SenderNonceMismatch,
+            ))
+        );
+        assert_eq!(state, before_execution);
+    }
+
+    #[test]
+    fn unrelated_state_change_does_not_stale_prepared_transaction() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let unrelated = Keypair::from_seed([9; 32]);
+        let mut state = funded_state(&sender, None);
+        let prepared_transfer = prepared(&state, sender_paid_fixture(&sender, &recipient));
+        state.accounts.insert(
+            unrelated.address(),
+            Account::with_balance(Amount::from_units(7)),
+        );
+
+        state
+            .execute_prepared_transaction_v1(
+                prepared_transfer,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("unrelated state does not invalidate preparation");
+        assert_eq!(
+            state.accounts[&unrelated.address()].balance,
+            Amount::from_units(7)
+        );
     }
 
     #[test]
