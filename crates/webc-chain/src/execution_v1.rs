@@ -17,14 +17,16 @@
 use crate::state::NativeActionEffects;
 use crate::state_key::StateAccessRecorder;
 use crate::{
-    calculate_fee_summary_v1, ActionIndex, ActionV1, Amount, AuthorizationLaneId, BlockHeight,
-    BlockPositionV1, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
-    ExecutionFailureCodeV1, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate, GasUnits,
-    Nonce, Operation, ProtocolStateKey, ReceiptError, ReceiptStatusV1, ReceiptV1, SessionKey,
-    SessionKeyId, SponsorUseCount, SponsorUseNonce, StateKey, TransactionKindV1, TransactionV5,
-    TransactionValidationErrorV1, EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION, RECEIPT_V1,
+    calculate_fee_summary_v1, ActionIndex, ActionV1, Amount, AssetId, AuthorizationLaneId,
+    BlockHeight, BlockPositionV1, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
+    ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate,
+    GasUnits, Nonce, ObjectId, Operation, ProtocolStateKey, ReceiptError, ReceiptStatusV1,
+    ReceiptV1, SessionKey, SessionKeyId, SponsorGrantId, SponsorUseCount, SponsorUseNonce,
+    StateKey, StateKeyKind, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
+    EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION, RECEIPT_V1,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
 
 /// Durable replay, fee-budget, use-count, and revocation state for one grant.
@@ -138,6 +140,319 @@ struct PreparationSnapshotV1 {
     base_fee_per_unit: FeeRate,
     effective_priority_fee_per_unit: FeeRate,
     authorization: PreparedAuthorizationV1,
+}
+
+/// Typed writable identities captured by one bounded execution overlay.
+///
+/// Converting hostile `StateKey` values into this closed enum happens before
+/// execution. Commit can therefore be infallible and cannot partially mutate
+/// the base state before discovering an unsupported key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExecutionWriteKeyV1 {
+    Account(Address),
+    AuthorizationPolicy(Address),
+    AssetBalance(AssetId, Address),
+    Validator(Address),
+    Delegation(Address, Address),
+    AuthorizationLane(Address, AuthorizationLaneId),
+    FeeAccumulator,
+    SessionKey(Address, SessionKeyId),
+    BridgeMessage(Hash256),
+    BridgeEscrow(ExternalChain),
+    SlashingEvidence(Hash256),
+    UnbondingQueue,
+    Object(ObjectId),
+    Application,
+    ProtocolBridgeNonce,
+    SponsorGrant(Address, SponsorGrantId),
+}
+
+/// Sui-style bounded input snapshot plus deterministic write effects.
+///
+/// Only records named by the signed access list are copied from the global
+/// state. Native transitions still operate on the existing `ChainState` API,
+/// while commit moves only declared writable records back. This preserves the
+/// replaceable storage boundary without cloning unrelated accounts or objects.
+struct SparseExecutionStateV1 {
+    state: ChainState,
+    writes: Vec<ExecutionWriteKeyV1>,
+}
+
+impl SparseExecutionStateV1 {
+    /// Captures all declared inputs and validates the complete write set before execution.
+    fn capture(
+        base: &ChainState,
+        read_only: &[StateKey],
+        read_write: &[StateKey],
+    ) -> Result<Self, BlockExecutionErrorV1> {
+        let mut state = ChainState {
+            protocol_version: base.protocol_version,
+            chain_id: base.chain_id.clone(),
+            burned_fees: base.burned_fees,
+            slashed_units: base.slashed_units,
+            validator_fee_pool: base.validator_fee_pool,
+            minted_supply: base.minted_supply,
+            inflation_year_start_supply: base.inflation_year_start_supply,
+            current_base_fee_per_unit: base.current_base_fee_per_unit,
+            current_epoch: base.current_epoch,
+            bridge_nonce: base.bridge_nonce,
+            last_block_timestamp_ms: base.last_block_timestamp_ms,
+            ..ChainState::default()
+        };
+        let mut unbonding_captured = false;
+        for key in read_only.iter().chain(read_write) {
+            capture_state_key(base, &mut state, key, &mut unbonding_captured)?;
+        }
+        let writes = read_write
+            .iter()
+            .map(execution_write_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { state, writes })
+    }
+
+    /// Applies only typed declared effects after receipt validation has succeeded.
+    fn commit(mut self, base: &mut ChainState) {
+        let commit_unbonding = self
+            .writes
+            .iter()
+            .any(|key| matches!(key, ExecutionWriteKeyV1::UnbondingQueue));
+        for key in self.writes {
+            match key {
+                ExecutionWriteKeyV1::Account(address) => {
+                    commit_map_entry(&mut base.accounts, &mut self.state.accounts, address);
+                }
+                ExecutionWriteKeyV1::AuthorizationPolicy(owner) => commit_map_entry(
+                    &mut base.authorization_policies,
+                    &mut self.state.authorization_policies,
+                    owner,
+                ),
+                ExecutionWriteKeyV1::AssetBalance(asset, owner) => commit_map_entry(
+                    &mut base.asset_balances,
+                    &mut self.state.asset_balances,
+                    (asset, owner),
+                ),
+                ExecutionWriteKeyV1::Validator(operator) => {
+                    commit_map_entry(&mut base.validators, &mut self.state.validators, operator)
+                }
+                ExecutionWriteKeyV1::Delegation(delegator, validator) => commit_map_entry(
+                    &mut base.delegations,
+                    &mut self.state.delegations,
+                    (delegator, validator),
+                ),
+                ExecutionWriteKeyV1::AuthorizationLane(owner, lane) => commit_map_entry(
+                    &mut base.authorization_lanes,
+                    &mut self.state.authorization_lanes,
+                    (owner, lane),
+                ),
+                ExecutionWriteKeyV1::FeeAccumulator => {}
+                ExecutionWriteKeyV1::SessionKey(owner, session_key) => commit_map_entry(
+                    &mut base.session_keys,
+                    &mut self.state.session_keys,
+                    (owner, session_key),
+                ),
+                ExecutionWriteKeyV1::BridgeMessage(message_hash) => commit_set_membership(
+                    &mut base.processed_bridge_messages,
+                    &mut self.state.processed_bridge_messages,
+                    message_hash,
+                ),
+                ExecutionWriteKeyV1::BridgeEscrow(domain) => commit_map_entry(
+                    &mut base.native_bridge_escrow,
+                    &mut self.state.native_bridge_escrow,
+                    domain,
+                ),
+                ExecutionWriteKeyV1::SlashingEvidence(evidence_hash) => commit_set_membership(
+                    &mut base.processed_slashing_evidence,
+                    &mut self.state.processed_slashing_evidence,
+                    evidence_hash,
+                ),
+                ExecutionWriteKeyV1::UnbondingQueue => {}
+                ExecutionWriteKeyV1::Object(object_id) => {
+                    commit_map_entry(&mut base.objects, &mut self.state.objects, object_id);
+                }
+                ExecutionWriteKeyV1::Application => {}
+                ExecutionWriteKeyV1::ProtocolBridgeNonce => {
+                    base.bridge_nonce = self.state.bridge_nonce;
+                }
+                ExecutionWriteKeyV1::SponsorGrant(sponsor, grant_id) => commit_map_entry(
+                    &mut base.sponsor_grants,
+                    &mut self.state.sponsor_grants,
+                    (sponsor, grant_id),
+                ),
+            }
+        }
+        if commit_unbonding {
+            base.unbonding = self.state.unbonding;
+        }
+        base.burned_fees = self.state.burned_fees;
+        base.validator_fee_pool = self.state.validator_fee_pool;
+    }
+}
+
+/// Copies one declared logical record into the bounded temporary state.
+fn capture_state_key(
+    base: &ChainState,
+    target: &mut ChainState,
+    key: &StateKey,
+    unbonding_captured: &mut bool,
+) -> Result<(), BlockExecutionErrorV1> {
+    key.validate_version().map_err(map_block_chain_error)?;
+    match &key.kind {
+        StateKeyKind::Account { address } => {
+            capture_map_entry(&base.accounts, &mut target.accounts, address);
+        }
+        StateKeyKind::AuthorizationPolicy { owner } => capture_map_entry(
+            &base.authorization_policies,
+            &mut target.authorization_policies,
+            owner,
+        ),
+        StateKeyKind::AssetBalance { asset, owner } => capture_map_entry(
+            &base.asset_balances,
+            &mut target.asset_balances,
+            &(asset.clone(), *owner),
+        ),
+        StateKeyKind::Validator { operator } => {
+            capture_map_entry(&base.validators, &mut target.validators, operator);
+        }
+        StateKeyKind::Delegation {
+            delegator,
+            validator,
+        } => capture_map_entry(
+            &base.delegations,
+            &mut target.delegations,
+            &(*delegator, *validator),
+        ),
+        StateKeyKind::AuthorizationLane { owner, lane } => capture_map_entry(
+            &base.authorization_lanes,
+            &mut target.authorization_lanes,
+            &(*owner, *lane),
+        ),
+        StateKeyKind::FeeAccumulator { .. } => {}
+        StateKeyKind::SessionKey { owner, session_key } => capture_map_entry(
+            &base.session_keys,
+            &mut target.session_keys,
+            &(*owner, *session_key),
+        ),
+        StateKeyKind::BridgeMessage { message_hash } => capture_set_membership(
+            &base.processed_bridge_messages,
+            &mut target.processed_bridge_messages,
+            message_hash,
+        ),
+        StateKeyKind::BridgeEscrow { domain } => capture_map_entry(
+            &base.native_bridge_escrow,
+            &mut target.native_bridge_escrow,
+            domain,
+        ),
+        StateKeyKind::SlashingEvidence { evidence_hash } => capture_set_membership(
+            &base.processed_slashing_evidence,
+            &mut target.processed_slashing_evidence,
+            evidence_hash,
+        ),
+        StateKeyKind::UnbondingQueue { .. } => {
+            if !*unbonding_captured {
+                target.unbonding = base.unbonding.clone();
+                *unbonding_captured = true;
+            }
+        }
+        StateKeyKind::Object { object_id } => {
+            capture_map_entry(&base.objects, &mut target.objects, object_id);
+        }
+        StateKeyKind::Protocol { .. } => {}
+        StateKeyKind::SponsorGrant { sponsor, grant_id } => capture_map_entry(
+            &base.sponsor_grants,
+            &mut target.sponsor_grants,
+            &(*sponsor, SponsorGrantId::new(*grant_id)),
+        ),
+        StateKeyKind::Application { .. } => {}
+        StateKeyKind::Module { .. } => {
+            return Err(BlockExecutionErrorV1::StateAccessInvariant);
+        }
+    }
+    Ok(())
+}
+
+/// Converts one prevalidated writable key into an infallible commit effect.
+fn execution_write_key(key: &StateKey) -> Result<ExecutionWriteKeyV1, BlockExecutionErrorV1> {
+    key.validate_version().map_err(map_block_chain_error)?;
+    match &key.kind {
+        StateKeyKind::Account { address } => Ok(ExecutionWriteKeyV1::Account(*address)),
+        StateKeyKind::AuthorizationPolicy { owner } => {
+            Ok(ExecutionWriteKeyV1::AuthorizationPolicy(*owner))
+        }
+        StateKeyKind::AssetBalance { asset, owner } => {
+            Ok(ExecutionWriteKeyV1::AssetBalance(asset.clone(), *owner))
+        }
+        StateKeyKind::Validator { operator } => Ok(ExecutionWriteKeyV1::Validator(*operator)),
+        StateKeyKind::Delegation {
+            delegator,
+            validator,
+        } => Ok(ExecutionWriteKeyV1::Delegation(*delegator, *validator)),
+        StateKeyKind::AuthorizationLane { owner, lane } => {
+            Ok(ExecutionWriteKeyV1::AuthorizationLane(*owner, *lane))
+        }
+        StateKeyKind::FeeAccumulator { .. } => Ok(ExecutionWriteKeyV1::FeeAccumulator),
+        StateKeyKind::SessionKey { owner, session_key } => {
+            Ok(ExecutionWriteKeyV1::SessionKey(*owner, *session_key))
+        }
+        StateKeyKind::BridgeMessage { message_hash } => {
+            Ok(ExecutionWriteKeyV1::BridgeMessage(*message_hash))
+        }
+        StateKeyKind::BridgeEscrow { domain } => {
+            Ok(ExecutionWriteKeyV1::BridgeEscrow(domain.clone()))
+        }
+        StateKeyKind::SlashingEvidence { evidence_hash } => {
+            Ok(ExecutionWriteKeyV1::SlashingEvidence(*evidence_hash))
+        }
+        StateKeyKind::UnbondingQueue { .. } => Ok(ExecutionWriteKeyV1::UnbondingQueue),
+        StateKeyKind::Object { object_id } => Ok(ExecutionWriteKeyV1::Object(*object_id)),
+        StateKeyKind::Application { .. } => Ok(ExecutionWriteKeyV1::Application),
+        StateKeyKind::Protocol {
+            field: ProtocolStateKey::BridgeNonce,
+        } => Ok(ExecutionWriteKeyV1::ProtocolBridgeNonce),
+        StateKeyKind::SponsorGrant { sponsor, grant_id } => Ok(ExecutionWriteKeyV1::SponsorGrant(
+            *sponsor,
+            SponsorGrantId::new(*grant_id),
+        )),
+        StateKeyKind::Protocol {
+            field: ProtocolStateKey::BaseFee,
+        }
+        | StateKeyKind::Module { .. } => Err(BlockExecutionErrorV1::StateAccessInvariant),
+    }
+}
+
+fn capture_map_entry<K: Clone + Ord, V: Clone>(
+    source: &BTreeMap<K, V>,
+    target: &mut BTreeMap<K, V>,
+    key: &K,
+) {
+    if let Some(value) = source.get(key) {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn capture_set_membership<T: Clone + Ord>(
+    source: &BTreeSet<T>,
+    target: &mut BTreeSet<T>,
+    value: &T,
+) {
+    if source.contains(value) {
+        target.insert(value.clone());
+    }
+}
+
+fn commit_map_entry<K: Ord, V>(base: &mut BTreeMap<K, V>, overlay: &mut BTreeMap<K, V>, key: K) {
+    if let Some(value) = overlay.remove(&key) {
+        base.insert(key, value);
+    } else {
+        base.remove(&key);
+    }
+}
+
+fn commit_set_membership<T: Ord>(base: &mut BTreeSet<T>, overlay: &mut BTreeSet<T>, value: T) {
+    if overlay.remove(&value) {
+        base.insert(value);
+    } else {
+        base.remove(&value);
+    }
 }
 
 impl PreparedTransactionV1 {
@@ -412,7 +727,14 @@ impl ChainState {
             &mut access,
         )?;
 
-        let mut parent = self.clone();
+        let SparseExecutionStateV1 {
+            state: mut parent,
+            writes,
+        } = SparseExecutionStateV1::capture(
+            self,
+            &transaction.access_list.read_only,
+            &transaction.access_list.read_write,
+        )?;
         debit_fee_reserve(&mut parent, snapshot.fee_payer, snapshot.fee_reserve)?;
         advance_sender_nonce(
             &mut parent,
@@ -469,7 +791,11 @@ impl ChainState {
         receipt
             .validate()
             .map_err(|_error: ReceiptError| BlockExecutionErrorV1::ReceiptInvariant)?;
-        *self = selected;
+        SparseExecutionStateV1 {
+            state: selected,
+            writes,
+        }
+        .commit(self);
         Ok(ExecutedTransactionV1 { receipt })
     }
 }
@@ -2619,6 +2945,36 @@ mod tests {
         assert_eq!(
             state.accounts[&unrelated.address()].balance,
             Amount::from_units(7)
+        );
+    }
+
+    #[test]
+    fn execution_overlay_captures_only_declared_existing_records() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let mut state = funded_state(&sender, None);
+        for seed in 10_u8..110 {
+            let unrelated = Keypair::from_seed([seed; 32]);
+            state.accounts.insert(
+                unrelated.address(),
+                Account::with_balance(Amount::from_units(u128::from(seed))),
+            );
+        }
+        let transaction = sender_paid_fixture(&sender, &recipient);
+        let overlay = SparseExecutionStateV1::capture(
+            &state,
+            &transaction.access_list.read_only,
+            &transaction.access_list.read_write,
+        )
+        .expect("declared transfer inputs capture");
+
+        assert_eq!(state.accounts.len(), 101);
+        assert_eq!(overlay.state.accounts.len(), 1);
+        assert!(overlay.state.accounts.contains_key(&sender.address()));
+        assert!(overlay.state.objects.is_empty());
+        assert_eq!(
+            overlay.writes.len(),
+            transaction.access_list.read_write.len()
         );
     }
 
