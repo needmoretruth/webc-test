@@ -1337,20 +1337,13 @@ impl ChainState {
 
         match &tx.operation {
             Operation::InstallAuthorizationPolicy { post_quantum_root } => {
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::AuthorizationPolicyRequiresDefaultLane);
-                }
-                if self.authorization_policies.contains_key(&tx.sender) {
-                    return Err(ChainError::AuthorizationPolicyAlreadyExists);
-                }
-                let policy = AccountAuthorizationPolicy::new_v1(tx.public_key, *post_quantum_root)?;
-                let revision = policy.revision();
-                self.authorization_policies.insert(tx.sender, policy);
-                events.push(Event::AuthorizationPolicyInstalled {
-                    owner: tx.sender,
-                    revision,
-                    post_quantum_root: *post_quantum_root,
-                });
+                self.apply_native_install_authorization_policy(
+                    tx.sender,
+                    tx.public_key,
+                    tx.authorization_lane,
+                    *post_quantum_root,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::OpenAuthorizationLane { lane, fee_deposit } => {
                 self.apply_native_lane_open(
@@ -2436,6 +2429,38 @@ impl ChainState {
             owner: sender,
             lane,
             fee_deposit,
+        });
+        Ok(())
+    }
+
+    /// Installs the first versioned account policy in the caller action overlay.
+    ///
+    /// The signing key becomes the active transaction key. Both protocol paths
+    /// require the default lane and reject replacement through this migration
+    /// action; later rotations use their separately authorized transitions.
+    pub(crate) fn apply_native_install_authorization_policy(
+        &mut self,
+        sender: Address,
+        active_transaction_key: webc_crypto::PublicKeyBytes,
+        authorization_lane: AuthorizationLaneId,
+        post_quantum_root: crate::PostQuantumRoot,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::AuthorizationPolicyRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::authorization_policy(sender))?;
+        if self.authorization_policies.contains_key(&sender) {
+            return Err(ChainError::AuthorizationPolicyAlreadyExists);
+        }
+        let policy = AccountAuthorizationPolicy::new_v1(active_transaction_key, post_quantum_root)?;
+        let revision = policy.revision();
+        self.authorization_policies.insert(sender, policy);
+        events.push(Event::AuthorizationPolicyInstalled {
+            owner: sender,
+            revision,
+            post_quantum_root,
         });
         Ok(())
     }

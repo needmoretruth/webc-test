@@ -352,6 +352,11 @@ impl ActionV1 {
             return Ok(());
         };
         match operation.as_ref() {
+            Operation::InstallAuthorizationPolicy { post_quantum_root }
+                if post_quantum_root.validate().is_err() =>
+            {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
             Operation::OpenAuthorizationLane { lane, fee_deposit }
                 if lane.is_default() || fee_deposit.is_zero() =>
             {
@@ -1136,7 +1141,8 @@ fn validate_native_action_lane(
                 ActionV1::Native { operation }
                     if matches!(
                         operation.as_ref(),
-                        Operation::OpenAuthorizationLane { .. }
+                        Operation::InstallAuthorizationPolicy { .. }
+                            | Operation::OpenAuthorizationLane { .. }
                             | Operation::FundAuthorizationLane { .. }
                     )
             )

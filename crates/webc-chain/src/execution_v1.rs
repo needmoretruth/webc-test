@@ -452,6 +452,7 @@ fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExec
                 if !matches!(
                     operation.as_ref(),
                     Operation::Transfer { .. }
+                        | Operation::InstallAuthorizationPolicy { .. }
                         | Operation::OpenAuthorizationLane { .. }
                         | Operation::FundAuthorizationLane { .. }
                         | Operation::ClaimValidatorRewards
@@ -480,6 +481,7 @@ enum NativeActionExecutionErrorV1 {
 #[derive(Clone, Copy)]
 struct NativeActionContextV1 {
     sender: Address,
+    sender_public_key: PublicKeyBytes,
     authorization_lane: AuthorizationLaneId,
 }
 
@@ -498,6 +500,14 @@ fn execute_native_action_v1(
 ) -> Result<(), NativeActionExecutionErrorV1> {
     let effects = NativeActionEffects::new(access, events);
     let result = match operation {
+        Operation::InstallAuthorizationPolicy { post_quantum_root } => state
+            .apply_native_install_authorization_policy(
+                context.sender,
+                context.sender_public_key,
+                context.authorization_lane,
+                *post_quantum_root,
+                effects,
+            ),
         Operation::Transfer { to, amount } => {
             state.apply_native_transfer(context.sender, *to, *amount, effects)
         }
@@ -715,6 +725,7 @@ fn execute_action_program_v1(
                 &mut child,
                 NativeActionContextV1 {
                     sender: transaction.sender,
+                    sender_public_key: transaction.sender_public_key,
                     authorization_lane: transaction.authorization.lane,
                 },
                 operation,
@@ -812,6 +823,7 @@ fn classify_action_failure(
         }
         ChainError::ObjectAlreadyExists
         | ChainError::ObjectNamespaceMismatch
+        | ChainError::AuthorizationPolicyAlreadyExists
         | ChainError::AuthorizationLaneExists
         | ChainError::AuthorizationLaneNotFound
         | ChainError::ValidatorNotFound(_)
@@ -1833,6 +1845,100 @@ mod tests {
             state
                 .supply_invariant_report()
                 .expect("failed lane action supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn authorization_policy_install_reuses_native_transition() {
+        let sender = Keypair::from_seed([1; 32]);
+        let root = PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([0x97; 32]))
+            .expect("valid recovery root");
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![ActionV1::native(Operation::InstallAuthorizationPolicy {
+                post_quantum_root: root,
+            })],
+            25_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.minted_supply = Amount::from_units(500_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("authorization policy installs")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 1);
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(75_000));
+        let policy = &state.authorization_policies[&sender.address()];
+        assert_eq!(policy.active_transaction_key(), &sender.public_key());
+        assert_eq!(policy.post_quantum_root(), &root);
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("policy install supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn duplicate_policy_install_discards_first_child_policy() {
+        let sender = Keypair::from_seed([1; 32]);
+        let root = PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([0x98; 32]))
+            .expect("valid recovery root");
+        let install = ActionV1::native(Operation::InstallAuthorizationPolicy {
+            post_quantum_root: root,
+        });
+        let transaction = sender_actions_fixture(&sender, vec![install.clone(), install], 50_000);
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.minted_supply = Amount::from_units(500_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("duplicate policy install is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(receipt.events.is_empty());
+        assert!(!state.authorization_policies.contains_key(&sender.address()));
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(350_000)
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed policy install supply report")
                 .balanced
         );
     }
