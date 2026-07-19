@@ -1353,52 +1353,22 @@ impl ChainState {
                 });
             }
             Operation::OpenAuthorizationLane { lane, fee_deposit } => {
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::LaneManagementRequiresDefault);
-                }
-                if lane.is_default() {
-                    return Err(ChainError::DefaultAuthorizationLaneReserved);
-                }
-                if fee_deposit.is_zero() {
-                    return Err(ChainError::AuthorizationLaneDepositZero);
-                }
-                access.write(StateKey::authorization_lane(tx.sender, *lane))?;
-                if self.authorization_lanes.contains_key(&(tx.sender, *lane)) {
-                    return Err(ChainError::AuthorizationLaneExists);
-                }
-                self.debit_native(tx.sender, *fee_deposit)?;
-                self.authorization_lanes.insert(
-                    (tx.sender, *lane),
-                    AuthorizationLane::new(tx.sender, *lane, *fee_deposit),
-                );
-                events.push(Event::AuthorizationLaneOpened {
-                    owner: tx.sender,
-                    lane: *lane,
-                    fee_deposit: *fee_deposit,
-                });
+                self.apply_native_lane_open(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *lane,
+                    *fee_deposit,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::FundAuthorizationLane { lane, fee_deposit } => {
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::LaneManagementRequiresDefault);
-                }
-                if fee_deposit.is_zero() {
-                    return Err(ChainError::AuthorizationLaneDepositZero);
-                }
-                access.write(StateKey::authorization_lane(tx.sender, *lane))?;
-                self.debit_native(tx.sender, *fee_deposit)?;
-                let target = self
-                    .authorization_lanes
-                    .get_mut(&(tx.sender, *lane))
-                    .ok_or(ChainError::AuthorizationLaneNotFound)?;
-                target.fee_balance = target
-                    .fee_balance
-                    .checked_add(*fee_deposit)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::AuthorizationLaneFunded {
-                    owner: tx.sender,
-                    lane: *lane,
-                    fee_deposit: *fee_deposit,
-                });
+                self.apply_native_lane_fund(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *lane,
+                    *fee_deposit,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::InstallSessionKey {
                 session_public_key,
@@ -2465,6 +2435,80 @@ impl ChainState {
             .balance
             .checked_sub(amount)
             .ok_or(ChainError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// Opens one prepaid fee lane under a caller-owned transaction overlay.
+    ///
+    /// Lane management is intentionally authorized only by the default lane.
+    /// Both transaction versions call this helper after their distinct parent
+    /// fee and replay rules have run.
+    pub(crate) fn apply_native_lane_open(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        lane: AuthorizationLaneId,
+        fee_deposit: Amount,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::LaneManagementRequiresDefault);
+        }
+        if lane.is_default() {
+            return Err(ChainError::DefaultAuthorizationLaneReserved);
+        }
+        if fee_deposit.is_zero() {
+            return Err(ChainError::AuthorizationLaneDepositZero);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::authorization_lane(sender, lane))?;
+        if self.authorization_lanes.contains_key(&(sender, lane)) {
+            return Err(ChainError::AuthorizationLaneExists);
+        }
+        self.debit_native(sender, fee_deposit)?;
+        self.authorization_lanes.insert(
+            (sender, lane),
+            AuthorizationLane::new(sender, lane, fee_deposit),
+        );
+        events.push(Event::AuthorizationLaneOpened {
+            owner: sender,
+            lane,
+            fee_deposit,
+        });
+        Ok(())
+    }
+
+    /// Adds native fee units to one existing prepaid lane in the caller overlay.
+    pub(crate) fn apply_native_lane_fund(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        lane: AuthorizationLaneId,
+        fee_deposit: Amount,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::LaneManagementRequiresDefault);
+        }
+        if fee_deposit.is_zero() {
+            return Err(ChainError::AuthorizationLaneDepositZero);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::authorization_lane(sender, lane))?;
+        self.debit_native(sender, fee_deposit)?;
+        let target = self
+            .authorization_lanes
+            .get_mut(&(sender, lane))
+            .ok_or(ChainError::AuthorizationLaneNotFound)?;
+        target.fee_balance = target
+            .fee_balance
+            .checked_add(fee_deposit)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::AuthorizationLaneFunded {
+            owner: sender,
+            lane,
+            fee_deposit,
+        });
         Ok(())
     }
 

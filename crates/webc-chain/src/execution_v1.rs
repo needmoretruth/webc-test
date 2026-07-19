@@ -452,6 +452,8 @@ fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExec
                 if !matches!(
                     operation.as_ref(),
                     Operation::Transfer { .. }
+                        | Operation::OpenAuthorizationLane { .. }
+                        | Operation::FundAuthorizationLane { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
                         | Operation::TransferObject { .. }
@@ -468,6 +470,16 @@ enum NativeActionExecutionErrorV1 {
     Transition(ChainError),
 }
 
+/// Transaction-envelope authority shared by every action in one V5 program.
+///
+/// This starts with sender and lane coordinates; later native groups add only
+/// the reviewed chain-config or authorization fields their V4 transition uses.
+#[derive(Clone, Copy)]
+struct NativeActionContextV1 {
+    sender: Address,
+    authorization_lane: AuthorizationLaneId,
+}
+
 /// Executes one supported native action without owning fee or rollback policy.
 ///
 /// Every arm delegates to the same transition helper used by V4. The caller's
@@ -476,7 +488,7 @@ enum NativeActionExecutionErrorV1 {
 /// configuration and authorization context is integrated here.
 fn execute_native_action_v1(
     state: &mut ChainState,
-    sender: Address,
+    context: NativeActionContextV1,
     operation: &Operation,
     access: &mut StateAccessRecorder,
     events: &mut Vec<Event>,
@@ -484,20 +496,36 @@ fn execute_native_action_v1(
     let effects = NativeActionEffects::new(access, events);
     let result = match operation {
         Operation::Transfer { to, amount } => {
-            state.apply_native_transfer(sender, *to, *amount, effects)
+            state.apply_native_transfer(context.sender, *to, *amount, effects)
         }
+        Operation::OpenAuthorizationLane { lane, fee_deposit } => state.apply_native_lane_open(
+            context.sender,
+            context.authorization_lane,
+            *lane,
+            *fee_deposit,
+            effects,
+        ),
+        Operation::FundAuthorizationLane { lane, fee_deposit } => state.apply_native_lane_fund(
+            context.sender,
+            context.authorization_lane,
+            *lane,
+            *fee_deposit,
+            effects,
+        ),
         Operation::CreateObject {
             object_id,
             namespace,
             data,
-        } => state.apply_native_object_create(sender, *object_id, *namespace, data, effects),
+        } => {
+            state.apply_native_object_create(context.sender, *object_id, *namespace, data, effects)
+        }
         Operation::MutateObject {
             object_id,
             namespace,
             expected_version,
             data,
         } => state.apply_native_object_mutation(
-            sender,
+            context.sender,
             *object_id,
             *namespace,
             *expected_version,
@@ -510,7 +538,7 @@ fn execute_native_action_v1(
             expected_version,
             new_owner,
         } => state.apply_native_object_transfer(
-            sender,
+            context.sender,
             *object_id,
             *namespace,
             *expected_version,
@@ -672,7 +700,10 @@ fn execute_action_program_v1(
         let result = match action {
             ActionV1::Native { operation } => match execute_native_action_v1(
                 &mut child,
-                transaction.sender,
+                NativeActionContextV1 {
+                    sender: transaction.sender,
+                    authorization_lane: transaction.authorization.lane,
+                },
                 operation,
                 access,
                 &mut action_events,
@@ -768,7 +799,8 @@ fn classify_action_failure(
         }
         ChainError::ObjectAlreadyExists
         | ChainError::ObjectNamespaceMismatch
-        | ChainError::ObjectDataTooLarge { .. } => Ok(ExecutionFailureCodeV1::Precondition),
+        | ChainError::AuthorizationLaneExists
+        | ChainError::AuthorizationLaneNotFound => Ok(ExecutionFailureCodeV1::Precondition),
         ChainError::AccountNotFound(_) => Ok(ExecutionFailureCodeV1::Precondition),
         other => Err(map_block_chain_error(other)),
     }
@@ -1629,6 +1661,122 @@ mod tests {
             state
                 .supply_invariant_report()
                 .expect("object action supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn action_program_reuses_authorization_lane_transitions() {
+        let sender = Keypair::from_seed([1; 32]);
+        let lane = AuthorizationLaneId::new(Hash256([0x95; 32]));
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::OpenAuthorizationLane {
+                    lane,
+                    fee_deposit: Amount::from_units(100_000),
+                }),
+                ActionV1::native(Operation::FundAuthorizationLane {
+                    lane,
+                    fee_deposit: Amount::from_units(20_000),
+                }),
+            ],
+            20_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.minted_supply = Amount::from_units(500_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("ordered lane actions execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 2);
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(60_000));
+        assert_eq!(
+            state.authorization_lanes[&(sender.address(), lane)].fee_balance,
+            Amount::from_units(120_000)
+        );
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(320_000)
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("lane action supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn lane_funding_failure_discards_opened_child_lane() {
+        let sender = Keypair::from_seed([1; 32]);
+        let lane = AuthorizationLaneId::new(Hash256([0x96; 32]));
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::OpenAuthorizationLane {
+                    lane,
+                    fee_deposit: Amount::from_units(100_000),
+                }),
+                ActionV1::native(Operation::FundAuthorizationLane {
+                    lane,
+                    fee_deposit: Amount::from_units(400_000),
+                }),
+            ],
+            20_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.minted_supply = Amount::from_units(500_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("lane funding balance failure is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::InsufficientBalance,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(receipt.events.is_empty());
+        assert!(!state
+            .authorization_lanes
+            .contains_key(&(sender.address(), lane)));
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(440_000)
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed lane action supply report")
                 .balanced
         );
     }

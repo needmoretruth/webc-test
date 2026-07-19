@@ -16,7 +16,8 @@
 
 use crate::{
     AccessList, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainId,
-    FeeBid, Nonce, Operation, ProtocolVersion, SessionKeyId, StateKey, MAX_TRANSACTION_STATE_KEYS,
+    FeeBid, Nonce, Operation, ProtocolVersion, SessionKeyId, StateKey, MAX_OBJECT_DATA_BYTES,
+    MAX_TRANSACTION_STATE_KEYS,
 };
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::BTreeSet, fmt};
@@ -95,6 +96,9 @@ pub enum TransactionValidationErrorV1 {
     /// Summing statically measured action units overflowed `u64`.
     #[error("V5 action units overflow")]
     ActionUnitsOverflow,
+    /// A native action contains an intrinsically invalid signed parameter or lane.
+    #[error("V5 native action is structurally invalid")]
+    InvalidNativeAction,
     /// The fee bid has a zero limit/rate or a priority rate above its maximum.
     #[error("V5 fee bid is structurally invalid")]
     InvalidFeeBid,
@@ -342,6 +346,29 @@ impl ActionV1 {
         }
     }
 
+    /// Validates signed native parameters that never require chain state.
+    fn validate_structure(&self) -> Result<(), TransactionValidationErrorV1> {
+        let Self::Native { operation } = self else {
+            return Ok(());
+        };
+        match operation.as_ref() {
+            Operation::OpenAuthorizationLane { lane, fee_deposit }
+                if lane.is_default() || fee_deposit.is_zero() =>
+            {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::FundAuthorizationLane { fee_deposit, .. } if fee_deposit.is_zero() => {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::CreateObject { data, .. } | Operation::MutateObject { data, .. }
+                if data.len() > MAX_OBJECT_DATA_BYTES =>
+            {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Builds the exact sender/action access for this action.
     fn default_access_list_for_lane(
         &self,
@@ -384,6 +411,9 @@ impl ActionProgramV1 {
         }
         if self.actions.len() > MAX_ACTIONS_V1 {
             return Err(TransactionValidationErrorV1::TooManyActions);
+        }
+        for action in &self.actions {
+            action.validate_structure()?;
         }
         self.required_units()?;
         Ok(())
@@ -803,6 +833,7 @@ impl TransactionV5 {
         fee_payment: FeePaymentV1,
     ) -> Result<Self, TransactionValidationErrorV1> {
         let program = ActionProgramV1::new(actions);
+        validate_native_action_lane(&program, authorization.lane)?;
         let access_list = program.default_access_list_for_lane(sender, authorization.lane)?;
         Ok(Self::new_unsigned(
             chain_id,
@@ -895,6 +926,9 @@ impl TransactionV5 {
         }
         self.validity.validate()?;
         self.kind.validate()?;
+        if let TransactionKindV1::Actions(program) = &self.kind {
+            validate_native_action_lane(program, self.authorization.lane)?;
+        }
         validate_fee_bid(self.fee_bid)?;
         validate_access_list(&self.access_list)?;
         if matches!(self.fee_payment, FeePaymentV1::SenderLane) {
@@ -1089,6 +1123,28 @@ impl TransactionV5 {
         }
         Ok(())
     }
+}
+
+fn validate_native_action_lane(
+    program: &ActionProgramV1,
+    authorization_lane: AuthorizationLaneId,
+) -> Result<(), TransactionValidationErrorV1> {
+    if !authorization_lane.is_default()
+        && program.actions.iter().any(|action| {
+            matches!(
+                action,
+                ActionV1::Native { operation }
+                    if matches!(
+                        operation.as_ref(),
+                        Operation::OpenAuthorizationLane { .. }
+                            | Operation::FundAuthorizationLane { .. }
+                    )
+            )
+        })
+    {
+        return Err(TransactionValidationErrorV1::InvalidNativeAction);
+    }
+    Ok(())
 }
 
 fn validate_fee_bid(fee_bid: FeeBid) -> Result<(), TransactionValidationErrorV1> {
@@ -1296,7 +1352,7 @@ mod fee_bid_decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Operation;
+    use crate::{ObjectId, Operation};
 
     fn transfer_kind(recipient: Address, amount: u128) -> TransactionKindV1 {
         TransactionKindV1::Actions(ActionProgramV1::new(vec![ActionV1::native(
@@ -1396,6 +1452,74 @@ mod tests {
         assert_eq!(
             extra_cancel_key.validate_structure(),
             Err(TransactionValidationErrorV1::InvalidAccessList)
+        );
+    }
+
+    #[test]
+    fn intrinsically_invalid_native_actions_fail_before_signing() {
+        let sender = Keypair::from_seed([1; 32]);
+        let target_lane = AuthorizationLaneId::new(Hash256([0x81; 32]));
+        let build = |lane, action| {
+            TransactionV5::for_actions_unsigned(
+                ChainId::devnet(),
+                sender.address(),
+                sender.public_key(),
+                TransactionAuthorizationV1 {
+                    lane,
+                    policy_revision: AuthorizationPolicyRevision::new(0),
+                    nonce: Nonce::new(0),
+                },
+                ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+                vec![action],
+                FeeBid {
+                    gas_limit: 100_000,
+                    max_fee_per_unit: 5,
+                    priority_fee_per_unit: 1,
+                },
+                FeePaymentV1::SenderLane,
+            )
+        };
+
+        assert_eq!(
+            build(
+                AuthorizationLaneId::DEFAULT,
+                ActionV1::native(Operation::OpenAuthorizationLane {
+                    lane: AuthorizationLaneId::DEFAULT,
+                    fee_deposit: Amount::from_units(1),
+                }),
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+        assert_eq!(
+            build(
+                AuthorizationLaneId::DEFAULT,
+                ActionV1::native(Operation::FundAuthorizationLane {
+                    lane: target_lane,
+                    fee_deposit: Amount::ZERO,
+                }),
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+        assert_eq!(
+            build(
+                target_lane,
+                ActionV1::native(Operation::OpenAuthorizationLane {
+                    lane: AuthorizationLaneId::new(Hash256([0x82; 32])),
+                    fee_deposit: Amount::from_units(1),
+                }),
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+        assert_eq!(
+            build(
+                AuthorizationLaneId::DEFAULT,
+                ActionV1::native(Operation::CreateObject {
+                    object_id: ObjectId::new(Hash256([0x83; 32])),
+                    namespace: Hash256([0x84; 32]),
+                    data: vec![0; MAX_OBJECT_DATA_BYTES + 1],
+                }),
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
         );
     }
 
