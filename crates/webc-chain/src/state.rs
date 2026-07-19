@@ -1913,39 +1913,17 @@ impl ChainState {
                 });
             }
             Operation::ClaimValidatorRewards => {
-                access.write(StateKey::validator(tx.sender))?;
-                let reward = {
-                    let validator = self
-                        .validators
-                        .get_mut(&tx.sender)
-                        .ok_or(ChainError::ValidatorNotFound(tx.sender))?;
-                    let reward = validator.accumulated_rewards;
-                    validator.accumulated_rewards = Amount::ZERO;
-                    reward
-                };
-                self.credit_native(tx.sender, reward)?;
-                events.push(Event::ValidatorRewardsClaimed {
-                    validator: tx.sender,
-                    amount: reward,
-                });
+                self.apply_native_claim_validator_rewards(
+                    tx.sender,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::ClaimDelegatorRewards { validator } => {
-                access.write(StateKey::delegation(tx.sender, *validator))?;
-                let reward = {
-                    let delegation = self
-                        .delegations
-                        .get_mut(&(tx.sender, *validator))
-                        .ok_or(ChainError::DelegationNotFound)?;
-                    let reward = delegation.accumulated_rewards;
-                    delegation.accumulated_rewards = Amount::ZERO;
-                    reward
-                };
-                self.credit_native(tx.sender, reward)?;
-                events.push(Event::DelegatorRewardsClaimed {
-                    delegator: tx.sender,
-                    validator: *validator,
-                    amount: reward,
-                });
+                self.apply_native_claim_delegator_rewards(
+                    tx.sender,
+                    *validator,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::SubmitSlashingEvidence { evidence } => {
                 let outcome = self.apply_slashing_evidence(evidence, config, Some(&mut access))?;
@@ -2508,6 +2486,58 @@ impl ChainState {
             owner: sender,
             lane,
             fee_deposit,
+        });
+        Ok(())
+    }
+
+    /// Claims all pending operator rewards in the caller's disposable overlay.
+    pub(crate) fn apply_native_claim_validator_rewards(
+        &mut self,
+        sender: Address,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::validator(sender))?;
+        let reward = {
+            let validator = self
+                .validators
+                .get_mut(&sender)
+                .ok_or(ChainError::ValidatorNotFound(sender))?;
+            let reward = validator.accumulated_rewards;
+            validator.accumulated_rewards = Amount::ZERO;
+            reward
+        };
+        self.credit_native(sender, reward)?;
+        events.push(Event::ValidatorRewardsClaimed {
+            validator: sender,
+            amount: reward,
+        });
+        Ok(())
+    }
+
+    /// Claims one delegation position's pending rewards in the caller overlay.
+    pub(crate) fn apply_native_claim_delegator_rewards(
+        &mut self,
+        sender: Address,
+        validator: Address,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::delegation(sender, validator))?;
+        let reward = {
+            let delegation = self
+                .delegations
+                .get_mut(&(sender, validator))
+                .ok_or(ChainError::DelegationNotFound)?;
+            let reward = delegation.accumulated_rewards;
+            delegation.accumulated_rewards = Amount::ZERO;
+            reward
+        };
+        self.credit_native(sender, reward)?;
+        events.push(Event::DelegatorRewardsClaimed {
+            delegator: sender,
+            validator,
+            amount: reward,
         });
         Ok(())
     }

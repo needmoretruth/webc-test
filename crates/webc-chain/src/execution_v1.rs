@@ -454,6 +454,8 @@ fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExec
                     Operation::Transfer { .. }
                         | Operation::OpenAuthorizationLane { .. }
                         | Operation::FundAuthorizationLane { .. }
+                        | Operation::ClaimValidatorRewards
+                        | Operation::ClaimDelegatorRewards { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
                         | Operation::TransferObject { .. }
@@ -512,6 +514,12 @@ fn execute_native_action_v1(
             *fee_deposit,
             effects,
         ),
+        Operation::ClaimValidatorRewards => {
+            state.apply_native_claim_validator_rewards(context.sender, effects)
+        }
+        Operation::ClaimDelegatorRewards { validator } => {
+            state.apply_native_claim_delegator_rewards(context.sender, *validator, effects)
+        }
         Operation::CreateObject {
             object_id,
             namespace,
@@ -800,7 +808,9 @@ fn classify_action_failure(
         ChainError::ObjectAlreadyExists
         | ChainError::ObjectNamespaceMismatch
         | ChainError::AuthorizationLaneExists
-        | ChainError::AuthorizationLaneNotFound => Ok(ExecutionFailureCodeV1::Precondition),
+        | ChainError::AuthorizationLaneNotFound
+        | ChainError::ValidatorNotFound(_)
+        | ChainError::DelegationNotFound => Ok(ExecutionFailureCodeV1::Precondition),
         ChainError::AccountNotFound(_) => Ok(ExecutionFailureCodeV1::Precondition),
         other => Err(map_block_chain_error(other)),
     }
@@ -1123,12 +1133,12 @@ mod tests {
     use super::*;
     use crate::{
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
-        AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Epoch, FeeBid,
-        FeePaymentV1, Nonce, ObjectId, ObjectOwner, ObjectVersion, Operation, PostQuantumRoot,
-        PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints, SponsorGrantId,
-        SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
-        TransactionIndex, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
-        TRANSACTION_V5_PROTOCOL_VERSION,
+        AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Delegation,
+        Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectOwner, ObjectVersion, Operation,
+        PostQuantumRoot, PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
+        SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
+        TransactionAuthorizationV1, TransactionIndex, Validator, ValidatorStatus, ValidityWindowV1,
+        INITIAL_AUTHORIZATION_POLICY_REVISION, TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
 
@@ -1782,6 +1792,152 @@ mod tests {
     }
 
     #[test]
+    fn action_program_claims_validator_and_delegator_rewards_atomically() {
+        let sender = Keypair::from_seed([1; 32]);
+        let other_validator = Keypair::from_seed([2; 32]);
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::ClaimValidatorRewards),
+                ActionV1::native(Operation::ClaimDelegatorRewards {
+                    validator: other_validator.address(),
+                }),
+            ],
+            10_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.validators.insert(
+            sender.address(),
+            Validator {
+                operator: sender.address(),
+                consensus_key: sender.public_key(),
+                self_stake: Amount::ZERO,
+                delegated_stake: Amount::ZERO,
+                commission_bps: 0,
+                status: ValidatorStatus::PendingActivation,
+                bootstrap: false,
+                accumulated_rewards: Amount::from_units(50),
+            },
+        );
+        state.delegations.insert(
+            (sender.address(), other_validator.address()),
+            Delegation {
+                delegator: sender.address(),
+                validator: other_validator.address(),
+                amount: Amount::ZERO,
+                accumulated_rewards: Amount::from_units(70),
+            },
+        );
+        state.minted_supply = Amount::from_units(500_120);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("ordered reward claims execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 2);
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(30_000));
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(470_120)
+        );
+        assert_eq!(
+            state.validators[&sender.address()].accumulated_rewards,
+            Amount::ZERO
+        );
+        assert_eq!(
+            state.delegations[&(sender.address(), other_validator.address())].accumulated_rewards,
+            Amount::ZERO
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("reward claim supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn missing_delegation_discards_prior_reward_claim() {
+        let sender = Keypair::from_seed([1; 32]);
+        let missing_validator = Keypair::from_seed([2; 32]);
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::ClaimValidatorRewards),
+                ActionV1::native(Operation::ClaimDelegatorRewards {
+                    validator: missing_validator.address(),
+                }),
+            ],
+            10_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.validators.insert(
+            sender.address(),
+            Validator {
+                operator: sender.address(),
+                consensus_key: sender.public_key(),
+                self_stake: Amount::ZERO,
+                delegated_stake: Amount::ZERO,
+                commission_bps: 0,
+                status: ValidatorStatus::PendingActivation,
+                bootstrap: false,
+                accumulated_rewards: Amount::from_units(50),
+            },
+        );
+        state.minted_supply = Amount::from_units(500_050);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("missing delegation is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(receipt.events.is_empty());
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(470_000)
+        );
+        assert_eq!(
+            state.validators[&sender.address()].accumulated_rewards,
+            Amount::from_units(50)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed reward claim supply report")
+                .balanced
+        );
+    }
+
+    #[test]
     fn object_precondition_failure_discards_child_and_events() {
         let sender = Keypair::from_seed([1; 32]);
         let object_id = ObjectId::new(Hash256([0x93; 32]));
@@ -2168,7 +2324,10 @@ mod tests {
             .balance = Amount::from_units(50_000);
         let unsupported = sender_actions_fixture(
             &sender,
-            vec![ActionV1::native(Operation::ClaimValidatorRewards)],
+            vec![ActionV1::native(Operation::Delegate {
+                validator: recipient.address(),
+                amount: Amount::from_units(1),
+            })],
             10_000,
         );
         let prepared_unsupported = prepared(&state, unsupported);
