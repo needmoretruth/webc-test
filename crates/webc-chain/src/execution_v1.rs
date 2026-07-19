@@ -14,6 +14,7 @@
 //! parent; undeclared access, arithmetic faults, and unsupported actions discard
 //! everything as block errors.
 
+use crate::state::NativeActionEffects;
 use crate::state_key::StateAccessRecorder;
 use crate::{
     calculate_fee_summary_v1, ActionIndex, ActionV1, Amount, AuthorizationLaneId, BlockHeight,
@@ -448,12 +449,77 @@ fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExec
         if matches!(
             action,
             ActionV1::Native { operation }
-                if !matches!(operation.as_ref(), Operation::Transfer { .. })
+                if !matches!(
+                    operation.as_ref(),
+                    Operation::Transfer { .. }
+                        | Operation::CreateObject { .. }
+                        | Operation::MutateObject { .. }
+                        | Operation::TransferObject { .. }
+                )
         ) {
             return Err(BlockExecutionErrorV1::UnsupportedNativeAction);
         }
     }
     Ok(())
+}
+
+enum NativeActionExecutionErrorV1 {
+    Unsupported,
+    Transition(ChainError),
+}
+
+/// Executes one supported native action without owning fee or rollback policy.
+///
+/// Every arm delegates to the same transition helper used by V4. The caller's
+/// child overlay decides whether a returned user-state error is chargeable and
+/// disposable; unsupported operations remain block errors until their complete
+/// configuration and authorization context is integrated here.
+fn execute_native_action_v1(
+    state: &mut ChainState,
+    sender: Address,
+    operation: &Operation,
+    access: &mut StateAccessRecorder,
+    events: &mut Vec<Event>,
+) -> Result<(), NativeActionExecutionErrorV1> {
+    let effects = NativeActionEffects::new(access, events);
+    let result = match operation {
+        Operation::Transfer { to, amount } => {
+            state.apply_native_transfer(sender, *to, *amount, effects)
+        }
+        Operation::CreateObject {
+            object_id,
+            namespace,
+            data,
+        } => state.apply_native_object_create(sender, *object_id, *namespace, data, effects),
+        Operation::MutateObject {
+            object_id,
+            namespace,
+            expected_version,
+            data,
+        } => state.apply_native_object_mutation(
+            sender,
+            *object_id,
+            *namespace,
+            *expected_version,
+            data,
+            effects,
+        ),
+        Operation::TransferObject {
+            object_id,
+            namespace,
+            expected_version,
+            new_owner,
+        } => state.apply_native_object_transfer(
+            sender,
+            *object_id,
+            *namespace,
+            *expected_version,
+            *new_owner,
+            effects,
+        ),
+        _ => return Err(NativeActionExecutionErrorV1::Unsupported),
+    };
+    result.map_err(NativeActionExecutionErrorV1::Transition)
 }
 
 fn record_parent_access(
@@ -604,15 +670,18 @@ fn execute_action_program_v1(
             .map_err(|_| BlockExecutionErrorV1::IndexOverflow)?;
         let mut action_events = Vec::new();
         let result = match action {
-            ActionV1::Native { operation } => match operation.as_ref() {
-                Operation::Transfer { to, amount } => child.apply_native_transfer(
-                    transaction.sender,
-                    *to,
-                    *amount,
-                    access,
-                    &mut action_events,
-                ),
-                _ => return Err(BlockExecutionErrorV1::UnsupportedNativeAction),
+            ActionV1::Native { operation } => match execute_native_action_v1(
+                &mut child,
+                transaction.sender,
+                operation,
+                access,
+                &mut action_events,
+            ) {
+                Ok(()) => Ok(()),
+                Err(NativeActionExecutionErrorV1::Unsupported) => {
+                    return Err(BlockExecutionErrorV1::UnsupportedNativeAction);
+                }
+                Err(NativeActionExecutionErrorV1::Transition(error)) => Err(error),
             },
             ActionV1::RevokeSponsorGrant { grant_id } => {
                 access
@@ -690,6 +759,16 @@ fn classify_action_failure(
 ) -> Result<ExecutionFailureCodeV1, BlockExecutionErrorV1> {
     match error {
         ChainError::InsufficientBalance { .. } => Ok(ExecutionFailureCodeV1::InsufficientBalance),
+        ChainError::ObjectNotFound => Ok(ExecutionFailureCodeV1::ObjectNotFound),
+        ChainError::ObjectOwnerMismatch | ChainError::SharedObjectMutationUnsupported => {
+            Ok(ExecutionFailureCodeV1::ObjectOwnerMismatch)
+        }
+        ChainError::ObjectVersionMismatch { .. } => {
+            Ok(ExecutionFailureCodeV1::ObjectVersionMismatch)
+        }
+        ChainError::ObjectAlreadyExists
+        | ChainError::ObjectNamespaceMismatch
+        | ChainError::ObjectDataTooLarge { .. } => Ok(ExecutionFailureCodeV1::Precondition),
         ChainError::AccountNotFound(_) => Ok(ExecutionFailureCodeV1::Precondition),
         other => Err(map_block_chain_error(other)),
     }
@@ -1013,9 +1092,9 @@ mod tests {
     use crate::{
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
         AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Epoch, FeeBid,
-        FeePaymentV1, Nonce, Operation, PostQuantumRoot, PostQuantumScheme,
-        SessionAllowedOperations, SessionKeyConstraints, SponsorGrantId, SponsorGrantV1,
-        SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
+        FeePaymentV1, Nonce, ObjectId, ObjectOwner, ObjectVersion, Operation, PostQuantumRoot,
+        PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints, SponsorGrantId,
+        SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
         TransactionIndex, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
         TRANSACTION_V5_PROTOCOL_VERSION,
     };
@@ -1484,6 +1563,131 @@ mod tests {
             state
                 .supply_invariant_report()
                 .expect("supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn action_program_reuses_ordered_object_transitions() {
+        let sender = Keypair::from_seed([1; 32]);
+        let new_owner = Keypair::from_seed([2; 32]);
+        let object_id = ObjectId::new(Hash256([0x91; 32]));
+        let namespace = Hash256([0x92; 32]);
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::CreateObject {
+                    object_id,
+                    namespace,
+                    data: vec![1, 2],
+                }),
+                ActionV1::native(Operation::MutateObject {
+                    object_id,
+                    namespace,
+                    expected_version: ObjectVersion::INITIAL,
+                    data: vec![3, 4],
+                }),
+                ActionV1::native(Operation::TransferObject {
+                    object_id,
+                    namespace,
+                    expected_version: ObjectVersion::new(2),
+                    new_owner: new_owner.address(),
+                }),
+            ],
+            60_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.minted_supply = Amount::from_units(500_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("ordered object actions execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 3);
+        assert_eq!(receipt.events[0].action_index, ActionIndex::new(0));
+        assert_eq!(receipt.events[1].action_index, ActionIndex::new(1));
+        assert_eq!(receipt.events[2].action_index, ActionIndex::new(2));
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(180_000));
+        let object = &state.objects[&object_id];
+        assert_eq!(object.owner, ObjectOwner::Address(new_owner.address()));
+        assert_eq!(object.version, ObjectVersion::new(3));
+        assert_eq!(object.data, vec![3, 4]);
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("object action supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn object_precondition_failure_discards_child_and_events() {
+        let sender = Keypair::from_seed([1; 32]);
+        let object_id = ObjectId::new(Hash256([0x93; 32]));
+        let namespace = Hash256([0x94; 32]);
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![
+                ActionV1::native(Operation::CreateObject {
+                    object_id,
+                    namespace,
+                    data: vec![1],
+                }),
+                ActionV1::native(Operation::MutateObject {
+                    object_id,
+                    namespace,
+                    expected_version: ObjectVersion::new(9),
+                    data: vec![2],
+                }),
+            ],
+            40_000,
+        );
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(500_000);
+        state.minted_supply = Amount::from_units(500_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("object version failure is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::ObjectVersionMismatch,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(receipt.events.is_empty());
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(120_000));
+        assert!(!state.objects.contains_key(&object_id));
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed object action supply report")
                 .balanced
         );
     }

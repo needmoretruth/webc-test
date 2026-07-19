@@ -435,6 +435,26 @@ impl Default for ChainState {
     }
 }
 
+/// Caller-owned logical access and event sinks for one native action.
+///
+/// Fee, nonce, authorization, and overlay commit policy deliberately remain
+/// outside this bundle so protocol-1 and protocol-2 envelopes can share native
+/// state transitions without sharing their different transaction semantics.
+pub(crate) struct NativeActionEffects<'a> {
+    access: &'a mut StateAccessRecorder,
+    events: &'a mut Vec<Event>,
+}
+
+impl<'a> NativeActionEffects<'a> {
+    /// Borrows the access recorder and raw event sink owned by the caller.
+    pub(crate) const fn new(
+        access: &'a mut StateAccessRecorder,
+        events: &'a mut Vec<Event>,
+    ) -> Self {
+        Self { access, events }
+    }
+}
+
 impl ChainState {
     /// Creates empty deterministic state for one supported protocol config.
     ///
@@ -1620,21 +1640,13 @@ impl ChainState {
                 namespace,
                 data,
             } => {
-                access.write(StateKey::object(*object_id))?;
-                access.write(StateKey::application(*namespace, object_id.hash()))?;
-                if self.objects.contains_key(object_id) {
-                    return Err(ChainError::ObjectAlreadyExists);
-                }
-                let object =
-                    StateObject::new_owned(*object_id, *namespace, tx.sender, data.clone())?;
-                let version = object.version;
-                self.objects.insert(*object_id, object);
-                events.push(Event::ObjectCreated {
-                    object_id: *object_id,
-                    namespace: *namespace,
-                    owner: tx.sender,
-                    version,
-                });
+                self.apply_native_object_create(
+                    tx.sender,
+                    *object_id,
+                    *namespace,
+                    data,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::MutateObject {
                 object_id,
@@ -1642,20 +1654,14 @@ impl ChainState {
                 expected_version,
                 data,
             } => {
-                access.write(StateKey::object(*object_id))?;
-                access.write(StateKey::application(*namespace, object_id.hash()))?;
-                validate_object_data(data)?;
-                let object = self
-                    .objects
-                    .get_mut(object_id)
-                    .ok_or(ChainError::ObjectNotFound)?;
-                validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
-                object.version = object.version.checked_next()?;
-                object.data = data.clone();
-                events.push(Event::ObjectMutated {
-                    object_id: *object_id,
-                    version: object.version,
-                });
+                self.apply_native_object_mutation(
+                    tx.sender,
+                    *object_id,
+                    *namespace,
+                    *expected_version,
+                    data,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::TransferObject {
                 object_id,
@@ -1663,24 +1669,22 @@ impl ChainState {
                 expected_version,
                 new_owner,
             } => {
-                access.write(StateKey::object(*object_id))?;
-                access.write(StateKey::application(*namespace, object_id.hash()))?;
-                let object = self
-                    .objects
-                    .get_mut(object_id)
-                    .ok_or(ChainError::ObjectNotFound)?;
-                validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
-                object.version = object.version.checked_next()?;
-                object.owner = ObjectOwner::Address(*new_owner);
-                events.push(Event::ObjectTransferred {
-                    object_id: *object_id,
-                    from: tx.sender,
-                    to: *new_owner,
-                    version: object.version,
-                });
+                self.apply_native_object_transfer(
+                    tx.sender,
+                    *object_id,
+                    *namespace,
+                    *expected_version,
+                    *new_owner,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::Transfer { to, amount } => {
-                self.apply_native_transfer(tx.sender, *to, *amount, &mut access, &mut events)?;
+                self.apply_native_transfer(
+                    tx.sender,
+                    *to,
+                    *amount,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::RegisterValidator {
                 consensus_key,
@@ -2464,6 +2468,102 @@ impl ChainState {
         Ok(())
     }
 
+    /// Applies an owned-object creation under a caller-owned transaction overlay.
+    ///
+    /// V4 single-operation and V5 ordered-action execution share this transition.
+    /// The caller owns fee, nonce, authorization, and rollback behavior; this
+    /// helper records only the exact object/application writes and action event.
+    pub(crate) fn apply_native_object_create(
+        &mut self,
+        sender: Address,
+        object_id: ObjectId,
+        namespace: Hash256,
+        data: &[u8],
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::object(object_id))?;
+        access.write(StateKey::application(namespace, object_id.hash()))?;
+        if self.objects.contains_key(&object_id) {
+            return Err(ChainError::ObjectAlreadyExists);
+        }
+        // Enforce the hostile-input bound before cloning the signed payload.
+        validate_object_data(data)?;
+        let object = StateObject::new_owned(object_id, namespace, sender, data.to_vec())?;
+        let version = object.version;
+        self.objects.insert(object_id, object);
+        events.push(Event::ObjectCreated {
+            object_id,
+            namespace,
+            owner: sender,
+            version,
+        });
+        Ok(())
+    }
+
+    /// Applies one checked owned-object data mutation inside the caller's overlay.
+    ///
+    /// Namespace, owner, and version checks remain identical for V4 and V5. A
+    /// caller may discard the overlay after a chargeable precondition failure.
+    pub(crate) fn apply_native_object_mutation(
+        &mut self,
+        sender: Address,
+        object_id: ObjectId,
+        namespace: Hash256,
+        expected_version: ObjectVersion,
+        data: &[u8],
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::object(object_id))?;
+        access.write(StateKey::application(namespace, object_id.hash()))?;
+        validate_object_data(data)?;
+        let object = self
+            .objects
+            .get_mut(&object_id)
+            .ok_or(ChainError::ObjectNotFound)?;
+        validate_owned_object(object, sender, namespace, expected_version)?;
+        object.version = object.version.checked_next()?;
+        object.data = data.to_vec();
+        events.push(Event::ObjectMutated {
+            object_id,
+            version: object.version,
+        });
+        Ok(())
+    }
+
+    /// Applies one checked owned-object authority transfer in the caller's overlay.
+    ///
+    /// The helper changes no account balance, fee, nonce, or authorization state;
+    /// those remain transaction-envelope responsibilities in both protocol paths.
+    pub(crate) fn apply_native_object_transfer(
+        &mut self,
+        sender: Address,
+        object_id: ObjectId,
+        namespace: Hash256,
+        expected_version: ObjectVersion,
+        new_owner: Address,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::object(object_id))?;
+        access.write(StateKey::application(namespace, object_id.hash()))?;
+        let object = self
+            .objects
+            .get_mut(&object_id)
+            .ok_or(ChainError::ObjectNotFound)?;
+        validate_owned_object(object, sender, namespace, expected_version)?;
+        object.version = object.version.checked_next()?;
+        object.owner = ObjectOwner::Address(new_owner);
+        events.push(Event::ObjectTransferred {
+            object_id,
+            from: sender,
+            to: new_owner,
+            version: object.version,
+        });
+        Ok(())
+    }
+
     /// Applies one native transfer under a caller-owned transaction overlay.
     ///
     /// Both V4 single-operation execution and V5 ordered action execution use
@@ -2475,9 +2575,9 @@ impl ChainState {
         sender: Address,
         recipient: Address,
         amount: Amount,
-        access: &mut StateAccessRecorder,
-        events: &mut Vec<Event>,
+        effects: NativeActionEffects<'_>,
     ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
         // On the default lane the parent fee step already records the sender
         // account write. Non-default lanes pay fees elsewhere, so recording it
         // here is required to consume the signed action declaration.
