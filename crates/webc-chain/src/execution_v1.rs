@@ -401,9 +401,13 @@ impl ChainState {
                     Vec::new(),
                 )
             }
-            TransactionKindV1::Actions(program) => {
-                execute_action_program_v1(parent, &transaction, program, &mut access)?
-            }
+            TransactionKindV1::Actions(program) => execute_action_program_v1(
+                parent,
+                &transaction,
+                prepared.transaction_id,
+                program,
+                &mut access,
+            )?,
         };
 
         let fee_summary = calculate_fee_summary_v1(
@@ -705,6 +709,7 @@ fn advance_sender_nonce(
 fn execute_action_program_v1(
     parent: ChainState,
     transaction: &TransactionV5,
+    transaction_id: crate::TransactionId,
     program: &crate::ActionProgramV1,
     access: &mut StateAccessRecorder,
 ) -> Result<(ChainState, ReceiptStatusV1, GasUnits, Vec<EventV1>), BlockExecutionErrorV1> {
@@ -770,14 +775,7 @@ fn execute_action_program_v1(
                 Vec::new(),
             ));
         }
-        append_typed_events(
-            &mut events,
-            transaction
-                .transaction_id()
-                .map_err(|_| BlockExecutionErrorV1::InvalidState)?,
-            action_index,
-            action_events,
-        )?;
+        append_typed_events(&mut events, transaction_id, action_index, action_events)?;
     }
 
     access.finish().map_err(map_block_chain_error)?;
