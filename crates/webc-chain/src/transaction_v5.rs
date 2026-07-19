@@ -99,6 +99,9 @@ pub enum TransactionValidationErrorV1 {
     /// A native action contains an intrinsically invalid signed parameter or lane.
     #[error("V5 native action is structurally invalid")]
     InvalidNativeAction,
+    /// This executable has not activated the selected native transition for V5.
+    #[error("V5 native action is not supported by this executable")]
+    UnsupportedNativeAction,
     /// The fee bid has a zero limit/rate or a priority rate above its maximum.
     #[error("V5 fee bid is structurally invalid")]
     InvalidFeeBid,
@@ -346,10 +349,43 @@ impl ActionV1 {
         }
     }
 
+    /// Returns whether this executable can run the action under V5 semantics.
+    ///
+    /// Admission and execution share this capability gate so an inactive
+    /// operation cannot occupy a queue or invalidate a proposed block after it
+    /// was described as prepared/includable.
+    pub(crate) fn execution_supported(&self) -> bool {
+        match self {
+            Self::RevokeSponsorGrant { .. } => true,
+            Self::Native { operation } => matches!(
+                operation.as_ref(),
+                Operation::Transfer { .. }
+                    | Operation::InstallAuthorizationPolicy { .. }
+                    | Operation::OpenAuthorizationLane { .. }
+                    | Operation::FundAuthorizationLane { .. }
+                    | Operation::ClaimValidatorRewards
+                    | Operation::ClaimDelegatorRewards { .. }
+                    | Operation::ClaimUnbonded { .. }
+                    | Operation::CreateObject { .. }
+                    | Operation::MutateObject { .. }
+                    | Operation::TransferObject { .. }
+            ),
+        }
+    }
+
     /// Validates signed native parameters that never require chain state.
     fn validate_structure(&self) -> Result<(), TransactionValidationErrorV1> {
+        if !self.execution_supported() {
+            return Err(TransactionValidationErrorV1::UnsupportedNativeAction);
+        }
         let Self::Native { operation } = self else {
-            return Ok(());
+            return match self {
+                Self::RevokeSponsorGrant { grant_id } if grant_id.digest() == Hash256::ZERO => {
+                    Err(TransactionValidationErrorV1::InvalidNativeAction)
+                }
+                Self::RevokeSponsorGrant { .. } => Ok(()),
+                Self::Native { .. } => Err(TransactionValidationErrorV1::InvalidNativeAction),
+            };
         };
         match operation.as_ref() {
             Operation::InstallAuthorizationPolicy { post_quantum_root }
@@ -362,7 +398,9 @@ impl ActionV1 {
             {
                 Err(TransactionValidationErrorV1::InvalidNativeAction)
             }
-            Operation::FundAuthorizationLane { fee_deposit, .. } if fee_deposit.is_zero() => {
+            Operation::FundAuthorizationLane { lane, fee_deposit }
+                if lane.is_default() || fee_deposit.is_zero() =>
+            {
                 Err(TransactionValidationErrorV1::InvalidNativeAction)
             }
             Operation::CreateObject { data, .. } | Operation::MutateObject { data, .. }
@@ -955,10 +993,10 @@ impl TransactionV5 {
         &self,
         expected_chain: &ChainId,
     ) -> Result<(), TransactionValidationErrorV1> {
-        self.validate_structure()?;
         if &self.chain_id != expected_chain {
             return Err(TransactionValidationErrorV1::WrongChain);
         }
+        self.validate_structure()?;
         let signature = self
             .sender_signature
             .as_ref()
@@ -1110,22 +1148,25 @@ impl TransactionV5 {
         let FeePaymentV1::Sponsored(sponsor_use) = &self.fee_payment else {
             return Ok(());
         };
-        sponsor_use.grant.verify()?;
+        sponsor_use.grant.validate_structure()?;
         if sponsor_use.grant.chain_id != self.chain_id
             || sponsor_use.grant.protocol_version != self.protocol_version
             || sponsor_use.grant.sender != self.sender
             || !sponsor_use.grant.validity.covers(self.validity)
-            || sponsor_use.grant_digest != sponsor_use.grant.digest()?
             || sponsor_use.action_digest != self.kind.digest()?
             || sponsor_use.grant.action_scope.exact_action_digest != sponsor_use.action_digest
             || sponsor_use.fee_bid_digest != fee_bid_digest(self.fee_bid)?
         {
             return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
         }
+        if sponsor_use.grant_digest != sponsor_use.grant.digest()? {
+            return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
+        }
         let reserve = fee_reserve(self.fee_bid)?;
         if reserve > sponsor_use.grant.max_fee_per_transaction {
             return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
         }
+        sponsor_use.grant.verify()?;
         Ok(())
     }
 }
@@ -1508,6 +1549,33 @@ mod tests {
         );
         assert_eq!(
             build(
+                AuthorizationLaneId::DEFAULT,
+                ActionV1::native(Operation::FundAuthorizationLane {
+                    lane: AuthorizationLaneId::DEFAULT,
+                    fee_deposit: Amount::from_units(1),
+                }),
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+        assert_eq!(
+            build(
+                AuthorizationLaneId::DEFAULT,
+                ActionV1::revoke_sponsor_grant(SponsorGrantId::new(Hash256::ZERO)),
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+        assert_eq!(
+            build(
+                AuthorizationLaneId::DEFAULT,
+                ActionV1::native(Operation::Delegate {
+                    validator: sender.address(),
+                    amount: Amount::from_units(1),
+                }),
+            ),
+            Err(TransactionValidationErrorV1::UnsupportedNativeAction)
+        );
+        assert_eq!(
+            build(
                 target_lane,
                 ActionV1::native(Operation::OpenAuthorizationLane {
                     lane: AuthorizationLaneId::new(Hash256([0x82; 32])),
@@ -1729,6 +1797,14 @@ mod tests {
             panic!("fixture is sponsored")
         };
         use_record.grant.max_uses = 11;
+        assert_eq!(
+            altered_grant.validate_structure(),
+            Err(TransactionValidationErrorV1::SponsorBindingMismatch)
+        );
+        let FeePaymentV1::Sponsored(use_record) = &mut altered_grant.fee_payment else {
+            panic!("fixture is sponsored")
+        };
+        use_record.grant_digest = use_record.grant.digest().expect("altered grant digest");
         assert_eq!(
             altered_grant.validate_structure(),
             Err(TransactionValidationErrorV1::InvalidSponsorSignature)

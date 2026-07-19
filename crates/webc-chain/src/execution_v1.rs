@@ -449,26 +449,12 @@ fn preflight_supported_actions(kind: &TransactionKindV1) -> Result<(), BlockExec
     let TransactionKindV1::Actions(program) = kind else {
         return Ok(());
     };
-    for action in &program.actions {
-        if matches!(
-            action,
-            ActionV1::Native { operation }
-                if !matches!(
-                    operation.as_ref(),
-                    Operation::Transfer { .. }
-                        | Operation::InstallAuthorizationPolicy { .. }
-                        | Operation::OpenAuthorizationLane { .. }
-                        | Operation::FundAuthorizationLane { .. }
-                        | Operation::ClaimValidatorRewards
-                        | Operation::ClaimDelegatorRewards { .. }
-                        | Operation::ClaimUnbonded { .. }
-                        | Operation::CreateObject { .. }
-                        | Operation::MutateObject { .. }
-                        | Operation::TransferObject { .. }
-                )
-        ) {
-            return Err(BlockExecutionErrorV1::UnsupportedNativeAction);
-        }
+    if program
+        .actions
+        .iter()
+        .any(|action| !action.execution_supported())
+    {
+        return Err(BlockExecutionErrorV1::UnsupportedNativeAction);
     }
     Ok(())
 }
@@ -2541,7 +2527,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_unsupported_execution_leave_state_unchanged() {
+    fn stale_execution_leaves_state_unchanged() {
         let sender = Keypair::from_seed([1; 32]);
         let recipient = Keypair::from_seed([2; 32]);
         let mut state = funded_state(&sender, None);
@@ -2556,31 +2542,6 @@ mod tests {
             Err(BlockExecutionErrorV1::StalePreparation)
         );
         assert_eq!(state, before_stale);
-
-        state.current_base_fee_per_unit = 2;
-        state
-            .accounts
-            .get_mut(&sender.address())
-            .expect("sender account")
-            .balance = Amount::from_units(50_000);
-        let unsupported = sender_actions_fixture(
-            &sender,
-            vec![ActionV1::native(Operation::Delegate {
-                validator: recipient.address(),
-                amount: Amount::from_units(1),
-            })],
-            10_000,
-        );
-        let prepared_unsupported = prepared(&state, unsupported);
-        let before_unsupported = state.clone();
-        assert_eq!(
-            state.execute_prepared_transaction_v1(
-                prepared_unsupported,
-                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(1)),
-            ),
-            Err(BlockExecutionErrorV1::UnsupportedNativeAction)
-        );
-        assert_eq!(state, before_unsupported);
     }
 
     #[test]

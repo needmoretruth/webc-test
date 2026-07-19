@@ -43,6 +43,8 @@ export const SPONSOR_USE_V1_DOMAIN = "WEBC_SPONSOR_USE_V1";
 
 /** Maximum ordered actions in one V1 action program. */
 export const MAX_ACTIONS_V1 = 32;
+/** Maximum decoded bytes stored in one native object payload. */
+export const MAX_OBJECT_DATA_BYTES_V1 = 64 * 1024;
 /** Maximum UTF-8 bytes accepted for a complete V5 transaction. */
 export const MAX_TRANSACTION_V5_CANONICAL_BYTES = 256 * 1024;
 /** Maximum block heights covered by the inclusive validity range. */
@@ -51,6 +53,17 @@ export const MAX_TRANSACTION_VALIDITY_BLOCKS = 4096n;
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
 const MAX_TRANSACTION_STATE_KEYS = 256;
+const SUPPORTED_NATIVE_ACTIONS_V1 = new Set([
+  "Transfer",
+  "InstallAuthorizationPolicy",
+  "OpenAuthorizationLane",
+  "FundAuthorizationLane",
+  "ClaimDelegatorRewards",
+  "ClaimUnbonded",
+  "CreateObject",
+  "MutateObject",
+  "TransferObject",
+]);
 
 /** Canonical unsigned decimal string whose value is within Rust `u64`. */
 export type DecimalU64 = string;
@@ -214,6 +227,7 @@ export function actionProgramV1(operations: OperationJson[]): TransactionKindV1J
   if (operations.length === 0 || operations.length > MAX_ACTIONS_V1) {
     throw new Error("V5 action program must contain between 1 and 32 actions");
   }
+  for (const operation of operations) validateNativeActionV1(operation);
   return {
     Actions: {
       actions: operations.map((operation) => ({ Native: { operation } })),
@@ -606,6 +620,7 @@ function validateKind(value: unknown): asserts value is TransactionKindV1Json {
         if (action.Native.operation === null || action.Native.operation === undefined) {
           throw new Error("V5 native action is missing its operation");
         }
+        validateNativeActionV1(action.Native.operation);
       } else if ("RevokeSponsorGrant" in action) {
         requireExactKeys(action, ["RevokeSponsorGrant"], "V5 action");
         requireRecord(action.RevokeSponsorGrant, "V5 sponsor revocation action");
@@ -623,6 +638,61 @@ function validateKind(value: unknown): asserts value is TransactionKindV1Json {
     return;
   }
   throw new Error("unsupported V5 transaction kind");
+}
+
+/**
+ * Enforces the executable's current V5 native-action capability boundary.
+ *
+ * This mirrors Rust admission so a browser cannot sign an inactive operation
+ * that would occupy a queue and later invalidate a proposed block. Checks here
+ * are deliberately limited to facts that do not require chain state.
+ */
+function validateNativeActionV1(operation: unknown): asserts operation is OperationJson {
+  if (operation === "ClaimValidatorRewards") return;
+  requireRecord(operation, "V5 native operation");
+  const variants = Object.keys(operation);
+  if (variants.length !== 1) {
+    throw new Error("V5 native operation must have one variant");
+  }
+  const variant = variants[0];
+  if (variant === undefined) throw new Error("V5 native operation is missing its variant");
+  if (!SUPPORTED_NATIVE_ACTIONS_V1.has(variant)) {
+    throw new Error("V5 native action is not supported by this executable");
+  }
+
+  if (variant === "InstallAuthorizationPolicy") {
+    requireRecord(operation[variant], "V5 policy-install operation");
+    requireExactKeys(operation[variant], ["post_quantum_root"], "V5 policy-install operation");
+    const root = operation[variant].post_quantum_root;
+    requireRecord(root, "V5 post-quantum root");
+    requireExactKeys(root, ["scheme", "public_key_hash"], "V5 post-quantum root");
+    if (root.scheme !== "MlDsa65") throw new Error("invalid V5 post-quantum root");
+    requireHex(root.public_key_hash, 32, "V5 post-quantum root", true);
+    return;
+  }
+
+  if (variant === "OpenAuthorizationLane" || variant === "FundAuthorizationLane") {
+    requireRecord(operation[variant], "V5 authorization-lane operation");
+    requireExactKeys(
+      operation[variant],
+      ["lane", "fee_deposit"],
+      "V5 authorization-lane operation",
+    );
+    requireHex(operation[variant].lane, 32, "V5 target authorization lane", true);
+    if (requireU128(operation[variant].fee_deposit, "V5 lane fee deposit") === 0n) {
+      throw new Error("V5 lane fee deposit must be positive");
+    }
+    return;
+  }
+
+  if (variant === "CreateObject" || variant === "MutateObject") {
+    requireRecord(operation[variant], "V5 object-data operation");
+    requireBoundedHex(
+      operation[variant].data,
+      MAX_OBJECT_DATA_BYTES_V1,
+      "V5 object data",
+    );
+  }
 }
 
 function validateAccessList(value: unknown): asserts value is StateAccessListJson {
@@ -782,6 +852,18 @@ function requireHex(value: unknown, bytes: number, label: string, nonZero: boole
     throw new Error(`invalid ${label}`);
   }
   hexToBytes(value);
+}
+
+function requireBoundedHex(
+  value: unknown,
+  maximumBytes: number,
+  label: string,
+): asserts value is string {
+  if (typeof value !== "string" || value.length % 2 !== 0
+    || value.length > maximumBytes * 2 || value !== value.toLowerCase()
+    || (value.length > 0 && !/^[0-9a-f]+$/u.test(value))) {
+    throw new Error(`invalid or oversized ${label}`);
+  }
 }
 
 function requireOptionalHash(value: unknown, label: string): void {

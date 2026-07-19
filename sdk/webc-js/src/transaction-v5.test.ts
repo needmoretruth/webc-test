@@ -15,6 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { canonicalJson } from "./canonical";
 import {
+  actionProgramV1,
   createSponsorUseV1,
   feeBidV1DigestHex,
   revokeSponsorGrantActionV1,
@@ -210,6 +211,25 @@ describe("V5 cross-language transaction fixtures", () => {
       "9ee7f737d552bfc49ba6351b0c8954c70a83b989175a0892b106e95c36846de8",
     );
     expect(() => revokeSponsorGrantActionV1("00".repeat(32))).toThrow();
+  });
+
+  it("rejects inactive or intrinsically invalid native actions before signing", () => {
+    expect(() => actionProgramV1([
+      { Delegate: { validator: RECIPIENT, amount: "1" } },
+    ])).toThrow("not supported");
+    expect(() => actionProgramV1([
+      { FundAuthorizationLane: { lane: DEFAULT_LANE, fee_deposit: "1" } },
+    ])).toThrow("target authorization lane");
+    expect(() => actionProgramV1([
+      { OpenAuthorizationLane: { lane: "11".repeat(32), fee_deposit: "0" } },
+    ])).toThrow("must be positive");
+    expect(() => actionProgramV1([{
+      CreateObject: {
+        object_id: "22".repeat(32),
+        namespace: "33".repeat(32),
+        data: "00".repeat(64 * 1024 + 1),
+      },
+    }])).toThrow("oversized");
   });
 
   it("reproduces the Rust sender-paid transfer wire byte-for-byte", async () => {
