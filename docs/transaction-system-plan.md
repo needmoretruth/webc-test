@@ -629,18 +629,33 @@ all child object state and events. The focused gate passed all 16 execution V1
 tests, strict all-target `webc-chain` clippy, formatting, and all 209
 `webc-chain` tests.
 
-This does not activate protocol 2. Existing V4 execution remains the node path,
-and V5 still rejects native operations other than transfer and the three owned
-object operations before touching state. Step 4 therefore remains open until
-the remaining V4 native transitions are extracted with their full chain-config,
-authorization, exact-access, failure-classification, and rollback semantics.
+Commits `2d60cc3`, `436baae`, `1f2e6a0`, and `84ef04e` extend that checkpoint.
+V5 now shares V4 transitions for fee-lane open/fund, validator/delegator reward
+claims, matured unbonding claims, and first authorization-policy installation.
+Statically invalid lane selection, zero deposits, oversized object data, and an
+invalid recovery root fail before signing or charging. Multi-action tests prove
+that insufficient lane funding, a missing delegation, a duplicate matured
+claim, and a duplicate policy install discard every prior child change and
+event while preserving only parent fee/nonce accounting. The latest focused
+gate passed 24 execution tests, strict all-target `webc-chain` clippy,
+formatting, and all 218 `webc-chain` tests.
 
-Exact next item: add the chain-config/action-envelope context required by the
-shared executor, then integrate the remaining native-operation groups in small
-tested commits. Keep statically invalid actions in the free validation or
-preparation layer; only state preconditions that can change after admission may
-become chargeable receipt failures. After every native variant is covered and
-the full step-4 gate passes, move to storage schema 2 and its resumable migration.
+This does not activate protocol 2. Existing V4 execution remains the node path.
+V5 currently supports transfers, owned-object operations, fee-lane management,
+reward and matured-principal claims, authorization-policy installation, and
+sponsor-grant revocation. It still rejects the remaining configuration-dependent
+staking mutations, session/policy rotations, slashing, and bridge operations
+before touching state. Step 4 therefore remains open until those V4 transitions
+are extracted with their full chain-config, authorization, exact-access,
+failure-classification, and rollback semantics.
+
+Exact next item: add immutable chain configuration and the remaining signed
+envelope fields to the shared execution context, then integrate validator
+registration/delegation/undelegation/operator-exit as one staking group. Keep
+statically invalid actions in the free validation or preparation layer; only
+state preconditions that can change after admission may become chargeable
+receipt failures. After every native variant is covered and the full step-4
+gate passes, move to storage schema 2 and its resumable migration.
 
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
