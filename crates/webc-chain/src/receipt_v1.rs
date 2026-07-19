@@ -36,6 +36,16 @@ pub const EVENT_V1_DOMAIN: &str = "WEBC_EVENT_V1";
 /// Domain separating an ordered transaction-tree leaf from the transaction ID.
 pub const TRANSACTION_LEAF_V1_DOMAIN: &str = "WEBC_TRANSACTION_LEAF_V1";
 
+/// Maximum events one decoded or locally constructed V1 receipt may contain.
+///
+/// The current native executor emits at most one event for each of 32 actions.
+/// Headroom keeps this boundary usable by later bounded runtimes while stopping
+/// a hostile receipt from turning validation and hashing into an unbounded loop.
+pub const MAX_RECEIPT_EVENTS_V1: usize = 256;
+
+/// Maximum JSON bytes accepted by [`ReceiptV1::decode_json`].
+pub const MAX_RECEIPT_V1_JSON_BYTES: usize = 256 * 1024;
+
 macro_rules! bounded_index {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -189,10 +199,29 @@ pub struct ReceiptV1 {
     /// Independently reconciled reservation, charge, refund, burn, and reward.
     pub fee_summary: FeeSummaryV1,
     /// Ordered successful child-overlay events; always empty on failure.
+    #[serde(deserialize_with = "bounded_events::deserialize")]
     pub events: Vec<EventV1>,
 }
 
 impl ReceiptV1 {
+    /// Decodes and validates one hostile JSON receipt under hard resource bounds.
+    ///
+    /// The byte ceiling is checked before JSON allocation. The event sequence
+    /// uses a bounded streaming visitor, so a forged length prefix or oversized
+    /// array cannot preallocate or retain an attacker-selected number of events.
+    pub fn decode_json(bytes: &[u8]) -> Result<Self, ReceiptError> {
+        if bytes.len() > MAX_RECEIPT_V1_JSON_BYTES {
+            return Err(ReceiptError::ReceiptTooLarge {
+                actual: bytes.len(),
+                maximum: MAX_RECEIPT_V1_JSON_BYTES,
+            });
+        }
+        let receipt =
+            serde_json::from_slice::<Self>(bytes).map_err(|_| ReceiptError::MalformedReceipt)?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
     /// Validates every receipt-local invariant before storage, hashing, or proof use.
     ///
     /// This check is pure. It rejects unknown versions, inconsistent fee
@@ -203,6 +232,12 @@ impl ReceiptV1 {
         if self.version != RECEIPT_V1 {
             return Err(ReceiptError::UnsupportedReceiptVersion {
                 actual: self.version,
+            });
+        }
+        if self.events.len() > MAX_RECEIPT_EVENTS_V1 {
+            return Err(ReceiptError::TooManyEvents {
+                actual: self.events.len(),
+                maximum: MAX_RECEIPT_EVENTS_V1,
             });
         }
         self.fee_summary.validate()?;
@@ -271,6 +306,25 @@ impl ReceiptV1 {
 /// Typed rejection while validating or committing V1 receipt data.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReceiptError {
+    /// Hostile JSON exceeded the pre-allocation receipt byte ceiling.
+    #[error("receipt JSON has {actual} bytes, maximum is {maximum}")]
+    ReceiptTooLarge {
+        /// Rejected input byte length.
+        actual: usize,
+        /// Protocol decoder ceiling in bytes.
+        maximum: usize,
+    },
+    /// Hostile JSON did not decode as one strict V1 receipt.
+    #[error("receipt JSON is malformed")]
+    MalformedReceipt,
+    /// A receipt attempted to retain more events than the schema permits.
+    #[error("receipt has {actual} events, maximum is {maximum}")]
+    TooManyEvents {
+        /// Rejected event count.
+        actual: usize,
+        /// V1 event-count ceiling.
+        maximum: usize,
+    },
     /// A decoded receipt names an unsupported schema.
     #[error("unsupported receipt version {actual}")]
     UnsupportedReceiptVersion {
@@ -600,6 +654,55 @@ fn canonical_hash<T: Serialize>(value: &T) -> Result<Hash256, ReceiptError> {
         .map_err(|_| ReceiptError::CanonicalEncoding)
 }
 
+mod bounded_events {
+    use super::{EventV1, MAX_RECEIPT_EVENTS_V1};
+    use serde::de::{Error as DeError, SeqAccess, Visitor};
+    use serde::Deserializer;
+    use std::fmt;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<EventV1>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedEventsVisitor;
+
+        impl<'de> Visitor<'de> for BoundedEventsVisitor {
+            type Value = Vec<EventV1>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "an event array with at most {MAX_RECEIPT_EVENTS_V1} entries"
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|length| length > MAX_RECEIPT_EVENTS_V1)
+                {
+                    return Err(A::Error::custom("receipt event array exceeds V1 limit"));
+                }
+                let mut events = Vec::with_capacity(
+                    sequence.size_hint().unwrap_or(0).min(MAX_RECEIPT_EVENTS_V1),
+                );
+                while let Some(event) = sequence.next_element()? {
+                    if events.len() == MAX_RECEIPT_EVENTS_V1 {
+                        return Err(A::Error::custom("receipt event array exceeds V1 limit"));
+                    }
+                    events.push(event);
+                }
+                Ok(events)
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedEventsVisitor)
+    }
+}
+
 mod block_height_decimal {
     use super::*;
     use serde::de::Error as DeError;
@@ -817,6 +920,42 @@ mod tests {
             Err(ReceiptError::EventActionOrderInvalid {
                 previous: ActionIndex::new(1),
                 actual: ActionIndex::new(0)
+            })
+        );
+    }
+
+    #[test]
+    fn hostile_receipt_decode_bounds_bytes_and_events_before_hashing() {
+        let transaction = sample_transaction(7, 123_456);
+        let mut receipt = successful_receipt(&transaction, 0);
+        let template = receipt.events[0].clone();
+        receipt.events = (0..=MAX_RECEIPT_EVENTS_V1)
+            .map(|index| {
+                let mut event = template.clone();
+                event.event_index = EventIndex::new(
+                    u32::try_from(index).expect("test event limit must fit the V1 index"),
+                );
+                event
+            })
+            .collect();
+
+        assert_eq!(
+            receipt.validate(),
+            Err(ReceiptError::TooManyEvents {
+                actual: MAX_RECEIPT_EVENTS_V1 + 1,
+                maximum: MAX_RECEIPT_EVENTS_V1,
+            })
+        );
+        let json = serde_json::to_vec(&receipt).expect("oversized event fixture must serialize");
+        assert_eq!(
+            ReceiptV1::decode_json(&json),
+            Err(ReceiptError::MalformedReceipt)
+        );
+        assert_eq!(
+            ReceiptV1::decode_json(&vec![b' '; MAX_RECEIPT_V1_JSON_BYTES + 1]),
+            Err(ReceiptError::ReceiptTooLarge {
+                actual: MAX_RECEIPT_V1_JSON_BYTES + 1,
+                maximum: MAX_RECEIPT_V1_JSON_BYTES,
             })
         );
     }

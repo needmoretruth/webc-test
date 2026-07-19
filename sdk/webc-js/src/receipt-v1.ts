@@ -25,6 +25,8 @@ export const RECEIPT_LEAF_V1_DOMAIN = "WEBC_RECEIPT_LEAF_V1";
 export const EVENT_V1_DOMAIN = "WEBC_EVENT_V1";
 export const TRANSACTION_LEAF_V1_DOMAIN = "WEBC_TRANSACTION_LEAF_V1";
 export const MERKLE_V1_DOMAIN = "WEBC_MERKLE_V1";
+/** Maximum events retained or hashed from one untrusted V1 receipt. */
+export const MAX_RECEIPT_EVENTS_V1 = 256;
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
@@ -152,6 +154,9 @@ export function validateReceiptV1(value: unknown): asserts value is ReceiptV1Jso
   const failedIndex = validateStatus(receipt.status);
   validateFeeSummaryV1(receipt.fee_summary);
   if (!Array.isArray(receipt.events)) throw new Error("receipt events must be an array");
+  if (receipt.events.length > MAX_RECEIPT_EVENTS_V1) {
+    throw new Error("receipt event array exceeds V1 limit");
+  }
   if (failedIndex !== undefined && receipt.events.length !== 0) {
     throw new Error("failed receipt must not contain events");
   }

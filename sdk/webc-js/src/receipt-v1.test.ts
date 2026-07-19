@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { canonicalJson } from "./canonical";
 import {
   eventV1DigestHex,
+  MAX_RECEIPT_EVENTS_V1,
   receiptRootV1Hex,
   receiptV1DigestHex,
   receiptV1LeafHex,
@@ -148,5 +149,16 @@ describe("V1 receipts and ordered roots", () => {
     const value = await receipt(transaction());
     value.events[0].body = { EpochRewardsDistributed: { epoch: Number.MAX_SAFE_INTEGER + 1, total: "1" } };
     expect(() => validateReceiptV1(value)).toThrow(/unsafe JSON number/u);
+  });
+
+  it("rejects an oversized hostile event array before hashing", async () => {
+    const value = await receipt(transaction());
+    const template = value.events[0];
+    value.events = Array.from({ length: MAX_RECEIPT_EVENTS_V1 + 1 }, (_, index) => ({
+      ...structuredClone(template),
+      event_index: index,
+    }));
+    expect(() => validateReceiptV1(value)).toThrow(/event array exceeds/u);
+    await expect(receiptV1LeafHex(value)).rejects.toThrow(/event array exceeds/u);
   });
 });
