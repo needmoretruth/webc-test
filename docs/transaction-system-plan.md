@@ -609,6 +609,39 @@ behind one reusable action executor, then implement the parent fee/nonce/sponsor
 and child action/event overlay with atomic success, chargeable failure,
 rollback, cancellation, and sponsor lifecycle coverage.
 
+### Partial step 4 checkpoint (2026-07-19): V5 overlays and object actions
+
+Continuation step 4 is materially advanced but is not complete. The branch now
+has stateless `ValidatedTransactionV1`, pure snapshot-bound
+`PreparedTransactionV1`, durable sponsor grant replay/budget/revocation state,
+sender/sponsor/session fee authority, and a two-level executor. The parent
+overlay commits nonce, actual fee, sponsor use, and session fee spend after an
+included action failure; the child overlay commits ordered action state/events
+only on success. Tests cover cancellation, default and non-default fee lanes,
+sponsored failure, session principal-versus-fee budgets, unused failure suffixes,
+and a failed transaction followed by an unrelated success.
+
+Commit `8b29cea` extends the reusable native action boundary beyond transfers:
+V4 and V5 now share the exact object create, mutate, and ownership-transfer
+transitions. Ordered object actions commit typed events on success, while an
+object version failure produces the stable chargeable receipt code and discards
+all child object state and events. The focused gate passed all 16 execution V1
+tests, strict all-target `webc-chain` clippy, formatting, and all 209
+`webc-chain` tests.
+
+This does not activate protocol 2. Existing V4 execution remains the node path,
+and V5 still rejects native operations other than transfer and the three owned
+object operations before touching state. Step 4 therefore remains open until
+the remaining V4 native transitions are extracted with their full chain-config,
+authorization, exact-access, failure-classification, and rollback semantics.
+
+Exact next item: add the chain-config/action-envelope context required by the
+shared executor, then integrate the remaining native-operation groups in small
+tested commits. Keep statically invalid actions in the free validation or
+preparation layer; only state preconditions that can change after admission may
+become chargeable receipt failures. After every native variant is covered and
+the full step-4 gate passes, move to storage schema 2 and its resumable migration.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
