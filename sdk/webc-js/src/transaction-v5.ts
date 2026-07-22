@@ -40,6 +40,9 @@ export const FEE_BID_V1_DOMAIN = "WEBC_FEE_BID_V1";
 export const SPONSOR_GRANT_V1_DOMAIN = "WEBC_SPONSOR_GRANT_V1";
 /** Replay-bounded sponsor-use digest domain matching Rust. */
 export const SPONSOR_USE_V1_DOMAIN = "WEBC_SPONSOR_USE_V1";
+/** Post-quantum root-signature domain for one exact staking-control action. */
+export const STAKING_CONTROL_AUTHORIZATION_V1_DOMAIN =
+  "WEBC_STAKING_CONTROL_AUTHORIZATION_V1";
 
 /** Maximum ordered actions in one V1 action program. */
 export const MAX_ACTIONS_V1 = 32;
@@ -57,6 +60,8 @@ export const REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS = 5_000n;
 export const REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS = 100_000n;
 /** Conservative bookkeeping units added to every sponsored transaction. */
 export const SPONSOR_GRANT_USE_V1_REQUIRED_UNITS = 100_000n;
+/** Conservative units for one post-quantum staking authorization verification. */
+export const STAKING_CONTROL_AUTHORIZATION_V1_REQUIRED_UNITS = 100_000n;
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
@@ -71,6 +76,7 @@ const SUPPORTED_NATIVE_ACTIONS_V1 = new Set([
   "CreateObject",
   "MutateObject",
   "TransferObject",
+  "DeleteObject",
 ]);
 
 /** Canonical unsigned decimal string whose value is within Rust `u64`. */
@@ -102,6 +108,40 @@ export interface TransactionAuthorizationV1Json {
   policy_revision: DecimalU64;
   /** Replay nonce in `lane`, encoded exactly as decimal u64. */
   nonce: DecimalU64;
+}
+
+/** Critical staking payload authorized separately by the post-quantum root. */
+export type StakingActionV1Json =
+  | {
+      RegisterValidator: {
+        /** Ed25519 consensus public key, lowercase hex. */
+        consensus_key: string;
+        /** Operator collateral in native base units. */
+        self_stake: string;
+        /** Commission in basis points, from 0 through 10,000. */
+        commission_bps: number;
+      };
+    }
+  | { Delegate: { validator: WebcAddress; amount: string } }
+  | { Undelegate: { validator: WebcAddress; amount: string } }
+  | { UnstakeValidator: { amount: string } };
+
+/** Inputs bound into one root-signature message for ordered staking control. */
+export interface StakingControlAuthorizationRequestV1 {
+  /** Canonical network identifier. */
+  chainId: string;
+  /** Account whose stake is controlled. */
+  owner: WebcAddress;
+  /** Current installed account-policy revision. */
+  policyRevision: DecimalU64;
+  /** Must be the all-zero default authorization lane. */
+  lane: string;
+  /** Default-lane transaction nonce. */
+  nonce: DecimalU64;
+  /** Zero-based position in the containing action program. */
+  actionIndex: number;
+  /** Exact staking transition being authorized. */
+  action: StakingActionV1Json;
 }
 
 /** One ordered V1 action wrapping an existing native operation. */
@@ -264,6 +304,45 @@ export function actionProgramV1(operations: OperationJson[]): TransactionKindV1J
       actions: operations.map((operation) => ({ Native: { operation } })),
     },
   };
+}
+
+/**
+ * Returns the canonical bytes the current post-quantum root must sign for one
+ * exact staking-control action.
+ *
+ * The root signature is bound to the chain, owner, current policy revision,
+ * default lane, transaction nonce, ordered action index, and complete payload.
+ * The SDK only constructs these bytes; ML-DSA signing stays in a dedicated
+ * recovery signer and stateful verification stays in the Rust node.
+ */
+export function stakingControlAuthorizationMessageV1(
+  request: StakingControlAuthorizationRequestV1,
+): Uint8Array {
+  requireChainId(request.chainId);
+  requireAddress(request.owner, "staking-control owner");
+  requireU64(request.policyRevision, "staking-control policy revision");
+  requireHex(request.lane, 32, "staking-control lane", false);
+  if (request.lane !== "00".repeat(32)) {
+    throw new Error("V5 staking control requires the default authorization lane");
+  }
+  requireU64(request.nonce, "staking-control nonce");
+  if (!Number.isSafeInteger(request.actionIndex)
+    || request.actionIndex < 0
+    || request.actionIndex >= MAX_ACTIONS_V1) {
+    throw new Error("V5 staking-control action index is outside the action program");
+  }
+  validateStakingActionV1(request.action);
+  return canonicalJsonBytes({
+    domain: STAKING_CONTROL_AUTHORIZATION_V1_DOMAIN,
+    protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+    chain_id: request.chainId,
+    owner: request.owner,
+    policy_revision: request.policyRevision,
+    lane: request.lane,
+    nonce: request.nonce,
+    action_index: request.actionIndex,
+    action: request.action,
+  });
 }
 
 /** Constructs a protocol-2 action that permanently revokes one sponsor grant. */
@@ -647,7 +726,9 @@ function kindMatchesApplicationNamespace(
         ? operation.MutateObject.namespace
         : "TransferObject" in operation
           ? operation.TransferObject.namespace
-          : null;
+          : "DeleteObject" in operation
+            ? operation.DeleteObject.namespace
+            : null;
     if (namespace === null) continue;
     if (namespace !== expected) return false;
     observed = true;
@@ -788,6 +869,54 @@ async function validateSponsorIntentConsistency(
   return true;
 }
 
+/** Validates the exact bounded staking payload shared with the Rust signer. */
+function validateStakingActionV1(value: unknown): asserts value is StakingActionV1Json {
+  requireRecord(value, "V5 staking action");
+  const variants = Object.keys(value);
+  if (variants.length !== 1) {
+    throw new Error("V5 staking action must have one variant");
+  }
+  const variant = variants[0];
+  if (variant === "RegisterValidator") {
+    const payload = value[variant];
+    requireRecord(payload, "V5 validator registration");
+    requireExactKeys(
+      payload,
+      ["consensus_key", "self_stake", "commission_bps"],
+      "V5 validator registration",
+    );
+    requireHex(payload.consensus_key, 32, "V5 validator consensus key", false);
+    if (requireU128(payload.self_stake, "V5 validator self stake") === 0n
+      || typeof payload.commission_bps !== "number"
+      || !Number.isInteger(payload.commission_bps)
+      || payload.commission_bps < 0
+      || payload.commission_bps > 10_000) {
+      throw new Error("invalid V5 validator registration parameters");
+    }
+    return;
+  }
+  if (variant === "Delegate" || variant === "Undelegate") {
+    const payload = value[variant];
+    requireRecord(payload, `V5 ${variant} action`);
+    requireExactKeys(payload, ["validator", "amount"], `V5 ${variant} action`);
+    requireAddress(payload.validator, `V5 ${variant} validator`);
+    if (requireU128(payload.amount, `V5 ${variant} amount`) === 0n) {
+      throw new Error(`V5 ${variant} amount must be positive`);
+    }
+    return;
+  }
+  if (variant === "UnstakeValidator") {
+    const payload = value[variant];
+    requireRecord(payload, "V5 validator unstake action");
+    requireExactKeys(payload, ["amount"], "V5 validator unstake action");
+    if (requireU128(payload.amount, "V5 validator unstake amount") === 0n) {
+      throw new Error("V5 validator unstake amount must be positive");
+    }
+    return;
+  }
+  throw new Error("unsupported V5 staking action");
+}
+
 /**
  * Enforces the executable's current V5 native-action capability boundary.
  *
@@ -861,6 +990,7 @@ function nativeActionRequiredUnits(operation: OperationJson): bigint {
     case "CreateObject":
     case "MutateObject":
     case "TransferObject":
+    case "DeleteObject":
       return 20_000n;
     default:
       throw new Error("native action is not supported by V5 execution");

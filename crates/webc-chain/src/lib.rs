@@ -165,13 +165,15 @@ pub use token::{
 };
 pub use transaction::{AccessList, FeeBid, Operation, Transaction};
 pub use transaction_v5::{
-    ActionProgramV1, ActionScopeV1, ActionV1, CancelV1, FeePaymentV1, SponsorGrantId,
-    SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
-    TransactionId, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
-    ValidityWindowV1, ACTION_PROGRAM_V1_DOMAIN, CANCEL_V1_REQUIRED_UNITS, FEE_BID_V1_DOMAIN,
-    MAX_ACTIONS_V1, MAX_TRANSACTION_V5_CANONICAL_BYTES, MAX_TRANSACTION_VALIDITY_BLOCKS,
+    staking_control_authorization_message, ActionProgramIndexV1, ActionProgramV1, ActionScopeV1,
+    ActionV1, CancelV1, FeePaymentV1, SponsorGrantId, SponsorGrantV1, SponsorUseCount,
+    SponsorUseNonce, SponsorUseV1, StakingActionV1, TransactionAuthorizationV1, TransactionId,
+    TransactionKindV1, TransactionV5, TransactionValidationErrorV1, ValidityWindowV1,
+    ACTION_PROGRAM_V1_DOMAIN, CANCEL_V1_REQUIRED_UNITS, FEE_BID_V1_DOMAIN, MAX_ACTIONS_V1,
+    MAX_TRANSACTION_V5_CANONICAL_BYTES, MAX_TRANSACTION_VALIDITY_BLOCKS,
     REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS,
     SPONSOR_GRANT_USE_V1_REQUIRED_UNITS, SPONSOR_GRANT_V1_DOMAIN, SPONSOR_USE_V1_DOMAIN,
+    STAKING_CONTROL_AUTHORIZATION_V1_DOMAIN, STAKING_CONTROL_AUTHORIZATION_V1_REQUIRED_UNITS,
     TRANSACTION_ID_V1_DOMAIN, TRANSACTION_V5_PROTOCOL_VERSION, TRANSACTION_V5_SIGNING_DOMAIN,
 };
 pub use unbonding::{

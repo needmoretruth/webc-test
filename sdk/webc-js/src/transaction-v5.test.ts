@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { canonicalJson } from "./canonical";
+import { canonicalJson, canonicalJsonHashHex } from "./canonical";
 import {
   actionProgramV1,
   createSponsorUseV1,
@@ -26,6 +26,7 @@ import {
   sponsorGrantSigningBytes,
   sponsorGrantV1DigestHex,
   sponsorUseV1DigestHex,
+  stakingControlAuthorizationMessageV1,
   transactionKindV1DigestHex,
   transactionV5RequiredUnits,
   transactionV5IdHex,
@@ -161,6 +162,69 @@ function decode(bytes: Uint8Array): string {
 }
 
 describe("V5 cross-language transaction fixtures", () => {
+  it("matches the Rust post-quantum staking-control authorization message", async () => {
+    const message = stakingControlAuthorizationMessageV1({
+      chainId: "webc-devnet-1",
+      owner: SENDER,
+      policyRevision: "7",
+      lane: DEFAULT_LANE,
+      nonce: "9",
+      actionIndex: 3,
+      action: {
+        RegisterValidator: {
+          consensus_key:
+            "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+          self_stake: "20000000000000",
+          commission_bps: 1250,
+        },
+      },
+    });
+    expect(decode(message)).toBe(
+      '{"action":{"RegisterValidator":{"commission_bps":1250,"consensus_key":"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394","self_stake":"20000000000000"}},"action_index":3,"chain_id":"webc-devnet-1","domain":"WEBC_STAKING_CONTROL_AUTHORIZATION_V1","lane":"0000000000000000000000000000000000000000000000000000000000000000","nonce":"9","owner":"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3","policy_revision":"7","protocol_version":2}',
+    );
+    await expect(canonicalJsonHashHex(JSON.parse(decode(message)))).resolves.toBe(
+      "57477f70eefae7829dd0785982050525673c434a5c22ce69227d32931bbf5de4",
+    );
+    expect(() => stakingControlAuthorizationMessageV1({
+      chainId: "webc-devnet-1",
+      owner: SENDER,
+      policyRevision: "7",
+      lane: "11".repeat(32),
+      nonce: "9",
+      actionIndex: 3,
+      action: { UnstakeValidator: { amount: "1" } },
+    })).toThrow("default authorization lane");
+    expect(() => stakingControlAuthorizationMessageV1({
+      chainId: "webc-devnet-1",
+      owner: SENDER,
+      policyRevision: "7",
+      lane: DEFAULT_LANE,
+      nonce: "9",
+      actionIndex: 32,
+      action: { UnstakeValidator: { amount: "1" } },
+    })).toThrow("outside the action program");
+    expect(() => stakingControlAuthorizationMessageV1({
+      chainId: "webc-devnet-1",
+      owner: SENDER,
+      policyRevision: "7",
+      lane: DEFAULT_LANE,
+      nonce: "9",
+      actionIndex: 0,
+      action: { Delegate: { validator: RECIPIENT, amount: "0" } },
+    })).toThrow("must be positive");
+  });
+
+  it("prices and accepts the active native object-delete action", () => {
+    const kind = actionProgramV1([{
+      DeleteObject: {
+        object_id: "22".repeat(32),
+        namespace: "33".repeat(32),
+        expected_version: 1,
+      },
+    }]);
+    expect(transactionV5RequiredUnits(kind, "SenderLane")).toBe(20_000n);
+  });
+
   it("accepts a sponsor paying from its default account lane like Rust", async () => {
     const sponsor = await createWalletFromSeed(new Uint8Array(32).fill(3));
     const grant = await signSponsorGrantV1(sponsor, {

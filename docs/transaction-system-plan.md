@@ -865,6 +865,30 @@ fixtures, then integrate the four shared transitions with chargeable state-race
 failures and full rollback/restart/supply coverage. Do not enable the legacy
 native staking variants as a shortcut.
 
+### Post-quantum staking authorization format checkpoint (2026-07-22)
+
+The recovery-signer boundary for staking control is frozen before execution is
+enabled. Rust and TypeScript now share a narrow `StakingActionV1` payload with no
+legacy bootstrap flag and construct byte-identical canonical authorization
+messages. The message binds protocol version 2, chain, owner, exact policy
+revision, default lane, transaction nonce, a bounded zero-based action-program
+index, and the complete staking payload under
+`WEBC_STAKING_CONTROL_AUTHORIZATION_V1`. A fixed Rust/TypeScript JSON and SHA-256
+vector prevents silent signer drift. Both implementations reject non-default
+lanes, out-of-range indices, zero amounts, and commission above 10,000 before a
+recovery signer is invoked. The SDK also now mirrors the already-active Rust V5
+object-delete operation in its operation type, namespace matching, validation,
+and 20,000-unit pricing.
+
+This checkpoint does not yet add `StakingControl` to the executable action
+envelope, so no new staking path is admitted from this format-only change.
+Exact next item: add the full action plus bounded root reveal to Rust and
+TypeScript together, reject sponsorship and non-default lanes structurally,
+verify the current installed root during free preparation, snapshot validated
+staking configuration, and connect the four shared transitions with atomic
+rollback, restart, and supply-invariant tests. The legacy native staking forms
+must remain unsupported.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at

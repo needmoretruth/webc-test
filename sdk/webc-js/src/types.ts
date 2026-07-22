@@ -316,6 +316,13 @@ export type OperationJson =
       };
     }
   | {
+      DeleteObject: {
+        object_id: HexString;
+        namespace: HexString;
+        expected_version: number;
+      };
+    }
+  | {
       RegisterValidator: {
         consensus_key: HexString;
         self_stake: string;

@@ -47,6 +47,9 @@ pub const SPONSOR_GRANT_V1_DOMAIN: &str = "WEBC_SPONSOR_GRANT_V1";
 /// Domain for binding one grant-use nonce to one action program and fee bid.
 pub const SPONSOR_USE_V1_DOMAIN: &str = "WEBC_SPONSOR_USE_V1";
 
+/// Post-quantum root-signature domain for one exact V5 staking-control action.
+pub const STAKING_CONTROL_AUTHORIZATION_V1_DOMAIN: &str = "WEBC_STAKING_CONTROL_AUTHORIZATION_V1";
+
 /// Maximum number of ordered actions in one V5 program.
 pub const MAX_ACTIONS_V1: usize = 32;
 
@@ -76,6 +79,14 @@ pub const REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS: u64 = 100_000;
 /// Charging every use is deliberately conservative until storage deposits and
 /// benchmark-backed dynamic state costs are available.
 pub const SPONSOR_GRANT_USE_V1_REQUIRED_UNITS: u64 = 100_000;
+
+/// Conservative units for verifying one post-quantum staking authorization.
+///
+/// The underlying staking transition cost is charged in addition to this
+/// authorization cost. This pre-activation value must be replaced only from a
+/// reproducible ML-DSA benchmark; keeping it explicit prevents wallets and
+/// nodes from silently pricing the expensive critical-action gate differently.
+pub const STAKING_CONTROL_AUTHORIZATION_V1_REQUIRED_UNITS: u64 = 100_000;
 
 /// Stable typed failures from stateless V5 decoding and verification.
 ///
@@ -328,6 +339,159 @@ pub struct TransactionAuthorizationV1 {
     /// Replay-protection sequence inside `lane`.
     #[serde(with = "nonce_decimal")]
     pub nonce: Nonce,
+}
+
+/// One critical staking transition authorized by the account's post-quantum root.
+///
+/// This deliberately excludes the legacy `bootstrap` flag and is distinct from
+/// [`Operation`]. V5 must never make an old Ed25519-only staking operation
+/// executable by accident: the containing action carries a root reveal over an
+/// exact domain-separated message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum StakingActionV1 {
+    /// Creates the sender's validator pool with operator self-stake.
+    RegisterValidator {
+        /// Ed25519 public key authenticating current consensus messages.
+        consensus_key: PublicKeyBytes,
+        /// Operator collateral in native base units; must be non-zero.
+        self_stake: Amount,
+        /// Commission in basis points, from 0 through 10,000.
+        commission_bps: u16,
+    },
+    /// Adds sender-owned native stake to one validator pool.
+    Delegate {
+        /// Validator operator receiving the delegation.
+        validator: Address,
+        /// Delegated native base units; must be non-zero.
+        amount: Amount,
+    },
+    /// Queues delayed exit from one sender-owned delegation position.
+    Undelegate {
+        /// Validator whose unbonding queue receives the request.
+        validator: Address,
+        /// Native base units requested for exit; must be non-zero.
+        amount: Amount,
+    },
+    /// Queues delayed exit of the sender's validator self-stake.
+    UnstakeValidator {
+        /// Operator native base units requested for exit; must be non-zero.
+        amount: Amount,
+    },
+}
+
+impl StakingActionV1 {
+    /// Returns the deterministic units for only the underlying state transition.
+    ///
+    /// [`STAKING_CONTROL_AUTHORIZATION_V1_REQUIRED_UNITS`] is charged separately
+    /// for the post-quantum signature verification performed by the envelope.
+    pub const fn transition_required_units(&self) -> u64 {
+        match self {
+            Self::RegisterValidator { .. } => 25_000,
+            Self::Delegate { .. } | Self::Undelegate { .. } | Self::UnstakeValidator { .. } => {
+                10_000
+            }
+        }
+    }
+
+    /// Validates signed parameters that do not depend on chain configuration.
+    fn validate_structure(&self) -> Result<(), TransactionValidationErrorV1> {
+        match self {
+            Self::RegisterValidator {
+                self_stake,
+                commission_bps,
+                ..
+            } if self_stake.is_zero() || *commission_bps > 10_000 => {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Self::Delegate { amount, .. }
+            | Self::Undelegate { amount, .. }
+            | Self::UnstakeValidator { amount }
+                if amount.is_zero() =>
+            {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Zero-based position of one action inside the bounded V5 action program.
+///
+/// Keeping this distinct from a receipt event index prevents a recovery signer
+/// from binding a root signature to the wrong ordinal domain. Construction
+/// enforces the same 32-action ceiling as [`ActionProgramV1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ActionProgramIndexV1(u32);
+
+impl ActionProgramIndexV1 {
+    /// Constructs an action position if it is representable by the V5 program.
+    pub fn new(value: u32) -> Result<Self, TransactionValidationErrorV1> {
+        let index = usize::try_from(value)
+            .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)?;
+        if index >= MAX_ACTIONS_V1 {
+            return Err(TransactionValidationErrorV1::InvalidNativeAction);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the zero-based unsigned ordinal carried in canonical JSON.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Returns the canonical bytes the current post-quantum root must sign for one
+/// exact staking-control action.
+///
+/// The message binds the protocol, chain, owner, current policy revision,
+/// default authorization lane, transaction nonce, ordered action index, and
+/// complete staking payload. Consequently, a root signature cannot be replayed
+/// in another transaction slot, account, network, policy revision, lane, or
+/// staking operation. Only indices representable by the 32-action envelope are
+/// accepted, and staking control is deliberately restricted to the default
+/// lane because it changes the account's long-lived security posture.
+pub fn staking_control_authorization_message(
+    chain_id: &ChainId,
+    owner: Address,
+    policy_revision: AuthorizationPolicyRevision,
+    lane: AuthorizationLaneId,
+    nonce: Nonce,
+    action_index: ActionProgramIndexV1,
+    action: &StakingActionV1,
+) -> Result<Vec<u8>, TransactionValidationErrorV1> {
+    if !lane.is_default() {
+        return Err(TransactionValidationErrorV1::InvalidNativeAction);
+    }
+    action.validate_structure()?;
+
+    #[derive(Serialize)]
+    struct AuthorizationMessage<'a> {
+        domain: &'static str,
+        protocol_version: ProtocolVersion,
+        chain_id: &'a ChainId,
+        owner: Address,
+        #[serde(with = "authorization_revision_decimal")]
+        policy_revision: AuthorizationPolicyRevision,
+        lane: AuthorizationLaneId,
+        #[serde(with = "nonce_decimal")]
+        nonce: Nonce,
+        action_index: ActionProgramIndexV1,
+        action: &'a StakingActionV1,
+    }
+
+    canonical_bytes(&AuthorizationMessage {
+        domain: STAKING_CONTROL_AUTHORIZATION_V1_DOMAIN,
+        protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+        chain_id,
+        owner,
+        policy_revision,
+        lane,
+        nonce,
+        action_index,
+        action,
+    })
 }
 
 /// One version-1 action, initially reusing a reviewed native operation.
@@ -1560,6 +1724,68 @@ mod fee_bid_decimal {
 mod tests {
     use super::*;
     use crate::{ObjectId, ObjectVersion, Operation};
+
+    #[test]
+    fn staking_control_authorization_message_is_bounded_and_cross_language_stable() {
+        let owner = Keypair::from_seed([1; 32]);
+        let consensus = Keypair::from_seed([2; 32]);
+        let action = StakingActionV1::RegisterValidator {
+            consensus_key: consensus.public_key(),
+            self_stake: Amount::from_webc(20),
+            commission_bps: 1_250,
+        };
+        let message = staking_control_authorization_message(
+            &ChainId::devnet(),
+            owner.address(),
+            AuthorizationPolicyRevision::new(7),
+            AuthorizationLaneId::DEFAULT,
+            Nonce::new(9),
+            ActionProgramIndexV1::new(3).expect("bounded action index"),
+            &action,
+        )
+        .expect("valid staking authorization message");
+        assert_eq!(
+            String::from_utf8(message.clone()).expect("canonical JSON is UTF-8"),
+            r#"{"action":{"RegisterValidator":{"commission_bps":1250,"consensus_key":"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394","self_stake":"20000000000000"}},"action_index":3,"chain_id":"webc-devnet-1","domain":"WEBC_STAKING_CONTROL_AUTHORIZATION_V1","lane":"0000000000000000000000000000000000000000000000000000000000000000","nonce":"9","owner":"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3","policy_revision":"7","protocol_version":2}"#
+        );
+        assert_eq!(
+            Hash256::digest(&message).to_string(),
+            "57477f70eefae7829dd0785982050525673c434a5c22ce69227d32931bbf5de4"
+        );
+
+        assert_eq!(
+            staking_control_authorization_message(
+                &ChainId::devnet(),
+                owner.address(),
+                AuthorizationPolicyRevision::new(7),
+                AuthorizationLaneId::new(Hash256::digest(b"non-default")),
+                Nonce::new(9),
+                ActionProgramIndexV1::new(3).expect("bounded action index"),
+                &action,
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+        assert_eq!(
+            ActionProgramIndexV1::new(32),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+        let zero = StakingActionV1::Delegate {
+            validator: consensus.address(),
+            amount: Amount::ZERO,
+        };
+        assert_eq!(
+            staking_control_authorization_message(
+                &ChainId::devnet(),
+                owner.address(),
+                AuthorizationPolicyRevision::new(7),
+                AuthorizationLaneId::DEFAULT,
+                Nonce::new(9),
+                ActionProgramIndexV1::new(0).expect("bounded action index"),
+                &zero,
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+    }
 
     fn transfer_kind(recipient: Address, amount: u128) -> TransactionKindV1 {
         TransactionKindV1::Actions(ActionProgramV1::new(vec![ActionV1::native(
