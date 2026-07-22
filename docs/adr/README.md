@@ -18,7 +18,11 @@ code depends on it. Every replacement states compatibility and migration rules.
 - [ADR-0009: node and validator key management](0009-node-key-management.md)
 - [ADR-0010: committee sampling](0010-committee-sampling.md)
 - [ADR-0011: historical state, archival, and weak-subjectivity sync](0011-historical-state-and-weak-subjectivity.md)
-- [ADR-0012: versioned transaction lifecycle and finalized proofs](0012-transaction-lifecycle-and-finalized-proofs.md)
+- [ADR-0012: inactivity leak and slashing posture](0012-inactivity-leak-and-slashing.md)
+- [ADR-0013: hot/cold storage tiering boundary](0013-hot-cold-storage-tiering.md)
+- [ADR-0014: contract runtime](0014-contract-runtime.md)
+- [ADR-0015: Weft authoring front end — earliest skeleton](0015-weft-skeleton.md)
+- [ADR-0016: versioned transaction lifecycle and finalized proofs](0016-transaction-lifecycle-and-finalized-proofs.md)
 
 ## Planned ADRs (from the 2026-07-16 plan review)
 
@@ -43,6 +47,6 @@ Status of each recommended ADR from the review (details in
 - **Off-chain contract-compilation invariant** — recorded in
   [ADR-0006](0006-contract-runtime-gate.md).
 - **End-to-end transaction lifecycle, failed execution, durable status, and
-  finalized proof interfaces** — [ADR-0012](0012-transaction-lifecycle-and-finalized-proofs.md)
+  finalized proof interfaces** — [ADR-0016](0016-transaction-lifecycle-and-finalized-proofs.md)
   (accepted implementation direction for the isolated transaction branch;
   production use still requires the plan's full gates and external review).

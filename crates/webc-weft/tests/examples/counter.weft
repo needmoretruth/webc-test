@@ -1,0 +1,15 @@
+/// A persistent little-endian u64 counter.
+component counter v1 {
+  /// The accumulated count, persisted across invocations.
+  state count: u64
+
+  /// Increment the persistent counter and return its new value.
+  entry bump()
+    reads count
+    writes count
+    -> u64
+  {
+    count = count + 1;
+    return count;
+  }
+}

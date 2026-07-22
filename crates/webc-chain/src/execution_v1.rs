@@ -45,6 +45,9 @@ pub const MAX_SPONSOR_REVOCATION_LOOKAHEAD_BLOCKS_V1: u64 = MAX_TRANSACTION_VALI
 /// failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TransactionPreparationErrorV1 {
+    /// The surrounding chain state has not activated protocol-2 execution.
+    #[error("V5 transaction execution is not active for this state protocol")]
+    ProtocolInactive,
     /// The signed validity window excludes the candidate block height.
     #[error("V5 transaction is outside its signed height window")]
     HeightOutsideValidity,
@@ -403,7 +406,20 @@ fn capture_state_key(
             )
             .map_err(map_sponsor_book_execution_error)?,
         StateKeyKind::Application { .. } => {}
-        StateKeyKind::Module { .. } => {
+        StateKeyKind::OracleFeed { .. }
+        | StateKeyKind::OracleReporter { .. }
+        | StateKeyKind::DexOrder { .. }
+        | StateKeyKind::Mandate { .. }
+        | StateKeyKind::Service { .. }
+        | StateKeyKind::Token { .. }
+        | StateKeyKind::TokenBalance { .. }
+        | StateKeyKind::TokenFreeze { .. }
+        | StateKeyKind::NftCollection { .. }
+        | StateKeyKind::NftItem { .. }
+        | StateKeyKind::GovernanceInstance { .. }
+        | StateKeyKind::GovernanceProposal { .. }
+        | StateKeyKind::GovernanceVote { .. }
+        | StateKeyKind::Module { .. } => {
             return Err(BlockExecutionErrorV1::StateAccessInvariant);
         }
     }
@@ -455,6 +471,19 @@ fn execution_write_key(key: &StateKey) -> Result<ExecutionWriteKeyV1, BlockExecu
         StateKeyKind::Protocol {
             field: ProtocolStateKey::BaseFee,
         }
+        | StateKeyKind::OracleFeed { .. }
+        | StateKeyKind::OracleReporter { .. }
+        | StateKeyKind::DexOrder { .. }
+        | StateKeyKind::Mandate { .. }
+        | StateKeyKind::Service { .. }
+        | StateKeyKind::Token { .. }
+        | StateKeyKind::TokenBalance { .. }
+        | StateKeyKind::TokenFreeze { .. }
+        | StateKeyKind::NftCollection { .. }
+        | StateKeyKind::NftItem { .. }
+        | StateKeyKind::GovernanceInstance { .. }
+        | StateKeyKind::GovernanceProposal { .. }
+        | StateKeyKind::GovernanceVote { .. }
         | StateKeyKind::Module { .. } => Err(BlockExecutionErrorV1::StateAccessInvariant),
     }
 }
@@ -664,6 +693,9 @@ impl ChainState {
         validated: &ValidatedTransactionV1,
         height: BlockHeight,
     ) -> Result<PreparationSnapshotV1, TransactionPreparationErrorV1> {
+        if self.protocol_version != crate::TRANSACTION_V5_PROTOCOL_VERSION {
+            return Err(TransactionPreparationErrorV1::ProtocolInactive);
+        }
         let transaction = validated.transaction();
         if !transaction.validity.contains(height) {
             return Err(TransactionPreparationErrorV1::HeightOutsideValidity);
@@ -960,26 +992,6 @@ fn execute_native_action_v1(
             *validator,
             *request_id,
             unbonding_claims,
-            effects,
-        ),
-        Operation::CreateObject {
-            object_id,
-            namespace,
-            data,
-        } => {
-            state.apply_native_object_create(context.sender, *object_id, *namespace, data, effects)
-        }
-        Operation::MutateObject {
-            object_id,
-            namespace,
-            expected_version,
-            data,
-        } => state.apply_native_object_mutation(
-            context.sender,
-            *object_id,
-            *namespace,
-            *expected_version,
-            data,
             effects,
         ),
         Operation::TransferObject {
@@ -1747,11 +1759,11 @@ mod tests {
     use crate::{
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
         AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Delegation,
-        Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectOwner, ObjectVersion, Operation,
-        PostQuantumRoot, PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
-        SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
-        TransactionAuthorizationV1, TransactionIndex, UnbondingKind, UnbondingRequestId, Validator,
-        ValidatorStatus, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
+        Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectVersion, Operation, PostQuantumRoot,
+        PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints, SponsorGrantId,
+        SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
+        TransactionIndex, UnbondingKind, UnbondingRequestId, Validator, ValidatorStatus,
+        ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
         MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1, REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
         TRANSACTION_V5_PROTOCOL_VERSION,
     };
@@ -1869,6 +1881,7 @@ mod tests {
 
     fn funded_state(sender: &Keypair, sponsor: Option<&Keypair>) -> ChainState {
         let mut state = ChainState {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
             current_base_fee_per_unit: 2,
             ..ChainState::default()
         };
@@ -2073,6 +2086,24 @@ mod tests {
     }
 
     #[test]
+    fn protocol_one_state_rejects_v5_preparation_before_any_state_lookup() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let validated = ValidatedTransactionV1::validate(
+            sender_paid_fixture(&sender, &recipient),
+            &ChainId::devnet(),
+        )
+        .expect("protocol-2 envelope validates structurally");
+        let state = ChainState::default();
+
+        assert!(matches!(
+            state.prepare_transaction_v1(validated, BlockHeight::new(10)),
+            Err(TransactionPreparationErrorV1::ProtocolInactive)
+        ));
+        assert!(state.sponsor_grants.is_empty());
+    }
+
+    #[test]
     fn sponsor_grant_state_is_exact_and_committed_by_the_state_root() {
         let sponsor = Keypair::from_seed([3; 32]);
         let grant_id = SponsorGrantId::new(Hash256([0x44; 32]));
@@ -2089,7 +2120,10 @@ mod tests {
         assert_eq!(value["uses"], "3");
         assert_eq!(value["total_charged"], "123");
 
-        let state = ChainState::default();
+        let state = ChainState {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            ..ChainState::default()
+        };
         let before = state.state_root().expect("empty state root");
         let mut with_grant = state;
         with_grant
@@ -2328,69 +2362,46 @@ mod tests {
     }
 
     #[test]
-    fn action_program_reuses_ordered_object_transitions() {
+    fn object_create_and_mutation_fail_closed_until_storage_pricing_is_bound() {
         let sender = Keypair::from_seed([1; 32]);
-        let new_owner = Keypair::from_seed([2; 32]);
         let object_id = ObjectId::new(Hash256([0x91; 32]));
         let namespace = Hash256([0x92; 32]);
-        let transaction = sender_actions_fixture(
-            &sender,
-            vec![
-                ActionV1::native(Operation::CreateObject {
-                    object_id,
-                    namespace,
-                    data: vec![1, 2],
-                }),
-                ActionV1::native(Operation::MutateObject {
-                    object_id,
-                    namespace,
-                    expected_version: ObjectVersion::INITIAL,
-                    data: vec![3, 4],
-                }),
-                ActionV1::native(Operation::TransferObject {
-                    object_id,
-                    namespace,
-                    expected_version: ObjectVersion::new(2),
-                    new_owner: new_owner.address(),
-                }),
-            ],
-            60_000,
-        );
-        let mut state = funded_state(&sender, None);
-        state
-            .accounts
-            .get_mut(&sender.address())
-            .expect("sender account")
-            .balance = Amount::from_units(500_000);
-        state.minted_supply = Amount::from_units(500_000);
-        state.inflation_year_start_supply = state.minted_supply;
-        let prepared = prepared(&state, transaction);
-
-        let receipt = state
-            .execute_prepared_transaction_v1(
-                prepared,
-                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
-            )
-            .expect("ordered object actions execute")
-            .into_receipt();
-
-        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
-        assert_eq!(receipt.events.len(), 3);
-        assert_eq!(receipt.events[0].action_index, ActionIndex::new(0));
-        assert_eq!(receipt.events[1].action_index, ActionIndex::new(1));
-        assert_eq!(receipt.events[2].action_index, ActionIndex::new(2));
-        assert_eq!(receipt.fee_summary.charged, Amount::from_units(180_000));
-        let object = &state.objects[&object_id];
-        assert_eq!(object.owner, ObjectOwner::Address(new_owner.address()));
-        assert_eq!(object.version, ObjectVersion::new(3));
-        assert_eq!(object.data, vec![3, 4]);
-        assert_eq!(state.accounts[&sender.address()].nonce, 1);
-        assert!(
-            state
-                .supply_invariant_report()
-                .expect("object action supply report")
-                .balanced
-        );
+        for operation in [
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![1, 2],
+            },
+            Operation::MutateObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::INITIAL,
+                data: vec![3, 4],
+            },
+        ] {
+            let result = TransactionV5::for_actions_unsigned(
+                ChainId::devnet(),
+                sender.address(),
+                sender.public_key(),
+                TransactionAuthorizationV1 {
+                    lane: AuthorizationLaneId::DEFAULT,
+                    policy_revision: AuthorizationPolicyRevision::new(0),
+                    nonce: Nonce::new(0),
+                },
+                ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+                vec![ActionV1::native(operation)],
+                FeeBid {
+                    gas_limit: 60_000,
+                    max_fee_per_unit: 5,
+                    priority_fee_per_unit: 1,
+                },
+                FeePaymentV1::SenderLane,
+            );
+            assert!(matches!(
+                result,
+                Err(TransactionValidationErrorV1::UnsupportedNativeAction)
+            ));
+        }
     }
 
     #[test]
@@ -2972,65 +2983,6 @@ mod tests {
         assert_eq!(
             journaled.state_root().expect("journaled state root"),
             direct.state_root().expect("direct state root")
-        );
-    }
-
-    #[test]
-    fn object_precondition_failure_discards_child_and_events() {
-        let sender = Keypair::from_seed([1; 32]);
-        let object_id = ObjectId::new(Hash256([0x93; 32]));
-        let namespace = Hash256([0x94; 32]);
-        let transaction = sender_actions_fixture(
-            &sender,
-            vec![
-                ActionV1::native(Operation::CreateObject {
-                    object_id,
-                    namespace,
-                    data: vec![1],
-                }),
-                ActionV1::native(Operation::MutateObject {
-                    object_id,
-                    namespace,
-                    expected_version: ObjectVersion::new(9),
-                    data: vec![2],
-                }),
-            ],
-            40_000,
-        );
-        let mut state = funded_state(&sender, None);
-        state
-            .accounts
-            .get_mut(&sender.address())
-            .expect("sender account")
-            .balance = Amount::from_units(500_000);
-        state.minted_supply = Amount::from_units(500_000);
-        state.inflation_year_start_supply = state.minted_supply;
-        let prepared = prepared(&state, transaction);
-
-        let receipt = state
-            .execute_prepared_transaction_v1(
-                prepared,
-                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
-            )
-            .expect("object version failure is chargeable")
-            .into_receipt();
-
-        assert_eq!(
-            receipt.status,
-            ReceiptStatusV1::Failed {
-                code: ExecutionFailureCodeV1::ObjectVersionMismatch,
-                failed_action_index: Some(ActionIndex::new(1)),
-            }
-        );
-        assert!(receipt.events.is_empty());
-        assert_eq!(receipt.fee_summary.charged, Amount::from_units(120_000));
-        assert!(!state.objects.contains_key(&object_id));
-        assert_eq!(state.accounts[&sender.address()].nonce, 1);
-        assert!(
-            state
-                .supply_invariant_report()
-                .expect("failed object action supply report")
-                .balanced
         );
     }
 

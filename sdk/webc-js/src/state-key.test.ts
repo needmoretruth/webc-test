@@ -70,14 +70,22 @@ describe("state-key wire schema", () => {
       },
       { version: 1, kind: { Protocol: { field: "BaseFee" } } },
       { version: 1, kind: { Protocol: { field: "BridgeNonce" } } },
-      {
-        version: 1,
-        kind: { SponsorGrant: { sponsor: owner, grant_id: "77".repeat(32) } },
-      },
     ];
 
     expect(await canonicalJsonHashHex(keys)).toBe(
-      "ce844cddc2979f04aacc81550845f574da2bbc1eeef9aa0f6bf2710a64dc68f4",
+      "86b42dee5ac735a7435d64b12b3f6f958e90c03ac03173ef6f98ec88169c9e20",
+    );
+  });
+
+  it("pins the protocol-2 sponsor-grant key separately", async () => {
+    const sponsor = "webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3";
+    const key: StateKeyJson = {
+      version: 1,
+      kind: { SponsorGrant: { sponsor, grant_id: "77".repeat(32) } },
+    };
+
+    expect(await canonicalJsonHashHex([key])).toBe(
+      "65efa533252699217ff2f91545228da78e00c12222bb5539b02e3161b7bd79c5",
     );
   });
 });

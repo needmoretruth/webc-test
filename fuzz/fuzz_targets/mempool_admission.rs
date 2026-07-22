@@ -9,6 +9,7 @@
 
 #![no_main]
 
+use bincode::Options;
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 use webc_chain::{
@@ -50,7 +51,12 @@ fn genesis() -> &'static (ChainConfig, ChainState) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(tx) = bincode::deserialize::<Transaction>(data) else {
+    // Match the wire/storage decode config (WEBC §15.14 variable-length integers)
+    // so admission is fuzzed against the bytes a hostile peer actually sends.
+    let Ok(tx) = bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .deserialize::<Transaction>(data)
+    else {
         return;
     };
     let (config, state) = genesis();

@@ -117,6 +117,70 @@ here (do not re-litigate; plan within them — §16 rules of engagement):
   delegated engineering choices that must be versioned, tested, and documented
   with reasons and a migration path.
 
+#### Slashing severity + liveness — DIRECTION set 2026-07-17, exact numbers DEFERRED
+
+The owner directed (2026-07-17) that the slashing **severity numbers are NOT
+finalized**: they live in a **flexible config structure** (`SlashingPolicy` plus
+the forthcoming inactivity-leak config) with provisional defaults, and the exact
+values will be **decided carefully later by referencing Ethereum, Solana, Sui,
+Polkadot, and Cardano** (comparison + proposed WEBC design captured in
+**ADR-0012**). What is fixed is the *design direction* below; what is deferred is
+every percentage/curve constant. Code MUST keep these parameterized (no hardcoded
+final magnitudes) until the owner confirms them.
+
+Design direction (intent, not final numbers):
+
+- **Severe faults** (conflicting signed votes/blocks — equivocation/double-sign;
+  later, objectively invalid signed transitions and fraudulent signed bridge
+  messages once their evidence artifacts exist): a large slash of the offender's
+  **whole pool** (operator self-stake plus delegated stake, pro-rata —
+  delegators share operator risk, which is what makes delegation a security
+  signal rather than free leverage) and a permanent **Tombstone** (consensus key
+  banned). Leaning aggressive, but the exact fraction is deferred.
+- **Correlated slashing** for coordinated provable attacks: the severe fraction
+  ramps with the share of total active stake that committed the same fault in
+  the same window (Ethereum-style, e.g. `min(100%, max(base, k ×
+  correlated_fraction))`) so an isolated fault is bounded while a near-majority
+  coordinated equivocation approaches a full slash. `base` and `k` are config,
+  deferred.
+- **Liveness / mass-offline — inactivity leak (owner-directed 2026-07-17).**
+  WEBC is Tendermint-style and today HALTS if >1/3 of stake is offline (no 2/3
+  quorum). The owner directed adopting an **Ethereum-style inactivity leak** so
+  the network does **not** halt permanently: when the online voting power cannot
+  reach the finality quorum, offline validators' effective stake is progressively
+  drained (a growing, e.g. quadratic, leak while finality is stalled) until the
+  online set regains >2/3 and finality resumes. Ordinary *isolated* downtime
+  stays in the soft "lost rewards + jail (re-bondable)" band; the heavy leak is
+  reserved for the correlated mass-offline case. Activation threshold, leak
+  curve/rate, quorum target, and exit conditions are config, deferred to ADR-0012
+  finalization. This is a consensus-layer change (a recovery mode that can update
+  weights without 2/3) and must be designed carefully before implementation.
+- All slashing still requires **objective signed evidence** (unchanged). Slashed
+  and leaked units are **burned** — moved to the `slashed_units` sink already
+  reconciled by the supply invariant, never redistributed to a reporter (no
+  bounty incentive to manufacture faults). This burn treatment is already the
+  code's behavior and is fixed.
+
+#### Bootstrap-phase issuance (§15.2) — owner-decided at the 2026-07-17 economics freeze
+
+The owner adopted **stake-keyed issuance with a supply-percentage cap** for the
+labeled bootstrap phase (the base schedule — 10%/yr decaying ×0.8/yr to a 1%
+floor — is unchanged and resumes after bootstrap exit):
+
+- During the bootstrap phase the reward budget is **`rate × total staked`,
+  hard-capped at a configured percentage of total supply per period**, so a tiny
+  early staking base cannot capture outsized *absolute* issuance (the cap binds
+  when stake is low; the stake-keying binds when stake is high).
+- **Published sunset criteria** (validator count, stake dispersion, distribution
+  progress) close the bootstrap phase; on exit the base schedule applies. The
+  exact sunset thresholds and the bootstrap rate/cap are config values published
+  with the distribution specification before the incentivized program starts
+  (Phase 16), but the *mechanism* (stake-keyed, capped, sunset-gated) is fixed
+  here.
+- This composes with the already-decided 5% validator-bootstrap grant ceiling
+  (§15.10) and the 30% contributor pool: grants seed operators; bootstrap
+  issuance funds ongoing validation while the staking base is thin.
+
 ### Bridge safety
 
 - Ethereum-side bridge contracts are written/audited in Solidity; Solana-side

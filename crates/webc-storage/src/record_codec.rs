@@ -2,7 +2,7 @@
 //!
 //! Purpose: keep the schema-v1 bincode representation and every hostile-record
 //! limit in one auditable seam. Responsibilities: choose an absolute byte cap
-//! for each record class, preserve bincode 1.x fixed-integer/little-endian bytes,
+//! for each record class, use the protocol's variable-length integer encoding,
 //! reject trailing bytes, and classify malformed persisted input as corruption.
 //! Non-responsibilities: table/key layout, schema migration, database I/O, and
 //! validation of consensus meaning remain with [`crate::ChainStore`] and the
@@ -31,7 +31,7 @@ const MIB: u64 = 1024 * KIB;
 ///
 /// Small metadata limits exceed their exact current encodings while remaining
 /// tight. Blocks and certificates align with the current 4 MiB network/block
-/// envelope. Validator sets allow the ADR-0012 authority-set ceiling with ample
+/// envelope. Validator sets allow the ADR-0016 authority-set ceiling with ample
 /// per-entry overhead. State and WAL records need larger caps because schema 1
 /// stores a complete latest-state snapshot and full signed proposal history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,19 +82,20 @@ impl StoredRecordKind {
 
 /// Returns the schema-v1 bincode configuration for `kind`.
 ///
-/// `bincode::serialize` historically uses fixed-width integers, little endian,
-/// and permits trailing bytes on decode. Explicit fixed integers and little
-/// endian preserve the bytes already stored by schema 1; rejecting trailing
-/// bytes strengthens reads without changing any valid encoding.
+/// Variable-length integers implement the current schema-1 at-rest format from
+/// §15.14. Little endian is explicit for the multi-byte varint payloads, while
+/// trailing bytes and kind-specific size overruns fail closed. The prototype's
+/// earlier fixed-width schema-1 snapshots require an ephemeral-store reset; no
+/// ambiguous dual decoder is accepted.
 fn options(kind: StoredRecordKind) -> impl Options {
     bincode::DefaultOptions::new()
-        .with_fixint_encoding()
+        .with_varint_encoding()
         .with_little_endian()
         .reject_trailing_bytes()
         .with_limit(kind.max_bytes())
 }
 
-/// Encodes one typed record without changing the schema-v1 byte representation.
+/// Encodes one typed record in the bounded schema-v1 at-rest representation.
 ///
 /// The record is rejected with [`StorageError::Serialization`] if its encoded
 /// form exceeds the kind-specific absolute byte cap or serialization otherwise
@@ -151,11 +152,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encoding_preserves_schema_v1_legacy_bytes() {
+    fn encoding_matches_schema_v1_varint_bytes() {
         let value = vec![1u64, 2, u64::MAX];
-        let legacy = bincode::serialize(&value).unwrap();
+        let expected = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .with_little_endian()
+            .serialize(&value)
+            .unwrap();
         let bounded = encode(StoredRecordKind::StateSnapshot, &value).unwrap();
-        assert_eq!(bounded, legacy);
+        assert_eq!(bounded, expected);
     }
 
     #[test]
@@ -169,10 +174,11 @@ mod tests {
 
     #[test]
     fn rejects_a_hostile_collection_length_prefix() {
-        // Fixed-int bincode begins a Vec with a little-endian u64 length. A
-        // maximal claimed length in an otherwise tiny record must report
-        // corruption rather than driving a correspondingly sized allocation.
-        let forged = u64::MAX.to_le_bytes();
+        // Varint marker 0xfd declares that the following eight bytes contain a
+        // u64 length. A maximal claimed length in an otherwise tiny record must
+        // report corruption rather than drive a correspondingly sized allocation.
+        let mut forged = vec![0xfd];
+        forged.extend_from_slice(&u64::MAX.to_le_bytes());
         let error = decode::<Vec<u8>>(StoredRecordKind::ChainId, &forged).unwrap_err();
         assert!(matches!(error, StorageError::Corruption(_)));
     }

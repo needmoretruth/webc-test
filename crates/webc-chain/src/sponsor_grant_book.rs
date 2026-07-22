@@ -190,6 +190,7 @@ impl SponsorGrantBookV1 {
     /// A grant remains valid through `valid_until_height`, so only records with
     /// an expiry strictly below `current_height` are removed. The global
     /// per-block limit bounds cleanup even when one expiry has a large backlog.
+    #[cfg(test)]
     pub(crate) fn prune_expired(
         &mut self,
         current_height: BlockHeight,

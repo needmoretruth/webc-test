@@ -312,8 +312,15 @@ async fn a_certified_invalid_block_is_a_surfaced_consensus_emergency() {
     ))
     .await
     .unwrap();
+    // Wait for the connection to be live in BOTH directions before broadcasting.
+    // The block below is delivered FROM the harness TO the driver, so the harness
+    // must have registered the driver as a peer — checking only the driver's view
+    // (`handle.connected_peers()`) raced: the driver's outbound dial could complete
+    // (its peer count > 0) a beat before the harness registered the inbound
+    // connection, so the one-shot broadcast reached no peer and the driver waited
+    // for a block that never arrived, timing out at 10s (the intermittent flake).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while handle.connected_peers() == 0 {
+    while handle.connected_peers() == 0 || harness.connected_peers() == 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "driver did not peer with the harness"

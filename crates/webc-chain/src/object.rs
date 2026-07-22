@@ -7,7 +7,7 @@
 //! identity is reserved but mutation remains disabled until a public runtime can
 //! supply an auditable authorization rule.
 
-use crate::ChainError;
+use crate::{Amount, ChainError};
 use serde::{Deserialize, Serialize};
 use webc_crypto::{Address, Hash256};
 
@@ -85,6 +85,16 @@ pub struct StateObject {
     /// Bounded opaque application bytes; large files remain off-chain.
     #[serde(with = "bounded_hex")]
     pub data: Vec<u8>,
+    /// Refundable native storage deposit locked for this revision (§15.22).
+    ///
+    /// Invariant: equals `ChainConfig::storage_pricing.deposit_for_bytes(data.len())`
+    /// at the object's current bytes. `CreateObject` locks it, `MutateObject`
+    /// resizes it, and `DeleteObject` refunds/burns it. Recorded on the object so
+    /// the object sub-root commits it and a later delete knows the exact amount
+    /// to release. `#[serde(default)]` keeps pre-deposit objects (deposit zero)
+    /// decodable across a bincode restart.
+    #[serde(default)]
+    pub deposit: Amount,
 }
 
 impl StateObject {
@@ -102,6 +112,9 @@ impl StateObject {
             owner: ObjectOwner::Address(owner),
             version: ObjectVersion::INITIAL,
             data,
+            // The caller (the CreateObject handler) computes and locks the
+            // deposit from the configured pricing, then records it here.
+            deposit: Amount::ZERO,
         })
     }
 }

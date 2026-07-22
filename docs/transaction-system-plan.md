@@ -322,7 +322,7 @@ Review status: provisional and explicitly replaceable after later review.
 
 ### 2026-07-17 — shared transaction lifecycle and proof interfaces
 
-Changed: [ADR-0012](adr/0012-transaction-lifecycle-and-finalized-proofs.md)
+Changed: [ADR-0016](adr/0016-transaction-lifecycle-and-finalized-proofs.md)
 freezes protocol-version-2 transaction/action/cancellation/sponsor shapes,
 typed validation/execution/block errors, two-level rollback, base/priority fee
 accounting, receipt/event/leaf formats, a single node runtime, durable lifecycle
@@ -339,7 +339,7 @@ Reused: existing canonical JSON, typed protocol integers, native operations,
 access recorder, fees/base-fee state, Merkle hashing, finality certificates,
 validator snapshots, `KvStore`, redb (`MIT OR Apache-2.0`), bounded network
 codec, axum/tokio, and browser canonical encoder. Sui and Agave official source
-were reviewed at the revisions and Apache-2.0 license links pinned in ADR-0012;
+were reviewed at the revisions and Apache-2.0 license links pinned in ADR-0016;
 no source was copied and no dependency was added.
 
 Rejected: optional fields added to V4, free failed work, partial action commits,
@@ -453,7 +453,7 @@ coordinated receipt-schema change to modify.
 
 Implementation checkpoint on 2026-07-18: the isolated branch contains code
 through `ee25016`; the paused-goal record below is a later docs-only handoff.
-ADR-0012 and `4d54170` freeze the shared interfaces. `d25eb57` adds the
+ADR-0016 and `4d54170` freeze the shared interfaces. `d25eb57` adds the
 versioned `FeeSummaryV1` accounting boundary without changing V4 execution.
 `ee09e61` routes every schema-1 `ChainStore` record through a bounded,
 trailing-rejecting codec while preserving its legacy bytes. `b405e6b` adds the
@@ -490,7 +490,7 @@ goal is **not complete** and must not be merged to `main` from this checkpoint.
 
 What is durable on the goal branch:
 
-- `4d54170`: ADR-0012 shared lifecycle/proof interface freeze;
+- `4d54170`: ADR-0016 shared lifecycle/proof interface freeze;
 - `d25eb57`: checked `FeeSummaryV1` base/priority/reserve/refund accounting;
 - `ee09e61`: bounded schema-1 storage codec integration;
 - `b405e6b`: pure indexed transparent Merkle proof integration;
@@ -663,7 +663,8 @@ Commit `2ba13f4` closes the signed pre-use revocation lifecycle without
 activating protocol 2. A signed grant can be revoked before its first fee use;
 the durable record authenticates its inclusive expiry; the state commitment
 binds the complete grant book; and a derived, canonically ordered expiry index
-prunes at most 256 expired records per block. The old per-expiry admission cap
+can prune at most 256 expired records per protocol-2 block after activation. The
+protocol-1 block path never calls this cleanup. The old per-expiry admission cap
 was removed because it created a hidden global conflict and allowed one sender
 to squat an expiry bucket. Instead, every sponsored transaction and every
 signed revocation action reserves 100,000 deterministic bookkeeping units.
@@ -731,10 +732,62 @@ Request-creating staking actions must use a bounded queue delta rather than
 reintroducing a global queue clone. Preserve V4 behavior and classify only
 state preconditions that can change after admission as chargeable failures.
 
+### Latest-main integration checkpoint (2026-07-22)
+
+The transaction branch now integrates `origin/main` at `ef1fb9d8913d`, including
+the V20 state commitment, the complete current native operation set, localized
+fees, storage deposits, native token/NFT/governance/DEX/oracle/agent systems,
+the WASM runtime, Weft, and the latest bounded/compressed storage stack. Conflict
+resolution preserves protocol 1 byte-for-byte instead of silently activating
+transaction-V5 state:
+
+- an empty protocol-1 state is pinned to the V20 root
+  `ddb1a0d463e7ef12b73b2408c344e9b7799570b16f06b7cb7f83727c9644127f`;
+- protocol 1 rejects any non-empty V5 grant book before block commitment and
+  does not run V5 grant pruning;
+- V5 preparation requires a protocol-2 `ChainState`; protocol 2 uses the V21
+  commitment and authenticates the grant subtree;
+- the original protocol-1 state-key fixture remains
+  `86b42dee5ac735a7435d64b12b3f6f958e90c03ac03173ef6f98ec88169c9e20`,
+  while the additive sponsor key has its own Rust/TypeScript fixture;
+- all main `Event` variants keep their existing binary discriminants and the V5
+  sponsor-revocation event is appended last;
+- schema-1 at-rest records use main's variable-length integer format through the
+  transaction branch's kind-specific bounded decoder, with trailing bytes and
+  hostile length prefixes rejected before unbounded work; and
+- the transaction lifecycle ADR is renumbered from the colliding ADR-0012 to
+  ADR-0016; main's ADR-0012 through ADR-0015 remain unchanged.
+
+Main added refundable storage-deposit economics after the old V5 object helper
+was written. Reusing that helper would let protocol 2 create or resize objects
+without locking the required deposit. `CreateObject` and `MutateObject` are
+therefore explicitly rejected at structural validation until V5 receives an
+immutable `ChainConfig`/storage-pricing snapshot and its sparse overlay commits
+the exact `storage_deposits` delta. `TransferObject` remains enabled because it
+preserves the existing deposit unchanged. New main state-key families are also
+explicitly rejected by the sparse overlay until their state adapters exist; no
+wildcard match can accidentally enable them.
+
+Integration verification passed: `cargo fmt --check`, workspace Clippy with
+warnings denied, the complete Rust workspace test suite, workspace rustdoc with
+warnings denied, `pnpm check`, and the deterministic node demo all succeed. The
+focused coverage includes all 501 `webc-chain` unit tests, the native
+supply-invariant integration test, eight parallel-execution integration tests,
+48 `webc-storage` tests, 257 JavaScript SDK tests, and three widget tests. The
+rustdoc gate also caught and fixed invalid intra-doc links in the newly imported
+Weft skeleton before this integration commit was accepted.
+
+Exact next item after the integration commit: inject the immutable chain config
+into V5 preparation/execution, upgrade the shared object create/mutate
+transitions to main's deposit debit/refund semantics, add signed account access
+and an additive `storage_deposits` sparse delta, then restore ordered object
+success/failure/restart/property coverage. After that, resume the remaining
+step-4 native operation groups against the now-current main types.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
-`d48f930`). This brief captures the ADR-0012 spec and the exact current-code
+`d48f930`). This brief captures the ADR-0016 spec and the exact current-code
 reuse map so the next session implements it directly without re-exploring. Do not
 duplicate any listed foundation; extend/reuse it.
 
@@ -764,9 +817,9 @@ Reuse (with file:line) — do not re-implement:
   (`crates/webc-proof/src/indexed_merkle.rs`). Do not write a new tree.
 - V4 precedent to diverge from deliberately: V4 tx/receipt leaves are UNDOMAINED
   `digest(canonical_json)` (`block_builder.rs:212-243`). V5 leaves ARE
-  domain-separated (ADR-0012 §"Frozen domains"); document the asymmetry.
+  domain-separated (ADR-0016 §"Frozen domains"); document the asymmetry.
 
-Types to add (ADR-0012 §Receipt/event/block, §Frozen domains):
+Types to add (ADR-0016 §Receipt/event/block, §Frozen domains):
 - Consts: `RECEIPT_V1: u16 = 1`, `EVENT_V1: u16 = 1`; domains `WEBC_RECEIPT_V1`,
   `WEBC_RECEIPT_LEAF_V1`, `WEBC_EVENT_V1`, `WEBC_TRANSACTION_LEAF_V1`.
 - Bounded index wrappers `ActionIndex(u32)`, `EventIndex(u32)`,

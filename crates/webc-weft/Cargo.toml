@@ -1,0 +1,29 @@
+[package]
+name = "webc-weft"
+version = "0.1.0"
+# Not published to crates.io: an internal workspace prototype crate.
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Weft authoring front end (earliest skeleton): compiles Weft source off-chain to deterministic WEBC WASM."
+
+[lints]
+workspace = true
+
+[dependencies]
+webc-crypto = { path = "../webc-crypto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Assembles the compiler's emitted WAT text into deterministic wasm bytes. The
+# skeleton codegen targets WAT for clarity; a production backend would lower via
+# the audited Rust framework and emit wasm directly. Same engine-accepted output.
+wat = "1.253"
+
+[dev-dependencies]
+# The end-to-end proof runs a Weft-compiled module on the real engine and chain:
+# Weft source -> wasm -> webc-vm execution -> webc-chain register + invoke.
+webc-vm = { path = "../webc-vm" }
+webc-chain = { path = "../webc-chain" }

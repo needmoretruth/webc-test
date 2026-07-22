@@ -19,7 +19,21 @@
 //! - `GET  /fees`                       current base fee and block unit budget
 //! - `GET  /accounts/{address}`         account snapshot
 //! - `GET  /accounts/{address}/proof`   Merkle account proof
+//! - `GET  /accounts/{address}/token-balances` paginated balances held by an address
+//! - `GET  /accounts/{address}/mandates` paginated mandates whose principal is an address
 //! - `GET  /objects/{id}`               persistent object by hex id
+//! - `GET  /tokens/{id}`                native token record by hex id
+//! - `GET  /tokens/{id}/balances/{address}` a holder's token balance
+//! - `GET  /tokens/{id}/supply`         per-token supply reconciliation
+//! - `GET  /nft/collections/{id}`       NFT collection record by hex id
+//! - `GET  /nft/collections/{id}/items/{serial}` one NFT item
+//! - `GET  /nft/collections/{id}/items` paginated items in a collection
+//! - `GET  /services`                   paginated services (optional `category`)
+//! - `GET  /services/{id}`              service-registry entry by hex id
+//! - `GET  /governance/instances/{id}`  governance instance by hex id
+//! - `GET  /governance/instances/{id}/proposals` paginated proposals (optional `status`)
+//! - `GET  /governance/proposals/{id}`  governance proposal by hex id
+//! - `GET  /mandates/{id}`              agent-payment mandate by hex id
 //! - `GET  /blocks/height/{height}`     finalized block by height
 //! - `GET  /blocks/hash/{hash}`         finalized block by hex header hash
 //! - `POST /transactions`               submit a signed transaction (JSON)
@@ -33,7 +47,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -41,13 +55,17 @@ use axum::{Json, Router};
 use tokio::sync::broadcast;
 use webc_net::{NetMessage, NetworkHandle};
 
-use webc_chain::{Block, ObjectId, Transaction};
+use webc_chain::{
+    Amount, Block, GovProposalStatus, GovernanceInstanceId, MandateId, NftCollectionId, NftId,
+    ObjectId, ProposalId, ServiceId, TokenId, Transaction,
+};
 use webc_crypto::{Address, Hash256};
 use webc_storage::KvStore;
 
 use crate::service::{
-    AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, NodeService, SealSummary,
-    SubmitReceipt, API_VERSION,
+    AccountSummary, ApiError, FaucetReceipt, FeeSummary, HealthSummary, MandatesPage, NftItemsPage,
+    NodeService, ProposalsPage, SealSummary, ServicesPage, SubmitReceipt, TokenBalancesPage,
+    ValidatorSummary, ValidatorsResponse, API_VERSION,
 };
 
 /// Default maximum request body size (1 MiB), bounding hostile payloads.
@@ -271,6 +289,60 @@ fn parse_hash(raw: &str) -> Result<Hash256, ApiRejection> {
     Ok(Hash256(fixed))
 }
 
+/// Query parameters shared by the simple paginated list endpoints (cursor + limit).
+/// `deny_unknown_fields` rejects any stray parameter with a 400 (via the `Query`
+/// extractor).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageParams {
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Query parameters for the services listing: an optional hex `category` tag plus
+/// pagination. `deny_unknown_fields` rejects any stray parameter with a 400 (via the
+/// `Query` extractor).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceListParams {
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Query parameters for the proposals listing: an optional `status` filter plus
+/// pagination.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalListParams {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Parses a governance proposal status filter, or a 400-mapped error. Mirrors the
+/// `GovProposalStatus` variant names exactly so the query value is self-describing.
+fn parse_proposal_status(raw: &str) -> Result<GovProposalStatus, ApiRejection> {
+    match raw {
+        "Active" => Ok(GovProposalStatus::Active),
+        "Passed" => Ok(GovProposalStatus::Passed),
+        "Defeated" => Ok(GovProposalStatus::Defeated),
+        "Executed" => Ok(GovProposalStatus::Executed),
+        "Expired" => Ok(GovProposalStatus::Expired),
+        _ => Err(ApiRejection(Box::new(ApiError::InvalidRequest(
+            "invalid proposal status".into(),
+        )))),
+    }
+}
+
 /// Builds the versioned API router with a request-body size limit.
 pub fn router<K>(state: AppState<K>) -> Router
 where
@@ -281,7 +353,48 @@ where
         .route("/v1/fees", get(fees::<K>))
         .route("/v1/accounts/{address}", get(account::<K>))
         .route("/v1/accounts/{address}/proof", get(account_proof::<K>))
+        .route(
+            "/v1/accounts/{address}/token-balances",
+            get(account_token_balances::<K>),
+        )
+        .route(
+            "/v1/accounts/{address}/mandates",
+            get(account_mandates::<K>),
+        )
+        .route("/v1/validators", get(validators::<K>))
+        .route("/v1/validators/{address}", get(validator::<K>))
+        .route("/v1/supply", get(supply::<K>))
         .route("/v1/objects/{id}", get(object::<K>))
+        .route("/v1/tokens/{id}", get(token::<K>))
+        .route(
+            "/v1/tokens/{id}/balances/{address}",
+            get(token_balance::<K>),
+        )
+        .route("/v1/tokens/{id}/supply", get(token_supply::<K>))
+        .route("/v1/nft/collections/{id}", get(nft_collection::<K>))
+        .route(
+            "/v1/nft/collections/{id}/items/{serial}",
+            get(nft_item::<K>),
+        )
+        .route(
+            "/v1/nft/collections/{id}/items",
+            get(nft_collection_items::<K>),
+        )
+        .route("/v1/services", get(list_services::<K>))
+        .route("/v1/services/{id}", get(service_entry::<K>))
+        .route(
+            "/v1/governance/instances/{id}",
+            get(governance_instance::<K>),
+        )
+        .route(
+            "/v1/governance/instances/{id}/proposals",
+            get(instance_proposals::<K>),
+        )
+        .route(
+            "/v1/governance/proposals/{id}",
+            get(governance_proposal::<K>),
+        )
+        .route("/v1/mandates/{id}", get(mandate::<K>))
         .route("/v1/blocks/height/{height}", get(block_by_height::<K>))
         .route("/v1/blocks/hash/{hash}", get(block_by_hash::<K>))
         .route("/v1/transactions", post(submit_transaction::<K>))
@@ -308,6 +421,26 @@ async fn account<K: KvStore>(
     Ok(Json(state.service().account(address)?))
 }
 
+async fn validators<K: KvStore>(
+    State(state): State<AppState<K>>,
+) -> Result<Json<ValidatorsResponse>, ApiRejection> {
+    Ok(Json(state.service().validators()?))
+}
+
+async fn validator<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(address): Path<String>,
+) -> Result<Json<ValidatorSummary>, ApiRejection> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.service().validator(address)?))
+}
+
+async fn supply<K: KvStore>(
+    State(state): State<AppState<K>>,
+) -> Result<Json<webc_chain::SupplyInvariantReport>, ApiRejection> {
+    Ok(Json(state.service().supply()?))
+}
+
 async fn account_proof<K: KvStore>(
     State(state): State<AppState<K>>,
     Path(address): Path<String>,
@@ -322,6 +455,152 @@ async fn object<K: KvStore>(
 ) -> Result<Json<webc_chain::StateObject>, ApiRejection> {
     let hash = parse_hash(&id)?;
     Ok(Json(state.service().object(ObjectId::new(hash))?))
+}
+
+async fn token<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+) -> Result<Json<webc_chain::TokenRecord>, ApiRejection> {
+    let token_id = TokenId::new(parse_hash(&id)?);
+    Ok(Json(state.service().token(token_id)?))
+}
+
+async fn token_balance<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path((id, address)): Path<(String, String)>,
+) -> Result<Json<Amount>, ApiRejection> {
+    let token_id = TokenId::new(parse_hash(&id)?);
+    let holder = parse_address(&address)?;
+    Ok(Json(state.service().token_balance(token_id, holder)?))
+}
+
+async fn token_supply<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+) -> Result<Json<webc_chain::TokenSupplyReport>, ApiRejection> {
+    let token_id = TokenId::new(parse_hash(&id)?);
+    Ok(Json(state.service().token_supply(token_id)?))
+}
+
+async fn nft_collection<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+) -> Result<Json<webc_chain::NftCollection>, ApiRejection> {
+    let collection_id = NftCollectionId::new(parse_hash(&id)?);
+    Ok(Json(state.service().nft_collection(collection_id)?))
+}
+
+async fn nft_item<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path((id, serial)): Path<(String, u64)>,
+) -> Result<Json<webc_chain::NftItem>, ApiRejection> {
+    let collection_id = NftCollectionId::new(parse_hash(&id)?);
+    let nft_id = NftId::new(collection_id, serial);
+    Ok(Json(state.service().nft_item(nft_id)?))
+}
+
+async fn service_entry<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+) -> Result<Json<webc_chain::ServiceEntry>, ApiRejection> {
+    let service_id = ServiceId::new(parse_hash(&id)?);
+    Ok(Json(state.service().service_entry(service_id)?))
+}
+
+async fn governance_instance<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+) -> Result<Json<webc_chain::GovernanceInstance>, ApiRejection> {
+    let instance_id = GovernanceInstanceId::new(parse_hash(&id)?);
+    Ok(Json(state.service().governance_instance(instance_id)?))
+}
+
+async fn governance_proposal<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+) -> Result<Json<webc_chain::GovernanceProposal>, ApiRejection> {
+    let proposal_id = ProposalId::new(parse_hash(&id)?);
+    Ok(Json(state.service().governance_proposal(proposal_id)?))
+}
+
+async fn mandate<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+) -> Result<Json<webc_chain::Mandate>, ApiRejection> {
+    let mandate_id = MandateId::new(parse_hash(&id)?);
+    Ok(Json(state.service().mandate(mandate_id)?))
+}
+
+async fn list_services<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Query(params): Query<ServiceListParams>,
+) -> Result<Json<ServicesPage>, ApiRejection> {
+    let category = match params.category.as_deref() {
+        Some(raw) => Some(parse_hash(raw)?),
+        None => None,
+    };
+    Ok(Json(state.service().services(
+        category,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn nft_collection_items<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<NftItemsPage>, ApiRejection> {
+    let collection_id = NftCollectionId::new(parse_hash(&id)?);
+    Ok(Json(state.service().nft_collection_items(
+        collection_id,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn instance_proposals<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(id): Path<String>,
+    Query(params): Query<ProposalListParams>,
+) -> Result<Json<ProposalsPage>, ApiRejection> {
+    let instance_id = GovernanceInstanceId::new(parse_hash(&id)?);
+    let status = match params.status.as_deref() {
+        Some(raw) => Some(parse_proposal_status(raw)?),
+        None => None,
+    };
+    Ok(Json(state.service().instance_proposals(
+        instance_id,
+        status,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn account_token_balances<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(address): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<TokenBalancesPage>, ApiRejection> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.service().account_token_balances(
+        address,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
+}
+
+async fn account_mandates<K: KvStore>(
+    State(state): State<AppState<K>>,
+    Path(address): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<MandatesPage>, ApiRejection> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.service().account_mandates(
+        address,
+        params.cursor.as_deref(),
+        params.limit,
+    )?))
 }
 
 async fn block_by_height<K: KvStore>(
@@ -438,12 +717,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use futures_util::StreamExt;
     use tower::ServiceExt;
-    use webc_chain::{Amount, ChainConfig, GenesisAccount, GenesisConfig};
-    use webc_crypto::Keypair;
+    use webc_chain::{
+        Amount, ChainConfig, Epoch, FeeBid, GenesisAccount, GenesisConfig, GovernanceAction,
+        GovernanceConfig, MandateCounterpartyPolicy, NftMetadata, Operation, ServicePaymentFlags,
+        TokenMetadata,
+    };
+    use webc_crypto::{Hash256, Keypair};
     use webc_storage::MemoryKvStore;
 
     use crate::mempool::MempoolConfig;
@@ -659,5 +944,1320 @@ mod tests {
         assert!(event.block_hash.is_some());
 
         drop(socket);
+    }
+
+    // ----- native-state (Phase 9/13) read endpoints -----
+
+    /// Fixed transport timestamp for the seeding seals (reads take no clock).
+    const SEED_NOW: u64 = 1_000;
+
+    /// The single application namespace all seeded native state is created under.
+    fn seed_namespace() -> Hash256 {
+        Hash256([0x77; 32])
+    }
+
+    /// Lowercase-hex form of a 32-byte id, as the SDK state-key builders emit it.
+    fn hash_hex(hash: Hash256) -> String {
+        hex::encode(hash.as_bytes())
+    }
+
+    /// Ids of the records seeded by [`native_state`], for endpoint assertions.
+    struct Seeded {
+        creator: Address,
+        holder: Address,
+        token_id: TokenId,
+        collection_id: NftCollectionId,
+        serial: u64,
+        service_id: ServiceId,
+        instance_id: GovernanceInstanceId,
+        proposal_id: ProposalId,
+        mandate_id: MandateId,
+    }
+
+    /// A generous fee bid covering any create operation's required units.
+    fn seed_fee() -> FeeBid {
+        FeeBid {
+            gas_limit: 100_000,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        }
+    }
+
+    /// Commits a prebuilt transaction in its own block via the ordinary
+    /// submit-and-seal harness (the same path a real client would drive).
+    fn seal_tx(state: &AppState<MemoryKvStore>, tx: Transaction) {
+        state
+            .service()
+            .submit_and_seal(tx, SEED_NOW)
+            .expect("operation seals into a block");
+    }
+
+    /// Signs `op` from `signer` at `nonce` and commits it in its own block.
+    fn seal_op(state: &AppState<MemoryKvStore>, signer: &Keypair, nonce: u64, op: Operation) {
+        let tx = Transaction::for_operation(signer, nonce, op, seed_fee())
+            .expect("operation transaction signs");
+        seal_tx(state, tx);
+    }
+
+    /// Builds a service whose committed state holds one of every native record:
+    /// a token (1_000 units held by `holder`), an NFT collection with one minted
+    /// item, a registered HTTP-402 service, a governance instance with an open
+    /// signaling proposal, and a mandate — all created by `creator` through the
+    /// real create operations.
+    fn native_state() -> (AppState<MemoryKvStore>, Seeded) {
+        let creator = Keypair::from_seed([31u8; 32]);
+        let holder = Keypair::from_seed([32u8; 32]);
+        let agent = Keypair::from_seed([33u8; 32]);
+        let namespace = seed_namespace();
+
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(1_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        // 1) Create a token, minting 1_000 base units to the holder.
+        seal_op(
+            &state,
+            &creator,
+            0,
+            Operation::CreateToken {
+                namespace,
+                create_nonce: 0,
+                metadata: TokenMetadata::new(
+                    b"Acme Dollar".to_vec(),
+                    b"ACME".to_vec(),
+                    6,
+                    Hash256([0x1f; 32]),
+                )
+                .unwrap(),
+                mint_authority: Some(creator.address()),
+                freeze_authority: Some(creator.address()),
+                initial_supply: Amount::from_units(1_000),
+                initial_recipient: holder.address(),
+            },
+        );
+        let token_id = TokenId::derive(namespace, creator.address(), 0);
+
+        // 2) Create an NFT collection and 3) mint its first item (serial 0).
+        seal_op(
+            &state,
+            &creator,
+            1,
+            Operation::CreateNftCollection {
+                namespace,
+                create_nonce: 0,
+                metadata: NftMetadata::new(
+                    b"Acme Apes".to_vec(),
+                    b"APE".to_vec(),
+                    Hash256([0x2f; 32]),
+                )
+                .unwrap(),
+                mint_authority: Some(creator.address()),
+                freeze_authority: Some(creator.address()),
+                max_supply: None,
+                royalty_bps: 0,
+            },
+        );
+        let collection_id = NftCollectionId::derive(namespace, creator.address(), 0);
+        seal_op(
+            &state,
+            &creator,
+            2,
+            Operation::MintNft {
+                collection_id,
+                recipient: holder.address(),
+                item_metadata_hash: Hash256([0x3f; 32]),
+            },
+        );
+        let serial: u64 = 0;
+
+        // 4) Register a service that accepts HTTP-402 payments (closes the 402 loop).
+        seal_op(
+            &state,
+            &creator,
+            3,
+            Operation::RegisterService {
+                namespace,
+                create_nonce: 0,
+                categories: BTreeSet::new(),
+                title: b"acme-svc".to_vec(),
+                endpoint: b"https://acme.example/api".to_vec(),
+                interface: Hash256([0x4f; 32]),
+                pricing: Vec::new(),
+                payment_flags: ServicePaymentFlags {
+                    on_chain_direct: false,
+                    http_402: true,
+                    subscription: false,
+                },
+            },
+        );
+        let service_id = ServiceId::derive(namespace, creator.address(), 0);
+
+        // 5) Create a governance instance over the token, 6) open a signaling proposal.
+        seal_op(
+            &state,
+            &creator,
+            4,
+            Operation::CreateGovernanceInstance {
+                namespace,
+                create_nonce: 0,
+                weight_token: token_id,
+                config: GovernanceConfig {
+                    voting_period_epochs: 1_000,
+                    timelock_epochs: 0,
+                    quorum_bps: 0,
+                    proposal_threshold: Amount::ZERO,
+                    approval_threshold_bps: 5_000,
+                },
+            },
+        );
+        let instance_id = GovernanceInstanceId::derive(namespace, creator.address(), 0);
+        // OpenProposal reads the proposer's weight-token balance to check the
+        // threshold; that balance key is state-derived (the weight token lives on
+        // the instance record), so the dedicated builder adds it to the signed
+        // access list.
+        let open = Transaction::for_open_proposal(
+            &creator,
+            5,
+            instance_id,
+            GovernanceAction::Signaling,
+            token_id,
+            seed_fee(),
+        )
+        .expect("open-proposal transaction signs");
+        seal_tx(&state, open);
+        let proposal_id = ProposalId::derive(instance_id, 0);
+
+        // 7) Grant a mandate to the agent key.
+        seal_op(
+            &state,
+            &creator,
+            6,
+            Operation::GrantMandate {
+                agent_key: agent.public_key(),
+                grant_nonce: 0,
+                budget_total: Amount::from_webc(10),
+                expiry_epoch: Epoch::new(1_000_000),
+                per_tx_max: Amount::from_webc(1),
+                rate_limit_per_day: 0,
+                counterparty_policy: MandateCounterpartyPolicy::Open,
+            },
+        );
+        let mandate_id = MandateId::derive(creator.address(), &agent.public_key(), 0);
+
+        (
+            state,
+            Seeded {
+                creator: creator.address(),
+                holder: holder.address(),
+                token_id,
+                collection_id,
+                serial,
+                service_id,
+                instance_id,
+                proposal_id,
+                mandate_id,
+            },
+        )
+    }
+
+    /// Issues a GET against a cloned router and returns the raw response.
+    async fn get_response(app: &Router, uri: String) -> Response {
+        app.clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_read_endpoints_serve_seeded_records() {
+        let (state, seed) = native_state();
+        let app = router(state);
+        let creator = seed.creator.to_string();
+        let holder = seed.holder.to_string();
+        let token_hex = hash_hex(seed.token_id.hash());
+
+        // GET /v1/tokens/{id}
+        let response = get_response(&app, format!("/v1/tokens/{token_hex}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["creator"], creator.as_str());
+        assert_eq!(body["issued_supply"], "1000");
+        assert_eq!(body["paused"], false);
+
+        // GET /v1/tokens/{id}/balances/{address} — the holder holds 1_000 units.
+        let response =
+            get_response(&app, format!("/v1/tokens/{token_hex}/balances/{holder}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_value(response).await, "1000");
+
+        // GET /v1/tokens/{id}/supply
+        let response = get_response(&app, format!("/v1/tokens/{token_hex}/supply")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["issued"], "1000");
+        assert_eq!(body["held"], "1000");
+        assert_eq!(body["balanced"], true);
+
+        // GET /v1/nft/collections/{id}
+        let collection_hex = hash_hex(seed.collection_id.hash());
+        let response = get_response(&app, format!("/v1/nft/collections/{collection_hex}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["creator"], creator.as_str());
+        assert_eq!(body["minted_count"], 1);
+
+        // GET /v1/nft/collections/{id}/items/{serial}
+        let response = get_response(
+            &app,
+            format!("/v1/nft/collections/{collection_hex}/items/{}", seed.serial),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["owner"], holder.as_str());
+        assert_eq!(body["frozen"], false);
+
+        // GET /v1/services/{id} — the full entry that closes the HTTP-402 loop.
+        let response = get_response(
+            &app,
+            format!("/v1/services/{}", hash_hex(seed.service_id.hash())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["owner"], creator.as_str());
+        assert_eq!(body["status"], "Active");
+        assert_eq!(body["payment_flags"]["http_402"], true);
+
+        // GET /v1/governance/instances/{id}
+        let response = get_response(
+            &app,
+            format!(
+                "/v1/governance/instances/{}",
+                hash_hex(seed.instance_id.hash())
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["creator"], creator.as_str());
+        assert_eq!(body["next_proposal_nonce"], 1);
+
+        // GET /v1/governance/proposals/{id}
+        let response = get_response(
+            &app,
+            format!(
+                "/v1/governance/proposals/{}",
+                hash_hex(seed.proposal_id.hash())
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["status"], "Active");
+        assert_eq!(body["proposer"], creator.as_str());
+
+        // GET /v1/mandates/{id}
+        let response = get_response(
+            &app,
+            format!("/v1/mandates/{}", hash_hex(seed.mandate_id.hash())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_value(response).await;
+        assert_eq!(body["principal"], creator.as_str());
+        assert_eq!(body["revoked"], false);
+        let budget = webc_units(10).to_string();
+        assert_eq!(body["budget_total"], budget.as_str());
+    }
+
+    #[tokio::test]
+    async fn native_read_endpoints_404_for_missing_ids() {
+        let (state, seed) = native_state();
+        let app = router(state);
+        // A syntactically valid 32-byte hex id that names no record.
+        let missing = "ab".repeat(32);
+        let token_hex = hash_hex(seed.token_id.hash());
+        let collection_hex = hash_hex(seed.collection_id.hash());
+        // A valid address that holds none of the token.
+        let stranger = Keypair::from_seed([222u8; 32]).address().to_string();
+
+        for uri in [
+            format!("/v1/tokens/{missing}"),
+            format!("/v1/tokens/{missing}/balances/{stranger}"),
+            format!("/v1/tokens/{missing}/supply"),
+            format!("/v1/nft/collections/{missing}"),
+            format!("/v1/nft/collections/{missing}/items/0"),
+            // Known collection, unknown serial.
+            format!("/v1/nft/collections/{collection_hex}/items/999"),
+            format!("/v1/services/{missing}"),
+            format!("/v1/governance/instances/{missing}"),
+            format!("/v1/governance/proposals/{missing}"),
+            format!("/v1/mandates/{missing}"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "expected 404 for {uri}"
+            );
+        }
+
+        // A known token with no balance entry for the holder reads back as zero
+        // (200), not 404: an absent balance and a zero balance are the same state.
+        let response =
+            get_response(&app, format!("/v1/tokens/{token_hex}/balances/{stranger}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_value(response).await, "0");
+    }
+
+    #[tokio::test]
+    async fn native_read_endpoints_400_for_malformed_ids() {
+        let (state, seed) = native_state();
+        let app = router(state);
+        // Not valid hex (and thus not a 32-byte id).
+        let bad = "zz";
+        let token_hex = hash_hex(seed.token_id.hash());
+        let collection_hex = hash_hex(seed.collection_id.hash());
+        let holder = seed.holder.to_string();
+
+        for uri in [
+            format!("/v1/tokens/{bad}"),
+            format!("/v1/tokens/{bad}/balances/{holder}"),
+            // Valid token id, malformed holder address.
+            format!("/v1/tokens/{token_hex}/balances/not-an-address"),
+            format!("/v1/tokens/{bad}/supply"),
+            format!("/v1/nft/collections/{bad}"),
+            format!("/v1/nft/collections/{bad}/items/0"),
+            // Valid collection id, non-numeric serial (rejected by the extractor).
+            format!("/v1/nft/collections/{collection_hex}/items/not-a-number"),
+            format!("/v1/services/{bad}"),
+            format!("/v1/governance/instances/{bad}"),
+            format!("/v1/governance/proposals/{bad}"),
+            format!("/v1/mandates/{bad}"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated services-by-category discovery endpoint -----
+
+    /// Two disjoint taxonomy tags used to exercise the category filter.
+    const CATEGORY_A: Hash256 = Hash256([0xa1; 32]);
+    const CATEGORY_B: Hash256 = Hash256([0xb2; 32]);
+
+    /// Builds a service holding `count` registered services under one namespace,
+    /// each tagged by `categories_for(i)`, and returns the state, the creator
+    /// address, and the derived `ServiceId`s (in creation order). Registrations go
+    /// through the real `RegisterService` create op via `submit_and_seal`.
+    fn services_state(
+        count: usize,
+        categories_for: impl Fn(usize) -> BTreeSet<Hash256>,
+    ) -> (AppState<MemoryKvStore>, Vec<ServiceId>) {
+        let creator = Keypair::from_seed([41u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+        let mut ids = Vec::new();
+        for i in 0..count {
+            seal_op(
+                &state,
+                &creator,
+                i as u64,
+                Operation::RegisterService {
+                    namespace,
+                    create_nonce: i as u64,
+                    categories: categories_for(i),
+                    title: format!("svc-{i}").into_bytes(),
+                    endpoint: b"https://acme.example/api".to_vec(),
+                    interface: Hash256([0x4f; 32]),
+                    pricing: Vec::new(),
+                    payment_flags: ServicePaymentFlags {
+                        on_chain_direct: false,
+                        http_402: true,
+                        subscription: false,
+                    },
+                },
+            );
+            ids.push(ServiceId::derive(namespace, creator.address(), i as u64));
+        }
+        (state, ids)
+    }
+
+    /// Walks every page of a services listing (following `next_cursor`), asserting
+    /// each page holds at most `limit` items, and returns the concatenated
+    /// `service_id`s in the order served. `query` is the query string without a
+    /// leading `?` or any `cursor` (e.g. `"limit=3"` or `"category=..&limit=2"`).
+    async fn walk_services(app: &Router, query: &str, limit: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!("/v1/services?{query}&cursor={c}"),
+                None => format!("/v1/services?{query}"),
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                ids.push(item["service_id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(ids.len() < 100_000, "pagination failed to terminate");
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn services_list_paginates_ascending_without_overlap() {
+        // Seven services, no categories: listing all must walk every one exactly
+        // once, in ascending service-id order, across bounded pages.
+        let (state, ids) = services_state(7, |_| BTreeSet::new());
+        let app = router(state);
+        let expected: BTreeSet<String> = ids.iter().map(|id| hash_hex(id.hash())).collect();
+
+        let walked = walk_services(&app, "limit=3", 3).await;
+        // Ascending key order and no duplicates.
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(
+            walked, sorted,
+            "items must be in ascending service-id order"
+        );
+        let unique: BTreeSet<String> = walked.iter().cloned().collect();
+        assert_eq!(unique.len(), walked.len(), "no id may repeat across pages");
+        // Exactly the seeded set, nothing missed.
+        assert_eq!(unique, expected);
+
+        // The first page is full and carries a cursor; the response also flattens
+        // the underlying ServiceEntry (owner/status/payment flags) alongside the id.
+        let first = body_value(get_response(&app, "/v1/services?limit=3".to_string()).await).await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["status"], "Active");
+        assert_eq!(first["items"][0]["payment_flags"]["http_402"], true);
+    }
+
+    #[tokio::test]
+    async fn services_category_filter_returns_only_matches() {
+        // i%3==0 -> {A}, i%3==1 -> {B}, i%3==2 -> untagged.
+        let (state, ids) = services_state(9, |i| {
+            let mut set = BTreeSet::new();
+            match i % 3 {
+                0 => {
+                    set.insert(CATEGORY_A);
+                }
+                1 => {
+                    set.insert(CATEGORY_B);
+                }
+                _ => {}
+            }
+            set
+        });
+        let app = router(state);
+        let cat_a_hex = hash_hex(CATEGORY_A);
+
+        let expected_a: BTreeSet<String> = (0..9)
+            .filter(|i| i % 3 == 0)
+            .map(|i| hash_hex(ids[i].hash()))
+            .collect();
+        let walked_a = walk_services(&app, &format!("category={cat_a_hex}&limit=2"), 2).await;
+        let got_a: BTreeSet<String> = walked_a.iter().cloned().collect();
+        assert_eq!(got_a, expected_a, "only category-A services are returned");
+        // Ascending order preserved under the filter.
+        let mut sorted_a = walked_a.clone();
+        sorted_a.sort();
+        assert_eq!(walked_a, sorted_a);
+
+        // A category tag no service declares yields an empty, cursor-null page.
+        let none_hex = hash_hex(Hash256([0xee; 32]));
+        let body =
+            body_value(get_response(&app, format!("/v1/services?category={none_hex}")).await).await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn services_limit_is_clamped_to_the_hard_maximum() {
+        // With more services than the hard cap, an over-large limit is clamped: the
+        // first page holds exactly MAX_PAGE_LIMIT items and carries a cursor.
+        let over = crate::service::MAX_PAGE_LIMIT + 1;
+        let (state, _ids) = services_state(over, |_| BTreeSet::new());
+        let app = router(state);
+
+        let body =
+            body_value(get_response(&app, "/v1/services?limit=100000".to_string()).await).await;
+        assert_eq!(
+            body["items"].as_array().unwrap().len(),
+            crate::service::MAX_PAGE_LIMIT
+        );
+        assert!(body["next_cursor"].is_string());
+    }
+
+    #[tokio::test]
+    async fn services_empty_state_returns_empty_page() {
+        let (state, _ids) = services_state(0, |_| BTreeSet::new());
+        let app = router(state);
+        let body = body_value(get_response(&app, "/v1/services".to_string()).await).await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn services_malformed_params_are_rejected() {
+        let (state, _ids) = services_state(1, |_| BTreeSet::new());
+        let app = router(state);
+        for uri in [
+            // Non-hex cursor.
+            "/v1/services?cursor=zz",
+            // Non-numeric limit (rejected by the Query extractor).
+            "/v1/services?limit=abc",
+            // Non-hex category tag.
+            "/v1/services?category=zz",
+            // Unknown query parameter (deny_unknown_fields).
+            "/v1/services?bogus=1",
+        ] {
+            let response = get_response(&app, uri.to_string()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated NFT-collection-items discovery endpoint -----
+
+    /// Builds a service with one collection that has `count` items minted to a
+    /// holder (serials `0..count`), plus a second, empty collection. Returns the
+    /// state, the populated collection id, the empty collection id, and the holder.
+    fn nft_items_state(
+        count: u64,
+    ) -> (
+        AppState<MemoryKvStore>,
+        NftCollectionId,
+        NftCollectionId,
+        Address,
+    ) {
+        let creator = Keypair::from_seed([51u8; 32]);
+        let holder = Keypair::from_seed([52u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        let new_collection =
+            |create_nonce: u64, name: &[u8], symbol: &[u8]| Operation::CreateNftCollection {
+                namespace,
+                create_nonce,
+                metadata: NftMetadata::new(name.to_vec(), symbol.to_vec(), Hash256([0x2f; 32]))
+                    .unwrap(),
+                mint_authority: Some(creator.address()),
+                freeze_authority: Some(creator.address()),
+                max_supply: None,
+                royalty_bps: 0,
+            };
+
+        // Populated collection (create nonce 0).
+        seal_op(&state, &creator, 0, new_collection(0, b"Acme Apes", b"APE"));
+        let collection_id = NftCollectionId::derive(namespace, creator.address(), 0);
+        let mut nonce = 1u64;
+        for _ in 0..count {
+            seal_op(
+                &state,
+                &creator,
+                nonce,
+                Operation::MintNft {
+                    collection_id,
+                    recipient: holder.address(),
+                    item_metadata_hash: Hash256([0x3f; 32]),
+                },
+            );
+            nonce += 1;
+        }
+
+        // Second, empty collection (create nonce 1).
+        seal_op(&state, &creator, nonce, new_collection(1, b"Empty", b"EMP"));
+        let empty_id = NftCollectionId::derive(namespace, creator.address(), 1);
+
+        (state, collection_id, empty_id, holder.address())
+    }
+
+    /// Walks every page of a collection's items, asserting each page is within
+    /// `limit`, and returns the serials in served order.
+    async fn walk_items(app: &Router, collection_hex: &str, limit: usize) -> Vec<u64> {
+        let mut serials = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => {
+                    format!("/v1/nft/collections/{collection_hex}/items?limit={limit}&cursor={c}")
+                }
+                None => format!("/v1/nft/collections/{collection_hex}/items?limit={limit}"),
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                serials.push(item["serial"].as_u64().unwrap());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(serials.len() < 100_000, "pagination failed to terminate");
+        }
+        serials
+    }
+
+    #[tokio::test]
+    async fn nft_items_paginate_ascending_by_serial() {
+        let (state, collection_id, empty_id, holder) = nft_items_state(7);
+        let app = router(state);
+        let collection_hex = hash_hex(collection_id.hash());
+
+        let serials = walk_items(&app, &collection_hex, 3).await;
+        // Every serial exactly once, contiguous and ascending.
+        assert_eq!(serials, (0..7).collect::<Vec<_>>());
+
+        // The first page carries the flattened NftItem record (owner, frozen).
+        let first = body_value(
+            get_response(
+                &app,
+                format!("/v1/nft/collections/{collection_hex}/items?limit=3"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["serial"], 0);
+        assert_eq!(first["items"][0]["owner"], holder.to_string());
+        assert_eq!(first["items"][0]["frozen"], false);
+
+        // An existing collection with no items is an empty, cursor-null page.
+        let empty_hex = hash_hex(empty_id.hash());
+        let body =
+            body_value(get_response(&app, format!("/v1/nft/collections/{empty_hex}/items")).await)
+                .await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn nft_items_reject_unknown_collection_and_malformed_inputs() {
+        let (state, collection_id, _empty, _holder) = nft_items_state(1);
+        let app = router(state);
+        let collection_hex = hash_hex(collection_id.hash());
+
+        // A well-formed id that names no collection is a 404 (mirrors the point-read).
+        let missing = "ab".repeat(32);
+        let response = get_response(&app, format!("/v1/nft/collections/{missing}/items")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        for uri in [
+            // Malformed collection id.
+            "/v1/nft/collections/zz/items".to_string(),
+            // Non-numeric cursor.
+            format!("/v1/nft/collections/{collection_hex}/items?cursor=notaserial"),
+            // Non-numeric limit.
+            format!("/v1/nft/collections/{collection_hex}/items?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/nft/collections/{collection_hex}/items?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated governance-proposals discovery endpoint -----
+
+    /// Builds a service with one governance instance holding `count` open
+    /// (signaling, Active) proposals, plus a second empty instance. Returns the
+    /// state, the populated instance id, the empty instance id, the proposal ids in
+    /// open order, and the proposer (creator) address.
+    fn proposals_state(
+        count: u64,
+    ) -> (
+        AppState<MemoryKvStore>,
+        GovernanceInstanceId,
+        GovernanceInstanceId,
+        Vec<ProposalId>,
+        Address,
+    ) {
+        let creator = Keypair::from_seed([61u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        // A weight token (held by the creator) the instance votes on.
+        seal_op(
+            &state,
+            &creator,
+            0,
+            Operation::CreateToken {
+                namespace,
+                create_nonce: 0,
+                metadata: TokenMetadata::new(
+                    b"Gov".to_vec(),
+                    b"GOV".to_vec(),
+                    6,
+                    Hash256([0x1f; 32]),
+                )
+                .unwrap(),
+                mint_authority: Some(creator.address()),
+                freeze_authority: Some(creator.address()),
+                initial_supply: Amount::from_units(1_000),
+                initial_recipient: creator.address(),
+            },
+        );
+        let token_id = TokenId::derive(namespace, creator.address(), 0);
+
+        // A zero-threshold config so the creator can open proposals freely.
+        let config = GovernanceConfig {
+            voting_period_epochs: 1_000,
+            timelock_epochs: 0,
+            quorum_bps: 0,
+            proposal_threshold: Amount::ZERO,
+            approval_threshold_bps: 5_000,
+        };
+        seal_op(
+            &state,
+            &creator,
+            1,
+            Operation::CreateGovernanceInstance {
+                namespace,
+                create_nonce: 0,
+                weight_token: token_id,
+                config,
+            },
+        );
+        let instance_id = GovernanceInstanceId::derive(namespace, creator.address(), 0);
+
+        let mut nonce = 2u64;
+        let mut proposal_ids = Vec::new();
+        for i in 0..count {
+            let open = Transaction::for_open_proposal(
+                &creator,
+                nonce,
+                instance_id,
+                GovernanceAction::Signaling,
+                token_id,
+                seed_fee(),
+            )
+            .expect("open-proposal transaction signs");
+            seal_tx(&state, open);
+            proposal_ids.push(ProposalId::derive(instance_id, i));
+            nonce += 1;
+        }
+
+        // A second instance with no proposals.
+        seal_op(
+            &state,
+            &creator,
+            nonce,
+            Operation::CreateGovernanceInstance {
+                namespace,
+                create_nonce: 1,
+                weight_token: token_id,
+                config,
+            },
+        );
+        let empty_instance = GovernanceInstanceId::derive(namespace, creator.address(), 1);
+
+        (
+            state,
+            instance_id,
+            empty_instance,
+            proposal_ids,
+            creator.address(),
+        )
+    }
+
+    /// Walks every page of an instance's proposals for the given query (without a
+    /// leading `?` or `cursor`), asserting each page is within `limit`, and returns
+    /// the proposal ids in served order.
+    async fn walk_proposals(
+        app: &Router,
+        instance_hex: &str,
+        query: &str,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let base = format!("/v1/governance/instances/{instance_hex}/proposals?{query}");
+            let uri = match &cursor {
+                Some(c) => format!("{base}&cursor={c}"),
+                None => base,
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                ids.push(item["proposal_id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(ids.len() < 100_000, "pagination failed to terminate");
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn proposals_paginate_and_filter_by_status() {
+        let (state, instance_id, empty_instance, proposal_ids, creator) = proposals_state(6);
+        let app = router(state);
+        let instance_hex = hash_hex(instance_id.hash());
+        let expected: BTreeSet<String> =
+            proposal_ids.iter().map(|id| hash_hex(id.hash())).collect();
+
+        // Unfiltered walk visits every proposal once, ascending by proposal id.
+        let walked = walk_proposals(&app, &instance_hex, "limit=2", 2).await;
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(walked, sorted, "ascending proposal-id order");
+        let got: BTreeSet<String> = walked.iter().cloned().collect();
+        assert_eq!(got.len(), walked.len(), "no proposal repeats");
+        assert_eq!(got, expected);
+
+        // The status filter returns only matches: every seeded proposal is Active,
+        // so status=Active returns them all and a terminal status returns none.
+        let active = walk_proposals(&app, &instance_hex, "status=Active&limit=2", 2).await;
+        assert_eq!(
+            active.iter().cloned().collect::<BTreeSet<_>>(),
+            expected,
+            "status=Active matches every open proposal"
+        );
+        let executed = body_value(
+            get_response(
+                &app,
+                format!("/v1/governance/instances/{instance_hex}/proposals?status=Executed"),
+            )
+            .await,
+        )
+        .await;
+        assert!(executed["items"].as_array().unwrap().is_empty());
+        assert!(executed["next_cursor"].is_null());
+
+        // The first page flattens the GovernanceProposal record.
+        let first = body_value(
+            get_response(
+                &app,
+                format!("/v1/governance/instances/{instance_hex}/proposals?limit=2"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["status"], "Active");
+        assert_eq!(first["items"][0]["instance_id"], instance_hex);
+        assert_eq!(first["items"][0]["proposer"], creator.to_string());
+
+        // An instance with no proposals is an empty, cursor-null page.
+        let empty_hex = hash_hex(empty_instance.hash());
+        let empty = body_value(
+            get_response(
+                &app,
+                format!("/v1/governance/instances/{empty_hex}/proposals"),
+            )
+            .await,
+        )
+        .await;
+        assert!(empty["items"].as_array().unwrap().is_empty());
+        assert!(empty["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn proposals_reject_unknown_instance_and_malformed_inputs() {
+        let (state, instance_id, _empty, _ids, _creator) = proposals_state(1);
+        let app = router(state);
+        let instance_hex = hash_hex(instance_id.hash());
+
+        // A well-formed id naming no instance is a 404.
+        let missing = "ab".repeat(32);
+        let response = get_response(
+            &app,
+            format!("/v1/governance/instances/{missing}/proposals"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        for uri in [
+            // Malformed instance id.
+            "/v1/governance/instances/zz/proposals".to_string(),
+            // Non-hex cursor.
+            format!("/v1/governance/instances/{instance_hex}/proposals?cursor=zz"),
+            // Unknown status filter value.
+            format!("/v1/governance/instances/{instance_hex}/proposals?status=Nope"),
+            // Non-numeric limit.
+            format!("/v1/governance/instances/{instance_hex}/proposals?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/governance/instances/{instance_hex}/proposals?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated account token-balances discovery endpoint -----
+
+    /// Builds a service where `holder` holds `count` distinct tokens (token `i`
+    /// minted `100 + i` units), plus one further token minted to a different
+    /// account. Returns the state, the holder, a stranger holding nothing, and the
+    /// holder's token ids in creation order.
+    fn token_balances_state(
+        count: u64,
+    ) -> (AppState<MemoryKvStore>, Address, Address, Vec<TokenId>) {
+        let creator = Keypair::from_seed([71u8; 32]);
+        let holder = Keypair::from_seed([72u8; 32]);
+        let other = Keypair::from_seed([73u8; 32]);
+        let stranger = Keypair::from_seed([222u8; 32]);
+        let namespace = seed_namespace();
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: creator.address(),
+                balance: Amount::from_webc(10_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        let mint_token = |create_nonce: u64, recipient: Address| Operation::CreateToken {
+            namespace,
+            create_nonce,
+            metadata: TokenMetadata::new(
+                format!("T{create_nonce}").into_bytes(),
+                format!("TK{create_nonce}").into_bytes(),
+                6,
+                Hash256([0x1f; 32]),
+            )
+            .unwrap(),
+            mint_authority: Some(creator.address()),
+            freeze_authority: Some(creator.address()),
+            initial_supply: Amount::from_units(u128::from(100 + create_nonce)),
+            initial_recipient: recipient,
+        };
+
+        let mut token_ids = Vec::new();
+        let mut nonce = 0u64;
+        for i in 0..count {
+            seal_op(&state, &creator, nonce, mint_token(i, holder.address()));
+            token_ids.push(TokenId::derive(namespace, creator.address(), i));
+            nonce += 1;
+        }
+        // One more token minted to a different holder — must not appear for `holder`.
+        seal_op(&state, &creator, nonce, mint_token(count, other.address()));
+
+        (state, holder.address(), stranger.address(), token_ids)
+    }
+
+    /// Walks every page of an address's token balances, asserting each page is
+    /// within `limit`, and returns `(token_id, balance)` pairs in served order.
+    async fn walk_balances(app: &Router, address: &str, limit: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let base = format!("/v1/accounts/{address}/token-balances?limit={limit}");
+            let uri = match &cursor {
+                Some(c) => format!("{base}&cursor={c}"),
+                None => base,
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                out.push((
+                    item["token_id"].as_str().unwrap().to_string(),
+                    item["balance"].as_str().unwrap().to_string(),
+                ));
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(out.len() < 100_000, "pagination failed to terminate");
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn token_balances_paginate_and_exclude_other_holders() {
+        let (state, holder, stranger, token_ids) = token_balances_state(5);
+        let app = router(state);
+        // Expected token -> balance for this holder (token i holds 100 + i units).
+        let expected: std::collections::BTreeMap<String, String> = token_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (hash_hex(id.hash()), (100 + i as u64).to_string()))
+            .collect();
+
+        let walked = walk_balances(&app, &holder.to_string(), 2).await;
+        // Ascending by token id, no duplicates.
+        let ids: Vec<String> = walked.iter().map(|(id, _)| id.clone()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "ascending token-id order");
+        let got: std::collections::BTreeMap<String, String> = walked.into_iter().collect();
+        // Exactly this holder's tokens, with the right balances, and nothing from
+        // the token minted to the other account.
+        assert_eq!(got, expected);
+
+        // An address holding no tokens yields an empty, cursor-null page.
+        let body = body_value(
+            get_response(&app, format!("/v1/accounts/{}/token-balances", stranger)).await,
+        )
+        .await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn token_balances_reject_malformed_inputs() {
+        let (state, holder, _stranger, _ids) = token_balances_state(1);
+        let app = router(state);
+        let holder = holder.to_string();
+        for uri in [
+            // Malformed holder address.
+            "/v1/accounts/not-an-address/token-balances".to_string(),
+            // Cursor without the token:address separator.
+            format!("/v1/accounts/{holder}/token-balances?cursor=deadbeef"),
+            // Cursor with non-hex halves.
+            format!("/v1/accounts/{holder}/token-balances?cursor=zz:zz"),
+            // Non-numeric limit.
+            format!("/v1/accounts/{holder}/token-balances?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/accounts/{holder}/token-balances?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+    }
+
+    // ----- paginated account-mandates discovery endpoint -----
+
+    /// Builds a service where `principal` has granted `count` mandates (to one agent
+    /// key, varying the grant nonce), plus one mandate granted by a different
+    /// principal. Returns the state, the principal, a stranger holding none, and the
+    /// principal's mandate ids in grant order.
+    fn mandates_state(count: u64) -> (AppState<MemoryKvStore>, Address, Address, Vec<MandateId>) {
+        let creator = Keypair::from_seed([81u8; 32]);
+        let other = Keypair::from_seed([82u8; 32]);
+        let agent = Keypair::from_seed([83u8; 32]);
+        let stranger = Keypair::from_seed([222u8; 32]);
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![
+                GenesisAccount {
+                    address: creator.address(),
+                    balance: Amount::from_webc(10_000_000),
+                },
+                GenesisAccount {
+                    address: other.address(),
+                    balance: Amount::from_webc(10_000_000),
+                },
+            ],
+            validators: Vec::new(),
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let options = NodeServiceOptions {
+            mempool: MempoolConfig::default(),
+            faucet: None,
+            proposer: creator.address(),
+        };
+        let state = AppState::new(NodeService::new(node, options));
+
+        let grant = |grant_nonce: u64| Operation::GrantMandate {
+            agent_key: agent.public_key(),
+            grant_nonce,
+            budget_total: Amount::from_webc(10),
+            expiry_epoch: Epoch::new(1_000_000),
+            per_tx_max: Amount::from_webc(1),
+            rate_limit_per_day: 0,
+            counterparty_policy: MandateCounterpartyPolicy::Open,
+        };
+
+        let mut ids = Vec::new();
+        for i in 0..count {
+            seal_op(&state, &creator, i, grant(i));
+            ids.push(MandateId::derive(creator.address(), &agent.public_key(), i));
+        }
+        // A mandate granted by a different principal — must not appear for `creator`.
+        seal_op(&state, &other, 0, grant(0));
+
+        (state, creator.address(), stranger.address(), ids)
+    }
+
+    /// Walks every page of an address's mandates, asserting each page is within
+    /// `limit`, and returns the mandate ids in served order.
+    async fn walk_mandates(app: &Router, address: &str, limit: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let base = format!("/v1/accounts/{address}/mandates?limit={limit}");
+            let uri = match &cursor {
+                Some(c) => format!("{base}&cursor={c}"),
+                None => base,
+            };
+            let response = get_response(app, uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_value(response).await;
+            let page = body["items"].as_array().unwrap();
+            assert!(page.len() <= limit, "page exceeded the requested limit");
+            for item in page {
+                ids.push(item["mandate_id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(ids.len() < 100_000, "pagination failed to terminate");
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn mandates_paginate_and_filter_by_principal() {
+        let (state, principal, stranger, mandate_ids) = mandates_state(5);
+        let app = router(state);
+        let expected: BTreeSet<String> = mandate_ids.iter().map(|id| hash_hex(id.hash())).collect();
+
+        let walked = walk_mandates(&app, &principal.to_string(), 2).await;
+        // Ascending by mandate id, no duplicates.
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(walked, sorted, "ascending mandate-id order");
+        let got: BTreeSet<String> = walked.iter().cloned().collect();
+        assert_eq!(got.len(), walked.len(), "no mandate repeats");
+        // Exactly this principal's mandates, excluding the other principal's.
+        assert_eq!(got, expected);
+
+        // The first page flattens the Mandate record.
+        let first = body_value(
+            get_response(&app, format!("/v1/accounts/{principal}/mandates?limit=2")).await,
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        assert!(first["next_cursor"].is_string());
+        assert_eq!(first["items"][0]["principal"], principal.to_string());
+        assert_eq!(first["items"][0]["revoked"], false);
+
+        // An address that is the principal of no mandate yields an empty page.
+        let body =
+            body_value(get_response(&app, format!("/v1/accounts/{stranger}/mandates")).await).await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn mandates_reject_malformed_inputs() {
+        let (state, principal, _stranger, _ids) = mandates_state(1);
+        let app = router(state);
+        let principal = principal.to_string();
+        for uri in [
+            // Malformed principal address.
+            "/v1/accounts/not-an-address/mandates".to_string(),
+            // Non-hex cursor.
+            format!("/v1/accounts/{principal}/mandates?cursor=zz"),
+            // Non-numeric limit.
+            format!("/v1/accounts/{principal}/mandates?limit=abc"),
+            // Unknown query parameter.
+            format!("/v1/accounts/{principal}/mandates?bogus=1"),
+        ] {
+            let response = get_response(&app, uri.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
     }
 }

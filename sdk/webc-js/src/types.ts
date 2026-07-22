@@ -181,6 +181,15 @@ export interface SignedTransactionJson {
   access_list: StateAccessListJson;
   fee: FeeBidJson;
   signature: HexString;
+  /**
+   * Optional sponsoring application namespace (fee sponsorship, §15.35): a
+   * 32-byte hash as a lowercase 64-char hex string. When present, the sender
+   * opts into having that app's pre-funded sponsor budget pay this transaction's
+   * fee (best-effort, fail-open). It is signed and, matching Rust's manual
+   * `Transaction` serializer, **omitted entirely from the canonical JSON when
+   * absent**, so every non-sponsored transaction is byte-identical to before.
+   */
+  sponsor?: HexString;
 }
 
 /** Versioned logical state key matching Rust `StateKey` canonical JSON. */
@@ -233,8 +242,28 @@ export type StateKeyKindJson =
   | { Object: { object_id: HexString } }
   | { Module: { module_id: HexString } }
   | { Application: { namespace: HexString; key_hash: HexString } }
-  | { Protocol: { field: "BaseFee" | "BridgeNonce" } }
-  | { SponsorGrant: { sponsor: WebcAddress; grant_id: HexString } };
+  | { SponsorGrant: { sponsor: WebcAddress; grant_id: HexString } }
+  // --- Native tokens (Phase 13a, §15) -------------------------------------
+  | { Token: { token_id: HexString } }
+  | { TokenBalance: { token_id: HexString; owner: WebcAddress } }
+  | { TokenFreeze: { token_id: HexString; account: WebcAddress } }
+  // --- Native NFTs (Phase 13b, §15) ---------------------------------------
+  | { NftCollection: { collection_id: HexString } }
+  | { NftItem: { collection_id: HexString; serial: number } }
+  // --- Native governance (Phase 13c, §15) ---------------------------------
+  | { GovernanceInstance: { instance_id: HexString } }
+  | { GovernanceProposal: { proposal_id: HexString } }
+  | { GovernanceVote: { proposal_id: HexString; voter: WebcAddress } }
+  // --- Agent mandates (Phase 9a, §15.32) ----------------------------------
+  | { Mandate: { mandate_id: HexString } }
+  // --- Service registry (Phase 9b, §15.5) ---------------------------------
+  | { Service: { service_id: HexString } }
+  // --- Native oracle (Phase 7, §15.17) ------------------------------------
+  | { OracleFeed: { feed_id: HexString } }
+  | { OracleReporter: { feed_id: HexString; reporter: WebcAddress } }
+  // --- Native DEX (§15.37) ------------------------------------------------
+  | { DexOrder: { order_id: HexString } }
+  | { Protocol: { field: "BaseFee" | "BridgeNonce" } };
 
 /**
  * Operation variant union. IMPORTANT: Rust's `serde` serializes enums in the
@@ -343,7 +372,463 @@ export type OperationJson =
         new_post_quantum_root: PostQuantumRootJson;
         post_quantum_root_reveal: PostQuantumRootRevealJson;
       };
-    };
+    }
+  // --- Native tokens (Phase 13a, §15) -------------------------------------
+  | {
+      CreateToken: {
+        namespace: HexString;
+        create_nonce: number;
+        metadata: TokenMetadataJson;
+        mint_authority: WebcAddress | null;
+        freeze_authority: WebcAddress | null;
+        initial_supply: string;
+        initial_recipient: WebcAddress;
+      };
+    }
+  | { MintToken: { token_id: HexString; recipient: WebcAddress; amount: string } }
+  | { BurnToken: { token_id: HexString; amount: string } }
+  | {
+      TransferToken: {
+        token_id: HexString;
+        recipient: WebcAddress;
+        amount: string;
+      };
+    }
+  | { SetTokenPaused: { token_id: HexString; paused: boolean } }
+  | { FreezeTokenAccount: { token_id: HexString; account: WebcAddress } }
+  | { ThawTokenAccount: { token_id: HexString; account: WebcAddress } }
+  | {
+      SetTokenAuthority: {
+        token_id: HexString;
+        authority_kind: TokenAuthorityKindJson;
+        new_authority: WebcAddress | null;
+      };
+    }
+  // --- Native NFTs (Phase 13b, §15) ---------------------------------------
+  | {
+      CreateNftCollection: {
+        namespace: HexString;
+        create_nonce: number;
+        metadata: NftMetadataJson;
+        mint_authority: WebcAddress | null;
+        freeze_authority: WebcAddress | null;
+        max_supply: number | null;
+        royalty_bps: number;
+      };
+    }
+  | {
+      MintNft: {
+        collection_id: HexString;
+        recipient: WebcAddress;
+        item_metadata_hash: HexString;
+      };
+    }
+  | {
+      TransferNft: {
+        collection_id: HexString;
+        serial: number;
+        recipient: WebcAddress;
+      };
+    }
+  | { BurnNft: { collection_id: HexString; serial: number } }
+  | { SetNftCollectionPaused: { collection_id: HexString; paused: boolean } }
+  | { FreezeNftItem: { collection_id: HexString; serial: number } }
+  | { ThawNftItem: { collection_id: HexString; serial: number } }
+  | {
+      SetNftAuthority: {
+        collection_id: HexString;
+        authority_kind: NftAuthorityKindJson;
+        new_authority: WebcAddress | null;
+      };
+    }
+  // --- Native governance (Phase 13c, §15) ---------------------------------
+  | {
+      CreateGovernanceInstance: {
+        namespace: HexString;
+        create_nonce: number;
+        weight_token: HexString;
+        config: GovernanceConfigJson;
+      };
+    }
+  | { FundGovernanceTreasury: { instance_id: HexString; amount: string } }
+  | { OpenProposal: { instance_id: HexString; action: GovernanceActionJson } }
+  | {
+      CastVote: {
+        proposal_id: HexString;
+        choice: VoteChoiceJson;
+        weight_amount: string;
+      };
+    }
+  | { ResolveProposal: { proposal_id: HexString } }
+  | { ExecuteProposal: { proposal_id: HexString } }
+  | { ReclaimVote: { proposal_id: HexString } }
+  // --- Agent mandates (Phase 9a, §15.32) ----------------------------------
+  | {
+      GrantMandate: {
+        agent_key: HexString;
+        grant_nonce: number;
+        budget_total: string;
+        expiry_epoch: number;
+        per_tx_max: string;
+        rate_limit_per_day: number;
+        counterparty_policy: MandateCounterpartyPolicyJson;
+      };
+    }
+  | { TopUpMandate: { mandate_id: HexString; amount: string } }
+  | {
+      SpendUnderMandate: {
+        mandate_id: HexString;
+        recipient: WebcAddress;
+        amount: string;
+      };
+    }
+  | { RevokeMandate: { mandate_id: HexString } }
+  // --- Service registry (Phase 9b, §15.5) ---------------------------------
+  | {
+      RegisterService: {
+        namespace: HexString;
+        create_nonce: number;
+        categories: HexString[];
+        title: HexString;
+        endpoint: HexString;
+        interface: HexString;
+        pricing: ServicePriceJson[];
+        payment_flags: ServicePaymentFlagsJson;
+      };
+    }
+  | {
+      UpdateService: {
+        service_id: HexString;
+        categories: HexString[];
+        title: HexString;
+        endpoint: HexString;
+        interface: HexString;
+        pricing: ServicePriceJson[];
+        payment_flags: ServicePaymentFlagsJson;
+      };
+    }
+  | { SetServiceStatus: { service_id: HexString; status: ServiceStatusJson } }
+  | {
+      SpendUnderMandateToService: {
+        mandate_id: HexString;
+        service_id: HexString;
+        amount: string;
+      };
+    }
+  // --- Native oracle (Phase 7, §15.17) ------------------------------------
+  | { CreateFeed: { feed_id: HexString } }
+  | { RegisterReporter: { feed_id: HexString } }
+  | { DeregisterReporter: { feed_id: HexString } }
+  | { SubmitReport: { feed_id: HexString; value: string } }
+  | { PayFeedRead: { feed_id: HexString; amount: string } }
+  // --- Native DEX (§15.13/§15.18/§15.37) ----------------------------------
+  | {
+      SubmitOrder: {
+        order_id: HexString;
+        pair: TradingPairJson;
+        side: OrderSideJson;
+        amount: string;
+        limit_price: string;
+        deadline_height: number;
+        fill_or_cancel: boolean;
+      };
+    }
+  | { CancelOrder: { order_id: HexString } };
+
+/** Oriented trading pair, mirroring Rust `TradingPair`. */
+export interface TradingPairJson {
+  /** Base asset; `amount` is denominated in this asset's base units. */
+  base: AssetIdJson;
+  /** Quote asset; the limit price is in quote base-units per base base-unit. */
+  quote: AssetIdJson;
+}
+
+/** Order direction, mirroring Rust `OrderSide`. */
+export type OrderSideJson = "Buy" | "Sell";
+
+/**
+ * Lifecycle status of a registered service, mirroring Rust `ServiceStatus`. Only
+ * `"Active"` accepts payments; `"Paused"` and `"Retired"` both reject a spend (a
+ * paused service intends to return, a retired one does not).
+ */
+export type ServiceStatusJson = "Active" | "Paused" | "Retired";
+
+/** One priced operation a service exposes, mirroring Rust `ServicePrice`. */
+export interface ServicePriceJson {
+  /** 32-byte lowercase-hex operation discriminant. */
+  operation: HexString;
+  /** Price in native base units (decimal string). */
+  price: string;
+  /** Unit label, LOWERCASE HEX of its bytes (≤ 32 bytes). */
+  unit: HexString;
+}
+
+/** Accepted payment flows, mirroring Rust `ServicePaymentFlags`. */
+export interface ServicePaymentFlagsJson {
+  on_chain_direct: boolean;
+  http_402: boolean;
+  subscription: boolean;
+}
+
+/**
+ * One allowlist entry, mirroring Rust `MandateCounterparty` (externally tagged):
+ * an opaque registry category tag (32-byte hex) or a specific recipient address.
+ */
+export type MandateCounterpartyJson =
+  | { Category: HexString }
+  | { Recipient: WebcAddress };
+
+/**
+ * Which counterparties a mandate may pay, mirroring Rust
+ * `MandateCounterpartyPolicy`. `"Open"` permits any recipient; `Allowlist`
+ * permits only the listed entries. NOTE: Rust stores the allowlist in a
+ * `BTreeSet`, so entries serialize in canonical (Category before Recipient, then
+ * byte order) order — `grantMandate` sorts and deduplicates them for you.
+ */
+export type MandateCounterpartyPolicyJson =
+  | "Open"
+  | { Allowlist: MandateCounterpartyJson[] };
+
+/** Which of a token's two authorities `SetTokenAuthority` targets. */
+export type TokenAuthorityKindJson = "Mint" | "Freeze";
+
+/** Immutable per-instance governance rule set, mirroring Rust `GovernanceConfig`. */
+export interface GovernanceConfigJson {
+  /** Voting window length in epochs (must be > 0). */
+  voting_period_epochs: number;
+  /** Delay in epochs after voting ends before a passed proposal may execute. */
+  timelock_epochs: number;
+  /** Participation quorum in basis points (≤ 10000). */
+  quorum_bps: number;
+  /** Minimum weight-token balance to open a proposal (decimal string). */
+  proposal_threshold: string;
+  /** Yes-ratio approval threshold in basis points (≤ 10000). */
+  approval_threshold_bps: number;
+}
+
+/**
+ * The single bounded typed effect a proposal carries, mirroring Rust
+ * `GovernanceAction` (externally tagged). `"Signaling"` has no on-chain effect.
+ */
+export type GovernanceActionJson =
+  | "Signaling"
+  | { TreasuryTransfer: { recipient: WebcAddress; amount: string } };
+
+/** One voter's choice, mirroring Rust `VoteChoice`. */
+export type VoteChoiceJson = "Yes" | "No" | "Abstain";
+
+/** Which of a collection's two authorities `SetNftAuthority` targets. */
+export type NftAuthorityKindJson = "Mint" | "Freeze";
+
+/**
+ * Bounded NFT collection metadata mirroring Rust `NftMetadata`. `name`/`symbol`
+ * are LOWERCASE HEX of their UTF-8 bytes; `metadata_hash` is a 32-byte hex
+ * commitment. (Unlike tokens, there is no `decimals` field.)
+ */
+export interface NftMetadataJson {
+  /** Lowercase hex of the UTF-8 name bytes (non-empty, ≤ 32 bytes). */
+  name: HexString;
+  /** Lowercase hex of the UTF-8 symbol bytes (non-empty, ≤ 12 bytes). */
+  symbol: HexString;
+  /** 32-byte lowercase-hex commitment to off-chain metadata. */
+  metadata_hash: HexString;
+}
+
+/**
+ * Bounded token metadata mirroring Rust `TokenMetadata`. `name` and `symbol` are
+ * the LOWERCASE HEX of their UTF-8 bytes on the wire (Rust `bounded_*_hex`), not
+ * plain text; `metadata_hash` is a 32-byte lowercase-hex content commitment.
+ */
+export interface TokenMetadataJson {
+  /** Lowercase hex of the UTF-8 name bytes (non-empty, ≤ 32 bytes). */
+  name: HexString;
+  /** Lowercase hex of the UTF-8 symbol bytes (non-empty, ≤ 12 bytes). */
+  symbol: HexString;
+  /** Fractional decimal places (≤ 18). */
+  decimals: number;
+  /** 32-byte lowercase-hex commitment to off-chain metadata. */
+  metadata_hash: HexString;
+}
+
+// ---------------------------------------------------------------------------
+// Native-state RECORD shapes served by the node read endpoints (Phase 9/13).
+//
+// These mirror the Rust `webc-chain` serde JSON EXACTLY: snake_case field names,
+// `Amount` values as canonical decimal strings, `Option<Address>`/`Option<u64>`
+// as the value or `null`, enums in their serde form, byte-strings as lowercase
+// hex, and 32-byte ids/keys/hashes as 64-char lowercase hex. The
+// `WebcNodeClient` read methods fetch and STRICTLY parse each of these; the SDK
+// treats every node response as untrusted input.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-token authority and supply record, mirroring Rust `TokenRecord`
+ * (`GET /v1/tokens/{id}`). An authority is `null` when the power has been
+ * permanently RENOUNCED; `issued_supply` is the outstanding supply (total minted
+ * minus total burned) as a decimal string.
+ */
+export interface TokenRecord {
+  /** Account that created the token (immutable provenance). */
+  creator: WebcAddress;
+  /** Validated bounded metadata (name/symbol lowercase hex, decimals, commitment). */
+  metadata: TokenMetadataJson;
+  /** Mint (and pause) authority, or `null` if minting is permanently renounced. */
+  mint_authority: WebcAddress | null;
+  /** Freeze/thaw authority, or `null` if freezing is permanently renounced. */
+  freeze_authority: WebcAddress | null;
+  /** Whether transfers are currently paused. */
+  paused: boolean;
+  /** Outstanding supply (minted minus burned), decimal string of base units. */
+  issued_supply: string;
+}
+
+/**
+ * Deterministic per-token supply reconciliation, mirroring Rust
+ * `TokenSupplyReport` (`GET /v1/tokens/{id}/supply`). `balanced` is true when the
+ * recorded `issued` supply exactly equals the summed `held` balances.
+ */
+export interface TokenSupplyReport {
+  /** The token's recorded issued supply (decimal string of base units). */
+  issued: string;
+  /** Checked sum of every held balance for this token (decimal string). */
+  held: string;
+  /** Whether `issued` exactly equals `held`. */
+  balanced: boolean;
+}
+
+/**
+ * Per-collection authority and supply record, mirroring Rust `NftCollection`
+ * (`GET /v1/nft/collections/{id}`). Counters are u64 JSON numbers; `max_supply`
+ * is `null` when the collection has no hard cap.
+ */
+export interface NftCollection {
+  /** Account that created the collection (immutable provenance). */
+  creator: WebcAddress;
+  /** Validated bounded metadata (name/symbol lowercase hex, commitment). */
+  metadata: NftMetadataJson;
+  /** Mint (and pause) authority, or `null` if minting is permanently renounced. */
+  mint_authority: WebcAddress | null;
+  /** Freeze/thaw authority, or `null` if freezing is permanently renounced. */
+  freeze_authority: WebcAddress | null;
+  /** Whether the collection is currently paused. */
+  paused: boolean;
+  /** Next serial to assign on mint (monotonic, never decremented). */
+  next_serial: number;
+  /** Total items ever minted in this collection. */
+  minted_count: number;
+  /** Total items ever burned in this collection. */
+  burned_count: number;
+  /** Optional hard cap on total items ever minted, or `null` for no cap. */
+  max_supply: number | null;
+  /** Creator royalty commitment in basis points (≤ 10000; metadata only). */
+  royalty_bps: number;
+}
+
+/**
+ * Per-item ownership record, mirroring Rust `NftItem`
+ * (`GET /v1/nft/collections/{id}/items/{serial}`). An item is owned by exactly one
+ * address; `frozen` items can be neither transferred nor burned.
+ */
+export interface NftItem {
+  /** The single account that owns (and may transfer/burn) this item. */
+  owner: WebcAddress;
+  /** 32-byte lowercase-hex commitment to the item's off-chain metadata. */
+  item_metadata_hash: HexString;
+  /** Whether the item is frozen (freeze authority-controlled). */
+  frozen: boolean;
+}
+
+/** Lifecycle status of a governance proposal, mirroring Rust `GovProposalStatus`. */
+export type GovProposalStatusJson =
+  | "Active"
+  | "Defeated"
+  | "Passed"
+  | "Executed"
+  | "Expired";
+
+/**
+ * Per-instance authority and treasury record, mirroring Rust `GovernanceInstance`
+ * (`GET /v1/governance/instances/{id}`). `weight_token` is the 32-byte hex token
+ * id whose balances denominate voting weight; `treasury` is native base units as
+ * a decimal string.
+ */
+export interface GovernanceInstance {
+  /** Account that created the instance (immutable provenance). */
+  creator: WebcAddress;
+  /** 32-byte lowercase-hex id of the fungible token denominating voting weight. */
+  weight_token: HexString;
+  /** Immutable rule set (voting period, timelock, quorum, thresholds). */
+  config: GovernanceConfigJson;
+  /** Native WEBC the instance controls, decimal string of base units. */
+  treasury: string;
+  /** Monotonic counter assigning the next proposal its nonce. */
+  next_proposal_nonce: number;
+}
+
+/**
+ * Canonical proposal record, mirroring Rust `Proposal` (exported as
+ * `GovernanceProposal`; `GET /v1/governance/proposals/{id}`). The weight token and
+ * rule set are the snapshot captured at open time; `eta_epoch` is `null` while
+ * `Active` or once `Defeated`; the `yes`/`no`/`abstain` tallies are decimal
+ * strings of locked weight.
+ */
+export interface GovernanceProposal {
+  /** 32-byte lowercase-hex id of the owning instance (payout source). */
+  instance_id: HexString;
+  /** Account that opened the proposal. */
+  proposer: WebcAddress;
+  /** 32-byte lowercase-hex weight-token snapshot captured at open. */
+  weight_token: HexString;
+  /** Rule-set snapshot captured at open (immutable for the proposal's life). */
+  config: GovernanceConfigJson;
+  /** The single bounded typed effect this proposal carries. */
+  action: GovernanceActionJson;
+  /** Epoch the proposal opened. */
+  created_epoch: number;
+  /** Last epoch votes are accepted. */
+  voting_ends_epoch: number;
+  /** Execution-available epoch (set on pass), or `null` while active/defeated. */
+  eta_epoch: number | null;
+  /** Current lifecycle status. */
+  status: GovProposalStatusJson;
+  /** Total weight locked for `Yes` (decimal string). */
+  yes: string;
+  /** Total weight locked for `No` (decimal string). */
+  no: string;
+  /** Total weight locked for `Abstain` (decimal string). */
+  abstain: string;
+}
+
+/**
+ * One live agent-payment mandate, mirroring Rust `Mandate`
+ * (`GET /v1/mandates/{id}`). `agent_key` is the agent's 32-byte lowercase-hex
+ * Ed25519 public key; every amount is a decimal string of native base units;
+ * `expiry_epoch`/`window_index` are u64 JSON numbers.
+ */
+export interface Mandate {
+  /** Account that owns this mandate: funds, tops up, and may revoke it. */
+  principal: WebcAddress;
+  /** Agent Ed25519 signing key, 32-byte lowercase hex. */
+  agent_key: HexString;
+  /** Total native base units authorized over the mandate's life (decimal string). */
+  budget_total: string;
+  /** Native base units already spent (decimal string; only grows). */
+  spent: string;
+  /** Last consensus epoch (inclusive) in which the mandate may be spent. */
+  expiry_epoch: number;
+  /** Maximum native value one mandate-signed spend may draw (decimal string). */
+  per_tx_max: string;
+  /** Maximum spends per rate-limit window; `0` means unlimited. */
+  rate_limit_per_day: number;
+  /** Which counterparties spends may pay. */
+  counterparty_policy: MandateCounterpartyPolicyJson;
+  /** Whether the principal has revoked the mandate. */
+  revoked: boolean;
+  /** Rate-limit window `spends_in_window` belongs to. */
+  window_index: number;
+  /** Spends counted in `window_index` (reset each new window). */
+  spends_in_window: number;
+}
 
 /** External chain identifier; matches the Rust `ExternalChain` enum. */
 export type ExternalChainJson = "Webc" | "Ethereum" | "Solana";

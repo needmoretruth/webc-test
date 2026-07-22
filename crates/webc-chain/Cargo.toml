@@ -14,6 +14,11 @@ workspace = true
 
 [dependencies]
 webc-crypto = { path = "../webc-crypto" }
+# Deterministic, gas-metered WASM execution engine for the untrusted-bytecode
+# contract path (Phase 7b). Kept behind the crate boundary so the interpreter
+# (wasmi today) can be swapped for a JIT later without touching this crate's
+# gas model, manifest schema, or contract ABI.
+webc-vm = { path = "../webc-vm" }
 bincode.workspace = true
 hex.workspace = true
 serde.workspace = true
@@ -24,3 +29,5 @@ thiserror.workspace = true
 # Property tests exercise long hostile operation sequences. Default features
 # are unnecessary because tests run in-process and do not require fork/timeouts.
 proptest = { version = "1.6", default-features = false, features = ["std"] }
+# Compiles WAT text fixtures to wasm bytes for the end-to-end contract tests.
+wat = "1.253"

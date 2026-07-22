@@ -391,19 +391,23 @@ impl ActionV1 {
     pub(crate) fn execution_supported(&self) -> bool {
         match self {
             Self::RevokeSponsorGrant { .. } | Self::RevokeSignedSponsorGrant { .. } => true,
-            Self::Native { operation } => matches!(
-                operation.as_ref(),
-                Operation::Transfer { .. }
-                    | Operation::InstallAuthorizationPolicy { .. }
-                    | Operation::OpenAuthorizationLane { .. }
-                    | Operation::FundAuthorizationLane { .. }
-                    | Operation::ClaimValidatorRewards
-                    | Operation::ClaimDelegatorRewards { .. }
-                    | Operation::ClaimUnbonded { .. }
-                    | Operation::CreateObject { .. }
-                    | Operation::MutateObject { .. }
-                    | Operation::TransferObject { .. }
-            ),
+            Self::Native { operation } => {
+                // CreateObject and MutateObject remain disabled until V5 binds an
+                // explicit ChainConfig storage-pricing snapshot and commits the
+                // storage-deposit delta through its sparse overlay. Reusing the
+                // older helper here would bypass protocol-1 deposit economics.
+                matches!(
+                    operation.as_ref(),
+                    Operation::Transfer { .. }
+                        | Operation::InstallAuthorizationPolicy { .. }
+                        | Operation::OpenAuthorizationLane { .. }
+                        | Operation::FundAuthorizationLane { .. }
+                        | Operation::ClaimValidatorRewards
+                        | Operation::ClaimDelegatorRewards { .. }
+                        | Operation::ClaimUnbonded { .. }
+                        | Operation::TransferObject { .. }
+                )
+            }
         }
     }
 
@@ -1749,7 +1753,7 @@ mod tests {
                     data: vec![0; MAX_OBJECT_DATA_BYTES + 1],
                 }),
             ),
-            Err(TransactionValidationErrorV1::InvalidNativeAction)
+            Err(TransactionValidationErrorV1::UnsupportedNativeAction)
         );
     }
 

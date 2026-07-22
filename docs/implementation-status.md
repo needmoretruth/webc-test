@@ -786,7 +786,23 @@ isolation, standard recovery/keystore behavior, and authorization policy remain.
 - Persistent owned objects have typed IDs/versions, namespace and owner checks,
   a 64 KiB payload bound, state-root commitments, exact runtime access, stale
   version/owner/size rollback tests, and cross-lane namespace parallelism.
-  Shared-object mutation and localized fee markets remain disabled.
+  Shared-object mutation remains disabled.
+- Localized (per-application-namespace) fee pricing is live (Phase 6, §8/§7):
+  object operations are priced by their namespace's own EIP-1559 base fee, which
+  adjusts each block from only that namespace's own usage vs
+  `FeePolicy::per_namespace_target_units`; account-scoped operations keep the
+  global base fee. Every localized fee is floored at the network-wide
+  `min_base_fee_per_unit`, and a namespace back at the floor sheds its record so
+  the committed `namespace_fees` map stays bounded. Fair block packing caps a
+  single namespace at `FeePolicy::namespace_block_share_bps` of `max_block_units`
+  — enforced as a hard block-validity rule in `build_block` (re-checked by
+  `apply_block`) and honoured up front by the mempool `select_block`, so one hot
+  application cannot monopolize a block. The state-commitment domain is
+  `WEBC_STATE_COMMITMENT_V11` (added `namespace_fee_root`); the localized map locks
+  no native units, so the supply invariant is unchanged. Tests cover namespace-A
+  congestion not raising namespace-B's price, the floor, fair packing, unaffected
+  account transfers, supply reconciliation, bincode crash-restart of the fee state
+  with a stable root, and cross-run determinism.
 - Objective signed double-vote evidence is enforced; other penalty classes remain
   disabled until equally objective artifacts exist.
 

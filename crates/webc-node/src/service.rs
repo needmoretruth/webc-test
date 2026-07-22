@@ -17,11 +17,15 @@
 //! top up already-funded accounts, and labels its drips as valueless test units.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Mutex;
 
 use webc_chain::{
-    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, ObjectId, Operation,
-    StateObject, Transaction,
+    Account, AccountStateProof, Amount, Block, ChainError, FeeBid, GovProposalStatus,
+    GovernanceInstance, GovernanceInstanceId, GovernanceProposal, Mandate, MandateId,
+    NftCollection, NftCollectionId, NftId, NftItem, ObjectId, Operation, ProposalId, ServiceEntry,
+    ServiceId, StateObject, SupplyInvariantReport, TokenId, TokenRecord, TokenSupplyReport,
+    Transaction, Validator,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_storage::{KvStore, StorageError};
@@ -173,6 +177,21 @@ pub struct AccountSummary {
     pub account: Account,
 }
 
+/// A validator snapshot with its derived total stake. Public, read-only.
+#[derive(Debug, serde::Serialize)]
+pub struct ValidatorSummary {
+    #[serde(flatten)]
+    pub validator: Validator,
+    pub total_stake: Amount,
+}
+
+/// The public validator set with its API version.
+#[derive(Debug, serde::Serialize)]
+pub struct ValidatorsResponse {
+    pub api_version: &'static str,
+    pub validators: Vec<ValidatorSummary>,
+}
+
 /// The classified outcome of admitting a gossiped transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkAdmission {
@@ -278,6 +297,60 @@ impl<K: KvStore> NodeService<K> {
             .cloned()
             .ok_or(ApiError::NotFound)?;
         Ok(AccountSummary { address, account })
+    }
+
+    /// Returns every validator with its derived total stake, in deterministic
+    /// address order. Public, read-only performance/stake data.
+    pub fn validators(&self) -> Result<ValidatorsResponse, ApiError> {
+        let inner = self.lock();
+        let validators = inner
+            .node
+            .state()
+            .validators
+            .values()
+            .map(|validator| {
+                Ok(ValidatorSummary {
+                    validator: validator.clone(),
+                    total_stake: validator
+                        .total_stake()
+                        .map_err(|error| ApiError::Internal(error.to_string()))?,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(ValidatorsResponse {
+            api_version: API_VERSION,
+            validators,
+        })
+    }
+
+    /// Returns a single validator by operator address, or `NotFound`.
+    pub fn validator(&self, address: Address) -> Result<ValidatorSummary, ApiError> {
+        let inner = self.lock();
+        let validator = inner
+            .node
+            .state()
+            .validators
+            .get(&address)
+            .cloned()
+            .ok_or(ApiError::NotFound)?;
+        let total_stake = validator
+            .total_stake()
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        Ok(ValidatorSummary {
+            validator,
+            total_stake,
+        })
+    }
+
+    /// Returns the deterministic supply-invariant reconciliation (gross issuance
+    /// vs. every value bucket). Public, read-only monetary transparency.
+    pub fn supply(&self) -> Result<SupplyInvariantReport, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .supply_invariant_report()
+            .map_err(|error| ApiError::Internal(error.to_string()))
     }
 
     /// Returns a Merkle proof of an account against the current account root.
@@ -494,10 +567,567 @@ impl<K: KvStore> NodeService<K> {
     }
 }
 
+impl<K: KvStore> NodeService<K> {
+    /// Submits `tx` and immediately seals a block so the transaction is final.
+    ///
+    /// A convenience for local/devnet drivers — the CLI staking subcommands and
+    /// tests — that want a submitted transaction to reach a committed block in a
+    /// single call. `now_ms` is supplied by the caller (this reads no clock), so
+    /// the flow stays deterministic. It errors if the mempool rejects the
+    /// transaction or if, unexpectedly, nothing seals (e.g. the transaction was
+    /// not runnable at selection time).
+    pub fn submit_and_seal(&self, tx: Transaction, now_ms: u64) -> Result<SealSummary, ApiError> {
+        self.submit_transaction(tx, now_ms)?;
+        self.seal_block(now_ms)?.ok_or_else(|| {
+            ApiError::Internal("submitted transaction did not seal into a block".to_owned())
+        })
+    }
+}
+
+/// Read accessors for the Phase 9/13 native state (tokens, NFTs, service
+/// registry, governance, mandates).
+///
+/// Each is a pure point-read of the current committed [`webc_chain::ChainState`]
+/// maps — the same shape as [`Self::account`] / [`Self::object`] — cloning the
+/// requested record out under the single service lock and mapping an absent key
+/// to [`ApiError::NotFound`]. They reuse the record types' own `Serialize`
+/// derives (no wrapper types) and read no clock, so they are deterministic and
+/// safe to expose to hostile callers.
+impl<K: KvStore> NodeService<K> {
+    /// Returns a native token's authority/supply record, or `NotFound`.
+    pub fn token(&self, token_id: TokenId) -> Result<TokenRecord, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .tokens
+            .get(&token_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns `holder`'s balance of `token_id`.
+    ///
+    /// Zero-vs-404 choice: mirrors the chain's own balance semantics, where an
+    /// absent `(token, holder)` entry is indistinguishable from a zero balance (a
+    /// transfer prunes an entry that reaches zero — see `token_balances`). Once
+    /// the token exists, every address holds a well-defined balance of it,
+    /// [`Amount::ZERO`] when it holds none, so a holder with no entry is `200`
+    /// with zero rather than `404`. An UNKNOWN token is `NotFound`: reporting zero
+    /// for a nonexistent token would falsely imply the token exists, and this
+    /// matches how [`Self::account`] 404s an absent account rather than inventing
+    /// a zero.
+    pub fn token_balance(&self, token_id: TokenId, holder: Address) -> Result<Amount, ApiError> {
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.tokens.contains_key(&token_id) {
+            return Err(ApiError::NotFound);
+        }
+        Ok(state
+            .token_balances
+            .get(&(token_id, holder))
+            .copied()
+            .unwrap_or(Amount::ZERO))
+    }
+
+    /// Returns the per-token supply reconciliation (issued vs. held), or
+    /// `NotFound` for an unknown token.
+    ///
+    /// Reuses [`webc_chain::ChainState::token_supply_report`]; an inconsistency in
+    /// the committed state (never reachable through the state transitions) is an
+    /// internal error, not a client error.
+    pub fn token_supply(&self, token_id: TokenId) -> Result<TokenSupplyReport, ApiError> {
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.tokens.contains_key(&token_id) {
+            return Err(ApiError::NotFound);
+        }
+        state
+            .token_supply_report(token_id)
+            .map_err(|error| ApiError::Internal(error.to_string()))
+    }
+
+    /// Returns a native NFT collection record, or `NotFound`.
+    pub fn nft_collection(
+        &self,
+        collection_id: NftCollectionId,
+    ) -> Result<NftCollection, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .nft_collections
+            .get(&collection_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a single NFT item (owner, frozen flag, metadata commitment), or
+    /// `NotFound`.
+    pub fn nft_item(&self, nft_id: NftId) -> Result<NftItem, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .nft_items
+            .get(&nft_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a registered service entry (the full current revision: owner,
+    /// categories, pricing, payment flags, status), or `NotFound`. This is the
+    /// read the SDK's HTTP-402 `validateChallenge` needs so a caller no longer has
+    /// to supply the `ServiceEntry` itself.
+    pub fn service_entry(&self, service_id: ServiceId) -> Result<ServiceEntry, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .services
+            .get(&service_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a governance instance record, or `NotFound`.
+    pub fn governance_instance(
+        &self,
+        instance_id: GovernanceInstanceId,
+    ) -> Result<GovernanceInstance, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .governance_instances
+            .get(&instance_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a governance proposal record (status, tallies, eta), or `NotFound`.
+    pub fn governance_proposal(
+        &self,
+        proposal_id: ProposalId,
+    ) -> Result<GovernanceProposal, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .governance_proposals
+            .get(&proposal_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Returns a mandate record (budget/spent/expiry/revoked/counterparty policy),
+    /// or `NotFound`.
+    pub fn mandate(&self, mandate_id: MandateId) -> Result<Mandate, ApiError> {
+        let inner = self.lock();
+        inner
+            .node
+            .state()
+            .mandates
+            .get(&mandate_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+}
+
+// ----- paginated discovery / list accessors (Phase 9/13 native state) -----
+
+/// Default page size when a caller supplies no `limit`.
+pub const DEFAULT_PAGE_LIMIT: usize = 50;
+
+/// Hard upper bound on a page size. A larger requested `limit` is clamped to this,
+/// so an unauthenticated caller can never force an unbounded response out of a map
+/// that grows without limit.
+pub const MAX_PAGE_LIMIT: usize = 200;
+
+/// Per-request scan multiplier for FILTERED list pages (e.g. services-by-category).
+/// Such a page examines at most `FILTER_SCAN_MULTIPLIER * limit` map entries even if
+/// fewer (or none) match, then returns a `next_cursor` so the client continues —
+/// this bounds the work one request can cost over a sparse filter regardless of map
+/// size.
+const FILTER_SCAN_MULTIPLIER: usize = 4;
+
+/// Clamps a requested page limit into `1..=MAX_PAGE_LIMIT`, applying
+/// `DEFAULT_PAGE_LIMIT` when unset. A `0` clamps up to `1` so a page always makes
+/// forward progress (a zero-size page with a cursor could never advance).
+fn clamp_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .clamp(1, MAX_PAGE_LIMIT)
+}
+
+/// Decodes an opaque hash-shaped cursor (32-byte lowercase hex) into a `Hash256`,
+/// mapping any malformed input to a fail-closed `InvalidRequest`.
+fn decode_hash_cursor(raw: &str) -> Result<Hash256, ApiError> {
+    let bytes = hex::decode(raw).map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let fixed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    Ok(Hash256(fixed))
+}
+
+/// Encodes a `(TokenId, Address)` balance key as the opaque cursor
+/// `"{token_hex}:{address_hex}"` (both 32-byte lowercase hex). The FULL key is
+/// carried so a resumed scan advances strictly past the last VISITED entry — never
+/// only the last match — guaranteeing forward progress through non-matching runs.
+fn encode_token_holder_cursor(token_id: TokenId, holder: Address) -> String {
+    format!(
+        "{}:{}",
+        token_id.hash().to_hex(),
+        hex::encode(holder.as_bytes())
+    )
+}
+
+/// Decodes a `(TokenId, Address)` balance cursor, fail-closed on any malformation.
+fn decode_token_holder_cursor(raw: &str) -> Result<(TokenId, Address), ApiError> {
+    let (token_hex, addr_hex) = raw
+        .split_once(':')
+        .ok_or_else(|| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let token_id = TokenId::new(decode_hash_cursor(token_hex)?);
+    let addr_bytes =
+        hex::decode(addr_hex).map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    let addr_fixed: [u8; 32] = addr_bytes
+        .try_into()
+        .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+    Ok((token_id, Address::from_bytes(addr_fixed)))
+}
+
+/// One entry in a services listing: the service's id alongside its full current
+/// `ServiceEntry` revision (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct ServiceListItem {
+    pub service_id: ServiceId,
+    #[serde(flatten)]
+    pub entry: ServiceEntry,
+}
+
+/// A paginated services page: `next_cursor` is non-null iff more may remain.
+#[derive(Debug, serde::Serialize)]
+pub struct ServicesPage {
+    pub items: Vec<ServiceListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in a collection's items listing: the item's serial alongside its
+/// full `NftItem` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct NftItemListItem {
+    pub serial: u64,
+    #[serde(flatten)]
+    pub item: NftItem,
+}
+
+/// A paginated NFT-collection-items page.
+#[derive(Debug, serde::Serialize)]
+pub struct NftItemsPage {
+    pub items: Vec<NftItemListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in an instance's proposals listing: the proposal's id alongside its
+/// full `GovernanceProposal` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct ProposalListItem {
+    pub proposal_id: ProposalId,
+    #[serde(flatten)]
+    pub proposal: GovernanceProposal,
+}
+
+/// A paginated governance-proposals page.
+#[derive(Debug, serde::Serialize)]
+pub struct ProposalsPage {
+    pub items: Vec<ProposalListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in an address's token-balances listing: the token id and the held
+/// amount (the holder is fixed by the request path).
+#[derive(Debug, serde::Serialize)]
+pub struct TokenBalanceListItem {
+    pub token_id: TokenId,
+    pub balance: Amount,
+}
+
+/// A paginated token-balances page.
+#[derive(Debug, serde::Serialize)]
+pub struct TokenBalancesPage {
+    pub items: Vec<TokenBalanceListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// One entry in an address's mandates listing: the mandate's id alongside its full
+/// `Mandate` record (the record's own serialization, flattened in).
+#[derive(Debug, serde::Serialize)]
+pub struct MandateListItem {
+    pub mandate_id: MandateId,
+    #[serde(flatten)]
+    pub mandate: Mandate,
+}
+
+/// A paginated mandates page.
+#[derive(Debug, serde::Serialize)]
+pub struct MandatesPage {
+    pub items: Vec<MandateListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// Bounded, cursor-paginated DISCOVERY reads over the Phase 9/13 native-state maps.
+///
+/// Every accessor here is a pure, deterministic ASCENDING walk of a committed
+/// `webc_chain::ChainState` `BTreeMap`, taken under the single service lock, that
+/// clones out at most `limit` records and returns an opaque `next_cursor` (the last
+/// key it visited) so the client can resume. A FILTERED walk additionally caps the
+/// scan at `FILTER_SCAN_MULTIPLIER * limit` VISITED entries, matching or not, then
+/// hands back a cursor — this bounds the per-request work over a sparse filter so a
+/// hostile query can never force a whole-map scan.
+///
+/// A malformed cursor/limit/id maps to `ApiError::InvalidRequest`. Nothing here
+/// reads a clock, network, or randomness, and nothing panics on hostile input.
+impl<K: KvStore> NodeService<K> {
+    /// Lists registered services in ascending `ServiceId` order. With `category`,
+    /// returns only entries whose `categories` set contains that tag (a bounded
+    /// filtered scan); without it, lists every service (a bounded range).
+    pub fn services(
+        &self,
+        category: Option<Hash256>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ServicesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let services = &inner.node.state().services;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(ServiceId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, entry) in services.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            let matched = match &category {
+                Some(tag) => entry.categories.contains(tag),
+                None => true,
+            };
+            if matched {
+                items.push(ServiceListItem {
+                    service_id: *id,
+                    entry: entry.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(ServicesPage { items, next_cursor })
+    }
+
+    /// Lists a collection's live items ascending by serial. This is a contiguous
+    /// range over `nft_items` (keyed by `(collection, serial)`, ordered by that
+    /// pair), so it needs no filter scan bound — every visited key is an item of the
+    /// collection, and the page is bounded by `limit` alone. The collection must
+    /// exist, else `NotFound` (mirroring the item point-read). The cursor is the
+    /// last serial returned; the next page starts strictly after it.
+    pub fn nft_collection_items(
+        &self,
+        collection_id: NftCollectionId,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<NftItemsPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.nft_collections.contains_key(&collection_id) {
+            return Err(ApiError::NotFound);
+        }
+
+        let start = match cursor {
+            Some(raw) => {
+                let serial: u64 = raw
+                    .parse()
+                    .map_err(|_| ApiError::InvalidRequest("invalid cursor".into()))?;
+                Bound::Excluded(NftId::new(collection_id, serial))
+            }
+            None => Bound::Included(NftId::new(collection_id, 0)),
+        };
+        // Bound the range to this collection's key space so the walk never crosses
+        // into the next collection's items.
+        let end = Bound::Included(NftId::new(collection_id, u64::MAX));
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        for (nft_id, item) in state.nft_items.range((start, end)) {
+            items.push(NftItemListItem {
+                serial: nft_id.serial,
+                item: item.clone(),
+            });
+            if items.len() >= limit {
+                next_cursor = Some(nft_id.serial.to_string());
+                break;
+            }
+        }
+        Ok(NftItemsPage { items, next_cursor })
+    }
+
+    /// Lists an instance's proposals in ascending `ProposalId` order, optionally
+    /// filtered by `status`. Proposals are keyed by their opaque `ProposalId`, not
+    /// grouped by instance, so this is a bounded filtered scan (at most
+    /// `FILTER_SCAN_MULTIPLIER * limit` entries per page); the cursor carries the
+    /// last-visited id for forward progress. The instance must exist, else
+    /// `NotFound`.
+    pub fn instance_proposals(
+        &self,
+        instance_id: GovernanceInstanceId,
+        status: Option<GovProposalStatus>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ProposalsPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let state = inner.node.state();
+        if !state.governance_instances.contains_key(&instance_id) {
+            return Err(ApiError::NotFound);
+        }
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(ProposalId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, proposal) in state.governance_proposals.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            let status_ok = match status {
+                Some(want) => proposal.status == want,
+                None => true,
+            };
+            if proposal.instance_id == instance_id && status_ok {
+                items.push(ProposalListItem {
+                    proposal_id: *id,
+                    proposal: proposal.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(ProposalsPage { items, next_cursor })
+    }
+
+    /// Lists the token balances held BY `address`, ascending by the `(token, holder)`
+    /// key. Balances are keyed by `(TokenId, Address)`, so one address's holdings are
+    /// scattered across the map; this is a bounded filtered scan (at most
+    /// `FILTER_SCAN_MULTIPLIER * limit` entries per page) whose cursor carries the
+    /// full last-visited key for forward progress. An address that holds nothing is a
+    /// 200 with an empty page (an absent holder is a zero balance, not an error).
+    pub fn account_token_balances(
+        &self,
+        address: Address,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<TokenBalancesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let balances = &inner.node.state().token_balances;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(decode_token_holder_cursor(raw)?),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (&(token_id, holder), amount) in balances.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            if holder == address {
+                items.push(TokenBalanceListItem {
+                    token_id,
+                    balance: *amount,
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(encode_token_holder_cursor(token_id, holder));
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(encode_token_holder_cursor(token_id, holder));
+                break;
+            }
+        }
+        Ok(TokenBalancesPage { items, next_cursor })
+    }
+
+    /// Lists the mandates whose `principal == address`, ascending by `MandateId`.
+    /// Mandates are keyed by their opaque `MandateId`, so this is a bounded filtered
+    /// scan (at most `FILTER_SCAN_MULTIPLIER * limit` entries per page); the cursor
+    /// carries the last-visited id for forward progress. An address that is the
+    /// principal of no mandate is a 200 with an empty page.
+    pub fn account_mandates(
+        &self,
+        address: Address,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<MandatesPage, ApiError> {
+        let limit = clamp_limit(limit);
+        let max_scan = limit.saturating_mul(FILTER_SCAN_MULTIPLIER);
+        let inner = self.lock();
+        let mandates = &inner.node.state().mandates;
+
+        let start = match cursor {
+            Some(raw) => Bound::Excluded(MandateId::new(decode_hash_cursor(raw)?)),
+            None => Bound::Unbounded,
+        };
+
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        let mut scanned = 0usize;
+        for (id, mandate) in mandates.range((start, Bound::Unbounded)) {
+            scanned += 1;
+            if mandate.principal == address {
+                items.push(MandateListItem {
+                    mandate_id: *id,
+                    mandate: mandate.clone(),
+                });
+                if items.len() >= limit {
+                    next_cursor = Some(id.hash().to_hex());
+                    break;
+                }
+            }
+            if scanned >= max_scan {
+                next_cursor = Some(id.hash().to_hex());
+                break;
+            }
+        }
+        Ok(MandatesPage { items, next_cursor })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webc_chain::{ChainConfig, GenesisAccount, GenesisConfig};
+    use webc_chain::{ChainConfig, GenesisAccount, GenesisConfig, GenesisValidator};
     use webc_storage::MemoryKvStore;
 
     const NOW: u64 = 1_000;
@@ -586,6 +1216,69 @@ mod tests {
         // A large jump caps at the burst, not beyond.
         faucet.refill_tokens(1_000_000 * FAUCET_GLOBAL_REFILL_MS);
         assert_eq!(faucet.tokens, FAUCET_GLOBAL_BURST);
+    }
+
+    #[test]
+    fn supply_endpoint_reconciles_gross_issuance() {
+        let (service, _alice, _bob, _faucet) = build_service(false);
+        let report = service.supply().expect("supply report");
+        // Genesis funded 1_000 + 1_000 + 1_000_000 WEBC; nothing minted yet, so
+        // gross issuance reconciles exactly against every value bucket.
+        assert_eq!(report.issued, Amount::from_webc(1_002_000));
+        assert!(report.balanced);
+    }
+
+    #[test]
+    fn validator_endpoints_list_and_look_up() {
+        // A service with no validators exposes an empty set and NotFound lookups.
+        let (empty, _a, _b, _f) = build_service(false);
+        assert!(empty
+            .validators()
+            .expect("validators")
+            .validators
+            .is_empty());
+        assert!(matches!(
+            empty.validator(keypair(3).address()),
+            Err(ApiError::NotFound)
+        ));
+
+        // A genesis validator is exposed with its derived total stake.
+        let operator = keypair(7);
+        let genesis = GenesisConfig {
+            chain: ChainConfig::default(),
+            accounts: vec![GenesisAccount {
+                address: operator.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: vec![GenesisValidator {
+                operator: operator.address(),
+                consensus_key: operator.public_key(),
+                self_stake: Amount::from_webc(100),
+                commission_bps: 500,
+                bootstrap: false,
+            }],
+        };
+        let node = Node::open(MemoryKvStore::new(), &genesis).unwrap();
+        let service = NodeService::new(
+            node,
+            NodeServiceOptions {
+                mempool: MempoolConfig::default(),
+                faucet: None,
+                proposer: operator.address(),
+            },
+        );
+
+        let listed = service.validators().expect("validators");
+        assert_eq!(listed.validators.len(), 1);
+        assert_eq!(listed.validators[0].validator.operator, operator.address());
+        assert_eq!(listed.validators[0].total_stake, Amount::from_webc(100));
+
+        let one = service.validator(operator.address()).expect("validator");
+        assert_eq!(one.total_stake, Amount::from_webc(100));
+        assert!(matches!(
+            service.validator(keypair(8).address()),
+            Err(ApiError::NotFound)
+        ));
     }
 
     #[test]
@@ -754,5 +1447,21 @@ mod tests {
             .submit_transaction(transfer(&alice, &bob, 10, 0), NOW)
             .unwrap_err();
         assert!(matches!(err, ApiError::Rejected(_)));
+    }
+
+    #[test]
+    fn submit_and_seal_commits_in_one_call() {
+        let (service, alice, bob, _faucet) = build_service(false);
+        let summary = service
+            .submit_and_seal(transfer(&alice, &bob, 5, 0), NOW)
+            .expect("submit and seal");
+        assert_eq!(summary.height, 1);
+        assert_eq!(summary.transaction_count, 1);
+        // The block is final: bob was paid and the mempool drained.
+        assert_eq!(
+            service.account(bob.address()).unwrap().account.balance,
+            Amount::from_webc(1_005)
+        );
+        assert_eq!(service.health().mempool_size, 0);
     }
 }

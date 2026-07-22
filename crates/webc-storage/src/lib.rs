@@ -14,7 +14,14 @@
 //! - `redb_store`: the durable, crash-safe backend ([`RedbKvStore`]) built on the
 //!   `redb` embedded ACID database (MIT OR Apache-2.0). Per WEBC's reuse rule we
 //!   adapt a proven database behind the seam rather than hand-rolling a
-//!   write-ahead log and recovery.
+//!   write-ahead log and recovery. Stored *values* pass through `codec` for
+//!   transparent zstd compression; keys and logical behavior are unchanged.
+//! - `codec`: the at-rest value compression seam (WEBC §15.19/§15.24). It
+//!   zstd-compresses values on write with an adaptive skip for tiny or
+//!   incompressible payloads and a 1-byte format tag, and decompresses on read.
+//!   Compression is a pure physical encoding: a value read back is byte-identical
+//!   to the value written, so hashes and signatures (computed over the canonical
+//!   bytes above this layer) are unaffected.
 //! - `chainstore`: the typed [`ChainStore`] — block/state/tip persistence with
 //!   atomic per-block commits and startup consistency checks — built on any
 //!   `KvStore`, so it runs identically on both backends.
@@ -23,6 +30,7 @@
 //! stored bytes: corruption is returned as [`StorageError::Corruption`].
 
 mod chainstore;
+mod codec;
 mod error;
 mod kv;
 mod memory;

@@ -271,6 +271,19 @@ not deeply audited.
   key tiebreak); `seal_block` calls `prune_expired` before selection. Reproduced
   first by `full_pool_evicts_lowest_fee_for_a_strictly_higher_bidder` and
   `seal_prunes_expired_transactions`.
+  - **Hardening follow-up (adversarial re-verification).** The first eviction rule
+    ranked purely by effective fee and was *runnability-blind*: a gapped-nonce bid
+    (nonce far above the sender's expected nonce) is never sealable — `select_block`
+    skips gaps — yet could evict an honest *runnable* tx by merely nominating a
+    higher fee, and never actually pay. Repeated across the future-nonce-gap window
+    this evicts up to `max_future_nonce_gap` honest txs per account for free — the
+    exact "free churn" the guard claimed to prevent. **Fix:** eviction now ranks by
+    the value tuple `(is_runnable, effective_fee)` where `is_runnable =
+    (nonce == expected_nonce)`; the least-valuable entry is evicted only for a
+    strictly more valuable newcomer. A non-runnable bid can no longer displace a
+    runnable entry, and a runnable newcomer actively clears parked non-runnable junk.
+    Reproduced first by `full_pool_gapped_bid_cannot_evict_a_runnable_transaction`
+    (with `full_pool_runnable_bid_evicts_a_parked_gap_entry` locking the dual).
 - **H3 — MEDIUM — RESOLVED (commit `ec327c7`) — unbounded WebSocket
   subscriptions.** `ws.on_upgrade` accepted unlimited concurrent, unauthenticated
   subscribers (FD/memory DoS). **Fix:** an atomic counter caps live subscriptions
@@ -369,6 +382,48 @@ mutation/transfer requires exact namespace + owner + version (rolls back on stal
 amount/nonce/version math is checked. `execute_transaction` mutates a clone and
 commits only on `Ok`, and its sole non-test caller (`block_builder.rs:90`)
 propagates errors, so an invalid tx cannot be cheaply block-included.
+
+**M1 — P2 — RESOLVED (Phase 9a mandate) — mandate per-tx cap ignored the fee.**
+An adversarial re-review of the just-shipped native agent mandate found that
+`SpendUnderMandate` / `SpendUnderMandateToService` bounded only the principal
+`amount` against `per_tx_max`, while the value actually leaving `mandate_escrow`
+is `amount + total_fee`, and the fee is agent-chosen via the priority bid and
+drawn from the same escrow. A hostile agent could set a within-cap principal but
+a huge fee, draining the whole budget in one transaction — 1000× the `per_tx_max`
+the principal set and bypassing `rate_limit_per_day` — with ~half recoverable
+through the validator fee pool (supply stayed conserved, so this was value
+extraction/grief, not a mint). **Fix:** both spend arms now compute
+`charge = amount + total_fee` and reject `charge > per_tx_max`, making `per_tx_max`
+a true per-spend blast-radius cap (principal + fee); zero-`amount` fee-only spends
+are also rejected (`MandateZeroAmount`). Reproduced first with
+`fee_bid_cannot_inflate_a_spend_past_per_tx_max` (asserts `MandatePerTxExceeded`
+and that the rejected spend leaves state byte-identical) and `zero_amount_spend_is_rejected`.
+Because grant enforces `per_tx_max <= budget_total`, `MandateBudgetExceeded` is now
+correctly reachable only cumulatively (the over-budget tests exercise two
+within-cap spends). Everything else in the mandate path (supply conservation,
+agent-key binding, replay, determinism, panic-safety) verified clean.
+
+**T1 — P2 — RESOLVED (Phase 13a tokens) — TransferToken under-declared its freeze
+read.** A read-only adversarial review of the native fungible-token system found
+that `TransferToken` consulted `frozen_token_accounts` directly on the value path
+but did NOT declare the two `(token, party)` `TokenFreeze` keys in its signed
+access list. Execution is sequential today (`build_block` loops `execute_transaction`
+in order; `parallel_batches` is exported/tested but wired into no executor), so it
+is latent — but the moment the declared-access parallel scheduler is enabled, a
+`TransferToken` and a concurrent `FreezeTokenAccount`/`ThawTokenAccount` of the
+same account would land in one batch and race (freeze bypass + nondeterministic
+state root), exactly the failure the declared-access model exists to prevent.
+**Fix:** the transfer path now declares both parties' `TokenFreeze` markers as
+reads (in the `transaction.rs` access-list builder) and records them
+unconditionally in the handler (before the short-circuiting frozen check), so the
+scheduler serializes a transfer against a freeze/thaw of either party. Regression:
+`scheduler::tests::token_transfer_serializes_against_a_freeze_of_either_party`
+(asserts the pair splits into two batches via the real access-list builder).
+Everything else in the token path (per-token supply conservation, native-WEBC
+neutrality, authority binding + permanent renounce, freeze/pause enforcement,
+checked arithmetic, determinism, bounds) verified clean. A second finding (a
+token's own freeze authority can freeze arbitrarily many accounts) is within that
+token's trust model and fee-cost-bounded — noted, no change.
 
 ## webc-chain — supply / staking / bridge (verified findings)
 

@@ -1,4 +1,4 @@
-# ADR-0012: versioned transaction lifecycle and finalized proofs
+# ADR-0016: versioned transaction lifecycle and finalized proofs
 
 Status: accepted implementation direction for protocol version 2; external
 security review remains required before a production network
