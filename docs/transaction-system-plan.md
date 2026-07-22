@@ -657,6 +657,49 @@ state preconditions that can change after admission may become chargeable
 receipt failures. After every native variant is covered and the full step-4
 gate passes, move to storage schema 2 and its resumable migration.
 
+### Adversarial sponsorship checkpoint (2026-07-22)
+
+Commit `2ba13f4` closes the signed pre-use revocation lifecycle without
+activating protocol 2. A signed grant can be revoked before its first fee use;
+the durable record authenticates its inclusive expiry; the state commitment
+binds the complete grant book; and a derived, canonically ordered expiry index
+prunes at most 256 expired records per block. The old per-expiry admission cap
+was removed because it created a hidden global conflict and allowed one sender
+to squat an expiry bucket. Instead, every sponsored transaction and every
+signed revocation action reserves 100,000 deterministic bookkeeping units.
+With the current 2,000,000-unit default block limit this admits at most 20 new
+records per block, while the 4,096-block signed-revocation lookahead bounds the
+default live set at approximately 163,840 records.
+
+The same commit preflights every sparse grant-book write before any base state
+mutation, replaces expired identities without prepare/execute divergence, and
+keeps Rust and TypeScript sender-first validation, signer ordering, identity
+conflict detection, and unit accounting aligned. Commit `8b92a75` freezes the
+adversarial boundaries: exact duplicate revocations remain valid and are
+verified once, cross-source fee/action identity conflicts fail closed, failed
+child actions discard revocations while the outer fee grant still advances,
+and sponsored cancellation charges the exact static units. The focused gate
+passed formatting, strict all-target `webc-chain` clippy, all 240
+`webc-chain` tests, Rust documentation, and `pnpm check` (95 SDK and 3 widget
+tests plus builds and documentation links).
+
+Protocol 2 remains inactive. Activation is gated on both of the following:
+
+1. enforce a fail-closed relationship between the configured block-unit policy
+   and pruning capacity (recommended invariant: pruning capacity is at least
+   four times the maximum per-block materialization count; the current defaults
+   provide 12.8 times headroom); and
+2. run a release-build benchmark at 163,840 live grant records covering state
+   cloning, state-root computation, block execution latency, and peak resident
+   memory. Do not raise the lookahead or block-unit limit without repeating it.
+
+Exact next item: replace V5 matured-unbonding claims' full global
+`UnbondingQueue` capture and child clone with a request-scoped delta journal.
+The journal must preserve the existing global conflict key and state-root
+semantics, validate all dirty entries before any base mutation, apply only after
+validation succeeds, and prove bounded overlay size for successful and missing
+request IDs against a large unrelated queue.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
