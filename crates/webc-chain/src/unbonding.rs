@@ -9,11 +9,11 @@
 
 use crate::{Amount, ChainError, Epoch};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use webc_crypto::Address;
 
 /// Principal source determining which active stake mirror admission reduces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum UnbondingKind {
     /// Validator operator self-stake.
     OperatorStake,
@@ -223,6 +223,73 @@ pub(crate) struct UnbondingClaimJournalV1 {
     entries: BTreeMap<UnbondingRequestId, UnbondingClaimEntryV1>,
 }
 
+/// One active-stake coordinate whose queued exit total affects a V5 action.
+///
+/// The key is deliberately owner- and kind-specific: operator exits and
+/// delegation exits share one validator FIFO but must never consume each
+/// other's available principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UnbondingPositionV1 {
+    /// Account that owns the active principal.
+    owner: Address,
+    /// Validator pool from which the principal will exit.
+    validator: Address,
+    /// Active principal bucket queried by staking rules.
+    kind: UnbondingKind,
+}
+
+impl UnbondingPositionV1 {
+    /// Constructs one exact queued-principal coordinate.
+    const fn new(owner: Address, validator: Address, kind: UnbondingKind) -> Self {
+        Self {
+            owner,
+            validator,
+            kind,
+        }
+    }
+}
+
+/// Captured and staged queued total for one signed staking coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnbondingQueuedTotalV1 {
+    /// Base total used to reject a stale sparse commit.
+    captured: Amount,
+    /// Base plus successful requests earlier in this ordered action program.
+    staged: Amount,
+}
+
+/// Bounded V5 overlay for creating FIFO unbonding requests.
+///
+/// The journal stores at most one queued-total scalar per signed staking action
+/// and at most one new request per action. It captures neither unrelated
+/// requests nor the global FIFO. New IDs remain byte-identical to direct queue
+/// execution, while commit validates `next_id`, every consulted queued total,
+/// and every destination ID before changing the base queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnbondingRequestJournalV1 {
+    /// Monotonic ID cursor observed before action execution.
+    captured_next_id: u64,
+    /// Virtual cursor after successful staged requests.
+    next_id: u64,
+    /// Exact queued totals read by the transaction, in deterministic order.
+    positions: BTreeMap<UnbondingPositionV1, UnbondingQueuedTotalV1>,
+    /// Complete new records in action/FIFO order, bounded by `MAX_ACTIONS_V1`.
+    staged_requests: Vec<UnbondingRequest>,
+}
+
+/// Append effects proven current against one queue snapshot.
+///
+/// Application is infallible when the queue remains exclusively borrowed after
+/// validation. Sparse execution validates this token before any account,
+/// sponsor, validator, delegation, or fee record is committed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedUnbondingRequestJournalV1 {
+    /// Cursor after append operations, or `None` for a read-only queue journal.
+    next_id: Option<u64>,
+    /// Complete records in the exact FIFO order to append.
+    staged_requests: Vec<UnbondingRequest>,
+}
+
 /// A claim journal proven current against one queue snapshot.
 ///
 /// The caller must apply this token to the same exclusively borrowed queue
@@ -310,6 +377,31 @@ impl UnbondingQueue {
                     .checked_add(request.queued)
                     .ok_or(ChainError::ArithmeticOverflow)
             })
+    }
+
+    /// Computes several queued totals in one pass without cloning request state.
+    fn queued_totals_for(
+        &self,
+        positions: &BTreeSet<UnbondingPositionV1>,
+    ) -> Result<BTreeMap<UnbondingPositionV1, Amount>, ChainError> {
+        if positions.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut totals = positions
+            .iter()
+            .copied()
+            .map(|position| (position, Amount::ZERO))
+            .collect::<BTreeMap<_, _>>();
+        for request in self.requests.values() {
+            let position = UnbondingPositionV1::new(request.owner, request.validator, request.kind);
+            let Some(total) = totals.get_mut(&position) else {
+                continue;
+            };
+            *total = total
+                .checked_add(request.queued)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        Ok(totals)
     }
 
     /// Reduces queued promises by up to the slash already applied to active stake.
@@ -547,6 +639,201 @@ impl UnbondingQueue {
     }
 }
 
+impl UnbondingRequestJournalV1 {
+    /// Captures only the queued totals named by this transaction's staking actions.
+    ///
+    /// The queue is scanned once regardless of action count. Duplicate
+    /// coordinates share one scalar, and the signed 32-action limit is enforced
+    /// again here so an internal caller cannot construct an unbounded journal.
+    pub(crate) fn capture<I>(queue: &UnbondingQueue, positions: I) -> Result<Self, ChainError>
+    where
+        I: IntoIterator<Item = (Address, Address, UnbondingKind)>,
+    {
+        let mut selected = BTreeSet::new();
+        for (owner, validator, kind) in positions {
+            selected.insert(UnbondingPositionV1::new(owner, validator, kind));
+            if selected.len() > crate::MAX_ACTIONS_V1 {
+                return Err(ChainError::InvalidUnbondingRequestJournal);
+            }
+        }
+        let totals = queue.queued_totals_for(&selected)?;
+        let positions = totals
+            .into_iter()
+            .map(|(position, amount)| {
+                (
+                    position,
+                    UnbondingQueuedTotalV1 {
+                        captured: amount,
+                        staged: amount,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            captured_next_id: queue.next_id,
+            next_id: queue.next_id,
+            positions,
+            staged_requests: Vec::new(),
+        })
+    }
+
+    /// Returns the queued total visible after prior successful staged actions.
+    pub(crate) fn queued_for(
+        &self,
+        owner: Address,
+        validator: Address,
+        kind: UnbondingKind,
+    ) -> Result<Amount, ChainError> {
+        self.positions
+            .get(&UnbondingPositionV1::new(owner, validator, kind))
+            .map(|total| total.staged)
+            .ok_or(ChainError::InvalidUnbondingRequestJournal)
+    }
+
+    /// Stages one direct-queue-equivalent request and returns its monotonic ID.
+    ///
+    /// Every fallible calculation occurs before the cursor, queued total, or
+    /// request vector changes, so zero amounts, cursor overflow, total overflow,
+    /// and capacity misuse leave the journal byte-for-byte unchanged.
+    pub(crate) fn stage_request(
+        &mut self,
+        owner: Address,
+        validator: Address,
+        kind: UnbondingKind,
+        amount: Amount,
+        requested_epoch: Epoch,
+        reward_checkpoint: Amount,
+    ) -> Result<UnbondingRequestId, ChainError> {
+        if amount.is_zero() {
+            return Err(ChainError::UnbondingAmountZero);
+        }
+        if self.staged_requests.len() >= crate::MAX_ACTIONS_V1 {
+            return Err(ChainError::InvalidUnbondingRequestJournal);
+        }
+        let position = UnbondingPositionV1::new(owner, validator, kind);
+        let total = self
+            .positions
+            .get(&position)
+            .ok_or(ChainError::InvalidUnbondingRequestJournal)?;
+        let next_total = total
+            .staged
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let request_id = UnbondingRequestId::new(self.next_id);
+        let next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let request = UnbondingRequest {
+            id: request_id,
+            owner,
+            validator,
+            kind,
+            requested_epoch,
+            queued: amount,
+            cooling: Vec::new(),
+            withdrawable: Amount::ZERO,
+            claimed: Amount::ZERO,
+            reward_checkpoint,
+        };
+
+        self.positions
+            .get_mut(&position)
+            .ok_or(ChainError::InvalidUnbondingRequestJournal)?
+            .staged = next_total;
+        self.next_id = next_id;
+        self.staged_requests.push(request);
+        Ok(request_id)
+    }
+
+    /// Validates all read coordinates and append destinations before mutation.
+    pub(crate) fn validate_against(
+        self,
+        queue: &UnbondingQueue,
+    ) -> Result<ValidatedUnbondingRequestJournalV1, ChainError> {
+        let selected = self.positions.keys().copied().collect::<BTreeSet<_>>();
+        let current_totals = queue.queued_totals_for(&selected)?;
+        for (position, total) in &self.positions {
+            if current_totals.get(position).copied() != Some(total.captured) {
+                return Err(ChainError::InvalidUnbondingRequestJournal);
+            }
+        }
+
+        if self.staged_requests.is_empty() {
+            return Ok(ValidatedUnbondingRequestJournalV1 {
+                next_id: None,
+                staged_requests: Vec::new(),
+            });
+        }
+        if queue.next_id != self.captured_next_id {
+            return Err(ChainError::InvalidUnbondingRequestJournal);
+        }
+
+        let mut expected_id = self.captured_next_id;
+        let mut recomputed_totals = self
+            .positions
+            .iter()
+            .map(|(position, total)| (*position, total.captured))
+            .collect::<BTreeMap<_, _>>();
+        let mut appended_ids = BTreeSet::new();
+        for request in &self.staged_requests {
+            if request.id != UnbondingRequestId::new(expected_id)
+                || request.queued.is_zero()
+                || !request.cooling.is_empty()
+                || !request.withdrawable.is_zero()
+                || !request.claimed.is_zero()
+                || queue.requests.contains_key(&request.id)
+                || !appended_ids.insert(request.id)
+            {
+                return Err(ChainError::InvalidUnbondingRequestJournal);
+            }
+            let position = UnbondingPositionV1::new(request.owner, request.validator, request.kind);
+            let total = recomputed_totals
+                .get_mut(&position)
+                .ok_or(ChainError::InvalidUnbondingRequestJournal)?;
+            *total = total
+                .checked_add(request.queued)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            expected_id = expected_id
+                .checked_add(1)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        if expected_id != self.next_id
+            || self.positions.iter().any(|(position, total)| {
+                recomputed_totals.get(position).copied() != Some(total.staged)
+            })
+            || queue.fifo.iter().any(|id| appended_ids.contains(id))
+        {
+            return Err(ChainError::InvalidUnbondingRequestJournal);
+        }
+
+        Ok(ValidatedUnbondingRequestJournalV1 {
+            next_id: Some(self.next_id),
+            staged_requests: self.staged_requests,
+        })
+    }
+
+    /// Returns bounded journal cardinalities in focused tests.
+    #[cfg(test)]
+    pub(crate) fn sizes(&self) -> (usize, usize) {
+        (self.positions.len(), self.staged_requests.len())
+    }
+}
+
+impl ValidatedUnbondingRequestJournalV1 {
+    /// Appends already-validated records without allocation based on hostile data.
+    pub(crate) fn apply(self, queue: &mut UnbondingQueue) {
+        let Some(next_id) = self.next_id else {
+            return;
+        };
+        queue.next_id = next_id;
+        for request in self.staged_requests {
+            queue.fifo.push_back(request.id);
+            queue.requests.insert(request.id, request);
+        }
+    }
+}
+
 impl UnbondingClaimJournalV1 {
     /// Captures only the fixed-size fields for the requested IDs.
     ///
@@ -697,6 +984,309 @@ mod tests {
             .advance_epoch(Epoch::new(3), Amount::ZERO, 1, 1)
             .expect("test maturity");
         request_ids
+    }
+
+    #[test]
+    fn request_journal_matches_direct_fifo_without_capturing_unrelated_requests() {
+        let owner = Keypair::from_seed([81; 32]).address();
+        let validator = Keypair::from_seed([82; 32]).address();
+        let unrelated_owner = Keypair::from_seed([83; 32]).address();
+        let unrelated_validator = Keypair::from_seed([84; 32]).address();
+        let mut queue = UnbondingQueue::default();
+        for _ in 0..1_025 {
+            queue
+                .request(
+                    unrelated_owner,
+                    unrelated_validator,
+                    UnbondingKind::Delegation,
+                    Amount::from_units(1),
+                    Epoch::new(3),
+                    Amount::ZERO,
+                )
+                .expect("unrelated request");
+        }
+        let mut direct = queue.clone();
+        let positions = [
+            (owner, validator, UnbondingKind::Delegation),
+            (validator, validator, UnbondingKind::OperatorStake),
+            (owner, validator, UnbondingKind::Delegation),
+        ];
+        let mut journal =
+            UnbondingRequestJournalV1::capture(&queue, positions).expect("bounded capture");
+        assert_eq!(journal.sizes(), (2, 0));
+        assert_eq!(queue.requests().count(), 1_025);
+
+        let expected_ids = [
+            direct
+                .request(
+                    owner,
+                    validator,
+                    UnbondingKind::Delegation,
+                    Amount::from_units(7),
+                    Epoch::new(4),
+                    Amount::from_units(2),
+                )
+                .expect("direct delegation request"),
+            direct
+                .request(
+                    validator,
+                    validator,
+                    UnbondingKind::OperatorStake,
+                    Amount::from_units(11),
+                    Epoch::new(4),
+                    Amount::from_units(3),
+                )
+                .expect("direct operator request"),
+            direct
+                .request(
+                    owner,
+                    validator,
+                    UnbondingKind::Delegation,
+                    Amount::from_units(5),
+                    Epoch::new(4),
+                    Amount::from_units(2),
+                )
+                .expect("second direct delegation request"),
+        ];
+        let staged_ids = [
+            journal
+                .stage_request(
+                    owner,
+                    validator,
+                    UnbondingKind::Delegation,
+                    Amount::from_units(7),
+                    Epoch::new(4),
+                    Amount::from_units(2),
+                )
+                .expect("staged delegation request"),
+            journal
+                .stage_request(
+                    validator,
+                    validator,
+                    UnbondingKind::OperatorStake,
+                    Amount::from_units(11),
+                    Epoch::new(4),
+                    Amount::from_units(3),
+                )
+                .expect("staged operator request"),
+            journal
+                .stage_request(
+                    owner,
+                    validator,
+                    UnbondingKind::Delegation,
+                    Amount::from_units(5),
+                    Epoch::new(4),
+                    Amount::from_units(2),
+                )
+                .expect("second staged delegation request"),
+        ];
+        assert_eq!(staged_ids, expected_ids);
+        assert_eq!(journal.sizes(), (2, 3));
+        assert_eq!(
+            journal
+                .queued_for(owner, validator, UnbondingKind::Delegation)
+                .expect("staged total"),
+            Amount::from_units(12)
+        );
+
+        journal
+            .validate_against(&queue)
+            .expect("unchanged queue validates")
+            .apply(&mut queue);
+        assert_eq!(queue, direct);
+        let restarted: UnbondingQueue =
+            serde_json::from_slice(&serde_json::to_vec(&queue).expect("serialize appended queue"))
+                .expect("restart appended queue");
+        assert_eq!(restarted, direct);
+    }
+
+    #[test]
+    fn request_journal_rejects_stale_cursor_or_queued_total_before_apply() {
+        let owner = Keypair::from_seed([85; 32]).address();
+        let validator = Keypair::from_seed([86; 32]).address();
+        let unrelated = Keypair::from_seed([87; 32]).address();
+        let position = [(owner, validator, UnbondingKind::Delegation)];
+
+        let mut cursor_queue = UnbondingQueue::default();
+        let mut cursor_journal =
+            UnbondingRequestJournalV1::capture(&cursor_queue, position).expect("capture");
+        cursor_journal
+            .stage_request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(2),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("stage request");
+        cursor_queue
+            .request(
+                unrelated,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(1),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("advance base cursor");
+        let before_cursor_validation = cursor_queue.clone();
+        assert!(matches!(
+            cursor_journal.validate_against(&cursor_queue),
+            Err(ChainError::InvalidUnbondingRequestJournal)
+        ));
+        assert_eq!(cursor_queue, before_cursor_validation);
+
+        let mut total_queue = UnbondingQueue::default();
+        total_queue
+            .request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(10),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("base request");
+        let mut total_journal =
+            UnbondingRequestJournalV1::capture(&total_queue, position).expect("capture total");
+        total_journal
+            .stage_request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(2),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("stage against total");
+        total_queue
+            .advance_epoch(Epoch::new(2), Amount::from_units(1), 2, 2)
+            .expect("change selected queued total without changing cursor");
+        let before_total_validation = total_queue.clone();
+        assert!(matches!(
+            total_journal.validate_against(&total_queue),
+            Err(ChainError::InvalidUnbondingRequestJournal)
+        ));
+        assert_eq!(total_queue, before_total_validation);
+    }
+
+    #[test]
+    fn empty_request_journal_ignores_unrelated_queue_growth_and_never_rewinds_cursor() {
+        let owner = Keypair::from_seed([90; 32]).address();
+        let validator = Keypair::from_seed([91; 32]).address();
+        let mut queue = UnbondingQueue::default();
+        let journal = UnbondingRequestJournalV1::capture(&queue, [])
+            .expect("empty transaction journal captures without queue state");
+        let request_id = queue
+            .request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(1),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("unrelated queue growth");
+        let expected = queue.clone();
+        journal
+            .validate_against(&queue)
+            .expect("empty journal is independent of the queue cursor")
+            .apply(&mut queue);
+        assert_eq!(queue, expected);
+        assert_eq!(
+            queue
+                .request(
+                    owner,
+                    validator,
+                    UnbondingKind::Delegation,
+                    Amount::from_units(1),
+                    Epoch::new(1),
+                    Amount::ZERO,
+                )
+                .expect("cursor was not rewound")
+                .get(),
+            request_id.get() + 1
+        );
+    }
+
+    #[test]
+    fn request_journal_bounds_and_overflows_are_internally_atomic() {
+        let owner = Keypair::from_seed([88; 32]).address();
+        let validator = Keypair::from_seed([89; 32]).address();
+        let position = [(owner, validator, UnbondingKind::Delegation)];
+        let queue = UnbondingQueue::default();
+        let mut bounded =
+            UnbondingRequestJournalV1::capture(&queue, position).expect("capture bounded");
+        for _ in 0..crate::MAX_ACTIONS_V1 {
+            bounded
+                .stage_request(
+                    owner,
+                    validator,
+                    UnbondingKind::Delegation,
+                    Amount::from_units(1),
+                    Epoch::new(1),
+                    Amount::ZERO,
+                )
+                .expect("within action bound");
+        }
+        let before_capacity_error = bounded.clone();
+        assert!(matches!(
+            bounded.stage_request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(1),
+                Epoch::new(1),
+                Amount::ZERO,
+            ),
+            Err(ChainError::InvalidUnbondingRequestJournal)
+        ));
+        assert_eq!(bounded, before_capacity_error);
+
+        let mut cursor_overflow =
+            UnbondingRequestJournalV1::capture(&queue, position).expect("capture cursor");
+        cursor_overflow.next_id = u64::MAX;
+        let before_cursor_error = cursor_overflow.clone();
+        assert!(matches!(
+            cursor_overflow.stage_request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(1),
+                Epoch::new(1),
+                Amount::ZERO,
+            ),
+            Err(ChainError::ArithmeticOverflow)
+        ));
+        assert_eq!(cursor_overflow, before_cursor_error);
+
+        let mut full_queue = UnbondingQueue::default();
+        full_queue
+            .request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(u128::MAX),
+                Epoch::new(1),
+                Amount::ZERO,
+            )
+            .expect("full-range base request");
+        let mut total_overflow =
+            UnbondingRequestJournalV1::capture(&full_queue, position).expect("capture full total");
+        let before_total_error = total_overflow.clone();
+        assert!(matches!(
+            total_overflow.stage_request(
+                owner,
+                validator,
+                UnbondingKind::Delegation,
+                Amount::from_units(1),
+                Epoch::new(1),
+                Amount::ZERO,
+            ),
+            Err(ChainError::ArithmeticOverflow)
+        ));
+        assert_eq!(total_overflow, before_total_error);
     }
 
     #[test]

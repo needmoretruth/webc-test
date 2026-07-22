@@ -67,7 +67,8 @@ use crate::token::{
 };
 use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{
-    UnbondingClaimJournalV1, UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition,
+    UnbondingClaimJournalV1, UnbondingKind, UnbondingQueue, UnbondingRequestId,
+    UnbondingRequestJournalV1, UnbondingTransition,
 };
 use crate::wasm_contract::{
     WasmBytecode, WasmContract, WasmContractManifest, WASM_CODE_LEAF_DOMAIN,
@@ -1609,6 +1610,35 @@ impl<'a> NativeObjectMutation<'a> {
             namespace,
             expected_version,
             data,
+        }
+    }
+}
+
+/// Validated wire fields for one validator registration transition.
+///
+/// This internal descriptor keeps the consensus key, stake, commission, and
+/// hostile legacy bootstrap flag inseparable when V4 and V5 call the shared
+/// staking transition. It is not a wire format.
+pub(crate) struct NativeValidatorRegistration {
+    consensus_key: webc_crypto::PublicKeyBytes,
+    self_stake: Amount,
+    commission_bps: u16,
+    bootstrap: bool,
+}
+
+impl NativeValidatorRegistration {
+    /// Constructs one registration descriptor from authenticated action fields.
+    pub(crate) const fn new(
+        consensus_key: webc_crypto::PublicKeyBytes,
+        self_stake: Amount,
+        commission_bps: u16,
+        bootstrap: bool,
+    ) -> Self {
+        Self {
+            consensus_key,
+            self_stake,
+            commission_bps,
+            bootstrap,
         }
     }
 }
@@ -3423,228 +3453,46 @@ impl ChainState {
                 commission_bps,
                 bootstrap,
             } => {
-                access.write(StateKey::validator(tx.sender))?;
-                if self.validators.contains_key(&tx.sender) {
-                    return Err(ChainError::ValidatorAlreadyExists(tx.sender));
-                }
-                if *commission_bps > config.staking.max_commission_bps {
-                    return Err(ChainError::CommissionTooHigh);
-                }
-                if *bootstrap {
-                    return Err(ChainError::BootstrapDisabled);
-                }
-                if *self_stake < config.staking.min_validator_self_stake {
-                    return Err(ChainError::StakeTooSmall);
-                }
-                if !self_stake.is_zero() {
-                    self.debit_native(tx.sender, *self_stake)?;
-                    let account = self.account_mut(tx.sender)?;
-                    account.staked = account
-                        .staked
-                        .checked_add(*self_stake)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                self.validators.insert(
+                self.apply_native_register_validator(
                     tx.sender,
-                    Validator {
-                        operator: tx.sender,
-                        consensus_key: *consensus_key,
-                        self_stake: *self_stake,
-                        delegated_stake: Amount::ZERO,
-                        commission_bps: *commission_bps,
-                        status: ValidatorStatus::PendingActivation,
-                        bootstrap: false,
-                        accumulated_rewards: Amount::ZERO,
-                    },
-                );
-                let validator = self
-                    .validators
-                    .get_mut(&tx.sender)
-                    .ok_or(ChainError::ValidatorNotFound(tx.sender))?;
-                validator.refresh_stake_status(&config.staking)?;
-                events.push(Event::ValidatorRegistered {
-                    operator: tx.sender,
-                    bootstrap: false,
-                });
+                    NativeValidatorRegistration::new(
+                        *consensus_key,
+                        *self_stake,
+                        *commission_bps,
+                        *bootstrap,
+                    ),
+                    &config.staking,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::Delegate { validator, amount } => {
-                access.write(StateKey::validator(*validator))?;
-                access.write(StateKey::delegation(tx.sender, *validator))?;
-                access.write(StateKey::unbonding_queue(*validator))?;
-                if *amount < config.staking.min_delegation {
-                    return Err(ChainError::DelegationTooSmall);
-                }
-                let target = self
-                    .validators
-                    .get(validator)
-                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
-                if matches!(
-                    target.status,
-                    ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
-                ) {
-                    return Err(ChainError::ValidatorNotActive(*validator));
-                }
-                // A queued operator exit remains slashable and voting-active
-                // until admission, but it cannot safely back new delegation:
-                // otherwise a delegator could enter after a full exit request
-                // and be stranded when the epoch snapshot admits that exit.
-                let queued_operator_stake = self.unbonding.queued_for(
+                self.apply_native_delegate(
+                    tx.sender,
                     *validator,
-                    *validator,
-                    UnbondingKind::OperatorStake,
+                    *amount,
+                    &config.staking,
+                    None,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                let available_operator_stake = target
-                    .self_stake
-                    .checked_sub(queued_operator_stake)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let maximum_delegated = available_operator_stake
-                    .checked_mul_u64(4)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let proposed_delegated = target
-                    .delegated_stake
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                if proposed_delegated > maximum_delegated {
-                    return Err(ChainError::DelegationRatioExceeded);
-                }
-
-                self.debit_native(tx.sender, *amount)?;
-                let account = self.account_mut(tx.sender)?;
-                account.delegated = account
-                    .delegated
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-
-                let validator_state = self
-                    .validators
-                    .get_mut(validator)
-                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
-                validator_state.delegated_stake = validator_state
-                    .delegated_stake
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                validator_state.refresh_stake_status(&config.staking)?;
-
-                let key = (tx.sender, *validator);
-                let delegation = self.delegations.entry(key).or_insert(Delegation {
-                    delegator: tx.sender,
-                    validator: *validator,
-                    amount: Amount::ZERO,
-                    accumulated_rewards: Amount::ZERO,
-                });
-                delegation.amount = delegation
-                    .amount
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::Delegated {
-                    delegator: tx.sender,
-                    validator: *validator,
-                    amount: *amount,
-                });
             }
             Operation::Undelegate { validator, amount } => {
-                access.write(StateKey::delegation(tx.sender, *validator))?;
-                access.write(StateKey::unbonding_queue(*validator))?;
-                let key = (tx.sender, *validator);
-                let existing = self
-                    .delegations
-                    .get(&key)
-                    .ok_or(ChainError::DelegationNotFound)?;
-                let already_queued =
-                    self.unbonding
-                        .queued_for(tx.sender, *validator, UnbondingKind::Delegation)?;
-                let available = existing
-                    .amount
-                    .checked_sub(already_queued)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                if available < *amount {
-                    return Err(ChainError::InsufficientBalance {
-                        address: tx.sender,
-                        needed: *amount,
-                        available,
-                    });
-                }
-                let remaining_active = available
-                    .checked_sub(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                if !remaining_active.is_zero() && remaining_active < config.staking.min_delegation {
-                    return Err(ChainError::DelegationTooSmall);
-                }
-                let request_id = self.unbonding.request(
+                self.apply_native_undelegate(
                     tx.sender,
                     *validator,
-                    UnbondingKind::Delegation,
                     *amount,
-                    Epoch::new(self.current_epoch),
-                    existing.accumulated_rewards,
+                    &config.staking,
+                    None,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::UnbondingRequested {
-                    request_id,
-                    delegator: tx.sender,
-                    validator: *validator,
-                    kind: UnbondingKind::Delegation,
-                    amount: *amount,
-                });
             }
             Operation::UnstakeValidator { amount } => {
-                access.write(StateKey::validator(tx.sender))?;
-                access.write(StateKey::unbonding_queue(tx.sender))?;
-                let validator = self
-                    .validators
-                    .get(&tx.sender)
-                    .ok_or(ChainError::ValidatorNotFound(tx.sender))?;
-                let already_queued = self.unbonding.queued_for(
+                self.apply_native_unstake_validator(
                     tx.sender,
-                    tx.sender,
-                    UnbondingKind::OperatorStake,
-                )?;
-                let available = validator
-                    .self_stake
-                    .checked_sub(already_queued)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                if available < *amount {
-                    return Err(ChainError::InsufficientBalance {
-                        address: tx.sender,
-                        needed: *amount,
-                        available,
-                    });
-                }
-                let remaining = available
-                    .checked_sub(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                if remaining.is_zero() {
-                    if !validator.delegated_stake.is_zero() {
-                        return Err(ChainError::OperatorExitHasDelegations);
-                    }
-                } else {
-                    let maximum_delegated = remaining
-                        .checked_mul_u64(4)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    let projected_total = remaining
-                        .checked_add(validator.delegated_stake)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    if remaining < config.staking.min_validator_self_stake
-                        || validator.delegated_stake > maximum_delegated
-                        || projected_total < config.staking.min_validator_total_stake
-                    {
-                        return Err(ChainError::OperatorExitWouldDeactivatePool);
-                    }
-                }
-                let request_id = self.unbonding.request(
-                    tx.sender,
-                    tx.sender,
-                    UnbondingKind::OperatorStake,
                     *amount,
-                    Epoch::new(self.current_epoch),
-                    validator.accumulated_rewards,
+                    &config.staking,
+                    None,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::UnbondingRequested {
-                    request_id,
-                    delegator: tx.sender,
-                    validator: tx.sender,
-                    kind: UnbondingKind::OperatorStake,
-                    amount: *amount,
-                });
             }
             Operation::ClaimUnbonded {
                 validator,
@@ -6518,6 +6366,327 @@ impl ChainState {
             owner: sender,
             lane,
             fee_deposit,
+        });
+        Ok(())
+    }
+
+    /// Registers one validator pool under the immutable staking thresholds.
+    ///
+    /// Registration moves operator principal from the sender's liquid account
+    /// into the validator and account stake mirrors. Bootstrap registration is
+    /// rejected on every transaction path; genesis owns bootstrap allocation.
+    /// The caller's transaction overlay provides whole-action rollback.
+    pub(crate) fn apply_native_register_validator(
+        &mut self,
+        sender: Address,
+        registration: NativeValidatorRegistration,
+        staking: &StakingConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeValidatorRegistration {
+            consensus_key,
+            self_stake,
+            commission_bps,
+            bootstrap,
+        } = registration;
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::validator(sender))?;
+        if self.validators.contains_key(&sender) {
+            return Err(ChainError::ValidatorAlreadyExists(sender));
+        }
+        if commission_bps > staking.max_commission_bps {
+            return Err(ChainError::CommissionTooHigh);
+        }
+        if bootstrap {
+            return Err(ChainError::BootstrapDisabled);
+        }
+        if self_stake < staking.min_validator_self_stake {
+            return Err(ChainError::StakeTooSmall);
+        }
+        if !self_stake.is_zero() {
+            self.debit_native(sender, self_stake)?;
+            let account = self.account_mut(sender)?;
+            account.staked = account
+                .staked
+                .checked_add(self_stake)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+        }
+        self.validators.insert(
+            sender,
+            Validator {
+                operator: sender,
+                consensus_key,
+                self_stake,
+                delegated_stake: Amount::ZERO,
+                commission_bps,
+                status: ValidatorStatus::PendingActivation,
+                bootstrap: false,
+                accumulated_rewards: Amount::ZERO,
+            },
+        );
+        self.validators
+            .get_mut(&sender)
+            .ok_or(ChainError::ValidatorNotFound(sender))?
+            .refresh_stake_status(staking)?;
+        events.push(Event::ValidatorRegistered {
+            operator: sender,
+            bootstrap: false,
+        });
+        Ok(())
+    }
+
+    /// Adds active delegation while preserving the operator/delegator ratio.
+    ///
+    /// A sparse V5 caller supplies a request journal so queued operator exits
+    /// earlier in the same action program reduce capacity immediately. V4 passes
+    /// `None` and reads its cloned full queue directly. Principal and all mirror
+    /// records change only inside the caller-owned transaction overlay.
+    pub(crate) fn apply_native_delegate(
+        &mut self,
+        sender: Address,
+        validator: Address,
+        amount: Amount,
+        staking: &StakingConfig,
+        request_journal: Option<&UnbondingRequestJournalV1>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::validator(validator))?;
+        access.write(StateKey::delegation(sender, validator))?;
+        access.write(StateKey::unbonding_queue(validator))?;
+        if amount < staking.min_delegation {
+            return Err(ChainError::DelegationTooSmall);
+        }
+        let target = self
+            .validators
+            .get(&validator)
+            .ok_or(ChainError::ValidatorNotFound(validator))?;
+        if matches!(
+            target.status,
+            ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
+        ) {
+            return Err(ChainError::ValidatorNotActive(validator));
+        }
+        // A queued operator exit remains slashable and voting-active until
+        // admission, but cannot safely back new delegation in the meantime.
+        let queued_operator_stake = match request_journal {
+            Some(journal) => {
+                journal.queued_for(validator, validator, UnbondingKind::OperatorStake)?
+            }
+            None => {
+                self.unbonding
+                    .queued_for(validator, validator, UnbondingKind::OperatorStake)?
+            }
+        };
+        let available_operator_stake = target
+            .self_stake
+            .checked_sub(queued_operator_stake)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let maximum_delegated = available_operator_stake
+            .checked_mul_u64(4)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let proposed_delegated = target
+            .delegated_stake
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if proposed_delegated > maximum_delegated {
+            return Err(ChainError::DelegationRatioExceeded);
+        }
+
+        self.debit_native(sender, amount)?;
+        let account = self.account_mut(sender)?;
+        account.delegated = account
+            .delegated
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+
+        let validator_state = self
+            .validators
+            .get_mut(&validator)
+            .ok_or(ChainError::ValidatorNotFound(validator))?;
+        validator_state.delegated_stake = validator_state
+            .delegated_stake
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        validator_state.refresh_stake_status(staking)?;
+
+        let delegation = self
+            .delegations
+            .entry((sender, validator))
+            .or_insert(Delegation {
+                delegator: sender,
+                validator,
+                amount: Amount::ZERO,
+                accumulated_rewards: Amount::ZERO,
+            });
+        delegation.amount = delegation
+            .amount
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::Delegated {
+            delegator: sender,
+            validator,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Queues delegation principal for epoch-bounded withdrawal.
+    ///
+    /// The active position remains unchanged until epoch admission. Ordered V5
+    /// actions observe earlier staged requests through the bounded journal;
+    /// direct V4 execution appends to its full cloned queue.
+    pub(crate) fn apply_native_undelegate(
+        &mut self,
+        sender: Address,
+        validator: Address,
+        amount: Amount,
+        staking: &StakingConfig,
+        request_journal: Option<&mut UnbondingRequestJournalV1>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::delegation(sender, validator))?;
+        access.write(StateKey::unbonding_queue(validator))?;
+        let existing = self
+            .delegations
+            .get(&(sender, validator))
+            .ok_or(ChainError::DelegationNotFound)?;
+        let already_queued = match request_journal.as_ref() {
+            Some(journal) => journal.queued_for(sender, validator, UnbondingKind::Delegation)?,
+            None => self
+                .unbonding
+                .queued_for(sender, validator, UnbondingKind::Delegation)?,
+        };
+        let available = existing
+            .amount
+            .checked_sub(already_queued)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if available < amount {
+            return Err(ChainError::InsufficientBalance {
+                address: sender,
+                needed: amount,
+                available,
+            });
+        }
+        let remaining_active = available
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if !remaining_active.is_zero() && remaining_active < staking.min_delegation {
+            return Err(ChainError::DelegationTooSmall);
+        }
+        let request_id = match request_journal {
+            Some(journal) => journal.stage_request(
+                sender,
+                validator,
+                UnbondingKind::Delegation,
+                amount,
+                Epoch::new(self.current_epoch),
+                existing.accumulated_rewards,
+            )?,
+            None => self.unbonding.request(
+                sender,
+                validator,
+                UnbondingKind::Delegation,
+                amount,
+                Epoch::new(self.current_epoch),
+                existing.accumulated_rewards,
+            )?,
+        };
+        events.push(Event::UnbondingRequested {
+            request_id,
+            delegator: sender,
+            validator,
+            kind: UnbondingKind::Delegation,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Queues operator self-stake while preserving pool activation constraints.
+    ///
+    /// A full exit is allowed only after all delegation leaves. A partial exit
+    /// must leave the operator minimum, total activation minimum, and 20/80
+    /// leverage limit intact. Principal remains slashable until epoch admission.
+    pub(crate) fn apply_native_unstake_validator(
+        &mut self,
+        sender: Address,
+        amount: Amount,
+        staking: &StakingConfig,
+        request_journal: Option<&mut UnbondingRequestJournalV1>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::validator(sender))?;
+        access.write(StateKey::unbonding_queue(sender))?;
+        let validator = self
+            .validators
+            .get(&sender)
+            .ok_or(ChainError::ValidatorNotFound(sender))?;
+        let already_queued = match request_journal.as_ref() {
+            Some(journal) => journal.queued_for(sender, sender, UnbondingKind::OperatorStake)?,
+            None => self
+                .unbonding
+                .queued_for(sender, sender, UnbondingKind::OperatorStake)?,
+        };
+        let available = validator
+            .self_stake
+            .checked_sub(already_queued)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if available < amount {
+            return Err(ChainError::InsufficientBalance {
+                address: sender,
+                needed: amount,
+                available,
+            });
+        }
+        let remaining = available
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if remaining.is_zero() {
+            if !validator.delegated_stake.is_zero() {
+                return Err(ChainError::OperatorExitHasDelegations);
+            }
+        } else {
+            let maximum_delegated = remaining
+                .checked_mul_u64(4)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            let projected_total = remaining
+                .checked_add(validator.delegated_stake)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            if remaining < staking.min_validator_self_stake
+                || validator.delegated_stake > maximum_delegated
+                || projected_total < staking.min_validator_total_stake
+            {
+                return Err(ChainError::OperatorExitWouldDeactivatePool);
+            }
+        }
+        let request_id = match request_journal {
+            Some(journal) => journal.stage_request(
+                sender,
+                sender,
+                UnbondingKind::OperatorStake,
+                amount,
+                Epoch::new(self.current_epoch),
+                validator.accumulated_rewards,
+            )?,
+            None => self.unbonding.request(
+                sender,
+                sender,
+                UnbondingKind::OperatorStake,
+                amount,
+                Epoch::new(self.current_epoch),
+                validator.accumulated_rewards,
+            )?,
+        };
+        events.push(Event::UnbondingRequested {
+            request_id,
+            delegator: sender,
+            validator: sender,
+            kind: UnbondingKind::OperatorStake,
+            amount,
         });
         Ok(())
     }
@@ -13218,6 +13387,119 @@ mod tests {
             Err(ChainError::NonceMismatch { .. })
         ));
         assert_eq!(state, replay_before);
+    }
+
+    #[test]
+    fn non_default_lane_register_and_delegate_consume_declared_main_accounts() {
+        let (config, mut state, operator, delegator) = funded_state();
+        let operator_lane = AuthorizationLaneId::new(Hash256::digest(b"operator-staking-lane"));
+        let delegator_lane = AuthorizationLaneId::new(Hash256::digest(b"delegator-staking-lane"));
+        let fund = Transaction::for_operation(
+            &operator,
+            0,
+            Operation::Transfer {
+                to: delegator.address(),
+                amount: Amount::from_webc(200),
+            },
+            FeeBid::default(),
+        )
+        .expect("delegator funding signs");
+        state
+            .execute_transaction(&fund, &config)
+            .expect("delegator funded");
+
+        for (owner, nonce, lane) in [
+            (&operator, 1_u64, operator_lane),
+            (&delegator, 0_u64, delegator_lane),
+        ] {
+            let open = Transaction::for_operation(
+                owner,
+                nonce,
+                Operation::OpenAuthorizationLane {
+                    lane,
+                    fee_deposit: Amount::from_webc(1),
+                },
+                FeeBid {
+                    gas_limit: 20_000,
+                    max_fee_per_unit: 1,
+                    priority_fee_per_unit: 0,
+                },
+            )
+            .expect("staking lane opening signs");
+            state
+                .execute_transaction(&open, &config)
+                .expect("staking lane opens");
+        }
+
+        let register = Transaction::for_operation_in_lane(
+            &operator,
+            operator_lane,
+            0,
+            Operation::RegisterValidator {
+                consensus_key: operator.public_key(),
+                self_stake: Amount::from_webc(100),
+                commission_bps: 500,
+                bootstrap: false,
+            },
+            FeeBid {
+                gas_limit: 30_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("lane registration signs");
+        state
+            .execute_transaction(&register, &config)
+            .expect("lane registration consumes its declared account write");
+        assert_eq!(
+            state.validators[&operator.address()].status,
+            ValidatorStatus::Active
+        );
+        assert_eq!(
+            state.accounts[&operator.address()].staked,
+            Amount::from_webc(100)
+        );
+
+        let delegate = Transaction::for_operation_in_lane(
+            &delegator,
+            delegator_lane,
+            0,
+            Operation::Delegate {
+                validator: operator.address(),
+                amount: Amount::from_webc(1),
+            },
+            FeeBid {
+                gas_limit: 15_000,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+        )
+        .expect("lane delegation signs");
+        state
+            .execute_transaction(&delegate, &config)
+            .expect("lane delegation consumes its declared account write");
+        assert_eq!(
+            state.delegations[&(delegator.address(), operator.address())].amount,
+            Amount::from_webc(1)
+        );
+        assert_eq!(
+            state.accounts[&delegator.address()].delegated,
+            Amount::from_webc(1)
+        );
+        assert_eq!(
+            state.authorization_lanes[&(operator.address(), operator_lane)].next_nonce,
+            Nonce::new(1)
+        );
+        assert_eq!(
+            state.authorization_lanes[&(delegator.address(), delegator_lane)].next_nonce,
+            Nonce::new(1)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("staking lane supply report")
+                .balanced
+        );
     }
 
     #[test]

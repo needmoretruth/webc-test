@@ -17,7 +17,9 @@
 use crate::sponsor_grant_book::SponsorGrantBookError;
 use crate::state::{NativeActionEffects, NativeObjectMutation};
 use crate::state_key::StateAccessRecorder;
-use crate::unbonding::{UnbondingClaimJournalV1, UnbondingRequestId};
+use crate::unbonding::{
+    UnbondingClaimJournalV1, UnbondingKind, UnbondingRequestId, UnbondingRequestJournalV1,
+};
 use crate::{
     calculate_fee_summary_v1, ActionIndex, ActionV1, Amount, AssetId, AuthorizationLaneId,
     BlockHeight, BlockPositionV1, ChainConfig, ChainError, ChainId, ChainState, Event, EventIndex,
@@ -234,6 +236,7 @@ enum ExecutionWriteKeyV1 {
 struct SparseExecutionStateV1 {
     state: ChainState,
     unbonding_claims: UnbondingClaimJournalV1,
+    unbonding_requests: UnbondingRequestJournalV1,
     writes: Vec<ExecutionWriteKeyV1>,
     captured_burned_fees: Amount,
     captured_validator_fee_pool: Amount,
@@ -247,6 +250,7 @@ impl SparseExecutionStateV1 {
         read_only: &[StateKey],
         read_write: &[StateKey],
         unbonding_claim_ids: &[UnbondingRequestId],
+        unbonding_request_positions: &[(Address, Address, UnbondingKind)],
     ) -> Result<Self, BlockExecutionErrorV1> {
         let mut state = ChainState {
             protocol_version: base.protocol_version,
@@ -276,6 +280,11 @@ impl SparseExecutionStateV1 {
                 &base.unbonding,
                 unbonding_claim_ids.iter().copied(),
             ),
+            unbonding_requests: UnbondingRequestJournalV1::capture(
+                &base.unbonding,
+                unbonding_request_positions.iter().copied(),
+            )
+            .map_err(map_block_chain_error)?,
             writes,
             captured_burned_fees: base.burned_fees,
             captured_validator_fee_pool: base.validator_fee_pool,
@@ -321,6 +330,10 @@ impl SparseExecutionStateV1 {
             .unbonding_claims
             .validate_against(&base.unbonding)
             .map_err(map_block_chain_error)?;
+        let validated_unbonding_requests = self
+            .unbonding_requests
+            .validate_against(&base.unbonding)
+            .map_err(map_block_chain_error)?;
         // The sponsor book is the only typed commit that can fail after
         // execution. Preflight and apply the complete batch before touching any
         // account/nonce/fee record, so an invalid sparse index cannot leave a
@@ -329,6 +342,7 @@ impl SparseExecutionStateV1 {
             .commit_entries_from(&self.state.sponsor_grants, sponsor_keys)
             .map_err(map_sponsor_book_execution_error)?;
         validated_unbonding_claims.apply(&mut base.unbonding);
+        validated_unbonding_requests.apply(&mut base.unbonding);
         for key in self.writes {
             match key {
                 ExecutionWriteKeyV1::Account(address) => {
@@ -884,10 +898,13 @@ impl ChainState {
             &mut access,
         )?;
         let unbonding_claim_ids = unbonding_claim_ids(&transaction.kind);
+        let unbonding_request_positions =
+            unbonding_request_positions(&transaction.kind, transaction.sender);
 
         let SparseExecutionStateV1 {
             state: mut parent,
             unbonding_claims: parent_unbonding_claims,
+            unbonding_requests: parent_unbonding_requests,
             writes,
             captured_burned_fees,
             captured_validator_fee_pool,
@@ -897,6 +914,7 @@ impl ChainState {
             &transaction.access_list.read_only,
             &transaction.access_list.read_write,
             &unbonding_claim_ids,
+            &unbonding_request_positions,
         )?;
         debit_fee_reserve(&mut parent, snapshot.fee_payer, snapshot.fee_reserve)?;
         advance_sender_nonce(
@@ -905,31 +923,40 @@ impl ChainState {
             transaction.authorization.lane,
         )?;
 
-        let (mut selected, selected_unbonding_claims, status, attempted_units, typed_events) =
-            match &transaction.kind {
-                TransactionKindV1::Cancel(_) => {
-                    access.finish().map_err(map_block_chain_error)?;
-                    (
-                        parent,
-                        parent_unbonding_claims,
-                        ReceiptStatusV1::Succeeded,
-                        snapshot.required_units,
-                        Vec::new(),
-                    )
+        let outcome = match &transaction.kind {
+            TransactionKindV1::Cancel(_) => {
+                access.finish().map_err(map_block_chain_error)?;
+                ActionProgramOutcomeV1 {
+                    state: parent,
+                    unbonding_claims: parent_unbonding_claims,
+                    unbonding_requests: parent_unbonding_requests,
+                    status: ReceiptStatusV1::Succeeded,
+                    attempted_units: snapshot.required_units,
+                    events: Vec::new(),
                 }
-                TransactionKindV1::Actions(program) => execute_action_program_v1(
-                    parent,
-                    parent_unbonding_claims,
-                    ActionProgramContextV1 {
-                        transaction: &transaction,
-                        transaction_id,
-                        program,
-                        height: position.height,
-                        storage_pricing: snapshot.storage_pricing,
-                    },
-                    &mut access,
-                )?,
-            };
+            }
+            TransactionKindV1::Actions(program) => execute_action_program_v1(
+                parent,
+                parent_unbonding_claims,
+                parent_unbonding_requests,
+                ActionProgramContextV1 {
+                    transaction: &transaction,
+                    transaction_id,
+                    program,
+                    height: position.height,
+                    storage_pricing: snapshot.storage_pricing,
+                },
+                &mut access,
+            )?,
+        };
+        let ActionProgramOutcomeV1 {
+            state: mut selected,
+            unbonding_claims: selected_unbonding_claims,
+            unbonding_requests: selected_unbonding_requests,
+            status,
+            attempted_units,
+            events: typed_events,
+        } = outcome;
 
         let fee_summary = calculate_fee_summary_v1(
             snapshot.fee_payer,
@@ -969,6 +996,7 @@ impl ChainState {
         SparseExecutionStateV1 {
             state: selected,
             unbonding_claims: selected_unbonding_claims,
+            unbonding_requests: selected_unbonding_requests,
             writes,
             captured_burned_fees,
             captured_validator_fee_pool,
@@ -990,6 +1018,35 @@ fn unbonding_claim_ids(kind: &TransactionKindV1) -> Vec<UnbondingRequestId> {
         .filter_map(|action| match action {
             ActionV1::Native { operation } => match operation.as_ref() {
                 Operation::ClaimUnbonded { request_id, .. } => Some(*request_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Extracts queued-principal coordinates consulted by V5 staking actions.
+fn unbonding_request_positions(
+    kind: &TransactionKindV1,
+    sender: Address,
+) -> Vec<(Address, Address, UnbondingKind)> {
+    let TransactionKindV1::Actions(program) = kind else {
+        return Vec::new();
+    };
+    program
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            ActionV1::Native { operation } => match operation.as_ref() {
+                Operation::Delegate { validator, .. } => {
+                    Some((*validator, *validator, UnbondingKind::OperatorStake))
+                }
+                Operation::Undelegate { validator, .. } => {
+                    Some((sender, *validator, UnbondingKind::Delegation))
+                }
+                Operation::UnstakeValidator { .. } => {
+                    Some((sender, sender, UnbondingKind::OperatorStake))
+                }
                 _ => None,
             },
             _ => None,
@@ -1037,6 +1094,7 @@ struct NativeActionContextV1 {
 fn execute_native_action_v1(
     state: &mut ChainState,
     unbonding_claims: &mut UnbondingClaimJournalV1,
+    _unbonding_requests: &mut UnbondingRequestJournalV1,
     context: NativeActionContextV1,
     operation: &Operation,
     access: &mut StateAccessRecorder,
@@ -1279,21 +1337,29 @@ struct ActionProgramContextV1<'a> {
     storage_pricing: StoragePricing,
 }
 
+/// Complete child-overlay result selected for fee and sparse-state commit.
+struct ActionProgramOutcomeV1 {
+    /// Child state on success, or the untouched parent on chargeable failure.
+    state: ChainState,
+    /// Claim effects selected with the same parent/child rollback boundary.
+    unbonding_claims: UnbondingClaimJournalV1,
+    /// Request append effects selected with the same rollback boundary.
+    unbonding_requests: UnbondingRequestJournalV1,
+    /// Receipt success or the first chargeable action failure.
+    status: ReceiptStatusV1,
+    /// Static units attempted through the selected action boundary.
+    attempted_units: GasUnits,
+    /// Typed events; always empty when the child program failed.
+    events: Vec<EventV1>,
+}
+
 fn execute_action_program_v1(
     parent: ChainState,
     parent_unbonding_claims: UnbondingClaimJournalV1,
+    parent_unbonding_requests: UnbondingRequestJournalV1,
     context: ActionProgramContextV1<'_>,
     access: &mut StateAccessRecorder,
-) -> Result<
-    (
-        ChainState,
-        UnbondingClaimJournalV1,
-        ReceiptStatusV1,
-        GasUnits,
-        Vec<EventV1>,
-    ),
-    BlockExecutionErrorV1,
-> {
+) -> Result<ActionProgramOutcomeV1, BlockExecutionErrorV1> {
     let ActionProgramContextV1 {
         transaction,
         transaction_id,
@@ -1303,6 +1369,7 @@ fn execute_action_program_v1(
     } = context;
     let mut child = parent.clone();
     let mut child_unbonding_claims = parent_unbonding_claims.clone();
+    let mut child_unbonding_requests = parent_unbonding_requests.clone();
     let mut attempted_units = if matches!(&transaction.fee_payment, FeePaymentV1::Sponsored(_)) {
         SPONSOR_GRANT_USE_V1_REQUIRED_UNITS
     } else {
@@ -1322,6 +1389,7 @@ fn execute_action_program_v1(
             ActionV1::Native { operation } => match execute_native_action_v1(
                 &mut child,
                 &mut child_unbonding_claims,
+                &mut child_unbonding_requests,
                 NativeActionContextV1 {
                     sender: transaction.sender,
                     sender_public_key: transaction.sender_public_key,
@@ -1385,28 +1453,30 @@ fn execute_action_program_v1(
 
         if let Err(error) = result {
             let code = classify_action_failure(error)?;
-            return Ok((
-                parent,
-                parent_unbonding_claims,
-                ReceiptStatusV1::Failed {
+            return Ok(ActionProgramOutcomeV1 {
+                state: parent,
+                unbonding_claims: parent_unbonding_claims,
+                unbonding_requests: parent_unbonding_requests,
+                status: ReceiptStatusV1::Failed {
                     code,
                     failed_action_index: Some(action_index),
                 },
-                GasUnits::new(attempted_units),
-                Vec::new(),
-            ));
+                attempted_units: GasUnits::new(attempted_units),
+                events: Vec::new(),
+            });
         }
         append_typed_events(&mut events, transaction_id, action_index, action_events)?;
     }
 
     access.finish().map_err(map_block_chain_error)?;
-    Ok((
-        child,
-        child_unbonding_claims,
-        ReceiptStatusV1::Succeeded,
-        GasUnits::new(attempted_units),
+    Ok(ActionProgramOutcomeV1 {
+        state: child,
+        unbonding_claims: child_unbonding_claims,
+        unbonding_requests: child_unbonding_requests,
+        status: ReceiptStatusV1::Succeeded,
+        attempted_units: GasUnits::new(attempted_units),
         events,
-    ))
+    })
 }
 
 /// Applies either a cheap materialized revoke or an authenticated pre-use revoke.
@@ -3501,6 +3571,7 @@ mod tests {
             &transaction.access_list.read_only,
             &transaction.access_list.read_write,
             &claim_ids,
+            &[],
         )
         .expect("request-scoped overlay captures");
 
@@ -3557,6 +3628,7 @@ mod tests {
             &transaction.access_list.read_only,
             &transaction.access_list.read_write,
             &claim_ids,
+            &[],
         )
         .expect("missing request captures authenticated absence");
         assert_eq!(overlay.state.unbonding.requests().count(), 0);
@@ -4476,6 +4548,7 @@ mod tests {
             &transaction.access_list.read_only,
             &transaction.access_list.read_write,
             &[],
+            &[],
         )
         .expect("declared transfer inputs capture");
 
@@ -4503,12 +4576,14 @@ mod tests {
             &[],
             &[StateKey::fee_accumulator(first_payer)],
             &[],
+            &[],
         )
         .expect("first fee overlay captures");
         let mut second = SparseExecutionStateV1::capture(
             &base,
             &[],
             &[StateKey::fee_accumulator(second_payer)],
+            &[],
             &[],
         )
         .expect("second fee overlay captures from same snapshot");
@@ -4527,9 +4602,9 @@ mod tests {
     #[test]
     fn independent_storage_overlays_merge_full_range_directional_deltas() {
         fn overlays(base: &ChainState) -> (SparseExecutionStateV1, SparseExecutionStateV1) {
-            let mut increase = SparseExecutionStateV1::capture(base, &[], &[], &[])
+            let mut increase = SparseExecutionStateV1::capture(base, &[], &[], &[], &[])
                 .expect("increase overlay captures");
-            let mut decrease = SparseExecutionStateV1::capture(base, &[], &[], &[])
+            let mut decrease = SparseExecutionStateV1::capture(base, &[], &[], &[], &[])
                 .expect("decrease overlay captures");
             increase.state.storage_deposits = Amount::from_units(130);
             decrease.state.storage_deposits = Amount::from_units(90);
@@ -4572,7 +4647,7 @@ mod tests {
         base.accounts
             .insert(owner, Account::with_balance(Amount::from_units(10)));
         let mut overlay =
-            SparseExecutionStateV1::capture(&base, &[], &[StateKey::account(owner)], &[])
+            SparseExecutionStateV1::capture(&base, &[], &[StateKey::account(owner)], &[], &[])
                 .expect("storage overlay captures");
         overlay.state.storage_deposits = Amount::ZERO;
         overlay

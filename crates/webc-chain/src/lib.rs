@@ -339,6 +339,8 @@ pub enum ChainError {
     UnbondingRequestNotFound,
     #[error("V5 unbonding claim journal is incomplete or stale")]
     InvalidUnbondingClaimJournal,
+    #[error("V5 unbonding request journal is incomplete, corrupt, or stale")]
+    InvalidUnbondingRequestJournal,
     #[error("unbonding request is owned by another account")]
     UnbondingOwnerMismatch,
     #[error("unbonding request has no matured principal to claim")]

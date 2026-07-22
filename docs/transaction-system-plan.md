@@ -825,6 +825,46 @@ actions must use a bounded additive/request journal rather than cloning the
 global `UnbondingQueue`; stable state races are chargeable receipt failures,
 while arithmetic, configuration, and access violations remain block errors.
 
+### Bounded staking-request journal checkpoint (2026-07-22)
+
+The queue and transition foundation for the V5 staking group is complete. A
+new request journal captures only the queued totals named by at most 32 signed
+actions plus the monotonic request cursor; it never clones unrelated requests or
+the global FIFO. Ordered actions see earlier staged exits, IDs remain identical
+to direct queue execution, and commit validates every consulted total, cursor,
+destination ID, and reconstructed staged total before changing any base record.
+Successful appends preserve direct-queue serialization and state-root semantics;
+stale totals/cursors, capacity misuse, and full-range arithmetic failures leave
+both journal and base byte-for-byte unchanged. Coverage includes 1,025 unrelated
+requests, mixed operator/delegation appends, restart equivalence, and the 32-action
+bound.
+
+V4 registration, delegation, undelegation, and operator-exit logic now call four
+focused shared transitions. This also fixes a pre-existing exact-access bug:
+registration and delegation paid from a non-default authorization lane declared
+the sender's main account but failed to record that write, so successful state
+changes were rejected as unused access. The regression test proves both actions
+now consume the main account while fee and nonce remain isolated in their lanes.
+The V5 sparse overlay already carries and atomically preflights the new request
+journal alongside the request-scoped claim journal. The focused gate passes
+formatting, strict all-target `webc-chain` Clippy, all 516 unit tests, the native
+supply-invariant test, all eight sharded-parallel tests, and Rust documentation.
+
+Legacy native staking operations deliberately remain unsupported in V5 at this
+checkpoint. `docs/decision-record.md` requires post-quantum-root authorization
+for staking control, but the protocol-1 `Operation` variants carry no such proof;
+enabling them unchanged would reproduce a known policy violation in the new
+transaction system.
+
+Exact next item: add a versioned V5 staking-control action format carrying a
+bounded post-quantum root reveal and a domain-separated authorization message
+bound to chain, owner, policy revision, default lane, transaction nonce, action
+index, and exact staking payload. Validate immutable staking configuration and
+snapshot it across preparation/execution, update the frozen Rust/TypeScript wire
+fixtures, then integrate the four shared transitions with chargeable state-race
+failures and full rollback/restart/supply coverage. Do not enable the legacy
+native staking variants as a shortcut.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
