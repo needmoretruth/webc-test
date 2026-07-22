@@ -14,6 +14,7 @@
 //! parent; undeclared access, arithmetic faults, and unsupported actions discard
 //! everything as block errors.
 
+use crate::sponsor_grant_book::SponsorGrantBookError;
 use crate::state::NativeActionEffects;
 use crate::state_key::StateAccessRecorder;
 use crate::{
@@ -21,33 +22,20 @@ use crate::{
     BlockHeight, BlockPositionV1, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
     ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate,
     GasUnits, Nonce, ObjectId, Operation, ProtocolStateKey, ReceiptError, ReceiptStatusV1,
-    ReceiptV1, SessionKey, SessionKeyId, SponsorGrantId, SponsorUseCount, SponsorUseNonce,
-    StateKey, StateKeyKind, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
-    EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION, RECEIPT_V1,
+    ReceiptV1, SessionKey, SessionKeyId, SponsorGrantId, SponsorGrantStateV1, StateKey,
+    StateKeyKind, TransactionKindV1, TransactionV5, TransactionValidationErrorV1, EVENT_V1,
+    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1,
+    SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
 
-/// Durable replay, fee-budget, use-count, and revocation state for one grant.
+/// Maximum blocks before activation at which a signed grant may be revoked.
 ///
-/// A grant may be revoked before its first use, so `grant_digest` is optional.
-/// Once a use records the digest it never changes; presenting another immutable
-/// grant under the same `(sponsor, grant_id)` is rejected during preparation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SponsorGrantStateV1 {
-    /// Digest of the first complete signed grant observed, or none before use.
-    pub grant_digest: Option<Hash256>,
-    /// Exact use nonce required by the next includable sponsored transaction.
-    pub next_use_nonce: SponsorUseNonce,
-    /// Actual native base units charged across all included uses.
-    pub total_charged: Amount,
-    /// Number of included uses, including chargeable action failures.
-    pub uses: SponsorUseCount,
-    /// Permanent owner-authorized revocation marker.
-    pub revoked: bool,
-}
+/// Combined with the grant's 4,096-block maximum span, this bounds a pre-use
+/// tombstone's lifetime to at most 8,191 blocks. The value is an experimental
+/// protocol-2 activation parameter and must be benchmarked before activation.
+pub const MAX_SPONSOR_REVOCATION_LOOKAHEAD_BLOCKS_V1: u64 = MAX_TRANSACTION_VALIDITY_BLOCKS;
 
 /// Stable state-dependent rejection before a transaction becomes includable.
 ///
@@ -95,6 +83,12 @@ pub enum TransactionPreparationErrorV1 {
     /// ID-only revocation cannot create state for a grant never observed on-chain.
     #[error("V5 sponsor grant must be materialized before ID-only revocation")]
     SponsorGrantNotMaterialized,
+    /// The authenticated grant lifetime ended before the candidate height.
+    #[error("V5 sponsor grant is already expired")]
+    SponsorGrantExpired,
+    /// A pre-use revocation would retain state beyond the bounded lookahead.
+    #[error("V5 sponsor grant starts beyond the revocation lookahead")]
+    SponsorGrantTooFarInFuture,
     /// The use nonce is not the durable next nonce.
     #[error("V5 sponsor use nonce does not match current state")]
     SponsorNonceMismatch,
@@ -244,6 +238,21 @@ impl SparseExecutionStateV1 {
             .writes
             .iter()
             .any(|key| matches!(key, ExecutionWriteKeyV1::UnbondingQueue));
+        let sponsor_keys = self
+            .writes
+            .iter()
+            .filter_map(|key| match key {
+                ExecutionWriteKeyV1::SponsorGrant(sponsor, grant_id) => Some((*sponsor, *grant_id)),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        // The sponsor book is the only typed commit that can fail after
+        // execution. Preflight and apply the complete batch before touching any
+        // account/nonce/fee record, so an invalid sparse index cannot leave a
+        // partially committed transaction.
+        base.sponsor_grants
+            .commit_entries_from(&self.state.sponsor_grants, sponsor_keys)
+            .map_err(map_sponsor_book_execution_error)?;
         for key in self.writes {
             match key {
                 ExecutionWriteKeyV1::Account(address) => {
@@ -301,11 +310,7 @@ impl SparseExecutionStateV1 {
                 ExecutionWriteKeyV1::ProtocolBridgeNonce => {
                     base.bridge_nonce = self.state.bridge_nonce;
                 }
-                ExecutionWriteKeyV1::SponsorGrant(sponsor, grant_id) => commit_map_entry(
-                    &mut base.sponsor_grants,
-                    &mut self.state.sponsor_grants,
-                    (sponsor, grant_id),
-                ),
+                ExecutionWriteKeyV1::SponsorGrant(_, _) => {}
             }
         }
         if commit_unbonding {
@@ -386,11 +391,13 @@ fn capture_state_key(
             capture_map_entry(&base.objects, &mut target.objects, object_id);
         }
         StateKeyKind::Protocol { .. } => {}
-        StateKeyKind::SponsorGrant { sponsor, grant_id } => capture_map_entry(
-            &base.sponsor_grants,
-            &mut target.sponsor_grants,
-            &(*sponsor, SponsorGrantId::new(*grant_id)),
-        ),
+        StateKeyKind::SponsorGrant { sponsor, grant_id } => target
+            .sponsor_grants
+            .capture_from(
+                &base.sponsor_grants,
+                (*sponsor, SponsorGrantId::new(*grant_id)),
+            )
+            .map_err(map_sponsor_book_execution_error)?,
         StateKeyKind::Application { .. } => {}
         StateKeyKind::Module { .. } => {
             return Err(BlockExecutionErrorV1::StateAccessInvariant);
@@ -689,8 +696,6 @@ impl ChainState {
         if expected_nonce != transaction.authorization.nonce {
             return Err(TransactionPreparationErrorV1::SenderNonceMismatch);
         }
-        prepare_action_storage(self, transaction)?;
-
         let fee_payer = match &transaction.fee_payment {
             FeePaymentV1::SenderLane => FeePayerV1 {
                 address: transaction.sender,
@@ -704,6 +709,7 @@ impl ChainState {
                 }
             }
         };
+        prepare_sponsor_storage(self, transaction, height)?;
         if payer_balance(self, fee_payer)? < fee_reserve {
             return Err(TransactionPreparationErrorV1::InsufficientFeeReserve);
         }
@@ -789,6 +795,7 @@ impl ChainState {
                 &transaction,
                 transaction_id,
                 program,
+                position.height,
                 &mut access,
             )?,
         };
@@ -802,7 +809,12 @@ impl ChainState {
             FeeRate::new(transaction.fee_bid.priority_fee_per_unit),
         )?;
         finalize_fee_accounting(&mut selected, &fee_summary)?;
-        finalize_sponsor_use(&mut selected, &transaction, fee_summary.charged)?;
+        finalize_sponsor_use(
+            &mut selected,
+            &transaction,
+            position.height,
+            fee_summary.charged,
+        )?;
         finalize_session_use(
             &mut selected,
             &transaction,
@@ -1086,10 +1098,15 @@ fn execute_action_program_v1(
     transaction: &TransactionV5,
     transaction_id: crate::TransactionId,
     program: &crate::ActionProgramV1,
+    height: BlockHeight,
     access: &mut StateAccessRecorder,
 ) -> Result<(ChainState, ReceiptStatusV1, GasUnits, Vec<EventV1>), BlockExecutionErrorV1> {
     let mut child = parent.clone();
-    let mut attempted_units = 0_u64;
+    let mut attempted_units = if matches!(&transaction.fee_payment, FeePaymentV1::Sponsored(_)) {
+        SPONSOR_GRANT_USE_V1_REQUIRED_UNITS
+    } else {
+        0
+    };
     let mut events = Vec::new();
 
     for (ordinal, action) in program.actions.iter().enumerate() {
@@ -1125,14 +1142,39 @@ fn execute_action_program_v1(
                         grant_id.digest(),
                     ))
                     .map_err(map_block_chain_error)?;
-                child
-                    .sponsor_grants
-                    .get_mut(&(transaction.sender, *grant_id))
-                    .ok_or(BlockExecutionErrorV1::InvalidState)?
-                    .revoked = true;
+                revoke_sponsor_grant_record(
+                    &mut child,
+                    transaction.sender,
+                    *grant_id,
+                    height,
+                    None,
+                )?;
                 action_events.push(Event::SponsorGrantRevoked {
                     sponsor: transaction.sender,
                     grant_id: *grant_id,
+                });
+                Ok(())
+            }
+            ActionV1::RevokeSignedSponsorGrant { grant } => {
+                access
+                    .write(StateKey::sponsor_grant(
+                        transaction.sender,
+                        grant.grant_id.digest(),
+                    ))
+                    .map_err(map_block_chain_error)?;
+                let digest = grant
+                    .digest()
+                    .map_err(|_| BlockExecutionErrorV1::InvalidState)?;
+                revoke_sponsor_grant_record(
+                    &mut child,
+                    transaction.sender,
+                    grant.grant_id,
+                    height,
+                    Some((digest, grant.validity.valid_until_height)),
+                )?;
+                action_events.push(Event::SponsorGrantRevoked {
+                    sponsor: transaction.sender,
+                    grant_id: grant.grant_id,
                 });
                 Ok(())
             }
@@ -1160,6 +1202,35 @@ fn execute_action_program_v1(
         GasUnits::new(attempted_units),
         events,
     ))
+}
+
+/// Applies either a cheap materialized revoke or an authenticated pre-use revoke.
+fn revoke_sponsor_grant_record(
+    state: &mut ChainState,
+    sponsor: Address,
+    grant_id: SponsorGrantId,
+    height: BlockHeight,
+    authenticated: Option<(Hash256, BlockHeight)>,
+) -> Result<(), BlockExecutionErrorV1> {
+    let key = (sponsor, grant_id);
+    let mut record = match state.sponsor_grants.get(&key).copied() {
+        Some(record) if record.valid_until_height >= height => record,
+        Some(_) | None => {
+            let (digest, valid_until_height) =
+                authenticated.ok_or(BlockExecutionErrorV1::InvalidState)?;
+            SponsorGrantStateV1::unused(digest, valid_until_height)
+        }
+    };
+    if let Some((digest, valid_until_height)) = authenticated {
+        if record.grant_digest != digest || record.valid_until_height != valid_until_height {
+            return Err(BlockExecutionErrorV1::InvalidState);
+        }
+    }
+    record.revoked = true;
+    state
+        .sponsor_grants
+        .set(key, record)
+        .map_err(map_sponsor_book_execution_error)
 }
 
 fn append_typed_events(
@@ -1223,6 +1294,10 @@ fn map_block_chain_error(error: ChainError) -> BlockExecutionErrorV1 {
     }
 }
 
+fn map_sponsor_book_execution_error(_error: SponsorGrantBookError) -> BlockExecutionErrorV1 {
+    BlockExecutionErrorV1::InvalidState
+}
+
 fn finalize_fee_accounting(
     state: &mut ChainState,
     summary: &crate::FeeSummaryV1,
@@ -1242,23 +1317,27 @@ fn finalize_fee_accounting(
 fn finalize_sponsor_use(
     state: &mut ChainState,
     transaction: &TransactionV5,
+    height: BlockHeight,
     actual_charge: Amount,
 ) -> Result<(), BlockExecutionErrorV1> {
     let FeePaymentV1::Sponsored(sponsor_use) = &transaction.fee_payment else {
         return Ok(());
     };
     let grant = &sponsor_use.grant;
-    let record = state
+    let key = (grant.sponsor, grant.grant_id);
+    let mut record = state
         .sponsor_grants
-        .entry((grant.sponsor, grant.grant_id))
-        .or_default();
-    if record
-        .grant_digest
-        .is_some_and(|digest| digest != sponsor_use.grant_digest)
+        .get(&key)
+        .copied()
+        .filter(|record| record.valid_until_height >= height)
+        .unwrap_or_else(|| {
+            SponsorGrantStateV1::unused(sponsor_use.grant_digest, grant.validity.valid_until_height)
+        });
+    if record.grant_digest != sponsor_use.grant_digest
+        || record.valid_until_height != grant.validity.valid_until_height
     {
         return Err(BlockExecutionErrorV1::InvalidState);
     }
-    record.grant_digest = Some(sponsor_use.grant_digest);
     record.next_use_nonce = record
         .next_use_nonce
         .checked_next()
@@ -1271,7 +1350,10 @@ fn finalize_sponsor_use(
         .total_charged
         .checked_add(actual_charge)
         .ok_or(BlockExecutionErrorV1::InvalidState)?;
-    Ok(())
+    state
+        .sponsor_grants
+        .set(key, record)
+        .map_err(map_sponsor_book_execution_error)
 }
 
 fn finalize_session_use(
@@ -1470,17 +1552,20 @@ fn prepare_sponsor_use(
     {
         return Err(TransactionPreparationErrorV1::SponsorAuthorizationInvalid);
     }
+    let key = (grant.sponsor, grant.grant_id);
+    let unused =
+        SponsorGrantStateV1::unused(sponsor_use.grant_digest, grant.validity.valid_until_height);
     let record = state
         .sponsor_grants
-        .get(&(grant.sponsor, grant.grant_id))
+        .get(&key)
         .copied()
-        .unwrap_or_default();
+        .filter(|record| record.valid_until_height >= height)
+        .unwrap_or(unused);
     if record.revoked {
         return Err(TransactionPreparationErrorV1::SponsorGrantRevoked);
     }
-    if record
-        .grant_digest
-        .is_some_and(|digest| digest != sponsor_use.grant_digest)
+    if record.grant_digest != sponsor_use.grant_digest
+        || record.valid_until_height != grant.validity.valid_until_height
     {
         return Err(TransactionPreparationErrorV1::SponsorGrantMismatch);
     }
@@ -1504,26 +1589,89 @@ fn prepare_sponsor_use(
     Ok(())
 }
 
-/// Rejects actions that would create unbounded state without authenticated lifetime metadata.
-fn prepare_action_storage(
+/// Validates and batches every durable sponsor identity in one transaction.
+fn prepare_sponsor_storage(
     state: &ChainState,
     transaction: &TransactionV5,
+    height: BlockHeight,
 ) -> Result<(), TransactionPreparationErrorV1> {
+    let mut candidates = Vec::new();
+    if let FeePaymentV1::Sponsored(sponsor_use) = &transaction.fee_payment {
+        candidates.push((
+            (sponsor_use.grant.sponsor, sponsor_use.grant.grant_id),
+            SponsorGrantStateV1::unused(
+                sponsor_use.grant_digest,
+                sponsor_use.grant.validity.valid_until_height,
+            ),
+        ));
+    }
     let TransactionKindV1::Actions(program) = &transaction.kind else {
-        return Ok(());
+        return state
+            .sponsor_grants
+            .ensure_can_set_batch(candidates)
+            .map_err(map_sponsor_book_preparation_error);
     };
     for action in &program.actions {
-        let ActionV1::RevokeSponsorGrant { grant_id } = action else {
-            continue;
-        };
-        if !state
-            .sponsor_grants
-            .contains_key(&(transaction.sender, *grant_id))
-        {
-            return Err(TransactionPreparationErrorV1::SponsorGrantNotMaterialized);
+        match action {
+            ActionV1::RevokeSponsorGrant { grant_id } => {
+                let materialized = state
+                    .sponsor_grants
+                    .get(&(transaction.sender, *grant_id))
+                    .is_some_and(|record| record.valid_until_height >= height);
+                if !materialized {
+                    return Err(TransactionPreparationErrorV1::SponsorGrantNotMaterialized);
+                }
+            }
+            ActionV1::RevokeSignedSponsorGrant { grant } => {
+                if grant.validity.valid_until_height < height {
+                    return Err(TransactionPreparationErrorV1::SponsorGrantExpired);
+                }
+                let latest_start = height
+                    .get()
+                    .checked_add(MAX_SPONSOR_REVOCATION_LOOKAHEAD_BLOCKS_V1)
+                    .map(BlockHeight::new)
+                    .unwrap_or(BlockHeight::new(u64::MAX));
+                if grant.validity.valid_from_height > latest_start {
+                    return Err(TransactionPreparationErrorV1::SponsorGrantTooFarInFuture);
+                }
+                let digest = grant
+                    .digest()
+                    .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+                let key = (transaction.sender, grant.grant_id);
+                let unused = SponsorGrantStateV1::unused(digest, grant.validity.valid_until_height);
+                if let Some(record) = state
+                    .sponsor_grants
+                    .get(&key)
+                    .filter(|record| record.valid_until_height >= height)
+                {
+                    if record.grant_digest != digest
+                        || record.valid_until_height != grant.validity.valid_until_height
+                    {
+                        return Err(TransactionPreparationErrorV1::SponsorGrantMismatch);
+                    }
+                }
+                candidates.push((key, unused));
+            }
+            ActionV1::Native { .. } => {}
         }
     }
-    Ok(())
+    state
+        .sponsor_grants
+        .ensure_can_set_batch(candidates)
+        .map_err(map_sponsor_book_preparation_error)
+}
+
+fn map_sponsor_book_preparation_error(
+    error: SponsorGrantBookError,
+) -> TransactionPreparationErrorV1 {
+    match error {
+        SponsorGrantBookError::ConflictingBatchIdentity => {
+            TransactionPreparationErrorV1::SponsorGrantMismatch
+        }
+        SponsorGrantBookError::InvalidRecord | SponsorGrantBookError::InvalidIndex => {
+            TransactionPreparationErrorV1::InvalidState
+        }
+    }
 }
 
 fn account_key_is_current(
@@ -1554,6 +1702,7 @@ mod tests {
         SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
         TransactionAuthorizationV1, TransactionIndex, UnbondingKind, UnbondingRequestId, Validator,
         ValidatorStatus, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
+        MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1, REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
         TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
@@ -1603,6 +1752,15 @@ mod tests {
         sponsor: &Keypair,
     ) -> TransactionV5 {
         transaction.sender_signature = None;
+        transaction.fee_bid.gas_limit = transaction
+            .kind
+            .required_units()
+            .expect("fixture action units")
+            .checked_add(SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+            .expect("fixture sponsored units");
+        let maximum_charge = u128::from(transaction.fee_bid.gas_limit)
+            .checked_mul(u128::from(transaction.fee_bid.max_fee_per_unit))
+            .expect("fixture maximum charge");
         let validity = transaction.validity;
         let mut grant = SponsorGrantV1 {
             protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
@@ -1616,8 +1774,12 @@ mod tests {
             application_namespace: None,
             action_scope: ActionScopeV1::exact(transaction.kind.digest().expect("action digest")),
             validity,
-            max_fee_per_transaction: Amount::from_units(10_000),
-            max_cumulative_fee: Amount::from_units(50_000),
+            max_fee_per_transaction: Amount::from_units(maximum_charge),
+            max_cumulative_fee: Amount::from_units(
+                maximum_charge
+                    .checked_mul(10)
+                    .expect("fixture cumulative charge"),
+            ),
             max_uses: 10,
             sponsor_signature: None,
         };
@@ -1827,14 +1989,15 @@ mod tests {
         let sponsor = Keypair::from_seed([3; 32]);
         let grant_id = SponsorGrantId::new(Hash256([0x44; 32]));
         let record = SponsorGrantStateV1 {
-            grant_digest: Some(Hash256([0x55; 32])),
-            next_use_nonce: SponsorUseNonce::new(7),
+            grant_digest: Hash256([0x55; 32]),
+            valid_until_height: BlockHeight::new(20),
+            next_use_nonce: SponsorUseNonce::new(3),
             total_charged: Amount::from_units(123),
             uses: SponsorUseCount::new(3),
             revoked: false,
         };
         let value = serde_json::to_value(record).expect("grant state serializes");
-        assert_eq!(value["next_use_nonce"], "7");
+        assert_eq!(value["next_use_nonce"], "3");
         assert_eq!(value["uses"], "3");
         assert_eq!(value["total_charged"], "123");
 
@@ -1843,7 +2006,8 @@ mod tests {
         let mut with_grant = state;
         with_grant
             .sponsor_grants
-            .insert((sponsor.address(), grant_id), record);
+            .set((sponsor.address(), grant_id), record)
+            .expect("valid grant record");
         assert_ne!(with_grant.state_root().expect("grant state root"), before);
         let restored: ChainState =
             bincode::deserialize(&bincode::serialize(&with_grant).expect("state serializes"))
@@ -1929,7 +2093,17 @@ mod tests {
         };
         let key = (use_record.grant.sponsor, use_record.grant.grant_id);
         let digest = use_record.grant_digest;
-        let state = funded_state(&sender, Some(&sponsor));
+        let mut state = funded_state(&sender, Some(&sponsor));
+        state
+            .accounts
+            .get_mut(&sponsor.address())
+            .expect("sponsor account")
+            .balance = Amount::from_units(2_000_000);
+
+        assert_eq!(
+            transaction.required_units(),
+            Ok(500 + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+        );
 
         assert!(state
             .prepare_transaction_v1(
@@ -1940,16 +2114,20 @@ mod tests {
             .is_ok());
 
         let mut replayed = state.clone();
-        replayed.sponsor_grants.insert(
-            key,
-            SponsorGrantStateV1 {
-                grant_digest: Some(digest),
-                next_use_nonce: SponsorUseNonce::new(1),
-                total_charged: Amount::ZERO,
-                uses: SponsorUseCount::new(1),
-                revoked: false,
-            },
-        );
+        replayed
+            .sponsor_grants
+            .set(
+                key,
+                SponsorGrantStateV1 {
+                    grant_digest: digest,
+                    valid_until_height: use_record.grant.validity.valid_until_height,
+                    next_use_nonce: SponsorUseNonce::new(1),
+                    total_charged: Amount::ZERO,
+                    uses: SponsorUseCount::new(1),
+                    revoked: false,
+                },
+            )
+            .expect("valid replay record");
         assert_eq!(
             replayed.prepare_transaction_v1(
                 ValidatedTransactionV1::validate(transaction.clone(), &ChainId::devnet())
@@ -1960,13 +2138,13 @@ mod tests {
         );
 
         let mut revoked = state.clone();
-        revoked.sponsor_grants.insert(
-            key,
-            SponsorGrantStateV1 {
-                revoked: true,
-                ..SponsorGrantStateV1::default()
-            },
-        );
+        let mut revoked_record =
+            SponsorGrantStateV1::unused(digest, use_record.grant.validity.valid_until_height);
+        revoked_record.revoked = true;
+        revoked
+            .sponsor_grants
+            .set(key, revoked_record)
+            .expect("valid revoked record");
         assert_eq!(
             revoked.prepare_transaction_v1(
                 ValidatedTransactionV1::validate(transaction.clone(), &ChainId::devnet())
@@ -1977,14 +2155,13 @@ mod tests {
         );
 
         let mut exhausted = state;
-        exhausted.sponsor_grants.insert(
-            key,
-            SponsorGrantStateV1 {
-                grant_digest: Some(digest),
-                total_charged: Amount::from_units(46_000),
-                ..SponsorGrantStateV1::default()
-            },
-        );
+        let mut exhausted_record =
+            SponsorGrantStateV1::unused(digest, use_record.grant.validity.valid_until_height);
+        exhausted_record.total_charged = use_record.grant.max_cumulative_fee;
+        exhausted
+            .sponsor_grants
+            .set(key, exhausted_record)
+            .expect("valid exhausted record");
         assert_eq!(
             exhausted.prepare_transaction_v1(
                 ValidatedTransactionV1::validate(transaction, &ChainId::devnet())
@@ -2940,7 +3117,12 @@ mod tests {
         };
         let grant_key = (sponsor.address(), sponsor_use.grant.grant_id);
         let mut state = funded_state(&sender, Some(&sponsor));
-        state.minted_supply = Amount::from_units(40_000);
+        state
+            .accounts
+            .get_mut(&sponsor.address())
+            .expect("sponsor account")
+            .balance = Amount::from_units(2_000_000);
+        state.minted_supply = Amount::from_units(2_020_000);
         state.inflation_year_start_supply = state.minted_supply;
         let prepared = prepared(&state, transaction);
 
@@ -2961,13 +3143,17 @@ mod tests {
         assert_eq!(state.accounts[&sponsor.address()].nonce, 0);
         assert_eq!(
             state.accounts[&sponsor.address()].balance,
-            Amount::from_units(17_000)
+            Amount::from_units(1_697_000)
         );
         assert!(!state.accounts.contains_key(&first.address()));
-        let grant = state.sponsor_grants[&grant_key];
+        let grant = state
+            .sponsor_grants
+            .get(&grant_key)
+            .copied()
+            .expect("sponsor grant materializes");
         assert_eq!(grant.next_use_nonce, SponsorUseNonce::new(1));
         assert_eq!(grant.uses, SponsorUseCount::new(1));
-        assert_eq!(grant.total_charged, Amount::from_units(3_000));
+        assert_eq!(grant.total_charged, Amount::from_units(303_000));
         assert!(
             state
                 .supply_invariant_report()
@@ -2982,6 +3168,10 @@ mod tests {
         let sender = Keypair::from_seed([1; 32]);
         let recipient = Keypair::from_seed([2; 32]);
         let grant_id = SponsorGrantId::new(Hash256([0x44; 32]));
+        let sponsored = sponsored_fixture(&sender, &recipient, &sponsor, true);
+        let FeePaymentV1::Sponsored(sponsor_use) = &sponsored.fee_payment else {
+            panic!("sponsored fixture")
+        };
         let revoke = sender_actions_fixture(
             &sponsor,
             vec![ActionV1::revoke_sponsor_grant(grant_id)],
@@ -2993,10 +3183,16 @@ mod tests {
             .get_mut(&sponsor.address())
             .expect("sponsor account")
             .balance = Amount::from_units(30_000);
-        state.sponsor_grants.insert(
-            (sponsor.address(), grant_id),
-            SponsorGrantStateV1::default(),
-        );
+        state
+            .sponsor_grants
+            .set(
+                (sponsor.address(), grant_id),
+                SponsorGrantStateV1::unused(
+                    sponsor_use.grant_digest,
+                    sponsor_use.grant.validity.valid_until_height,
+                ),
+            )
+            .expect("valid materialized grant");
         let prepared_revoke = prepared(&state, revoke);
         let receipt = state
             .execute_prepared_transaction_v1(
@@ -3006,9 +3202,14 @@ mod tests {
             .expect("revocation executes")
             .into_receipt();
         assert_eq!(receipt.events.len(), 1);
-        assert!(state.sponsor_grants[&(sponsor.address(), grant_id)].revoked);
+        assert!(
+            state
+                .sponsor_grants
+                .get(&(sponsor.address(), grant_id))
+                .expect("revoked grant remains through expiry")
+                .revoked
+        );
 
-        let sponsored = sponsored_fixture(&sender, &recipient, &sponsor, true);
         assert_eq!(
             state.prepare_transaction_v1(
                 ValidatedTransactionV1::validate(sponsored, &ChainId::devnet())
@@ -3017,6 +3218,212 @@ mod tests {
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantRevoked)
         );
+    }
+
+    #[test]
+    fn signed_grant_revocation_blocks_first_use_and_records_authenticated_expiry() {
+        let sponsor = Keypair::from_seed([3; 32]);
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let sponsored = sponsored_fixture(&sender, &recipient, &sponsor, true);
+        let FeePaymentV1::Sponsored(sponsor_use) = &sponsored.fee_payment else {
+            panic!("sponsored fixture")
+        };
+        let grant = sponsor_use.grant.clone();
+        let grant_digest = sponsor_use.grant_digest;
+        let grant_key = (sponsor.address(), grant.grant_id);
+        let revoke = sender_actions_fixture(
+            &sponsor,
+            vec![ActionV1::revoke_signed_sponsor_grant(grant.clone())],
+            REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+        );
+        let mut state = funded_state(&sender, Some(&sponsor));
+        state
+            .accounts
+            .get_mut(&sponsor.address())
+            .expect("sponsor account")
+            .balance = Amount::from_units(1_000_000);
+
+        let prepared_revoke = prepared(&state, revoke);
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_revoke,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("pre-use revocation executes")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        let record = state
+            .sponsor_grants
+            .get(&grant_key)
+            .copied()
+            .expect("bounded revocation record");
+        assert_eq!(record.grant_digest, grant_digest);
+        assert_eq!(record.valid_until_height, grant.validity.valid_until_height);
+        assert_eq!(record.uses, SponsorUseCount::new(0));
+        assert_eq!(record.next_use_nonce, SponsorUseNonce::new(0));
+        assert!(record.revoked);
+        assert_eq!(
+            state.prepare_transaction_v1(
+                ValidatedTransactionV1::validate(sponsored, &ChainId::devnet())
+                    .expect("sponsored wire validates"),
+                BlockHeight::new(10),
+            ),
+            Err(TransactionPreparationErrorV1::SponsorGrantRevoked)
+        );
+    }
+
+    #[test]
+    fn sponsored_signed_revocation_prices_both_possible_records() {
+        let grant_sponsor = Keypair::from_seed([3; 32]);
+        let outer_sponsor = Keypair::from_seed([4; 32]);
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let sponsored = sponsored_fixture(&sender, &recipient, &grant_sponsor, true);
+        let FeePaymentV1::Sponsored(use_record) = sponsored.fee_payment else {
+            panic!("sponsored fixture")
+        };
+        let sender_paid_revoke = sender_actions_fixture(
+            &grant_sponsor,
+            vec![ActionV1::revoke_signed_sponsor_grant(use_record.grant)],
+            REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+        );
+        let doubly_materializing =
+            sponsor_transaction(sender_paid_revoke, &grant_sponsor, &outer_sponsor);
+
+        assert_eq!(
+            doubly_materializing.required_units(),
+            Ok(REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+        );
+        doubly_materializing
+            .verify_for_chain(&ChainId::devnet())
+            .expect("both nested grants verify");
+    }
+
+    #[test]
+    fn signed_grant_revocation_rejects_expired_and_far_future_lifetimes() {
+        let sponsor = Keypair::from_seed([3; 32]);
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let sponsored = sponsored_fixture(&sender, &recipient, &sponsor, true);
+        let FeePaymentV1::Sponsored(sponsor_use) = &sponsored.fee_payment else {
+            panic!("sponsored fixture")
+        };
+        let signed_revoke = |validity: ValidityWindowV1| {
+            let mut grant = sponsor_use.grant.clone();
+            grant.validity = validity;
+            grant.sponsor_signature = None;
+            grant.sign(&sponsor).expect("adjusted grant signs");
+            sender_actions_fixture(
+                &sponsor,
+                vec![ActionV1::revoke_signed_sponsor_grant(grant)],
+                REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+            )
+        };
+        let mut state = funded_state(&sender, Some(&sponsor));
+        state
+            .accounts
+            .get_mut(&sponsor.address())
+            .expect("sponsor account")
+            .balance = Amount::from_units(1_000_000);
+
+        let expired = signed_revoke(ValidityWindowV1::new(
+            BlockHeight::new(1),
+            BlockHeight::new(9),
+        ));
+        assert_eq!(
+            state.prepare_transaction_v1(
+                ValidatedTransactionV1::validate(expired, &ChainId::devnet())
+                    .expect("expired revoke wire validates"),
+                BlockHeight::new(10),
+            ),
+            Err(TransactionPreparationErrorV1::SponsorGrantExpired)
+        );
+
+        let first_too_far = 10_u64 + MAX_SPONSOR_REVOCATION_LOOKAHEAD_BLOCKS_V1 + 1;
+        let far_future = signed_revoke(ValidityWindowV1::new(
+            BlockHeight::new(first_too_far),
+            BlockHeight::new(first_too_far),
+        ));
+        assert_eq!(
+            state.prepare_transaction_v1(
+                ValidatedTransactionV1::validate(far_future, &ChainId::devnet())
+                    .expect("future revoke wire validates"),
+                BlockHeight::new(10),
+            ),
+            Err(TransactionPreparationErrorV1::SponsorGrantTooFarInFuture)
+        );
+        assert!(state.sponsor_grants.is_empty());
+    }
+
+    #[test]
+    fn expired_backlog_record_is_replaced_without_prepare_execute_divergence() {
+        let sponsor = Keypair::from_seed([3; 32]);
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let sponsored = sponsored_fixture(&sender, &recipient, &sponsor, true);
+        let FeePaymentV1::Sponsored(sponsor_use) = &sponsored.fee_payment else {
+            panic!("sponsored fixture")
+        };
+        let target = (sponsor.address(), sponsor_use.grant.grant_id);
+        let expected_digest = sponsor_use.grant_digest;
+        let expected_expiry = sponsor_use.grant.validity.valid_until_height;
+        let mut state = funded_state(&sender, Some(&sponsor));
+        state
+            .accounts
+            .get_mut(&sponsor.address())
+            .expect("sponsor account")
+            .balance = Amount::from_units(2_000_000);
+
+        for ordinal in 1..=MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1 {
+            let mut grant_id = [0_u8; 32];
+            grant_id[24..].copy_from_slice(
+                &u64::try_from(ordinal)
+                    .expect("test ordinal fits u64")
+                    .to_be_bytes(),
+            );
+            state
+                .sponsor_grants
+                .set(
+                    (sponsor.address(), SponsorGrantId::new(Hash256(grant_id))),
+                    SponsorGrantStateV1::unused(Hash256([0xF0; 32]), BlockHeight::new(9)),
+                )
+                .expect("expired filler record");
+        }
+        state
+            .sponsor_grants
+            .set(
+                target,
+                SponsorGrantStateV1::unused(Hash256([0xAA; 32]), BlockHeight::new(9)),
+            )
+            .expect("expired target record");
+        assert_eq!(
+            state
+                .prune_expired_sponsor_grants_v1(BlockHeight::new(10))
+                .expect("bounded prune"),
+            MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1
+        );
+        assert!(state.sponsor_grants.contains_key(&target));
+
+        let prepared = prepared(&state, sponsored);
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("expired identity is atomically replaced")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        let replacement = state
+            .sponsor_grants
+            .get(&target)
+            .copied()
+            .expect("replacement grant record");
+        assert_eq!(replacement.grant_digest, expected_digest);
+        assert_eq!(replacement.valid_until_height, expected_expiry);
+        assert_eq!(replacement.uses, SponsorUseCount::new(1));
     }
 
     #[test]

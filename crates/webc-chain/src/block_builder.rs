@@ -7,8 +7,8 @@
 //! discards the overlay and leaves the caller's state unchanged.
 
 use crate::{
-    Block, BlockHeader, ChainConfig, ChainError, ChainId, ChainState, Receipt, SlashingEvidence,
-    Transaction,
+    Block, BlockHeader, BlockHeight, ChainConfig, ChainError, ChainId, ChainState, Receipt,
+    SlashingEvidence, Transaction,
 };
 use serde::{Deserialize, Serialize};
 use webc_crypto::{merkle_root, Address, Hash256};
@@ -72,6 +72,10 @@ pub fn build_block(
     }
 
     let mut next_state = state.clone();
+    // Sponsor records are protocol state, not user actions. Expiring them once
+    // at the block boundary makes cleanup deterministic even in an empty block
+    // and prevents a transaction from receiving free, input-dependent work.
+    next_state.prune_expired_sponsor_grants_v1(BlockHeight::new(input.height))?;
     let base_fee_for_block = next_state.current_base_fee_per_unit;
     let mut receipts = Vec::with_capacity(transactions.len());
     let mut units_used = 0u64;
@@ -247,9 +251,59 @@ mod tests {
     use super::*;
     use crate::{
         Amount, DoubleVoteEvidence, FeeBid, FeePolicy, GenesisAccount, GenesisConfig,
-        GenesisValidator, Operation, SignedVote, SlashingEvidence, ValidatorStatus, Vote, VoteType,
+        GenesisValidator, Operation, SignedVote, SlashingEvidence, SponsorGrantId,
+        SponsorGrantStateV1, ValidatorStatus, Vote, VoteType,
     };
     use webc_crypto::Keypair;
+
+    #[test]
+    fn block_boundary_prunes_only_grants_expired_before_the_height() {
+        let config = ChainConfig::default();
+        let proposer = Keypair::from_seed([9; 32]);
+        let expired = SponsorGrantId::new(Hash256([0x31; 32]));
+        let inclusive = SponsorGrantId::new(Hash256([0x32; 32]));
+        let mut producer = ChainState::default();
+        producer
+            .sponsor_grants
+            .set(
+                (proposer.address(), expired),
+                SponsorGrantStateV1::unused(Hash256([0x41; 32]), BlockHeight::new(10)),
+            )
+            .expect("expired test record");
+        producer
+            .sponsor_grants
+            .set(
+                (proposer.address(), inclusive),
+                SponsorGrantStateV1::unused(Hash256([0x42; 32]), BlockHeight::new(11)),
+            )
+            .expect("inclusive test record");
+        let mut importer = producer.clone();
+
+        let block = build_block(
+            &mut producer,
+            &config,
+            BlockBuildInput {
+                chain_id: config.chain_id.clone(),
+                height: 11,
+                epoch: 0,
+                previous_hash: Hash256::ZERO,
+                proposer: proposer.address(),
+                timestamp_ms: 1,
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("empty block builds");
+
+        assert!(!producer
+            .sponsor_grants
+            .contains_key(&(proposer.address(), expired)));
+        assert!(producer
+            .sponsor_grants
+            .contains_key(&(proposer.address(), inclusive)));
+        apply_block(&mut importer, &config, &block).expect("import reproduces pruning");
+        assert_eq!(importer, producer);
+    }
 
     #[test]
     fn block_builder_executes_transactions_and_commits_roots() {

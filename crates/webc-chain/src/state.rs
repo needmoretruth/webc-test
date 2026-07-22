@@ -23,14 +23,15 @@ use crate::session_key::{
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
 };
+use crate::sponsor_grant_book::SponsorGrantBookError;
 use crate::staking::{Delegation, StakingConfig, Validator, ValidatorStatus};
 use crate::state_key::StateAccessRecorder;
 use crate::transaction::{Operation, Transaction};
 use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
 use crate::{
     Amount, AuthorizationLaneId, ChainError, ChainId, Epoch, InflationSchedule, ObjectId,
-    ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, SponsorGrantId,
-    SponsorGrantStateV1, StateKey, CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, SponsorGrantBookV1,
+    SponsorGrantId, StateKey, CURRENT_PROTOCOL_VERSION, LEGACY_AUTHORIZATION_POLICY_REVISION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,12 +296,12 @@ pub struct ChainState {
     /// cumulative spend, never funds, so they do not enter supply reconciliation.
     #[serde(default)]
     pub session_keys: BTreeMap<(Address, SessionKeyId), SessionKey>,
-    /// Replay, cumulative fee/use, and permanent revocation state for V5 grants.
+    /// Replay, cumulative fee/use, bounded revocation, and expiry state for V5 grants.
     ///
     /// The map holds no funds; the payer account or authorization lane remains
     /// the single supply-accounted fee source.
     #[serde(default)]
-    pub sponsor_grants: BTreeMap<(Address, SponsorGrantId), SponsorGrantStateV1>,
+    pub sponsor_grants: SponsorGrantBookV1,
     /// Persistent versioned application/NFT objects keyed by stable identity.
     pub objects: BTreeMap<ObjectId, StateObject>,
     pub validators: BTreeMap<Address, Validator>,
@@ -413,7 +414,7 @@ impl Default for ChainState {
             authorization_policies: BTreeMap::new(),
             authorization_lanes: BTreeMap::new(),
             session_keys: BTreeMap::new(),
-            sponsor_grants: BTreeMap::new(),
+            sponsor_grants: SponsorGrantBookV1::default(),
             objects: BTreeMap::new(),
             validators: BTreeMap::new(),
             delegations: BTreeMap::new(),
@@ -456,6 +457,21 @@ impl<'a> NativeActionEffects<'a> {
 }
 
 impl ChainState {
+    /// Prunes expired V5 sponsor records at one consensus block boundary.
+    ///
+    /// Grants remain valid at their inclusive expiry height. Materialization
+    /// units bound ingress while the derived expiry index limits deterministic
+    /// cleanup to a fixed number per block. The caller's whole-block overlay
+    /// supplies rollback if this detects corrupted durable state.
+    pub(crate) fn prune_expired_sponsor_grants_v1(
+        &mut self,
+        height: crate::BlockHeight,
+    ) -> Result<usize, ChainError> {
+        self.sponsor_grants
+            .prune_expired(height)
+            .map_err(|_error: SponsorGrantBookError| ChainError::InvalidSponsorGrantState)
+    }
+
     /// Creates empty deterministic state for one supported protocol config.
     ///
     /// This operation allocates no supply and performs no external I/O. Unknown
@@ -1073,11 +1089,11 @@ impl ChainState {
         }
 
         let commitment = StateCommitment {
-            // V8 adds durable sponsor-grant replay/budget/revocation state. The
-            // protocol-2 transaction path is inactive, so no finalized V7 block
-            // can contain this subtree; existing account and state-key leaves
-            // remain byte-identical.
-            domain: "WEBC_STATE_COMMITMENT_V8",
+            // V9 gives every sponsor-grant record an authenticated expiry and
+            // makes deterministic pruning part of the block transition. The
+            // protocol-2 transaction path is inactive, so this coordinated
+            // format change precedes any finalized block carrying the subtree.
+            domain: "WEBC_STATE_COMMITMENT_V9",
             protocol_version: self.protocol_version,
             chain_id: self.chain_id.clone(),
             account_root: self.account_root()?,
@@ -1094,7 +1110,7 @@ impl ChainState {
                 self.session_keys.iter(),
             )?,
             sponsor_grant_root: ordered_value_root(
-                b"WEBC_SPONSOR_GRANT_STATE_LEAF_V1",
+                b"WEBC_SPONSOR_GRANT_STATE_LEAF_V2",
                 self.sponsor_grants.iter(),
             )?,
             object_root: ordered_value_root(b"WEBC_OBJECT_LEAF_V1", self.objects.iter())?,

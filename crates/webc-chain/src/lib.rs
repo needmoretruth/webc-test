@@ -25,6 +25,7 @@ pub mod round;
 pub mod scheduler;
 pub mod session_key;
 pub mod slashing;
+pub mod sponsor_grant_book;
 pub mod staking;
 pub mod state;
 pub mod state_key;
@@ -58,7 +59,8 @@ pub use consensus::{
 };
 pub use execution_v1::{
     BlockExecutionErrorV1, ExecutedTransactionV1, PreparedAuthorizationV1, PreparedTransactionV1,
-    SponsorGrantStateV1, TransactionPreparationErrorV1, ValidatedTransactionV1,
+    TransactionPreparationErrorV1, ValidatedTransactionV1,
+    MAX_SPONSOR_REVOCATION_LOOKAHEAD_BLOCKS_V1,
 };
 pub use fees::{
     calculate_fee_summary_v1, split_fee, FeeBreakdown, FeeComputationError, FeePayerV1, FeePolicy,
@@ -89,6 +91,9 @@ pub use session_key::{
     SESSION_KEY_AUTHORIZATION_DOMAIN,
 };
 pub use slashing::{SlashingEvidence, SlashingOutcome, SlashingPolicy};
+pub use sponsor_grant_book::{
+    SponsorGrantBookV1, SponsorGrantStateV1, MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1,
+};
 pub use staking::{
     Delegation, StakingConfig, Validator, ValidatorStatus, SEVEN_DAY_TARGET_AT_ONE_MINUTE_EPOCHS,
 };
@@ -105,7 +110,8 @@ pub use transaction_v5::{
     TransactionId, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
     ValidityWindowV1, ACTION_PROGRAM_V1_DOMAIN, CANCEL_V1_REQUIRED_UNITS, FEE_BID_V1_DOMAIN,
     MAX_ACTIONS_V1, MAX_TRANSACTION_V5_CANONICAL_BYTES, MAX_TRANSACTION_VALIDITY_BLOCKS,
-    REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS, SPONSOR_GRANT_V1_DOMAIN, SPONSOR_USE_V1_DOMAIN,
+    REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+    SPONSOR_GRANT_USE_V1_REQUIRED_UNITS, SPONSOR_GRANT_V1_DOMAIN, SPONSOR_USE_V1_DOMAIN,
     TRANSACTION_ID_V1_DOMAIN, TRANSACTION_V5_PROTOCOL_VERSION, TRANSACTION_V5_SIGNING_DOMAIN,
 };
 pub use unbonding::{
@@ -248,6 +254,8 @@ pub enum ChainError {
     UndeclaredStateWrite { key: StateKey },
     #[error("transaction declared state it did not access")]
     UnusedDeclaredStateAccess,
+    #[error("durable sponsor grant state or its expiry index is invalid")]
+    InvalidSponsorGrantState,
     #[error("unbonding amount must be greater than zero")]
     UnbondingAmountZero,
     #[error("unbonding request was not found")]

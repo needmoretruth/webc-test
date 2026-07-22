@@ -49,6 +49,14 @@ export const MAX_OBJECT_DATA_BYTES_V1 = 64 * 1024;
 export const MAX_TRANSACTION_V5_CANONICAL_BYTES = 256 * 1024;
 /** Maximum block heights covered by the inclusive validity range. */
 export const MAX_TRANSACTION_VALIDITY_BLOCKS = 4096n;
+/** Fixed Rust-parity units for a V5 cancellation. */
+export const CANCEL_V1_REQUIRED_UNITS = 50n;
+/** Fixed Rust-parity units for an ID-only materialized grant revocation. */
+export const REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS = 5_000n;
+/** Conservative units for a complete signed-grant revocation. */
+export const REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS = 100_000n;
+/** Conservative bookkeeping units added to every sponsored transaction. */
+export const SPONSOR_GRANT_USE_V1_REQUIRED_UNITS = 100_000n;
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
@@ -99,7 +107,8 @@ export interface TransactionAuthorizationV1Json {
 /** One ordered V1 action wrapping an existing native operation. */
 export type ActionV1Json =
   | { Native: { operation: OperationJson } }
-  | { RevokeSponsorGrant: { grant_id: string } };
+  | { RevokeSponsorGrant: { grant_id: string } }
+  | { RevokeSignedSponsorGrant: { grant: SponsorGrantV1Json } };
 
 /** Non-empty bounded ordered action program. */
 export interface ActionProgramV1Json {
@@ -111,6 +120,28 @@ export interface ActionProgramV1Json {
 export type TransactionKindV1Json =
   | { Actions: ActionProgramV1Json }
   | { Cancel: Record<string, never> };
+
+/** Returns the exact static units used by Rust V5 preparation and receipts. */
+export function transactionV5RequiredUnits(
+  kind: TransactionKindV1Json,
+  feePayment: FeePaymentV1Json,
+): bigint {
+  validateKind(kind);
+  validateFeePaymentShape(feePayment);
+  let units = "Cancel" in kind
+    ? CANCEL_V1_REQUIRED_UNITS
+    : kind.Actions.actions.reduce((total, action) => {
+        if ("RevokeSponsorGrant" in action) {
+          return total + REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS;
+        }
+        if ("RevokeSignedSponsorGrant" in action) {
+          return total + REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS;
+        }
+        return total + nativeActionRequiredUnits(action.Native.operation);
+      }, 0n);
+  if (feePayment !== "SenderLane") units += SPONSOR_GRANT_USE_V1_REQUIRED_UNITS;
+  return units;
+}
 
 /** Exact action/cancellation digest authorized by a sponsor. */
 export interface ActionScopeV1Json {
@@ -241,6 +272,14 @@ export function revokeSponsorGrantActionV1(grantId: string): ActionV1Json {
   return { RevokeSponsorGrant: { grant_id: grantId } };
 }
 
+/** Constructs a pre-use revocation carrying authenticated grant lifetime. */
+export function revokeSignedSponsorGrantActionV1(
+  grant: SponsorGrantV1Json,
+): ActionV1Json {
+  validateSponsorGrant(grant, true);
+  return { RevokeSignedSponsorGrant: { grant } };
+}
+
 /** Constructs the signed no-effect cancellation form. */
 export function cancelV1(): TransactionKindV1Json {
   return { Cancel: {} };
@@ -325,6 +364,17 @@ export async function signTransactionV5(
   request: TransactionV5SignRequest,
 ): Promise<SignedTransactionV5Json> {
   const unsigned = createUnsignedTransactionV5(wallet, request);
+  // Wallets must never approve an envelope containing an invalid nested grant.
+  // This preflight happens before the trusted key is invoked, matching Rust.
+  if (!(await validateSponsorIntentConsistency(unsigned))) {
+    throw new Error("conflicting V5 sponsor grant identities");
+  }
+  if (!(await validateFeePaymentBinding(unsigned))) {
+    throw new Error("invalid V5 sponsor fee-payment binding");
+  }
+  if (!(await validateSignedRevocationBindings(unsigned))) {
+    throw new Error("invalid V5 nested sponsor revocation");
+  }
   const signature = await signWithWallet(
     wallet,
     transactionV5SigningBytes(unsigned),
@@ -482,12 +532,17 @@ export async function verifySignedTransactionV5(
   try {
     validateTransactionV5Structure(transaction);
     if (transaction.chain_id !== expectedChainId) return false;
-    if (!(await validateFeePaymentBinding(transaction))) return false;
-    return verifyEd25519(
+    // Authenticate the cheap outer sender signature before up to 32 nested
+    // sponsor signatures, preventing invalid-envelope CPU amplification.
+    if (!(await verifyEd25519(
       hexToBytes(transaction.sender_public_key),
       transactionV5SigningBytes(transaction),
       hexToBytes(transaction.sender_signature),
-    );
+    ))) return false;
+    if (!(await validateSponsorIntentConsistency(transaction))) return false;
+    if (!(await validateFeePaymentBinding(transaction))) return false;
+    if (!(await validateSignedRevocationBindings(transaction))) return false;
+    return true;
   } catch {
     return false;
   }
@@ -555,7 +610,7 @@ export function validateTransactionV5Structure(
 }
 
 async function validateFeePaymentBinding(
-  transaction: SignedTransactionV5Json,
+  transaction: UnsignedTransactionV5Json | SignedTransactionV5Json,
 ): Promise<boolean> {
   if (transaction.fee_payment === "SenderLane") return true;
   const use = transaction.fee_payment.Sponsored;
@@ -659,6 +714,15 @@ function validateKind(value: unknown): asserts value is TransactionKindV1Json {
         requireRecord(action.RevokeSponsorGrant, "V5 sponsor revocation action");
         requireExactKeys(action.RevokeSponsorGrant, ["grant_id"], "V5 sponsor revocation action");
         requireHex(action.RevokeSponsorGrant.grant_id, 32, "sponsor grant id", true);
+      } else if ("RevokeSignedSponsorGrant" in action) {
+        requireExactKeys(action, ["RevokeSignedSponsorGrant"], "V5 action");
+        requireRecord(action.RevokeSignedSponsorGrant, "V5 signed sponsor revocation action");
+        requireExactKeys(
+          action.RevokeSignedSponsorGrant,
+          ["grant"],
+          "V5 signed sponsor revocation action",
+        );
+        validateSponsorGrant(action.RevokeSignedSponsorGrant.grant, true);
       } else {
         throw new Error("unsupported V5 action");
       }
@@ -671,6 +735,52 @@ function validateKind(value: unknown): asserts value is TransactionKindV1Json {
     return;
   }
   throw new Error("unsupported V5 transaction kind");
+}
+
+async function validateSignedRevocationBindings(
+  transaction: UnsignedTransactionV5Json | SignedTransactionV5Json,
+): Promise<boolean> {
+  if (!("Actions" in transaction.kind)) return true;
+  for (const action of transaction.kind.Actions.actions) {
+    if (!("RevokeSignedSponsorGrant" in action)) continue;
+    const grant = action.RevokeSignedSponsorGrant.grant;
+    if (
+      grant.sponsor !== transaction.sender
+      || grant.chain_id !== transaction.chain_id
+      || grant.protocol_version !== transaction.protocol_version
+      || !(await verifySponsorGrantV1(grant))
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Rejects two immutable grants sharing one `(sponsor, grant_id)` replay key. */
+async function validateSponsorIntentConsistency(
+  transaction: UnsignedTransactionV5Json | SignedTransactionV5Json,
+): Promise<boolean> {
+  const identities = new Map<string, string>();
+  const observe = (grant: SponsorGrantV1Json, digest: string): boolean => {
+    const key = `${grant.sponsor}:${grant.grant_id}`;
+    const identity = `${digest}:${grant.validity.valid_until_height}`;
+    const previous = identities.get(key);
+    if (previous !== undefined && previous !== identity) return false;
+    identities.set(key, identity);
+    return true;
+  };
+
+  if (transaction.fee_payment !== "SenderLane") {
+    const use = transaction.fee_payment.Sponsored;
+    if (!observe(use.grant, use.grant_digest)) return false;
+  }
+  if (!("Actions" in transaction.kind)) return true;
+  for (const action of transaction.kind.Actions.actions) {
+    if (!("RevokeSignedSponsorGrant" in action)) continue;
+    const grant = action.RevokeSignedSponsorGrant.grant;
+    if (!observe(grant, await sponsorGrantV1DigestHex(grant))) return false;
+  }
+  return true;
 }
 
 /**
@@ -725,6 +835,30 @@ function validateNativeActionV1(operation: unknown): asserts operation is Operat
       MAX_OBJECT_DATA_BYTES_V1,
       "V5 object data",
     );
+  }
+}
+
+/** Mirrors `webc_chain::Operation::required_units` for active V5 actions. */
+function nativeActionRequiredUnits(operation: OperationJson): bigint {
+  if (operation === "ClaimValidatorRewards") return 5_000n;
+  const variant = Object.keys(operation)[0];
+  switch (variant) {
+    case "Transfer":
+      return 500n;
+    case "InstallAuthorizationPolicy":
+      return 25_000n;
+    case "OpenAuthorizationLane":
+    case "FundAuthorizationLane":
+    case "ClaimUnbonded":
+      return 10_000n;
+    case "ClaimDelegatorRewards":
+      return 5_000n;
+    case "CreateObject":
+    case "MutateObject":
+    case "TransferObject":
+      return 20_000n;
+    default:
+      throw new Error("native action is not supported by V5 execution");
   }
 }
 

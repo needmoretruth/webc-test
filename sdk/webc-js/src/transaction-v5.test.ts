@@ -18,6 +18,7 @@ import {
   actionProgramV1,
   createSponsorUseV1,
   feeBidV1DigestHex,
+  revokeSignedSponsorGrantActionV1,
   revokeSponsorGrantActionV1,
   sessionAuthorizationAccessListV1,
   signTransactionV5,
@@ -26,6 +27,7 @@ import {
   sponsorGrantV1DigestHex,
   sponsorUseV1DigestHex,
   transactionKindV1DigestHex,
+  transactionV5RequiredUnits,
   transactionV5IdHex,
   transactionV5SigningBytes,
   verifySignedTransactionV5,
@@ -56,6 +58,10 @@ const GRANT_DIGEST =
   "4bae024a7f9c82f7218cbdda309a7734d4e8c02b2c2a530376ac7531a499eb57";
 const SPONSOR_USE_DIGEST =
   "4d929bbcb2e2e6bb8b827b3a584de213cca91aca95ce9e6e838c16b4da29fc83";
+const SIGNED_REVOKE_KIND_DIGEST =
+  "99a8fb14c579034d0ec37e1fb715ae624a91cbee227397db6e1d069f02e8560a";
+const SIGNED_REVOKE_KIND_JSON =
+  '{"Actions":{"actions":[{"RevokeSignedSponsorGrant":{"grant":{"action_scope":{"exact_action_digest":"bb25a54623accd384abc84091335e289a9d3cfca5728b7f775f0329c6fa3e0a0"},"application_namespace":null,"chain_id":"webc-devnet-1","grant_id":"4444444444444444444444444444444444444444444444444444444444444444","max_cumulative_fee":"100000","max_fee_per_transaction":"10000","max_uses":"10","payer_lane":"5555555555555555555555555555555555555555555555555555555555555555","protocol_version":2,"sender":"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3","site_namespace":"6666666666666666666666666666666666666666666666666666666666666666","sponsor":"webc121uVaRnHeoTdcumRjrvYZuEaBBiHn4wito3PKSpNzjAf","sponsor_public_key":"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1","sponsor_signature":"8114099820bc2d1cdfd7be9a9180fe848c98dad6b9a1b54cbfa3a5dbb61f73b82bbe9ba37f2f0370ed73d3d460bed9a3faebee629c7743fa4d53bd554650820d","validity":{"valid_from_height":"10","valid_until_height":"20"}}}}]}}';
 
 const SENDER_PAID_SIGNATURE =
   "fae71eef9827891d2bc4362ef49ccb9559a7e91fed98f041d0f56d690a120e05f6d3af6396bcd92cd66d63c0af144fdbf654fb2b4cd59162637dbe76592d050a";
@@ -212,6 +218,82 @@ describe("V5 cross-language transaction fixtures", () => {
       "9ee7f737d552bfc49ba6351b0c8954c70a83b989175a0892b106e95c36846de8",
     );
     expect(() => revokeSponsorGrantActionV1("00".repeat(32))).toThrow();
+  });
+
+  it("verifies a signed-grant pre-use revocation and rejects grant tampering", async () => {
+    const sponsor = await createWalletFromSeed(new Uint8Array(32).fill(3));
+    const grant = sponsorGrantFixture();
+    const kind: TransactionKindV1Json = {
+      Actions: { actions: [revokeSignedSponsorGrantActionV1(grant)] },
+    };
+    expect(canonicalJson(kind)).toBe(SIGNED_REVOKE_KIND_JSON);
+    expect(await transactionKindV1DigestHex(kind)).toBe(SIGNED_REVOKE_KIND_DIGEST);
+    expect(transactionV5RequiredUnits(kind, "SenderLane")).toBe(100_000n);
+    expect(transactionV5RequiredUnits(kind, sponsoredFixture().fee_payment)).toBe(200_000n);
+    const accessList = {
+      read_only: [
+        { version: 1 as const, kind: { AuthorizationPolicy: { owner: SPONSOR } } },
+        { version: 1 as const, kind: { Protocol: { field: "BaseFee" as const } } },
+      ],
+      read_write: [
+        { version: 1 as const, kind: { Account: { address: SPONSOR } } },
+        {
+          version: 1 as const,
+          kind: { FeeAccumulator: { lane: DEFAULT_LANE, payer: SPONSOR } },
+        },
+        {
+          version: 1 as const,
+          kind: { SponsorGrant: { sponsor: SPONSOR, grant_id: grant.grant_id } },
+        },
+      ],
+    };
+    const signRevocation = (candidate: SponsorGrantV1Json) => signTransactionV5(sponsor, {
+      chainId: "webc-devnet-1",
+      authorization: { lane: DEFAULT_LANE, policy_revision: "0", nonce: "0" },
+      validity: { valid_from_height: "10", valid_until_height: "20" },
+      kind: { Actions: { actions: [revokeSignedSponsorGrantActionV1(candidate)] } },
+      accessList,
+      feeBid: { gas_limit: "100000", max_fee_per_unit: "1", priority_fee_per_unit: "0" },
+      feePayment: "SenderLane",
+    });
+
+    const valid = await signRevocation(grant);
+    expect(await verifySignedTransactionV5(valid, "webc-devnet-1")).toBe(true);
+
+    await expect(signRevocation({
+      ...grant,
+      sponsor_signature: `00${grant.sponsor_signature?.slice(2)}`,
+    })).rejects.toThrow("nested sponsor revocation");
+
+    const conflicting = await signSponsorGrantV1(sponsor, {
+      chain_id: grant.chain_id,
+      grant_id: grant.grant_id,
+      payer_lane: grant.payer_lane,
+      sender: grant.sender,
+      site_namespace: grant.site_namespace,
+      application_namespace: grant.application_namespace,
+      action_scope: grant.action_scope,
+      validity: { valid_from_height: "10", valid_until_height: "21" },
+      max_fee_per_transaction: grant.max_fee_per_transaction,
+      max_cumulative_fee: grant.max_cumulative_fee,
+      max_uses: grant.max_uses,
+    });
+    await expect(signTransactionV5(sponsor, {
+      chainId: "webc-devnet-1",
+      authorization: { lane: DEFAULT_LANE, policy_revision: "0", nonce: "0" },
+      validity: { valid_from_height: "10", valid_until_height: "20" },
+      kind: {
+        Actions: {
+          actions: [
+            revokeSignedSponsorGrantActionV1(grant),
+            revokeSignedSponsorGrantActionV1(conflicting),
+          ],
+        },
+      },
+      accessList,
+      feeBid: { gas_limit: "200000", max_fee_per_unit: "1", priority_fee_per_unit: "0" },
+      feePayment: "SenderLane",
+    })).rejects.toThrow("conflicting V5 sponsor grant identities");
   });
 
   it("rejects inactive or intrinsically invalid native actions before signing", () => {

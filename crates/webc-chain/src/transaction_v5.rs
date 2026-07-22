@@ -20,7 +20,10 @@ use crate::{
     MAX_TRANSACTION_STATE_KEYS,
 };
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 use webc_crypto::{verify_signature, Address, Hash256, Keypair, PublicKeyBytes, SignatureBytes};
 
 /// Protocol configuration that interprets the V5 transaction schema.
@@ -58,6 +61,21 @@ pub const CANCEL_V1_REQUIRED_UNITS: u64 = 50;
 
 /// Fixed deterministic units for revoking one scoped sponsor grant.
 pub const REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS: u64 = 5_000;
+
+/// Fixed units for verifying and potentially recording a signed-grant revocation.
+///
+/// The conservative prototype value prices one durable record even if that
+/// record already exists. Keeping this cost stateless prevents block admission,
+/// receipts, and fee charging from disagreeing about first-use state.
+pub const REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS: u64 = 100_000;
+
+/// Fixed units charged to every sponsored transaction for grant bookkeeping.
+///
+/// A first use creates one durable replay/budget record, including when the
+/// sponsored transaction is a 50-unit cancellation or later action failure.
+/// Charging every use is deliberately conservative until storage deposits and
+/// benchmark-backed dynamic state costs are available.
+pub const SPONSOR_GRANT_USE_V1_REQUIRED_UNITS: u64 = 100_000;
 
 /// Stable typed failures from stateless V5 decoding and verification.
 ///
@@ -326,6 +344,14 @@ pub enum ActionV1 {
         /// Wallet-generated identity of the grant being revoked.
         grant_id: SponsorGrantId,
     },
+    /// Revokes an unused grant while authenticating its identity and expiry.
+    ///
+    /// This form is larger than the ID-only path but can safely create a
+    /// bounded pre-use record. The sender must be the grant sponsor.
+    RevokeSignedSponsorGrant {
+        /// Complete immutable grant carrying sponsor signature and lifetime.
+        grant: Box<SponsorGrantV1>,
+    },
 }
 
 impl ActionV1 {
@@ -341,11 +367,19 @@ impl ActionV1 {
         Self::RevokeSponsorGrant { grant_id }
     }
 
+    /// Constructs a pre-use revocation carrying authenticated grant lifetime.
+    pub fn revoke_signed_sponsor_grant(grant: SponsorGrantV1) -> Self {
+        Self::RevokeSignedSponsorGrant {
+            grant: Box::new(grant),
+        }
+    }
+
     /// Returns the deterministic units statically assigned to this action.
     pub fn required_units(&self) -> u64 {
         match self {
             Self::Native { operation } => operation.required_units(),
             Self::RevokeSponsorGrant { .. } => REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+            Self::RevokeSignedSponsorGrant { .. } => REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
         }
     }
 
@@ -356,7 +390,7 @@ impl ActionV1 {
     /// was described as prepared/includable.
     pub(crate) fn execution_supported(&self) -> bool {
         match self {
-            Self::RevokeSponsorGrant { .. } => true,
+            Self::RevokeSponsorGrant { .. } | Self::RevokeSignedSponsorGrant { .. } => true,
             Self::Native { operation } => matches!(
                 operation.as_ref(),
                 Operation::Transfer { .. }
@@ -384,6 +418,13 @@ impl ActionV1 {
                     Err(TransactionValidationErrorV1::InvalidNativeAction)
                 }
                 Self::RevokeSponsorGrant { .. } => Ok(()),
+                Self::RevokeSignedSponsorGrant { grant } => {
+                    grant.validate_structure()?;
+                    if grant.sponsor_signature.is_none() {
+                        return Err(TransactionValidationErrorV1::MissingSponsorSignature);
+                    }
+                    Ok(())
+                }
                 Self::Native { .. } => Err(TransactionValidationErrorV1::InvalidNativeAction),
             };
         };
@@ -427,6 +468,13 @@ impl ActionV1 {
                 access
                     .read_write
                     .push(StateKey::sponsor_grant(sender, grant_id.digest()));
+                Ok(access)
+            }
+            Self::RevokeSignedSponsorGrant { grant } => {
+                let mut access = cancel_access_list(sender, lane);
+                access
+                    .read_write
+                    .push(StateKey::sponsor_grant(sender, grant.grant_id.digest()));
                 Ok(access)
             }
         }
@@ -971,6 +1019,17 @@ impl TransactionV5 {
         self.kind.validate()?;
         if let TransactionKindV1::Actions(program) = &self.kind {
             validate_native_action_lane(program, self.authorization.lane)?;
+            for action in &program.actions {
+                let ActionV1::RevokeSignedSponsorGrant { grant } = action else {
+                    continue;
+                };
+                if grant.sponsor != self.sender
+                    || grant.chain_id != self.chain_id
+                    || grant.protocol_version != self.protocol_version
+                {
+                    return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
+                }
+            }
         }
         validate_fee_bid(self.fee_bid)?;
         validate_access_list(&self.access_list)?;
@@ -981,7 +1040,8 @@ impl TransactionV5 {
                 return Err(TransactionValidationErrorV1::InvalidAccessList);
             }
         }
-        self.validate_fee_payment()?;
+        self.validate_fee_payment_binding()?;
+        self.validate_sponsor_intent_consistency()?;
         if canonical_bytes(self)?.len() > MAX_TRANSACTION_V5_CANONICAL_BYTES {
             return Err(TransactionValidationErrorV1::TransactionTooLarge);
         }
@@ -1002,7 +1062,8 @@ impl TransactionV5 {
             .as_ref()
             .ok_or(TransactionValidationErrorV1::MissingSenderSignature)?;
         verify_signature(&self.sender_public_key, &self.signing_bytes()?, signature)
-            .map_err(|_| TransactionValidationErrorV1::InvalidSenderSignature)
+            .map_err(|_| TransactionValidationErrorV1::InvalidSenderSignature)?;
+        self.verify_nested_sponsor_authorizations()
     }
 
     /// Signs using an address-derived sender key.
@@ -1020,13 +1081,21 @@ impl TransactionV5 {
     ) -> Result<(), TransactionValidationErrorV1> {
         self.sender_public_key = keypair.public_key();
         self.validate_structure()?;
+        self.verify_nested_sponsor_authorizations()?;
         self.sender_signature = Some(keypair.sign(&self.signing_bytes()?));
         self.validate_structure()
     }
 
-    /// Returns checked static execution units for actions or cancellation.
+    /// Returns checked static units, including conservative sponsor bookkeeping.
     pub fn required_units(&self) -> Result<u64, TransactionValidationErrorV1> {
-        self.kind.required_units()
+        let units = self.kind.required_units()?;
+        if matches!(&self.fee_payment, FeePaymentV1::Sponsored(_)) {
+            units
+                .checked_add(SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+                .ok_or(TransactionValidationErrorV1::ActionUnitsOverflow)
+        } else {
+            Ok(units)
+        }
     }
 
     /// Recomputes the exact logical state declaration required for inclusion.
@@ -1144,11 +1213,14 @@ impl TransactionV5 {
         })
     }
 
-    fn validate_fee_payment(&self) -> Result<(), TransactionValidationErrorV1> {
+    fn validate_fee_payment_binding(&self) -> Result<(), TransactionValidationErrorV1> {
         let FeePaymentV1::Sponsored(sponsor_use) = &self.fee_payment else {
             return Ok(());
         };
         sponsor_use.grant.validate_structure()?;
+        if sponsor_use.grant.sponsor_signature.is_none() {
+            return Err(TransactionValidationErrorV1::MissingSponsorSignature);
+        }
         if sponsor_use.grant.chain_id != self.chain_id
             || sponsor_use.grant.protocol_version != self.protocol_version
             || sponsor_use.grant.sender != self.sender
@@ -1170,7 +1242,63 @@ impl TransactionV5 {
         if reserve > sponsor_use.grant.max_fee_per_transaction {
             return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
         }
-        sponsor_use.grant.verify()?;
+        Ok(())
+    }
+
+    /// Rejects one replay key naming different immutable grants in one envelope.
+    fn validate_sponsor_intent_consistency(&self) -> Result<(), TransactionValidationErrorV1> {
+        let mut identities = BTreeMap::<(Address, SponsorGrantId), (Hash256, BlockHeight)>::new();
+        let mut observe = |key: (Address, SponsorGrantId), digest: Hash256, expiry: BlockHeight| {
+            if let Some(previous) = identities.insert(key, (digest, expiry)) {
+                if previous != (digest, expiry) {
+                    return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
+                }
+            }
+            Ok(())
+        };
+
+        if let FeePaymentV1::Sponsored(sponsor_use) = &self.fee_payment {
+            observe(
+                (sponsor_use.grant.sponsor, sponsor_use.grant.grant_id),
+                sponsor_use.grant_digest,
+                sponsor_use.grant.validity.valid_until_height,
+            )?;
+        }
+        if let TransactionKindV1::Actions(program) = &self.kind {
+            for action in &program.actions {
+                let ActionV1::RevokeSignedSponsorGrant { grant } = action else {
+                    continue;
+                };
+                observe(
+                    (grant.sponsor, grant.grant_id),
+                    grant.digest()?,
+                    grant.validity.valid_until_height,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies each unique nested sponsor signature after sender authentication.
+    fn verify_nested_sponsor_authorizations(&self) -> Result<(), TransactionValidationErrorV1> {
+        let mut verified = BTreeSet::new();
+        let mut verify = |grant: &SponsorGrantV1| {
+            let digest = grant.digest()?;
+            if verified.insert(digest) {
+                grant.verify()?;
+            }
+            Ok(())
+        };
+        if let FeePaymentV1::Sponsored(sponsor_use) = &self.fee_payment {
+            verify(&sponsor_use.grant)?;
+        }
+        if let TransactionKindV1::Actions(program) = &self.kind {
+            for action in &program.actions {
+                if let ActionV1::RevokeSignedSponsorGrant { grant } = action {
+                    verify(grant)?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1730,6 +1858,143 @@ mod tests {
     }
 
     #[test]
+    fn signed_sponsor_revocation_binds_grant_chain_owner_signature_and_access() {
+        let sponsor = Keypair::from_seed([3; 32]);
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let scoped_kind = transfer_kind(recipient.address(), 123_456);
+        let mut grant = SponsorGrantV1 {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            grant_id: SponsorGrantId::new(Hash256([0x44; 32])),
+            sponsor: sponsor.address(),
+            sponsor_public_key: sponsor.public_key(),
+            payer_lane: AuthorizationLaneId::new(Hash256([0x55; 32])),
+            sender: sender.address(),
+            site_namespace: Some(Hash256([0x66; 32])),
+            application_namespace: None,
+            action_scope: ActionScopeV1::exact(scoped_kind.digest().expect("scoped action digest")),
+            validity: ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            max_fee_per_transaction: Amount::from_units(10_000),
+            max_cumulative_fee: Amount::from_units(100_000),
+            max_uses: 10,
+            sponsor_signature: None,
+        };
+        grant.sign(&sponsor).expect("grant signs");
+        let signed_revoke_kind = TransactionKindV1::Actions(ActionProgramV1::new(vec![
+            ActionV1::revoke_signed_sponsor_grant(grant.clone()),
+        ]));
+        const SIGNED_REVOKE_KIND_JSON: &str = r#"{"Actions":{"actions":[{"RevokeSignedSponsorGrant":{"grant":{"action_scope":{"exact_action_digest":"bb25a54623accd384abc84091335e289a9d3cfca5728b7f775f0329c6fa3e0a0"},"application_namespace":null,"chain_id":"webc-devnet-1","grant_id":"4444444444444444444444444444444444444444444444444444444444444444","max_cumulative_fee":"100000","max_fee_per_transaction":"10000","max_uses":"10","payer_lane":"5555555555555555555555555555555555555555555555555555555555555555","protocol_version":2,"sender":"webc16gBDxEHLXj6Tmntfm8227w6JHNoAhAtkoUvAaFw4N4J3","site_namespace":"6666666666666666666666666666666666666666666666666666666666666666","sponsor":"webc121uVaRnHeoTdcumRjrvYZuEaBBiHn4wito3PKSpNzjAf","sponsor_public_key":"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1","sponsor_signature":"8114099820bc2d1cdfd7be9a9180fe848c98dad6b9a1b54cbfa3a5dbb61f73b82bbe9ba37f2f0370ed73d3d460bed9a3faebee629c7743fa4d53bd554650820d","validity":{"valid_from_height":"10","valid_until_height":"20"}}}}]}}"#;
+        assert_eq!(
+            String::from_utf8(
+                crate::canonical::canonical_json_bytes(&signed_revoke_kind)
+                    .expect("kind canonicalizes")
+            )
+            .expect("canonical JSON is UTF-8"),
+            SIGNED_REVOKE_KIND_JSON
+        );
+        assert_eq!(
+            signed_revoke_kind
+                .digest()
+                .expect("kind digest")
+                .to_string(),
+            "99a8fb14c579034d0ec37e1fb715ae624a91cbee227397db6e1d069f02e8560a"
+        );
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sponsor.address(),
+            sponsor.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![ActionV1::revoke_signed_sponsor_grant(grant.clone())],
+            FeeBid {
+                gas_limit: REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("signed revocation builds");
+        transaction.sign(&sponsor).expect("revocation signs");
+        transaction
+            .verify_for_chain(&ChainId::devnet())
+            .expect("revocation verifies");
+        assert_eq!(
+            transaction.required_units(),
+            Ok(REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS)
+        );
+        assert!(transaction
+            .access_list
+            .read_write
+            .contains(&StateKey::sponsor_grant(
+                sponsor.address(),
+                grant.grant_id.digest()
+            )));
+
+        let mut conflicting_grant = grant.clone();
+        conflicting_grant.validity =
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(21));
+        conflicting_grant.sponsor_signature = None;
+        conflicting_grant
+            .sign(&sponsor)
+            .expect("conflicting grant signs independently");
+        let conflict = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sponsor.address(),
+            sponsor.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![
+                ActionV1::revoke_signed_sponsor_grant(grant.clone()),
+                ActionV1::revoke_signed_sponsor_grant(conflicting_grant),
+            ],
+            FeeBid {
+                gas_limit: REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS * 2,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("unsigned candidates remain representable for validation");
+        assert_eq!(
+            conflict.validate_structure(),
+            Err(TransactionValidationErrorV1::SponsorBindingMismatch)
+        );
+
+        let mut wrong_owner = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![ActionV1::revoke_signed_sponsor_grant(grant)],
+            FeeBid {
+                gas_limit: REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("structurally signed grant builds");
+        assert_eq!(
+            wrong_owner.sign(&sender),
+            Err(TransactionValidationErrorV1::SponsorBindingMismatch)
+        );
+    }
+
+    #[test]
     fn introduced_u64_fields_are_exact_decimal_strings() {
         let sender = Keypair::from_seed([1; 32]);
         let recipient = Keypair::from_seed([2; 32]);
@@ -1859,7 +2124,12 @@ mod tests {
         };
         use_record.grant_digest = use_record.grant.digest().expect("altered grant digest");
         assert_eq!(
-            altered_grant.validate_structure(),
+            altered_grant.verify_for_chain(&ChainId::devnet()),
+            Err(TransactionValidationErrorV1::InvalidSenderSignature)
+        );
+        altered_grant.sender_signature = None;
+        assert_eq!(
+            altered_grant.sign(&sender),
             Err(TransactionValidationErrorV1::InvalidSponsorSignature)
         );
     }
