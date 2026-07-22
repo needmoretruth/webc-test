@@ -27,7 +27,9 @@ use crate::sponsor_grant_book::SponsorGrantBookError;
 use crate::staking::{Delegation, StakingConfig, Validator, ValidatorStatus};
 use crate::state_key::StateAccessRecorder;
 use crate::transaction::{Operation, Transaction};
-use crate::unbonding::{UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition};
+use crate::unbonding::{
+    UnbondingClaimJournalV1, UnbondingKind, UnbondingQueue, UnbondingRequestId, UnbondingTransition,
+};
 use crate::{
     Amount, AuthorizationLaneId, ChainError, ChainId, Epoch, InflationSchedule, ObjectId,
     ObjectVersion, ProtocolStateKey, ProtocolVersion, SlashingEvidence, SponsorGrantBookV1,
@@ -2589,6 +2591,37 @@ impl ChainState {
         }
         let kind = request.kind;
         let amount = self.unbonding.claim(request_id, sender)?;
+        self.credit_claimed_unbonding_principal(sender, request_id, kind, amount, events)
+    }
+
+    /// Stages a V5 matured-principal claim without cloning the global queue.
+    ///
+    /// The request journal owns ordered claim visibility and commit validation;
+    /// this sparse `ChainState` owns only the declared account and event effects.
+    pub(crate) fn apply_native_claim_unbonded_staged(
+        &mut self,
+        sender: Address,
+        validator: Address,
+        request_id: UnbondingRequestId,
+        journal: &mut UnbondingClaimJournalV1,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::unbonding_queue(validator))?;
+        let (kind, amount) = journal.stage_claim(request_id, sender, validator)?;
+        self.credit_claimed_unbonding_principal(sender, request_id, kind, amount, events)
+    }
+
+    /// Credits one already-authorized claim and updates its account mirror.
+    fn credit_claimed_unbonding_principal(
+        &mut self,
+        sender: Address,
+        request_id: UnbondingRequestId,
+        kind: UnbondingKind,
+        amount: Amount,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ChainError> {
         let account = self.account_mut(sender)?;
         account.unbonding = account
             .unbonding

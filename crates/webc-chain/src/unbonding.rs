@@ -166,6 +166,73 @@ pub struct UnbondingQueue {
     requests: BTreeMap<UnbondingRequestId, UnbondingRequest>,
 }
 
+/// Fixed-size claim fields captured for one request-scoped V5 overlay.
+///
+/// Cooling tranches, FIFO order, and unrelated requests are deliberately not
+/// copied: a matured claim reads and changes only these immutable coordinates
+/// and two amount fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnbondingClaimSnapshotV1 {
+    /// Request identity redundantly checked against its map key.
+    id: UnbondingRequestId,
+    /// Account authorized to receive the matured principal.
+    owner: Address,
+    /// Validator coordinate signed by the claim action.
+    validator: Address,
+    /// Principal source copied into the emitted claim event.
+    kind: UnbondingKind,
+    /// Matured principal visible to the staged action sequence.
+    withdrawable: Amount,
+    /// Previously claimed principal plus successful staged claims.
+    claimed: Amount,
+}
+
+impl From<&UnbondingRequest> for UnbondingClaimSnapshotV1 {
+    fn from(request: &UnbondingRequest) -> Self {
+        Self {
+            id: request.id,
+            owner: request.owner,
+            validator: request.validator,
+            kind: request.kind,
+            withdrawable: request.withdrawable,
+            claimed: request.claimed,
+        }
+    }
+}
+
+/// Captured and virtual values for one possibly absent request ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnbondingClaimEntryV1 {
+    /// Exact base fields used to reject a stale commit.
+    captured: Option<UnbondingClaimSnapshotV1>,
+    /// Child-overlay value after zero or more ordered claims.
+    staged: Option<UnbondingClaimSnapshotV1>,
+    /// Whether a successful staged action changed this request.
+    dirty: bool,
+}
+
+/// Request-scoped V5 claim overlay that never clones the global queue.
+///
+/// At most one entry exists per signed claim request ID. Exact duplicates share
+/// the same virtual value, so a second claim observes zero withdrawable funds
+/// just as it would against `UnbondingQueue` directly. Commit validation checks
+/// every dirty base snapshot before any request is changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnbondingClaimJournalV1 {
+    /// Captured request fields in deterministic request-ID order.
+    entries: BTreeMap<UnbondingRequestId, UnbondingClaimEntryV1>,
+}
+
+/// A claim journal proven current against one queue snapshot.
+///
+/// The caller must apply this token to the same exclusively borrowed queue
+/// without an intervening unbonding lifecycle mutation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedUnbondingClaimJournalV1 {
+    /// Complete replacement requests in deterministic request-ID order.
+    replacements: BTreeMap<UnbondingRequestId, UnbondingRequest>,
+}
+
 /// Cooling/withdrawable principal destroyed by a verified validator slash.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnbondingSlashOutcome {
@@ -480,10 +547,274 @@ impl UnbondingQueue {
     }
 }
 
+impl UnbondingClaimJournalV1 {
+    /// Captures only the fixed-size fields for the requested IDs.
+    ///
+    /// Missing IDs are retained as authenticated absence so hostile lookups do
+    /// not trigger a global queue clone. Duplicate IDs consume one entry.
+    pub(crate) fn capture<I>(queue: &UnbondingQueue, request_ids: I) -> Self
+    where
+        I: IntoIterator<Item = UnbondingRequestId>,
+    {
+        let mut entries = BTreeMap::new();
+        for request_id in request_ids {
+            entries.entry(request_id).or_insert_with(|| {
+                let captured = queue.get(request_id).map(UnbondingClaimSnapshotV1::from);
+                UnbondingClaimEntryV1 {
+                    captured,
+                    staged: captured,
+                    dirty: false,
+                }
+            });
+        }
+        Self { entries }
+    }
+
+    /// Stages one owner/validator-bound matured claim in action order.
+    ///
+    /// Returns the event kind and native base-unit amount. All error variants
+    /// match the legacy queue transition so V4 and V5 classify failures alike.
+    pub(crate) fn stage_claim(
+        &mut self,
+        request_id: UnbondingRequestId,
+        owner: Address,
+        validator: Address,
+    ) -> Result<(UnbondingKind, Amount), ChainError> {
+        let entry = self
+            .entries
+            .get_mut(&request_id)
+            .ok_or(ChainError::InvalidUnbondingClaimJournal)?;
+        let staged = entry
+            .staged
+            .as_mut()
+            .ok_or(ChainError::UnbondingRequestNotFound)?;
+        if staged.id != request_id {
+            return Err(ChainError::InvalidUnbondingClaimJournal);
+        }
+        if staged.validator != validator {
+            return Err(ChainError::UnbondingRequestNotFound);
+        }
+        if staged.owner != owner {
+            return Err(ChainError::UnbondingOwnerMismatch);
+        }
+        if staged.withdrawable.is_zero() {
+            return Err(ChainError::UnbondingNotWithdrawable);
+        }
+        let amount = staged.withdrawable;
+        let claimed = staged
+            .claimed
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        staged.withdrawable = Amount::ZERO;
+        staged.claimed = claimed;
+        entry.dirty = true;
+        Ok((staged.kind, amount))
+    }
+
+    /// Validates every dirty request before producing an applicable commit token.
+    pub(crate) fn validate_against(
+        self,
+        queue: &UnbondingQueue,
+    ) -> Result<ValidatedUnbondingClaimJournalV1, ChainError> {
+        let mut replacements = BTreeMap::new();
+        for (request_id, entry) in self.entries {
+            if !entry.dirty {
+                continue;
+            }
+            let captured = entry
+                .captured
+                .ok_or(ChainError::InvalidUnbondingClaimJournal)?;
+            let current_request = queue
+                .get(request_id)
+                .ok_or(ChainError::InvalidUnbondingClaimJournal)?;
+            let current = UnbondingClaimSnapshotV1::from(current_request);
+            if current != captured {
+                return Err(ChainError::InvalidUnbondingClaimJournal);
+            }
+            let staged = entry
+                .staged
+                .ok_or(ChainError::InvalidUnbondingClaimJournal)?;
+            // Clone only a successfully claimed request at final commit. This
+            // preserves its queued/cooling topology and turns apply into an
+            // infallible map replacement without cloning the global queue.
+            let mut replacement = current_request.clone();
+            replacement.withdrawable = staged.withdrawable;
+            replacement.claimed = staged.claimed;
+            replacements.insert(request_id, replacement);
+        }
+        Ok(ValidatedUnbondingClaimJournalV1 { replacements })
+    }
+
+    /// Returns the number of captured request identities in focused tests.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl ValidatedUnbondingClaimJournalV1 {
+    /// Applies already-validated request replacements without a fallible lookup.
+    pub(crate) fn apply(self, queue: &mut UnbondingQueue) {
+        for (request_id, replacement) in self.replacements {
+            queue.requests.insert(request_id, replacement);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use webc_crypto::Keypair;
+
+    fn mature_requests(
+        queue: &mut UnbondingQueue,
+        owner: Address,
+        validator: Address,
+        amounts: &[u128],
+    ) -> Vec<UnbondingRequestId> {
+        let mut total = Amount::ZERO;
+        let mut request_ids = Vec::new();
+        for amount in amounts {
+            let amount = Amount::from_units(*amount);
+            total = total.checked_add(amount).expect("test total fits");
+            request_ids.push(
+                queue
+                    .request(
+                        owner,
+                        validator,
+                        UnbondingKind::Delegation,
+                        amount,
+                        Epoch::new(0),
+                        Amount::ZERO,
+                    )
+                    .expect("test request"),
+            );
+        }
+        queue
+            .advance_epoch(Epoch::new(1), total, 1, 1)
+            .expect("test admission");
+        queue
+            .advance_epoch(Epoch::new(3), Amount::ZERO, 1, 1)
+            .expect("test maturity");
+        request_ids
+    }
+
+    #[test]
+    fn request_scoped_claim_journal_matches_direct_queue_transition() {
+        let owner = Keypair::from_seed([91; 32]).address();
+        let validator = Keypair::from_seed([92; 32]).address();
+        let mut journal_queue = UnbondingQueue::default();
+        let request_id = mature_requests(&mut journal_queue, owner, validator, &[17])[0];
+        let mut direct_queue = journal_queue.clone();
+
+        let direct_amount = direct_queue.claim(request_id, owner).expect("direct claim");
+        let mut journal =
+            UnbondingClaimJournalV1::capture(&journal_queue, [request_id, request_id]);
+        assert_eq!(journal.len(), 1);
+        let (kind, staged_amount) = journal
+            .stage_claim(request_id, owner, validator)
+            .expect("journal claim");
+        let validated = journal
+            .validate_against(&journal_queue)
+            .expect("unchanged request validates");
+        validated.apply(&mut journal_queue);
+
+        assert_eq!(kind, UnbondingKind::Delegation);
+        assert_eq!(staged_amount, direct_amount);
+        assert_eq!(journal_queue, direct_queue);
+    }
+
+    #[test]
+    fn stale_multi_claim_journal_fails_before_mutating_any_request() {
+        let owner = Keypair::from_seed([93; 32]).address();
+        let validator = Keypair::from_seed([94; 32]).address();
+        let mut queue = UnbondingQueue::default();
+        let request_ids = mature_requests(&mut queue, owner, validator, &[5, 7]);
+        let mut journal = UnbondingClaimJournalV1::capture(&queue, request_ids.iter().copied());
+        for request_id in &request_ids {
+            journal
+                .stage_claim(*request_id, owner, validator)
+                .expect("both staged claims are valid");
+        }
+
+        queue
+            .claim(request_ids[1], owner)
+            .expect("ordered base change makes the journal stale");
+        let before_validation = queue.clone();
+        assert!(matches!(
+            journal.validate_against(&queue),
+            Err(ChainError::InvalidUnbondingClaimJournal)
+        ));
+        assert_eq!(queue, before_validation);
+        assert_eq!(
+            queue
+                .get(request_ids[0])
+                .expect("first request remains untouched")
+                .withdrawable,
+            Amount::from_units(5)
+        );
+    }
+
+    #[test]
+    fn claim_journal_rejects_missing_misbound_duplicate_and_overflow() {
+        let owner = Keypair::from_seed([95; 32]).address();
+        let wrong_owner = Keypair::from_seed([96; 32]).address();
+        let validator = Keypair::from_seed([97; 32]).address();
+        let wrong_validator = Keypair::from_seed([98; 32]).address();
+        let mut queue = UnbondingQueue::default();
+        let request_id = mature_requests(&mut queue, owner, validator, &[1])[0];
+        let missing = UnbondingRequestId::new(request_id.get() + 1);
+
+        assert!(matches!(
+            UnbondingClaimJournalV1::default().stage_claim(request_id, owner, validator),
+            Err(ChainError::InvalidUnbondingClaimJournal)
+        ));
+
+        let mut journal = UnbondingClaimJournalV1::capture(&queue, [request_id, missing]);
+        assert!(matches!(
+            journal.stage_claim(missing, owner, validator),
+            Err(ChainError::UnbondingRequestNotFound)
+        ));
+        assert!(matches!(
+            journal.stage_claim(request_id, owner, wrong_validator),
+            Err(ChainError::UnbondingRequestNotFound)
+        ));
+        assert!(matches!(
+            journal.stage_claim(request_id, wrong_owner, validator),
+            Err(ChainError::UnbondingOwnerMismatch)
+        ));
+        journal
+            .stage_claim(request_id, owner, validator)
+            .expect("first correctly bound claim succeeds");
+        assert!(matches!(
+            journal.stage_claim(request_id, owner, validator),
+            Err(ChainError::UnbondingNotWithdrawable)
+        ));
+
+        let overflow_request = queue
+            .requests
+            .get_mut(&request_id)
+            .expect("test request is present");
+        overflow_request.claimed = Amount::from_units(u128::MAX);
+        overflow_request.withdrawable = Amount::from_units(1);
+        let mut overflow_journal = UnbondingClaimJournalV1::capture(&queue, [request_id]);
+        assert!(matches!(
+            overflow_journal.stage_claim(request_id, owner, validator),
+            Err(ChainError::ArithmeticOverflow)
+        ));
+
+        let mismatched_request = queue
+            .requests
+            .get_mut(&request_id)
+            .expect("test request is present");
+        mismatched_request.id = missing;
+        mismatched_request.claimed = Amount::ZERO;
+        let mut mismatched_journal = UnbondingClaimJournalV1::capture(&queue, [request_id]);
+        assert!(matches!(
+            mismatched_journal.stage_claim(request_id, owner, validator),
+            Err(ChainError::InvalidUnbondingClaimJournal)
+        ));
+    }
 
     #[test]
     fn fifo_partial_admission_and_maturity_are_deterministic() {
