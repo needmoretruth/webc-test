@@ -92,6 +92,9 @@ pub enum TransactionPreparationErrorV1 {
     /// The grant was permanently revoked by its sponsor.
     #[error("V5 sponsor grant is revoked")]
     SponsorGrantRevoked,
+    /// ID-only revocation cannot create state for a grant never observed on-chain.
+    #[error("V5 sponsor grant must be materialized before ID-only revocation")]
+    SponsorGrantNotMaterialized,
     /// The use nonce is not the durable next nonce.
     #[error("V5 sponsor use nonce does not match current state")]
     SponsorNonceMismatch,
@@ -686,6 +689,7 @@ impl ChainState {
         if expected_nonce != transaction.authorization.nonce {
             return Err(TransactionPreparationErrorV1::SenderNonceMismatch);
         }
+        prepare_action_storage(self, transaction)?;
 
         let fee_payer = match &transaction.fee_payment {
             FeePaymentV1::SenderLane => FeePayerV1 {
@@ -1123,8 +1127,8 @@ fn execute_action_program_v1(
                     .map_err(map_block_chain_error)?;
                 child
                     .sponsor_grants
-                    .entry((transaction.sender, *grant_id))
-                    .or_default()
+                    .get_mut(&(transaction.sender, *grant_id))
+                    .ok_or(BlockExecutionErrorV1::InvalidState)?
                     .revoked = true;
                 action_events.push(Event::SponsorGrantRevoked {
                     sponsor: transaction.sender,
@@ -1496,6 +1500,28 @@ fn prepare_sponsor_use(
     }
     if transaction.sender != grant.sender {
         return Err(TransactionPreparationErrorV1::SponsorGrantMismatch);
+    }
+    Ok(())
+}
+
+/// Rejects actions that would create unbounded state without authenticated lifetime metadata.
+fn prepare_action_storage(
+    state: &ChainState,
+    transaction: &TransactionV5,
+) -> Result<(), TransactionPreparationErrorV1> {
+    let TransactionKindV1::Actions(program) = &transaction.kind else {
+        return Ok(());
+    };
+    for action in &program.actions {
+        let ActionV1::RevokeSponsorGrant { grant_id } = action else {
+            continue;
+        };
+        if !state
+            .sponsor_grants
+            .contains_key(&(transaction.sender, *grant_id))
+        {
+            return Err(TransactionPreparationErrorV1::SponsorGrantNotMaterialized);
+        }
     }
     Ok(())
 }
@@ -2967,6 +2993,10 @@ mod tests {
             .get_mut(&sponsor.address())
             .expect("sponsor account")
             .balance = Amount::from_units(30_000);
+        state.sponsor_grants.insert(
+            (sponsor.address(), grant_id),
+            SponsorGrantStateV1::default(),
+        );
         let prepared_revoke = prepared(&state, revoke);
         let receipt = state
             .execute_prepared_transaction_v1(
@@ -2987,6 +3017,28 @@ mod tests {
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantRevoked)
         );
+    }
+
+    #[test]
+    fn unknown_id_revocations_cannot_create_sponsor_tombstones() {
+        let sponsor = Keypair::from_seed([3; 32]);
+        let actions = (1_u8..=32)
+            .map(|byte| ActionV1::revoke_sponsor_grant(SponsorGrantId::new(Hash256([byte; 32]))))
+            .collect();
+        let transaction = sender_actions_fixture(&sponsor, actions, 1_000_000);
+        let state = funded_state(&sponsor, None);
+        let before = state.clone();
+
+        assert_eq!(
+            state.prepare_transaction_v1(
+                ValidatedTransactionV1::validate(transaction, &ChainId::devnet())
+                    .expect("bounded revocation batch validates"),
+                BlockHeight::new(10),
+            ),
+            Err(TransactionPreparationErrorV1::SponsorGrantNotMaterialized)
+        );
+        assert_eq!(state, before);
+        assert!(state.sponsor_grants.is_empty());
     }
 
     #[test]
