@@ -700,6 +700,37 @@ semantics, validate all dirty entries before any base mutation, apply only after
 validation succeeds, and prove bounded overlay size for successful and missing
 request IDs against a large unrelated queue.
 
+### Request-scoped unbonding checkpoint (2026-07-22)
+
+Commit `6865eb2` completes that exact item. V5 execution no longer copies the
+global `UnbondingQueue` into its sparse parent and child states. It captures only
+the fixed-size owner, validator, kind, request ID, withdrawable, and claimed
+fields for the at-most-32 signed action IDs. Ordered duplicate claims share one
+virtual record, successful execution validates every dirty snapshot before any
+sponsor/account mutation, and final commit clones and replaces only the claimed
+requests so unrelated queued/cooling topology is preserved. Chargeable action
+failure selects the unchanged parent journal. V4 continues to use the direct
+queue transition.
+
+The logical `StateKey::unbonding_queue(validator)` and its
+`GlobalUnbondingQueue` scheduler conflict are unchanged; only the physical copy
+strategy changed. Tests prove direct-transition and state-root parity, stale
+multi-request validation before mutation, duplicate/missing/wrong-owner/
+wrong-validator/zero/overflow/corrupt-ID behavior, later-action rollback, and
+both successful and missing claims against 1,025 live requests. In those large
+queue tests the sparse `ChainState` contains zero queue requests and the journal
+contains exactly one entry. An independent final diff review reported no
+actionable finding. The focused gate passed formatting, strict all-target
+`webc-chain` clippy, all 246 `webc-chain` tests, and Rust documentation.
+
+Exact next item: resume the still-open step-4 native transition set. Introduce
+an explicit immutable `ChainConfig` execution context with no production
+default fallback, then extract and integrate validator registration,
+delegation, undelegation, and operator unstaking as one reviewed staking group.
+Request-creating staking actions must use a bounded queue delta rather than
+reintroducing a global queue clone. Preserve V4 behavior and classify only
+state preconditions that can change after admission as chargeable failures.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
