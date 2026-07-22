@@ -554,7 +554,24 @@ fn assert_invariants(state: &ChainState, genesis_total: Amount) -> Result<(), Te
         "issued native supply drifted from the genesis total"
     );
 
-    // 2. Per-token supply: issued == sum of held balances, for every token.
+    // 2. The aggregate storage bucket must equal the deposits authenticated by
+    // live object leaves. Native supply can remain numerically balanced even if
+    // these two drift together with a liquid-account bug, so check the stronger
+    // object-level ownership invariant explicitly.
+    let live_object_deposits = state
+        .objects
+        .values()
+        .try_fold(Amount::ZERO, |total, object| {
+            total.checked_add(object.deposit)
+        })
+        .expect("bounded object deposits sum without overflow");
+    prop_assert_eq!(
+        state.storage_deposits,
+        live_object_deposits,
+        "aggregate storage deposits drifted from live object deposits"
+    );
+
+    // 3. Per-token supply: issued == sum of held balances, for every token.
     for token_id in state.tokens.keys() {
         let token_report = state
             .token_supply_report(*token_id)
@@ -565,7 +582,7 @@ fn assert_invariants(state: &ChainState, genesis_total: Amount) -> Result<(), Te
         );
     }
 
-    // 3. Per-collection NFT supply: minted - burned == live items.
+    // 4. Per-collection NFT supply: minted - burned == live items.
     for collection_id in state.nft_collections.keys() {
         let collection_report = state
             .nft_collection_supply_report(*collection_id)

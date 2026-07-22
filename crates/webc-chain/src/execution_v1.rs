@@ -15,17 +15,17 @@
 //! everything as block errors.
 
 use crate::sponsor_grant_book::SponsorGrantBookError;
-use crate::state::NativeActionEffects;
+use crate::state::{NativeActionEffects, NativeObjectMutation};
 use crate::state_key::StateAccessRecorder;
 use crate::unbonding::{UnbondingClaimJournalV1, UnbondingRequestId};
 use crate::{
     calculate_fee_summary_v1, ActionIndex, ActionV1, Amount, AssetId, AuthorizationLaneId,
-    BlockHeight, BlockPositionV1, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
-    ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate,
-    GasUnits, Nonce, ObjectId, Operation, ProtocolStateKey, ReceiptError, ReceiptStatusV1,
+    BlockHeight, BlockPositionV1, ChainConfig, ChainError, ChainId, ChainState, Event, EventIndex,
+    EventV1, ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1,
+    FeeRate, GasUnits, Nonce, ObjectId, Operation, ProtocolStateKey, ReceiptError, ReceiptStatusV1,
     ReceiptV1, SessionKey, SessionKeyId, SponsorGrantId, SponsorGrantStateV1, StateKey,
-    StateKeyKind, TransactionKindV1, TransactionV5, TransactionValidationErrorV1, EVENT_V1,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1,
+    StateKeyKind, StoragePricing, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
+    EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1,
     SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +48,12 @@ pub enum TransactionPreparationErrorV1 {
     /// The surrounding chain state has not activated protocol-2 execution.
     #[error("V5 transaction execution is not active for this state protocol")]
     ProtocolInactive,
+    /// Genesis config, state, and signed replay domains do not identify one chain.
+    #[error("V5 chain configuration does not match state and transaction domains")]
+    ChainConfigurationMismatch,
+    /// A deterministic configuration field is outside its permitted range.
+    #[error("V5 chain configuration is invalid")]
+    InvalidChainConfiguration,
     /// The signed validity window excludes the candidate block height.
     #[error("V5 transaction is outside its signed height window")]
     HeightOutsideValidity,
@@ -141,6 +147,54 @@ struct PreparationSnapshotV1 {
     base_fee_per_unit: FeeRate,
     effective_priority_fee_per_unit: FeeRate,
     authorization: PreparedAuthorizationV1,
+    storage_pricing: StoragePricing,
+}
+
+/// Direction-preserving delta between a sparse overlay scalar and its snapshot.
+///
+/// Native amounts are `u128`; converting them to `i128` would reject valid high
+/// values and make consensus depend on a narrower type. This enum keeps the full
+/// range and merges independent object-bucket effects with checked arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AmountDeltaV1 {
+    /// The overlay left the scalar unchanged.
+    Unchanged,
+    /// The overlay increased the scalar by the contained native base units.
+    Increase(Amount),
+    /// The overlay decreased the scalar by the contained native base units.
+    Decrease(Amount),
+}
+
+impl AmountDeltaV1 {
+    /// Computes a full-range delta without signed integer conversion.
+    fn between(after: Amount, before: Amount) -> Result<Self, BlockExecutionErrorV1> {
+        if after > before {
+            after
+                .checked_sub(before)
+                .map(Self::Increase)
+                .ok_or(BlockExecutionErrorV1::InvalidState)
+        } else if before > after {
+            before
+                .checked_sub(after)
+                .map(Self::Decrease)
+                .ok_or(BlockExecutionErrorV1::InvalidState)
+        } else {
+            Ok(Self::Unchanged)
+        }
+    }
+
+    /// Applies the delta to the latest base value during sparse commit.
+    fn apply(self, base: Amount) -> Result<Amount, BlockExecutionErrorV1> {
+        match self {
+            Self::Unchanged => Ok(base),
+            Self::Increase(amount) => base
+                .checked_add(amount)
+                .ok_or(BlockExecutionErrorV1::InvalidState),
+            Self::Decrease(amount) => base
+                .checked_sub(amount)
+                .ok_or(BlockExecutionErrorV1::InvalidState),
+        }
+    }
 }
 
 /// Typed writable identities captured by one bounded execution overlay.
@@ -174,12 +228,16 @@ enum ExecutionWriteKeyV1 {
 /// state. Native transitions still operate on the existing `ChainState` API,
 /// while commit moves only declared writable records back. This preserves the
 /// replaceable storage boundary without cloning unrelated accounts or objects.
+/// Each object leaf owns its contribution to the aggregate storage-deposit
+/// bucket, so independent object deltas merge additively instead of introducing
+/// one global conflict key that would serialize every object write.
 struct SparseExecutionStateV1 {
     state: ChainState,
     unbonding_claims: UnbondingClaimJournalV1,
     writes: Vec<ExecutionWriteKeyV1>,
     captured_burned_fees: Amount,
     captured_validator_fee_pool: Amount,
+    captured_storage_deposits: Amount,
 }
 
 impl SparseExecutionStateV1 {
@@ -196,6 +254,7 @@ impl SparseExecutionStateV1 {
             burned_fees: base.burned_fees,
             slashed_units: base.slashed_units,
             validator_fee_pool: base.validator_fee_pool,
+            storage_deposits: base.storage_deposits,
             minted_supply: base.minted_supply,
             inflation_year_start_supply: base.inflation_year_start_supply,
             current_base_fee_per_unit: base.current_base_fee_per_unit,
@@ -220,6 +279,7 @@ impl SparseExecutionStateV1 {
             writes,
             captured_burned_fees: base.burned_fees,
             captured_validator_fee_pool: base.validator_fee_pool,
+            captured_storage_deposits: base.storage_deposits,
         })
     }
 
@@ -243,6 +303,9 @@ impl SparseExecutionStateV1 {
             .validator_fee_pool
             .checked_add(validator_fee_delta)
             .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        let storage_deposit_delta =
+            AmountDeltaV1::between(self.state.storage_deposits, self.captured_storage_deposits)?;
+        let merged_storage_deposits = storage_deposit_delta.apply(base.storage_deposits)?;
         let sponsor_keys = self
             .writes
             .iter()
@@ -328,6 +391,7 @@ impl SparseExecutionStateV1 {
         }
         base.burned_fees = merged_burned_fees;
         base.validator_fee_pool = merged_validator_fee_pool;
+        base.storage_deposits = merged_storage_deposits;
         Ok(())
     }
 }
@@ -668,14 +732,18 @@ impl ChainState {
     /// This pure check performs no reservation or nonce mutation. It verifies
     /// height, static units, base-fee coverage, sender authority/nonce/session
     /// constraints, payer reserve, and sponsor replay/budget/revocation state.
+    /// `config` is the immutable genesis configuration; its protocol and chain
+    /// domains must match both state and the signed transaction, and its storage
+    /// pricing is copied into the snapshot consumed by execution.
     /// The returned value is snapshot-specific and must be consumed before any
     /// other transaction changes the same logical keys.
     pub fn prepare_transaction_v1(
         &self,
         validated: ValidatedTransactionV1,
         height: BlockHeight,
+        config: &ChainConfig,
     ) -> Result<PreparedTransactionV1, TransactionPreparationErrorV1> {
-        let snapshot = self.prepare_snapshot_v1(&validated, height)?;
+        let snapshot = self.prepare_snapshot_v1(&validated, height, config)?;
         let transaction_id = validated
             .transaction()
             .transaction_id()
@@ -692,11 +760,24 @@ impl ChainState {
         &self,
         validated: &ValidatedTransactionV1,
         height: BlockHeight,
+        config: &ChainConfig,
     ) -> Result<PreparationSnapshotV1, TransactionPreparationErrorV1> {
         if self.protocol_version != crate::TRANSACTION_V5_PROTOCOL_VERSION {
             return Err(TransactionPreparationErrorV1::ProtocolInactive);
         }
         let transaction = validated.transaction();
+        if config.protocol_version != crate::TRANSACTION_V5_PROTOCOL_VERSION
+            || config.protocol_version != self.protocol_version
+            || transaction.protocol_version != self.protocol_version
+            || config.chain_id != self.chain_id
+            || transaction.chain_id != self.chain_id
+        {
+            return Err(TransactionPreparationErrorV1::ChainConfigurationMismatch);
+        }
+        config
+            .storage_pricing
+            .validate()
+            .map_err(|_| TransactionPreparationErrorV1::InvalidChainConfiguration)?;
         if !transaction.validity.contains(height) {
             return Err(TransactionPreparationErrorV1::HeightOutsideValidity);
         }
@@ -759,6 +840,7 @@ impl ChainState {
                 transaction.fee_bid.priority_fee_per_unit.min(priority_room),
             ),
             authorization,
+            storage_pricing: config.storage_pricing,
         })
     }
 
@@ -770,13 +852,16 @@ impl ChainState {
     /// accounting. Ordered actions run in a child clone. Success merges that
     /// clone and all typed events; a chargeable action failure discards the child
     /// while committing the parent nonce and measured fee. Any returned error
-    /// leaves `self` byte-for-byte unchanged.
+    /// leaves `self` byte-for-byte unchanged. Execution rechecks the supplied
+    /// immutable config, so changing storage pricing after preparation produces
+    /// [`BlockExecutionErrorV1::StalePreparation`] before any mutation.
     pub fn execute_prepared_transaction_v1(
         &mut self,
         prepared: PreparedTransactionV1,
         position: BlockPositionV1,
+        config: &ChainConfig,
     ) -> Result<ExecutedTransactionV1, BlockExecutionErrorV1> {
-        let refreshed = self.prepare_snapshot_v1(&prepared.validated, position.height)?;
+        let refreshed = self.prepare_snapshot_v1(&prepared.validated, position.height, config)?;
         if refreshed != prepared.snapshot {
             return Err(BlockExecutionErrorV1::StalePreparation);
         }
@@ -806,6 +891,7 @@ impl ChainState {
             writes,
             captured_burned_fees,
             captured_validator_fee_pool,
+            captured_storage_deposits,
         } = SparseExecutionStateV1::capture(
             self,
             &transaction.access_list.read_only,
@@ -834,10 +920,13 @@ impl ChainState {
                 TransactionKindV1::Actions(program) => execute_action_program_v1(
                     parent,
                     parent_unbonding_claims,
-                    &transaction,
-                    transaction_id,
-                    program,
-                    position.height,
+                    ActionProgramContextV1 {
+                        transaction: &transaction,
+                        transaction_id,
+                        program,
+                        height: position.height,
+                        storage_pricing: snapshot.storage_pricing,
+                    },
                     &mut access,
                 )?,
             };
@@ -883,6 +972,7 @@ impl ChainState {
             writes,
             captured_burned_fees,
             captured_validator_fee_pool,
+            captured_storage_deposits,
         }
         .commit(self)?;
         Ok(ExecutedTransactionV1 { receipt })
@@ -935,6 +1025,7 @@ struct NativeActionContextV1 {
     sender: Address,
     sender_public_key: PublicKeyBytes,
     authorization_lane: AuthorizationLaneId,
+    storage_pricing: StoragePricing,
 }
 
 /// Executes one supported native action without owning fee or rollback policy.
@@ -994,6 +1085,29 @@ fn execute_native_action_v1(
             unbonding_claims,
             effects,
         ),
+        Operation::CreateObject {
+            object_id,
+            namespace,
+            data,
+        } => state.apply_native_object_create(
+            context.sender,
+            *object_id,
+            *namespace,
+            data,
+            context.storage_pricing,
+            effects,
+        ),
+        Operation::MutateObject {
+            object_id,
+            namespace,
+            expected_version,
+            data,
+        } => state.apply_native_object_mutation(
+            context.sender,
+            NativeObjectMutation::new(*object_id, *namespace, *expected_version, data),
+            context.storage_pricing,
+            effects,
+        ),
         Operation::TransferObject {
             object_id,
             namespace,
@@ -1005,6 +1119,18 @@ fn execute_native_action_v1(
             *namespace,
             *expected_version,
             *new_owner,
+            effects,
+        ),
+        Operation::DeleteObject {
+            object_id,
+            namespace,
+            expected_version,
+        } => state.apply_native_object_delete(
+            context.sender,
+            *object_id,
+            *namespace,
+            *expected_version,
+            context.storage_pricing,
             effects,
         ),
         _ => return Err(NativeActionExecutionErrorV1::Unsupported),
@@ -1141,13 +1267,22 @@ fn advance_sender_nonce(
     Ok(())
 }
 
+/// Immutable envelope inputs shared by every action in one ordered program.
+///
+/// Keeping these bound as one descriptor makes the pricing snapshot visibly
+/// inseparable from the transaction and block height it was prepared for.
+struct ActionProgramContextV1<'a> {
+    transaction: &'a TransactionV5,
+    transaction_id: crate::TransactionId,
+    program: &'a crate::ActionProgramV1,
+    height: BlockHeight,
+    storage_pricing: StoragePricing,
+}
+
 fn execute_action_program_v1(
     parent: ChainState,
     parent_unbonding_claims: UnbondingClaimJournalV1,
-    transaction: &TransactionV5,
-    transaction_id: crate::TransactionId,
-    program: &crate::ActionProgramV1,
-    height: BlockHeight,
+    context: ActionProgramContextV1<'_>,
     access: &mut StateAccessRecorder,
 ) -> Result<
     (
@@ -1159,6 +1294,13 @@ fn execute_action_program_v1(
     ),
     BlockExecutionErrorV1,
 > {
+    let ActionProgramContextV1 {
+        transaction,
+        transaction_id,
+        program,
+        height,
+        storage_pricing,
+    } = context;
     let mut child = parent.clone();
     let mut child_unbonding_claims = parent_unbonding_claims.clone();
     let mut attempted_units = if matches!(&transaction.fee_payment, FeePaymentV1::Sponsored(_)) {
@@ -1184,6 +1326,7 @@ fn execute_action_program_v1(
                     sender: transaction.sender,
                     sender_public_key: transaction.sender_public_key,
                     authorization_lane: transaction.authorization.lane,
+                    storage_pricing,
                 },
                 operation,
                 access,
@@ -1785,6 +1928,15 @@ mod tests {
         actions: Vec<ActionV1>,
         gas_limit: u64,
     ) -> TransactionV5 {
+        sender_actions_fixture_with_nonce(sender, Nonce::new(0), actions, gas_limit)
+    }
+
+    fn sender_actions_fixture_with_nonce(
+        sender: &Keypair,
+        nonce: Nonce,
+        actions: Vec<ActionV1>,
+        gas_limit: u64,
+    ) -> TransactionV5 {
         let mut transaction = TransactionV5::for_actions_unsigned(
             ChainId::devnet(),
             sender.address(),
@@ -1792,7 +1944,7 @@ mod tests {
             TransactionAuthorizationV1 {
                 lane: AuthorizationLaneId::DEFAULT,
                 policy_revision: AuthorizationPolicyRevision::new(0),
-                nonce: Nonce::new(0),
+                nonce,
             },
             ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
             actions,
@@ -1898,12 +2050,38 @@ mod tests {
         state
     }
 
+    fn v5_config() -> ChainConfig {
+        ChainConfig {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            ..ChainConfig::default()
+        }
+    }
+
+    fn live_object_deposit_total(state: &ChainState) -> Amount {
+        state
+            .objects
+            .values()
+            .try_fold(Amount::ZERO, |total, object| {
+                total.checked_add(object.deposit)
+            })
+            .expect("test object deposits sum without overflow")
+    }
+
     fn prepared(state: &ChainState, transaction: TransactionV5) -> PreparedTransactionV1 {
+        prepared_with_config(state, transaction, &v5_config())
+    }
+
+    fn prepared_with_config(
+        state: &ChainState,
+        transaction: TransactionV5,
+        config: &ChainConfig,
+    ) -> PreparedTransactionV1 {
         state
             .prepare_transaction_v1(
                 ValidatedTransactionV1::validate(transaction, &ChainId::devnet())
                     .expect("fixture validates"),
                 BlockHeight::new(10),
+                config,
             )
             .expect("fixture prepares")
     }
@@ -2097,10 +2275,106 @@ mod tests {
         let state = ChainState::default();
 
         assert!(matches!(
-            state.prepare_transaction_v1(validated, BlockHeight::new(10)),
+            state.prepare_transaction_v1(validated, BlockHeight::new(10), &v5_config()),
             Err(TransactionPreparationErrorV1::ProtocolInactive)
         ));
         assert!(state.sponsor_grants.is_empty());
+    }
+
+    #[test]
+    fn preparation_rejects_cross_chain_state_even_when_caller_validated_that_chain() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let other_chain = ChainId::new("webc-other-1").expect("test chain id");
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            other_chain.clone(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            })],
+            FeeBid {
+                gas_limit: 1_000,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("other-chain transaction builds");
+        transaction
+            .sign(&sender)
+            .expect("other-chain transaction signs");
+        let validated = ValidatedTransactionV1::validate(transaction, &other_chain)
+            .expect("caller-provided chain validates structurally");
+        let state = funded_state(&sender, None);
+
+        assert_eq!(
+            state.prepare_transaction_v1(validated, BlockHeight::new(10), &v5_config()),
+            Err(TransactionPreparationErrorV1::ChainConfigurationMismatch)
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_invalid_storage_pricing() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let state = funded_state(&sender, None);
+        let validated = ValidatedTransactionV1::validate(
+            sender_paid_fixture(&sender, &recipient),
+            &ChainId::devnet(),
+        )
+        .expect("transaction validates");
+        let mut invalid = v5_config();
+        invalid.storage_pricing.refund_bps = 10_001;
+
+        assert_eq!(
+            state.prepare_transaction_v1(validated, BlockHeight::new(10), &invalid),
+            Err(TransactionPreparationErrorV1::InvalidChainConfiguration)
+        );
+    }
+
+    #[test]
+    fn execution_rejects_changed_storage_pricing_before_mutation() {
+        let sender = Keypair::from_seed([1; 32]);
+        let operation = Operation::CreateObject {
+            object_id: ObjectId::new(Hash256([0xD1; 32])),
+            namespace: Hash256([0xD2; 32]),
+            data: vec![0x77; 4],
+        };
+        let transaction = sender_actions_fixture(
+            &sender,
+            vec![ActionV1::native(operation.clone())],
+            operation.required_units(),
+        );
+        let mut prepared_config = v5_config();
+        prepared_config.storage_pricing.deposit_per_byte = 100;
+        let mut execution_config = prepared_config.clone();
+        execution_config.storage_pricing.deposit_per_byte = 101;
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(1_000_000);
+        let prepared = prepared_with_config(&state, transaction, &prepared_config);
+        let before = state.clone();
+
+        assert_eq!(
+            state.execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &execution_config,
+            ),
+            Err(BlockExecutionErrorV1::StalePreparation)
+        );
+        assert_eq!(state, before);
     }
 
     #[test]
@@ -2151,6 +2425,7 @@ mod tests {
                 )
                 .expect("valid sender transaction"),
                 BlockHeight::new(10),
+                &v5_config(),
             )
             .expect("transaction prepares");
         assert_eq!(prepared.fee_reserve(), Amount::from_units(5_000));
@@ -2166,6 +2441,7 @@ mod tests {
             )
             .expect("valid sender transaction"),
             BlockHeight::new(21),
+            &v5_config(),
         );
         assert_eq!(
             outside,
@@ -2181,6 +2457,7 @@ mod tests {
                 ValidatedTransactionV1::validate(wrong_nonce, &ChainId::devnet())
                     .expect("nonce is stateful"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SenderNonceMismatch)
         );
@@ -2199,6 +2476,7 @@ mod tests {
                 )
                 .expect("valid sender transaction"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::InsufficientFeeReserve)
         );
@@ -2232,6 +2510,7 @@ mod tests {
                 ValidatedTransactionV1::validate(transaction.clone(), &ChainId::devnet())
                     .expect("valid sponsored transaction"),
                 BlockHeight::new(10),
+                &v5_config(),
             )
             .is_ok());
 
@@ -2255,6 +2534,7 @@ mod tests {
                 ValidatedTransactionV1::validate(transaction.clone(), &ChainId::devnet())
                     .expect("valid sponsored transaction"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorNonceMismatch)
         );
@@ -2272,6 +2552,7 @@ mod tests {
                 ValidatedTransactionV1::validate(transaction.clone(), &ChainId::devnet())
                     .expect("valid sponsored transaction"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantRevoked)
         );
@@ -2289,6 +2570,7 @@ mod tests {
                 ValidatedTransactionV1::validate(transaction, &ChainId::devnet())
                     .expect("valid sponsored transaction"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorBudgetExceeded)
         );
@@ -2322,6 +2604,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 success_prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("two transfers execute");
         let receipt = executed.receipt();
@@ -2362,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn object_create_and_mutation_fail_closed_until_storage_pricing_is_bound() {
+    fn object_create_and_mutation_are_structurally_supported() {
         let sender = Keypair::from_seed([1; 32]);
         let object_id = ObjectId::new(Hash256([0x91; 32]));
         let namespace = Hash256([0x92; 32]);
@@ -2379,7 +2662,7 @@ mod tests {
                 data: vec![3, 4],
             },
         ] {
-            let result = TransactionV5::for_actions_unsigned(
+            TransactionV5::for_actions_unsigned(
                 ChainId::devnet(),
                 sender.address(),
                 sender.public_key(),
@@ -2396,12 +2679,346 @@ mod tests {
                     priority_fee_per_unit: 1,
                 },
                 FeePaymentV1::SenderLane,
-            );
-            assert!(matches!(
-                result,
-                Err(TransactionValidationErrorV1::UnsupportedNativeAction)
-            ));
+            )
+            .expect("storage-priced object action is structurally supported");
         }
+    }
+
+    #[test]
+    fn object_storage_deposit_lifecycle_uses_immutable_pricing_and_conserves_supply() {
+        let sender = Keypair::from_seed([1; 32]);
+        let object_id = ObjectId::new(Hash256([0xA1; 32]));
+        let namespace = Hash256([0xA2; 32]);
+        let mut config = v5_config();
+        config.storage_pricing = StoragePricing {
+            deposit_per_byte: 100,
+            refund_bps: 9_000,
+        };
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(2_000_000);
+        state.minted_supply = Amount::from_units(2_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let create_operation = Operation::CreateObject {
+            object_id,
+            namespace,
+            data: vec![0x11; 10],
+        };
+        let create = sender_actions_fixture_with_nonce(
+            &sender,
+            Nonce::new(0),
+            vec![ActionV1::native(create_operation.clone())],
+            create_operation.required_units(),
+        );
+        let liquid_before = state.accounts[&sender.address()].balance;
+        let create_receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, create, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("object creation executes")
+            .into_receipt();
+        let deposit_10 = config
+            .storage_pricing
+            .deposit_for_bytes(10)
+            .expect("ten-byte deposit");
+        assert_eq!(create_receipt.status, ReceiptStatusV1::Succeeded);
+        assert!(matches!(
+            create_receipt.events.as_slice(),
+            [EventV1 {
+                body: Event::ObjectCreated { object_id: id, .. },
+                ..
+            }] if *id == object_id
+        ));
+        assert_eq!(state.objects[&object_id].deposit, deposit_10);
+        assert_eq!(state.storage_deposits, deposit_10);
+        assert_eq!(live_object_deposit_total(&state), state.storage_deposits);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            liquid_before
+                .checked_sub(create_receipt.fee_summary.charged)
+                .and_then(|balance| balance.checked_sub(deposit_10))
+                .expect("create balance settles")
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("create report")
+                .balanced
+        );
+
+        let grow_operation = Operation::MutateObject {
+            object_id,
+            namespace,
+            expected_version: ObjectVersion::INITIAL,
+            data: vec![0x22; 30],
+        };
+        let grow = sender_actions_fixture_with_nonce(
+            &sender,
+            Nonce::new(1),
+            vec![ActionV1::native(grow_operation.clone())],
+            grow_operation.required_units(),
+        );
+        let liquid_before = state.accounts[&sender.address()].balance;
+        let grow_receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, grow, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(1)),
+                &config,
+            )
+            .expect("object growth executes")
+            .into_receipt();
+        let deposit_30 = config
+            .storage_pricing
+            .deposit_for_bytes(30)
+            .expect("thirty-byte deposit");
+        let growth = deposit_30.checked_sub(deposit_10).expect("growth delta");
+        assert_eq!(state.objects[&object_id].deposit, deposit_30);
+        assert_eq!(state.storage_deposits, deposit_30);
+        assert_eq!(live_object_deposit_total(&state), state.storage_deposits);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            liquid_before
+                .checked_sub(grow_receipt.fee_summary.charged)
+                .and_then(|balance| balance.checked_sub(growth))
+                .expect("grow balance settles")
+        );
+
+        let shrink_operation = Operation::MutateObject {
+            object_id,
+            namespace,
+            expected_version: ObjectVersion::new(2),
+            data: vec![0x33; 5],
+        };
+        let shrink = sender_actions_fixture_with_nonce(
+            &sender,
+            Nonce::new(2),
+            vec![ActionV1::native(shrink_operation.clone())],
+            shrink_operation.required_units(),
+        );
+        let liquid_before = state.accounts[&sender.address()].balance;
+        let shrink_receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, shrink, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(2)),
+                &config,
+            )
+            .expect("object shrink executes")
+            .into_receipt();
+        let deposit_5 = config
+            .storage_pricing
+            .deposit_for_bytes(5)
+            .expect("five-byte deposit");
+        let shrink_refund = deposit_30.checked_sub(deposit_5).expect("shrink delta");
+        assert_eq!(state.objects[&object_id].deposit, deposit_5);
+        assert_eq!(state.storage_deposits, deposit_5);
+        assert_eq!(live_object_deposit_total(&state), state.storage_deposits);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            liquid_before
+                .checked_sub(shrink_receipt.fee_summary.charged)
+                .and_then(|balance| balance.checked_add(shrink_refund))
+                .expect("shrink balance settles")
+        );
+        let restored: ChainState =
+            bincode::deserialize(&bincode::serialize(&state).expect("serialize V5 object state"))
+                .expect("restore V5 object state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored state root"),
+            state.state_root().expect("live state root")
+        );
+
+        let delete_operation = Operation::DeleteObject {
+            object_id,
+            namespace,
+            expected_version: ObjectVersion::new(3),
+        };
+        let delete = sender_actions_fixture_with_nonce(
+            &sender,
+            Nonce::new(3),
+            vec![ActionV1::native(delete_operation.clone())],
+            delete_operation.required_units(),
+        );
+        let split = config
+            .storage_pricing
+            .refund_split(deposit_5)
+            .expect("delete split");
+        let liquid_before = state.accounts[&sender.address()].balance;
+        let burned_before = state.burned_fees;
+        let delete_receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, delete, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(3)),
+                &config,
+            )
+            .expect("object deletion executes")
+            .into_receipt();
+        assert!(!state.objects.contains_key(&object_id));
+        assert_eq!(state.storage_deposits, Amount::ZERO);
+        assert_eq!(live_object_deposit_total(&state), Amount::ZERO);
+        assert!(matches!(
+            delete_receipt.events.as_slice(),
+            [EventV1 {
+                body: Event::ObjectDeleted { refund, burned, .. },
+                ..
+            }] if *refund == split.refund && *burned == split.burned
+        ));
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            liquid_before
+                .checked_sub(delete_receipt.fee_summary.charged)
+                .and_then(|balance| balance.checked_add(split.refund))
+                .expect("delete balance settles")
+        );
+        assert_eq!(
+            state.burned_fees,
+            burned_before
+                .checked_add(delete_receipt.fee_summary.burned)
+                .and_then(|burned| burned.checked_add(split.burned))
+                .expect("delete burns settle")
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("delete report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn failed_later_object_action_discards_objects_deposits_and_events() {
+        let sender = Keypair::from_seed([1; 32]);
+        let object_id = ObjectId::new(Hash256([0xB1; 32]));
+        let namespace = Hash256([0xB2; 32]);
+        let wrong_namespace = Hash256([0xB3; 32]);
+        let config = v5_config();
+        let actions = vec![
+            ActionV1::native(Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![0x44; 10],
+            }),
+            ActionV1::native(Operation::MutateObject {
+                object_id,
+                namespace: wrong_namespace,
+                expected_version: ObjectVersion::INITIAL,
+                data: vec![0x55; 20],
+            }),
+        ];
+        let gas_limit = actions
+            .iter()
+            .try_fold(0_u64, |total, action| {
+                total.checked_add(action.required_units())
+            })
+            .expect("object action units");
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(1_000_000);
+        state.minted_supply = Amount::from_units(1_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        let liquid_before = state.accounts[&sender.address()].balance;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, transaction, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("namespace failure is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(receipt.events.is_empty());
+        assert!(!state.objects.contains_key(&object_id));
+        assert_eq!(state.storage_deposits, Amount::ZERO);
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            liquid_before
+                .checked_sub(receipt.fee_summary.charged)
+                .expect("only fee remains")
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failure report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn insufficient_object_deposit_is_chargeable_without_partial_storage_state() {
+        let sender = Keypair::from_seed([1; 32]);
+        let object_id = ObjectId::new(Hash256([0xC1; 32]));
+        let operation = Operation::CreateObject {
+            object_id,
+            namespace: Hash256([0xC2; 32]),
+            data: vec![0x66; 10],
+        };
+        let gas_limit = operation.required_units();
+        let transaction =
+            sender_actions_fixture(&sender, vec![ActionV1::native(operation)], gas_limit);
+        let reserve = Amount::from_units(
+            u128::from(gas_limit)
+                .checked_mul(5)
+                .expect("fixture reserve"),
+        );
+        let config = v5_config();
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = reserve;
+        state.minted_supply = reserve;
+        state.inflation_year_start_supply = reserve;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, transaction, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("deposit shortfall is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::InsufficientBalance,
+                failed_action_index: Some(ActionIndex::new(0)),
+            }
+        );
+        assert!(!state.objects.contains_key(&object_id));
+        assert_eq!(state.storage_deposits, Amount::ZERO);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            reserve
+                .checked_sub(receipt.fee_summary.charged)
+                .expect("actual fee remains")
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("shortfall report")
+                .balanced
+        );
     }
 
     #[test]
@@ -2436,6 +3053,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("ordered lane actions execute")
             .into_receipt();
@@ -2492,6 +3110,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("lane funding balance failure is chargeable")
             .into_receipt();
@@ -2546,6 +3165,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("authorization policy installs")
             .into_receipt();
@@ -2588,6 +3208,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("duplicate policy install is chargeable")
             .into_receipt();
@@ -2664,6 +3285,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("ordered reward claims execute")
             .into_receipt();
@@ -2732,6 +3354,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("missing delegation is chargeable")
             .into_receipt();
@@ -2779,6 +3402,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("matured unbonding claim executes")
             .into_receipt();
@@ -2815,6 +3439,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("duplicate claim is chargeable")
             .into_receipt();
@@ -2888,6 +3513,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("large-queue claim executes")
             .into_receipt();
@@ -2942,6 +3568,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("missing claim is a chargeable precondition")
             .into_receipt();
@@ -3025,6 +3652,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 failed_prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("chargeable failure is an executed result");
 
@@ -3068,6 +3696,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 unrelated_prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(1)),
+                &v5_config(),
             )
             .expect("unrelated transaction still executes")
             .into_receipt();
@@ -3113,6 +3742,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("cancel executes")
             .into_receipt();
@@ -3169,6 +3799,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("lane transaction executes");
 
@@ -3240,6 +3871,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("non-default lane reward claim executes")
             .into_receipt();
@@ -3305,6 +3937,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("sponsored failure executes")
             .into_receipt();
@@ -3382,6 +4015,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("sponsored cancellation executes")
             .into_receipt();
@@ -3441,6 +4075,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("chargeable later action failure executes")
             .into_receipt();
@@ -3495,6 +4130,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared_revoke,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("revocation executes")
             .into_receipt();
@@ -3512,6 +4148,7 @@ mod tests {
                 ValidatedTransactionV1::validate(sponsored, &ChainId::devnet())
                     .expect("sponsored wire validates"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantRevoked)
         );
@@ -3546,6 +4183,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared_revoke,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("pre-use revocation executes")
             .into_receipt();
@@ -3566,6 +4204,7 @@ mod tests {
                 ValidatedTransactionV1::validate(sponsored, &ChainId::devnet())
                     .expect("sponsored wire validates"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantRevoked)
         );
@@ -3634,6 +4273,7 @@ mod tests {
                 ValidatedTransactionV1::validate(expired, &ChainId::devnet())
                     .expect("expired revoke wire validates"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantExpired)
         );
@@ -3648,6 +4288,7 @@ mod tests {
                 ValidatedTransactionV1::validate(far_future, &ChainId::devnet())
                     .expect("future revoke wire validates"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantTooFarInFuture)
         );
@@ -3708,6 +4349,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("expired identity is atomically replaced")
             .into_receipt();
@@ -3738,6 +4380,7 @@ mod tests {
                 ValidatedTransactionV1::validate(transaction, &ChainId::devnet())
                     .expect("bounded revocation batch validates"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::SponsorGrantNotMaterialized)
         );
@@ -3757,6 +4400,7 @@ mod tests {
             state.execute_prepared_transaction_v1(
                 prepared_transfer,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             ),
             Err(BlockExecutionErrorV1::StalePreparation)
         );
@@ -3780,6 +4424,7 @@ mod tests {
             state.execute_prepared_transaction_v1(
                 prepared_transfer,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             ),
             Err(BlockExecutionErrorV1::Preparation(
                 TransactionPreparationErrorV1::SenderNonceMismatch,
@@ -3804,6 +4449,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared_transfer,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("unrelated state does not invalidate preparation");
         assert_eq!(
@@ -3879,6 +4525,76 @@ mod tests {
     }
 
     #[test]
+    fn independent_storage_overlays_merge_full_range_directional_deltas() {
+        fn overlays(base: &ChainState) -> (SparseExecutionStateV1, SparseExecutionStateV1) {
+            let mut increase = SparseExecutionStateV1::capture(base, &[], &[], &[])
+                .expect("increase overlay captures");
+            let mut decrease = SparseExecutionStateV1::capture(base, &[], &[], &[])
+                .expect("decrease overlay captures");
+            increase.state.storage_deposits = Amount::from_units(130);
+            decrease.state.storage_deposits = Amount::from_units(90);
+            (increase, decrease)
+        }
+
+        let initial = ChainState {
+            storage_deposits: Amount::from_units(100),
+            ..ChainState::default()
+        };
+        let (increase, decrease) = overlays(&initial);
+        let mut increase_first = initial.clone();
+        increase
+            .commit(&mut increase_first)
+            .expect("increase commits");
+        decrease
+            .commit(&mut increase_first)
+            .expect("decrease merges");
+
+        let (increase, decrease) = overlays(&initial);
+        let mut decrease_first = initial;
+        decrease
+            .commit(&mut decrease_first)
+            .expect("decrease commits");
+        increase
+            .commit(&mut decrease_first)
+            .expect("increase merges");
+
+        assert_eq!(increase_first.storage_deposits, Amount::from_units(120));
+        assert_eq!(decrease_first.storage_deposits, Amount::from_units(120));
+    }
+
+    #[test]
+    fn stale_storage_decrease_fails_before_any_sparse_record_commits() {
+        let owner = Keypair::from_seed([0x51; 32]).address();
+        let mut base = ChainState {
+            storage_deposits: Amount::from_units(5),
+            ..ChainState::default()
+        };
+        base.accounts
+            .insert(owner, Account::with_balance(Amount::from_units(10)));
+        let mut overlay =
+            SparseExecutionStateV1::capture(&base, &[], &[StateKey::account(owner)], &[])
+                .expect("storage overlay captures");
+        overlay.state.storage_deposits = Amount::ZERO;
+        overlay
+            .state
+            .accounts
+            .get_mut(&owner)
+            .expect("captured account")
+            .balance = Amount::from_units(99);
+
+        // Simulate an independently committed decrease consuming the available
+        // bucket after this overlay captured its snapshot.
+        base.storage_deposits = Amount::ZERO;
+        let account_before = base.accounts[&owner].clone();
+        assert_eq!(
+            overlay.commit(&mut base),
+            Err(BlockExecutionErrorV1::InvalidState)
+        );
+        assert_eq!(base.accounts[&owner], account_before);
+        assert_eq!(base.storage_deposits, Amount::ZERO);
+    }
+
+    #[test]
     fn session_access_shape_is_statefully_bound_to_session_authority() {
         let owner = Keypair::from_seed([1; 32]);
         let recipient = Keypair::from_seed([2; 32]);
@@ -3917,6 +4633,7 @@ mod tests {
                 ValidatedTransactionV1::validate(account_shaped_as_session, &ChainId::devnet(),)
                     .expect("both static authorization shapes validate"),
                 BlockHeight::new(10),
+                &v5_config(),
             ),
             Err(TransactionPreparationErrorV1::AuthorizationAccessMismatch)
         );
@@ -3945,6 +4662,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared_success,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("session transfer executes");
         let success_record = &success_state.session_keys[&(owner.address(), session_id)];
@@ -3972,6 +4690,7 @@ mod tests {
             .execute_prepared_transaction_v1(
                 prepared_failure,
                 BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
             )
             .expect("session action failure is chargeable")
             .into_receipt();

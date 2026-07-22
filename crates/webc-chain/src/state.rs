@@ -1583,6 +1583,36 @@ impl<'a> NativeActionEffects<'a> {
     }
 }
 
+/// Borrowed coordinates and replacement bytes for one owned-object mutation.
+///
+/// Grouping the namespace/version preconditions with the target prevents V4 and
+/// V5 callers from swapping positional arguments while both reuse the same
+/// deposit-aware transition. This is an internal call descriptor, not a wire
+/// format; the signed [`Operation::MutateObject`] remains authoritative.
+pub(crate) struct NativeObjectMutation<'a> {
+    object_id: ObjectId,
+    namespace: Hash256,
+    expected_version: ObjectVersion,
+    data: &'a [u8],
+}
+
+impl<'a> NativeObjectMutation<'a> {
+    /// Creates a borrowed mutation descriptor from already validated wire fields.
+    pub(crate) const fn new(
+        object_id: ObjectId,
+        namespace: Hash256,
+        expected_version: ObjectVersion,
+        data: &'a [u8],
+    ) -> Self {
+        Self {
+            object_id,
+            namespace,
+            expected_version,
+            data,
+        }
+    }
+}
+
 /// The resolved specification of one contract invocation handed to
 /// [`ChainState::run_contract_call`].
 ///
@@ -1649,6 +1679,10 @@ impl ChainState {
     /// supply reconciliation and prevents stake from being counted twice.
     pub fn from_genesis(genesis: &GenesisConfig) -> Result<Self, ChainError> {
         let mut state = Self::new(&genesis.chain)?;
+        // Storage pricing is immutable genesis state. Reject an impossible
+        // refund share now rather than allowing object creation and discovering
+        // the malformed policy only when a later owner attempts deletion.
+        genesis.chain.storage_pricing.validate()?;
         // Reject a malformed sponsorship window (zero epochs) before any state
         // exists, so a chain never runs with an undefined "per day" boundary.
         genesis.chain.sponsorship.validate()?;
@@ -3324,39 +3358,14 @@ impl ChainState {
                 namespace,
                 data,
             } => {
-                access.write(StateKey::object(*object_id))?;
-                access.write(StateKey::application(*namespace, object_id.hash()))?;
-                // The storage deposit is locked from the creator's liquid
-                // balance, so this operation also writes the sender account
-                // (already recorded on the default lane; declared explicitly so
-                // it is covered on a non-default fee lane too).
-                access.write(StateKey::account(tx.sender))?;
-                if self.objects.contains_key(object_id) {
-                    return Err(ChainError::ObjectAlreadyExists);
-                }
-                let mut object =
-                    StateObject::new_owned(*object_id, *namespace, tx.sender, data.clone())?;
-                // §15.22: lock a refundable storage deposit proportional to the
-                // deterministic stored byte count. `debit_native` fails closed
-                // (rolling the whole transaction back) if the creator cannot
-                // afford it, so an object can never exist without its deposit.
-                let deposit = config
-                    .storage_pricing
-                    .deposit_for_bytes(object.data.len())?;
-                self.debit_native(tx.sender, deposit)?;
-                object.deposit = deposit;
-                self.storage_deposits = self
-                    .storage_deposits
-                    .checked_add(deposit)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let version = object.version;
-                self.objects.insert(*object_id, object);
-                events.push(Event::ObjectCreated {
-                    object_id: *object_id,
-                    namespace: *namespace,
-                    owner: tx.sender,
-                    version,
-                });
+                self.apply_native_object_create(
+                    tx.sender,
+                    *object_id,
+                    *namespace,
+                    data,
+                    config.storage_pricing,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::MutateObject {
                 object_id,
@@ -3364,60 +3373,12 @@ impl ChainState {
                 expected_version,
                 data,
             } => {
-                access.write(StateKey::object(*object_id))?;
-                access.write(StateKey::application(*namespace, object_id.hash()))?;
-                // A resize locks or refunds the difference against the sender's
-                // liquid balance, so the sender account is written here too.
-                access.write(StateKey::account(tx.sender))?;
-                validate_object_data(data)?;
-                let new_deposit = config.storage_pricing.deposit_for_bytes(data.len())?;
-                // Validate ownership/version and read the current deposit, then
-                // release the object borrow before touching balances (which
-                // borrow `self` mutably through the native credit/debit helpers).
-                let old_deposit = {
-                    let object = self
-                        .objects
-                        .get_mut(object_id)
-                        .ok_or(ChainError::ObjectNotFound)?;
-                    validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
-                    object.deposit
-                };
-                // Keep the locked deposit exactly matching the new byte size:
-                // lock the extra when growing (fail closed if unaffordable),
-                // refund the difference when shrinking. Both conserve supply
-                // (liquid <-> storage_deposits).
-                if new_deposit > old_deposit {
-                    let extra = new_deposit
-                        .checked_sub(old_deposit)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    self.debit_native(tx.sender, extra)?;
-                    self.storage_deposits = self
-                        .storage_deposits
-                        .checked_add(extra)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                } else if old_deposit > new_deposit {
-                    let refund = old_deposit
-                        .checked_sub(new_deposit)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    self.storage_deposits = self
-                        .storage_deposits
-                        .checked_sub(refund)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    self.credit_native(tx.sender, refund)?;
-                }
-                // Commit the new revision, bytes, and matching deposit only after
-                // the balance move succeeded.
-                let object = self
-                    .objects
-                    .get_mut(object_id)
-                    .ok_or(ChainError::ObjectNotFound)?;
-                object.version = object.version.checked_next()?;
-                object.data = data.clone();
-                object.deposit = new_deposit;
-                events.push(Event::ObjectMutated {
-                    object_id: *object_id,
-                    version: object.version,
-                });
+                self.apply_native_object_mutation(
+                    tx.sender,
+                    NativeObjectMutation::new(*object_id, *namespace, *expected_version, data),
+                    config.storage_pricing,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::TransferObject {
                 object_id,
@@ -3439,40 +3400,14 @@ impl ChainState {
                 namespace,
                 expected_version,
             } => {
-                access.write(StateKey::object(*object_id))?;
-                access.write(StateKey::application(*namespace, object_id.hash()))?;
-                // The deletion refund credits the owner's liquid balance.
-                access.write(StateKey::account(tx.sender))?;
-                // Validate ownership/version and read the recorded deposit, then
-                // release the borrow before settling balances.
-                let deposit = {
-                    let object = self
-                        .objects
-                        .get(object_id)
-                        .ok_or(ChainError::ObjectNotFound)?;
-                    validate_owned_object(object, tx.sender, *namespace, *expected_version)?;
-                    object.deposit
-                };
-                // §15.22: refund the majority to the owner, burn the occupancy
-                // remainder. `refund + burned == deposit`, so the deposit leaves
-                // `storage_deposits` with no mint or loss.
-                let split = config.storage_pricing.refund_split(deposit)?;
-                self.storage_deposits = self
-                    .storage_deposits
-                    .checked_sub(deposit)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.credit_native(tx.sender, split.refund)?;
-                self.burned_fees = self
-                    .burned_fees
-                    .checked_add(split.burned)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.objects.remove(object_id);
-                events.push(Event::ObjectDeleted {
-                    object_id: *object_id,
-                    owner: tx.sender,
-                    refund: split.refund,
-                    burned: split.burned,
-                });
+                self.apply_native_object_delete(
+                    tx.sender,
+                    *object_id,
+                    *namespace,
+                    *expected_version,
+                    config.storage_pricing,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::Transfer { to, amount } => {
                 self.apply_native_transfer(
@@ -6411,6 +6346,76 @@ impl ChainState {
         Ok(())
     }
 
+    /// Moves liquid native units into the aggregate refundable-storage bucket.
+    ///
+    /// Both results are checked before either field changes, so this primitive is
+    /// internally atomic even before the transaction-level overlay is considered.
+    /// The caller must have declared the account write and must attach the same
+    /// `amount` to a live object's `deposit` field before committing its overlay.
+    fn lock_storage_deposit(&mut self, address: Address, amount: Amount) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let account = self
+            .accounts
+            .get(&address)
+            .ok_or(ChainError::AccountNotFound(address))?;
+        if account.balance < amount {
+            return Err(ChainError::InsufficientBalance {
+                address,
+                needed: amount,
+                available: account.balance,
+            });
+        }
+        let next_balance = account
+            .balance
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let next_storage_deposits = self
+            .storage_deposits
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.accounts
+            .get_mut(&address)
+            .ok_or(ChainError::AccountNotFound(address))?
+            .balance = next_balance;
+        self.storage_deposits = next_storage_deposits;
+        Ok(())
+    }
+
+    /// Returns a resize surplus from the storage bucket to its object's owner.
+    ///
+    /// This is the exact inverse of [`Self::lock_storage_deposit`] for object
+    /// shrinkage. Deletion uses a separate refund/burn split and cannot call this
+    /// helper because not all released principal returns to the owner.
+    fn release_storage_deposit(
+        &mut self,
+        address: Address,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let account = self
+            .accounts
+            .get(&address)
+            .ok_or(ChainError::AccountNotFound(address))?;
+        let next_balance = account
+            .balance
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let next_storage_deposits = self
+            .storage_deposits
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.accounts
+            .get_mut(&address)
+            .ok_or(ChainError::AccountNotFound(address))?
+            .balance = next_balance;
+        self.storage_deposits = next_storage_deposits;
+        Ok(())
+    }
+
     /// Opens one prepaid fee lane under a caller-owned transaction overlay.
     ///
     /// Lane management is intentionally authorized only by the default lane.
@@ -6633,6 +6638,163 @@ impl ChainState {
             delegator: sender,
             kind,
             amount,
+        });
+        Ok(())
+    }
+
+    /// Creates one owned object and locks its byte-priced refundable deposit.
+    ///
+    /// `storage_pricing` is the immutable genesis snapshot selected by the
+    /// transaction envelope. The transition writes the object, its application
+    /// conflict key, and the sender account; it fails before insertion on an
+    /// existing id, oversized bytes, insufficient liquid balance, or checked
+    /// arithmetic failure. The caller owns whole-action rollback.
+    pub(crate) fn apply_native_object_create(
+        &mut self,
+        sender: Address,
+        object_id: ObjectId,
+        namespace: Hash256,
+        data: &[u8],
+        storage_pricing: StoragePricing,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::object(object_id))?;
+        access.write(StateKey::application(namespace, object_id.hash()))?;
+        access.write(StateKey::account(sender))?;
+        if self.objects.contains_key(&object_id) {
+            return Err(ChainError::ObjectAlreadyExists);
+        }
+        let mut object = StateObject::new_owned(object_id, namespace, sender, data.to_vec())?;
+        let deposit = storage_pricing.deposit_for_bytes(object.data.len())?;
+        self.lock_storage_deposit(sender, deposit)?;
+        object.deposit = deposit;
+        let version = object.version;
+        self.objects.insert(object_id, object);
+        events.push(Event::ObjectCreated {
+            object_id,
+            namespace,
+            owner: sender,
+            version,
+        });
+        Ok(())
+    }
+
+    /// Mutates one owned object and settles only its byte-price deposit delta.
+    ///
+    /// Growing locks additional liquid units; shrinking returns the exact excess.
+    /// Ownership, namespace, and expected version are checked before any balance
+    /// move, and the object bytes/version/deposit change only after settlement.
+    /// The immutable pricing snapshot prevents preparation and execution from
+    /// disagreeing about the amount of native principal being moved.
+    pub(crate) fn apply_native_object_mutation(
+        &mut self,
+        sender: Address,
+        mutation: NativeObjectMutation<'_>,
+        storage_pricing: StoragePricing,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeObjectMutation {
+            object_id,
+            namespace,
+            expected_version,
+            data,
+        } = mutation;
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::object(object_id))?;
+        access.write(StateKey::application(namespace, object_id.hash()))?;
+        access.write(StateKey::account(sender))?;
+        validate_object_data(data)?;
+        let new_deposit = storage_pricing.deposit_for_bytes(data.len())?;
+        let old_deposit = {
+            let object = self
+                .objects
+                .get(&object_id)
+                .ok_or(ChainError::ObjectNotFound)?;
+            validate_owned_object(object, sender, namespace, expected_version)?;
+            object.deposit
+        };
+        if new_deposit > old_deposit {
+            let extra = new_deposit
+                .checked_sub(old_deposit)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            self.lock_storage_deposit(sender, extra)?;
+        } else if old_deposit > new_deposit {
+            let refund = old_deposit
+                .checked_sub(new_deposit)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            self.release_storage_deposit(sender, refund)?;
+        }
+        let object = self
+            .objects
+            .get_mut(&object_id)
+            .ok_or(ChainError::ObjectNotFound)?;
+        object.version = object.version.checked_next()?;
+        object.data = data.to_vec();
+        object.deposit = new_deposit;
+        events.push(Event::ObjectMutated {
+            object_id,
+            version: object.version,
+        });
+        Ok(())
+    }
+
+    /// Deletes one owned object and releases its recorded deposit conservingly.
+    ///
+    /// The current recorded deposit, rather than a repriced byte length, is split
+    /// into an owner refund and occupancy burn. All three scalar results are
+    /// checked before mutation, then the object is removed and a single event
+    /// carries the exact refund/burn amounts. This preserves supply even if a
+    /// later protocol changes pricing for newly written objects.
+    pub(crate) fn apply_native_object_delete(
+        &mut self,
+        sender: Address,
+        object_id: ObjectId,
+        namespace: Hash256,
+        expected_version: ObjectVersion,
+        storage_pricing: StoragePricing,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::object(object_id))?;
+        access.write(StateKey::application(namespace, object_id.hash()))?;
+        access.write(StateKey::account(sender))?;
+        let deposit = {
+            let object = self
+                .objects
+                .get(&object_id)
+                .ok_or(ChainError::ObjectNotFound)?;
+            validate_owned_object(object, sender, namespace, expected_version)?;
+            object.deposit
+        };
+        let split = storage_pricing.refund_split(deposit)?;
+        let next_storage_deposits = self
+            .storage_deposits
+            .checked_sub(deposit)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let next_balance = self
+            .accounts
+            .get(&sender)
+            .ok_or(ChainError::AccountNotFound(sender))?
+            .balance
+            .checked_add(split.refund)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let next_burned_fees = self
+            .burned_fees
+            .checked_add(split.burned)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.storage_deposits = next_storage_deposits;
+        self.accounts
+            .get_mut(&sender)
+            .ok_or(ChainError::AccountNotFound(sender))?
+            .balance = next_balance;
+        self.burned_fees = next_burned_fees;
+        self.objects.remove(&object_id);
+        events.push(Event::ObjectDeleted {
+            object_id,
+            owner: sender,
+            refund: split.refund,
+            burned: split.burned,
         });
         Ok(())
     }
@@ -7626,6 +7788,22 @@ mod tests {
             validators: Vec::new(),
         };
         assert!(ChainState::from_genesis(&genesis).is_ok());
+    }
+
+    #[test]
+    fn genesis_rejects_invalid_storage_refund_policy_before_state_exists() {
+        let mut chain = ChainConfig::default();
+        chain.storage_pricing.refund_bps = 10_001;
+        let genesis = GenesisConfig {
+            chain,
+            accounts: Vec::new(),
+            validators: Vec::new(),
+        };
+
+        assert!(matches!(
+            ChainState::from_genesis(&genesis),
+            Err(ChainError::InvalidStoragePricing)
+        ));
     }
 
     // ----- F1: epoch-reward supply conservation with multiple validators -----

@@ -392,10 +392,6 @@ impl ActionV1 {
         match self {
             Self::RevokeSponsorGrant { .. } | Self::RevokeSignedSponsorGrant { .. } => true,
             Self::Native { operation } => {
-                // CreateObject and MutateObject remain disabled until V5 binds an
-                // explicit ChainConfig storage-pricing snapshot and commits the
-                // storage-deposit delta through its sparse overlay. Reusing the
-                // older helper here would bypass protocol-1 deposit economics.
                 matches!(
                     operation.as_ref(),
                     Operation::Transfer { .. }
@@ -405,7 +401,10 @@ impl ActionV1 {
                         | Operation::ClaimValidatorRewards
                         | Operation::ClaimDelegatorRewards { .. }
                         | Operation::ClaimUnbonded { .. }
+                        | Operation::CreateObject { .. }
+                        | Operation::MutateObject { .. }
                         | Operation::TransferObject { .. }
+                        | Operation::DeleteObject { .. }
                 )
             }
         }
@@ -1320,7 +1319,8 @@ fn kind_matches_application_namespace(kind: &TransactionKindV1, expected: Hash25
         let namespace = match operation.as_ref() {
             Operation::CreateObject { namespace, .. }
             | Operation::MutateObject { namespace, .. }
-            | Operation::TransferObject { namespace, .. } => namespace,
+            | Operation::TransferObject { namespace, .. }
+            | Operation::DeleteObject { namespace, .. } => namespace,
             _ => continue,
         };
         if *namespace != expected {
@@ -1559,7 +1559,7 @@ mod fee_bid_decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectId, Operation};
+    use crate::{ObjectId, ObjectVersion, Operation};
 
     fn transfer_kind(recipient: Address, amount: u128) -> TransactionKindV1 {
         TransactionKindV1::Actions(ActionProgramV1::new(vec![ActionV1::native(
@@ -1753,8 +1753,77 @@ mod tests {
                     data: vec![0; MAX_OBJECT_DATA_BYTES + 1],
                 }),
             ),
-            Err(TransactionValidationErrorV1::UnsupportedNativeAction)
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
         );
+    }
+
+    #[test]
+    fn non_default_lane_object_deposits_still_bind_the_main_account() {
+        let sender = Keypair::from_seed([1; 32]);
+        let lane = AuthorizationLaneId::new(Hash256([0x91; 32]));
+        let object_id = ObjectId::new(Hash256([0x92; 32]));
+        let namespace = Hash256([0x93; 32]);
+        let build = |operation| {
+            TransactionV5::for_actions_unsigned(
+                ChainId::devnet(),
+                sender.address(),
+                sender.public_key(),
+                TransactionAuthorizationV1 {
+                    lane,
+                    policy_revision: AuthorizationPolicyRevision::new(0),
+                    nonce: Nonce::new(0),
+                },
+                ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+                vec![ActionV1::native(operation)],
+                FeeBid {
+                    gas_limit: 100_000,
+                    max_fee_per_unit: 5,
+                    priority_fee_per_unit: 1,
+                },
+                FeePaymentV1::SenderLane,
+            )
+            .expect("object action builds")
+        };
+
+        for operation in [
+            Operation::CreateObject {
+                object_id,
+                namespace,
+                data: vec![1],
+            },
+            Operation::MutateObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::INITIAL,
+                data: vec![2],
+            },
+            Operation::DeleteObject {
+                object_id,
+                namespace,
+                expected_version: ObjectVersion::INITIAL,
+            },
+        ] {
+            let transaction = build(operation);
+            assert!(transaction
+                .access_list
+                .read_write
+                .contains(&StateKey::authorization_lane(sender.address(), lane)));
+            assert!(transaction
+                .access_list
+                .read_write
+                .contains(&StateKey::account(sender.address())));
+        }
+
+        let transfer = build(Operation::TransferObject {
+            object_id,
+            namespace,
+            expected_version: ObjectVersion::INITIAL,
+            new_owner: Keypair::from_seed([2; 32]).address(),
+        });
+        assert!(!transfer
+            .access_list
+            .read_write
+            .contains(&StateKey::account(sender.address())));
     }
 
     #[test]

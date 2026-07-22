@@ -784,6 +784,47 @@ and an additive `storage_deposits` sparse delta, then restore ordered object
 success/failure/restart/property coverage. After that, resume the remaining
 step-4 native operation groups against the now-current main types.
 
+### V5 refundable object-deposit checkpoint (2026-07-22)
+
+The post-integration object blocker is resolved without a protocol-1 behavior
+fork. V4 and V5 now call the same focused create, mutate, transfer, and delete
+transitions. V5 preparation and execution both require an explicit immutable
+`ChainConfig`; preparation fails closed unless the config, state, and signed
+transaction identify the same chain and protocol. The storage-pricing value is
+part of the preparation snapshot, so a changed price rejects execution before
+fee, nonce, object, or account mutation. Invalid refund basis points are rejected
+both at genesis construction and V5 preparation.
+
+Create/grow moves native units from the current owner's main account into the
+object's recorded deposit and the aggregate `storage_deposits` bucket. Shrink
+returns the exact difference. Delete uses the recorded deposit, returns the
+configured share to the current owner, and burns the remainder. The sparse V5
+overlay captures the aggregate bucket and commits a full-`u128` directional
+increase/decrease delta. All scalar merges are checked before any base record is
+changed. No global storage conflict key was added: the object key owns the delta,
+the account key protects liquid funding, and independent object deltas remain
+commutative and parallelizable.
+
+Adversarial coverage proves create→grow→shrink→delete balance and event
+semantics, restart/state-root stability, insufficient-deposit charging with no
+partial object, later-action rollback of all child deposits/events, cross-chain
+API misuse rejection, immutable-price stale rejection, independent mixed-sign
+overlay merge order, and stale-decrease failure before any account commit. The
+shared randomized native-operation invariant now also requires
+`storage_deposits == sum(live object.deposit)`, which catches bucket/leaf drift
+that aggregate supply reconciliation alone could miss. The focused gate passes
+strict all-target `webc-chain` Clippy, all 511 unit tests, the randomized native
+supply test, and all eight sharded-parallel tests. The complete workspace gate
+also passes formatting, warnings-denied all-target Clippy, every Rust test,
+warnings-denied rustdoc, and the deterministic node demo.
+
+Exact next item: extract and integrate validator registration, delegation,
+undelegation, and operator unstaking as one reviewed V5 staking group. Preserve
+the current V4 `ChainConfig` semantics and exact access lists. Request-creating
+actions must use a bounded additive/request journal rather than cloning the
+global `UnbondingQueue`; stable state races are chargeable receipt failures,
+while arithmetic, configuration, and access violations remain block errors.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
