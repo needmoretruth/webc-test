@@ -20,6 +20,7 @@ import {
   feeBidV1DigestHex,
   revokeSponsorGrantActionV1,
   sessionAuthorizationAccessListV1,
+  signTransactionV5,
   signSponsorGrantV1,
   sponsorGrantSigningBytes,
   sponsorGrantV1DigestHex,
@@ -310,5 +311,39 @@ describe("V5 cross-language transaction fixtures", () => {
     const badGrant = sponsorGrantFixture();
     badGrant.sponsor_signature = `aa${SPONSOR_GRANT_SIGNATURE.slice(2)}`;
     expect(await verifySponsorGrantV1(badGrant)).toBe(false);
+
+    // An application-scoped grant must actually contain an object action in
+    // that namespace; a correctly re-signed transfer cannot consume it.
+    const senderWallet = await createWalletFromSeed(new Uint8Array(32).fill(1));
+    const sponsorWallet = await createWalletFromSeed(new Uint8Array(32).fill(3));
+    const applicationGrant = await signSponsorGrantV1(sponsorWallet, {
+      chain_id: "webc-devnet-1",
+      grant_id: "77".repeat(32),
+      payer_lane: "55".repeat(32),
+      sender: SENDER,
+      site_namespace: null,
+      application_namespace: "88".repeat(32),
+      action_scope: { exact_action_digest: ACTION_DIGEST },
+      validity: { valid_from_height: "10", valid_until_height: "20" },
+      max_fee_per_transaction: "10000",
+      max_cumulative_fee: "100000",
+      max_uses: "10",
+    });
+    const applicationUse = await createSponsorUseV1(
+      applicationGrant,
+      "0",
+      senderPaidFixture().kind,
+      senderPaidFixture().fee_bid,
+    );
+    const template = sponsoredFixture();
+    await expect(signTransactionV5(senderWallet, {
+      chainId: template.chain_id,
+      authorization: template.authorization,
+      validity: template.validity,
+      kind: template.kind,
+      accessList: template.access_list,
+      feeBid: template.fee_bid,
+      feePayment: { Sponsored: applicationUse },
+    })).rejects.toThrow("application namespace");
   });
 });

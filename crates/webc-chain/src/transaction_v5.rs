@@ -1156,6 +1156,10 @@ impl TransactionV5 {
             || sponsor_use.action_digest != self.kind.digest()?
             || sponsor_use.grant.action_scope.exact_action_digest != sponsor_use.action_digest
             || sponsor_use.fee_bid_digest != fee_bid_digest(self.fee_bid)?
+            || sponsor_use
+                .grant
+                .application_namespace
+                .is_some_and(|namespace| !kind_matches_application_namespace(&self.kind, namespace))
         {
             return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
         }
@@ -1169,6 +1173,30 @@ impl TransactionV5 {
         sponsor_use.grant.verify()?;
         Ok(())
     }
+}
+
+/// Requires at least one object action and rejects every mismatched object namespace.
+fn kind_matches_application_namespace(kind: &TransactionKindV1, expected: Hash256) -> bool {
+    let TransactionKindV1::Actions(program) = kind else {
+        return false;
+    };
+    let mut observed = false;
+    for action in &program.actions {
+        let ActionV1::Native { operation } = action else {
+            continue;
+        };
+        let namespace = match operation.as_ref() {
+            Operation::CreateObject { namespace, .. }
+            | Operation::MutateObject { namespace, .. }
+            | Operation::TransferObject { namespace, .. } => namespace,
+            _ => continue,
+        };
+        if *namespace != expected {
+            return false;
+        }
+        observed = true;
+    }
+    observed
 }
 
 fn validate_native_action_lane(
@@ -1784,6 +1812,31 @@ mod tests {
         tx.sign(&sender).expect("sponsored transaction signs");
         tx.verify_for_chain(&ChainId::devnet())
             .expect("sponsored transaction verifies");
+
+        let mut application_misbound = tx.clone();
+        let FeePaymentV1::Sponsored(existing_use) = &application_misbound.fee_payment else {
+            panic!("fixture is sponsored")
+        };
+        let mut application_grant = existing_use.grant.clone();
+        application_grant.application_namespace = Some(Hash256([0x77; 32]));
+        application_grant.sponsor_signature = None;
+        application_grant
+            .sign(&sponsor)
+            .expect("application-scoped grant signs");
+        application_misbound.fee_payment = FeePaymentV1::Sponsored(Box::new(
+            SponsorUseV1::for_transaction(
+                application_grant,
+                SponsorUseNonce::new(0),
+                &application_misbound.kind,
+                application_misbound.fee_bid,
+            )
+            .expect("application-scoped use builds"),
+        ));
+        application_misbound.sender_signature = None;
+        assert_eq!(
+            application_misbound.sign(&sender),
+            Err(TransactionValidationErrorV1::SponsorBindingMismatch)
+        );
 
         let mut altered_fee = tx.clone();
         altered_fee.fee_bid.max_fee_per_unit = 6;

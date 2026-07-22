@@ -538,6 +538,14 @@ export function validateTransactionV5Structure(
   validateAccessList(value.access_list);
   validateFeeBid(value.fee_bid);
   validateFeePaymentShape(value.fee_payment);
+  if (value.fee_payment !== "SenderLane"
+    && value.fee_payment.Sponsored.grant.application_namespace !== null
+    && !kindMatchesApplicationNamespace(
+      value.kind,
+      value.fee_payment.Sponsored.grant.application_namespace,
+    )) {
+    throw new Error("sponsor application namespace does not match V5 object actions");
+  }
   if (value.sender_signature !== null) {
     requireHex(value.sender_signature, 64, "sender signature", false);
   }
@@ -559,12 +567,37 @@ async function validateFeePaymentBinding(
     !(await digestEquals(use.action_digest, transactionKindV1DigestHex(transaction.kind))) ||
     use.grant.action_scope.exact_action_digest !== use.action_digest ||
     !(await digestEquals(use.fee_bid_digest, feeBidV1DigestHex(transaction.fee_bid))) ||
-    !validityCovers(use.grant.validity, transaction.validity)
+    !validityCovers(use.grant.validity, transaction.validity) ||
+    (use.grant.application_namespace !== null
+      && !kindMatchesApplicationNamespace(transaction.kind, use.grant.application_namespace))
   ) {
     return false;
   }
   const reserve = BigInt(transaction.fee_bid.gas_limit) * BigInt(transaction.fee_bid.max_fee_per_unit);
   return reserve <= BigInt(use.grant.max_fee_per_transaction);
+}
+
+function kindMatchesApplicationNamespace(
+  kind: TransactionKindV1Json,
+  expected: string,
+): boolean {
+  if (!("Actions" in kind)) return false;
+  let observed = false;
+  for (const action of kind.Actions.actions) {
+    if (!("Native" in action) || typeof action.Native.operation !== "object") continue;
+    const operation = action.Native.operation;
+    const namespace = "CreateObject" in operation
+      ? operation.CreateObject.namespace
+      : "MutateObject" in operation
+        ? operation.MutateObject.namespace
+        : "TransferObject" in operation
+          ? operation.TransferObject.namespace
+          : null;
+    if (namespace === null) continue;
+    if (namespace !== expected) return false;
+    observed = true;
+  }
+  return observed;
 }
 
 async function digestEquals(expected: string, actual: Promise<string>): Promise<boolean> {
