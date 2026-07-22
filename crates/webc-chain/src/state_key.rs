@@ -96,6 +96,30 @@ pub enum StateKeyKind {
     },
 }
 
+/// Physical conflict identity used by deterministic parallel scheduling.
+///
+/// Most logical keys map one-to-one. Validator-labelled unbonding keys still
+/// share one physical `UnbondingQueue`, so they intentionally collapse to a
+/// singleton lock until storage is sharded by validator. This prevents two
+/// apparently independent effects from overwriting the same queue snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StateConflictKey {
+    /// One logical record with independent physical storage.
+    Exact(StateKeyKind),
+    /// Current global unbonding queue shared by every validator label.
+    GlobalUnbondingQueue,
+}
+
+impl StateKeyKind {
+    /// Returns the conservative physical lock identity for this logical key.
+    pub fn conflict_key(&self) -> StateConflictKey {
+        match self {
+            Self::UnbondingQueue { .. } => StateConflictKey::GlobalUnbondingQueue,
+            other => StateConflictKey::Exact(other.clone()),
+        }
+    }
+}
+
 /// One versioned key in the unified consensus state space.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StateKey {

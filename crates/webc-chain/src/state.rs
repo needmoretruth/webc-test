@@ -2506,6 +2506,7 @@ impl ChainState {
         effects: NativeActionEffects<'_>,
     ) -> Result<(), ChainError> {
         let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
         access.write(StateKey::validator(sender))?;
         let reward = {
             let validator = self
@@ -2532,6 +2533,7 @@ impl ChainState {
         effects: NativeActionEffects<'_>,
     ) -> Result<(), ChainError> {
         let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
         access.write(StateKey::delegation(sender, validator))?;
         let reward = {
             let delegation = self
@@ -2560,6 +2562,7 @@ impl ChainState {
         effects: NativeActionEffects<'_>,
     ) -> Result<(), ChainError> {
         let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
         access.write(StateKey::unbonding_queue(validator))?;
         let request = self
             .unbonding

@@ -5,7 +5,7 @@
 //! mandatory. Batches preserve input order and use ordered sets, so local hash
 //! iteration or thread timing cannot change the proposed schedule.
 
-use crate::{StateKeyKind, Transaction};
+use crate::{StateConflictKey, Transaction};
 use std::collections::BTreeSet;
 
 /// Builds optimistic parallel execution batches from transaction access lists.
@@ -51,8 +51,8 @@ pub fn parallel_batches(transactions: &[Transaction]) -> Vec<Vec<usize>> {
 #[derive(Clone, Debug)]
 struct BatchLocks {
     indices: Vec<usize>,
-    reads: BTreeSet<StateKeyKind>,
-    writes: BTreeSet<StateKeyKind>,
+    reads: BTreeSet<StateConflictKey>,
+    writes: BTreeSet<StateConflictKey>,
 }
 
 impl BatchLocks {
@@ -65,25 +65,23 @@ impl BatchLocks {
     }
 
     fn from_transaction(tx: &Transaction) -> Self {
-        // Conflict detection keys on the version-independent logical identity
-        // (`StateKeyKind`), not the full versioned `StateKey` (finding SC2). Two
-        // keys with the same logical `kind` but different schema `version` refer
-        // to the same state, so they MUST conflict; keying on the whole `StateKey`
-        // (where `version` participates in `Eq`/`Ord`) would let them share a
-        // parallel batch.
+        // Conflict detection uses the version-independent physical identity,
+        // not the full versioned `StateKey` (finding SC2). This also collapses
+        // validator-labelled unbonding keys onto the current global queue lock;
+        // the labels may become independent only after physical state sharding.
         Self {
             indices: Vec::new(),
             reads: tx
                 .access_list
                 .read_only
                 .iter()
-                .map(|key| key.kind.clone())
+                .map(|key| key.kind.conflict_key())
                 .collect(),
             writes: tx
                 .access_list
                 .read_write
                 .iter()
-                .map(|key| key.kind.clone())
+                .map(|key| key.kind.conflict_key())
                 .collect(),
         }
     }
@@ -101,7 +99,7 @@ impl BatchLocks {
     }
 }
 
-fn intersects(left: &BTreeSet<StateKeyKind>, right: &BTreeSet<StateKeyKind>) -> bool {
+fn intersects(left: &BTreeSet<StateConflictKey>, right: &BTreeSet<StateConflictKey>) -> bool {
     left.iter().any(|item| right.contains(item))
 }
 
@@ -202,6 +200,16 @@ mod tests {
     }
 
     #[test]
+    fn validator_scoped_unbonding_keys_lock_the_current_global_queue() {
+        let first = Keypair::from_seed([21u8; 32]).address();
+        let second = Keypair::from_seed([22u8; 32]).address();
+        let tx0 = tx_writing(first, vec![StateKey::unbonding_queue(first)]);
+        let tx1 = tx_writing(second, vec![StateKey::unbonding_queue(second)]);
+
+        assert_eq!(parallel_batches(&[tx0, tx1]), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
     fn conflicting_transactions_are_split() {
         let a = Keypair::from_seed([1u8; 32]).address();
         let b = Keypair::from_seed([2u8; 32]).address();
@@ -229,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn same_wallet_independent_lanes_can_share_a_batch() {
+    fn global_unbonding_queue_serializes_otherwise_independent_wallet_lanes() {
         let wallet = Keypair::from_seed([9u8; 32]);
         let first_validator = Keypair::from_seed([10u8; 32]).address();
         let second_validator = Keypair::from_seed([11u8; 32]).address();
@@ -262,7 +270,10 @@ mod tests {
         )
         .expect("second lane signs");
 
-        assert_eq!(parallel_batches(&[first, second]), vec![vec![0, 1]]);
+        // The fee lanes and validator labels differ, but both operations write
+        // the same physical queue today. Treating them as independent would
+        // permit a last-writer-wins merge that loses one exit request.
+        assert_eq!(parallel_batches(&[first, second]), vec![vec![0], vec![1]]);
     }
 
     #[test]

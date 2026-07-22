@@ -176,6 +176,8 @@ enum ExecutionWriteKeyV1 {
 struct SparseExecutionStateV1 {
     state: ChainState,
     writes: Vec<ExecutionWriteKeyV1>,
+    captured_burned_fees: Amount,
+    captured_validator_fee_pool: Amount,
 }
 
 impl SparseExecutionStateV1 {
@@ -207,11 +209,34 @@ impl SparseExecutionStateV1 {
             .iter()
             .map(execution_write_key)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { state, writes })
+        Ok(Self {
+            state,
+            writes,
+            captured_burned_fees: base.burned_fees,
+            captured_validator_fee_pool: base.validator_fee_pool,
+        })
     }
 
-    /// Applies only typed declared effects after receipt validation has succeeded.
-    fn commit(mut self, base: &mut ChainState) {
+    /// Applies typed records and additive global fee deltas after receipt validation.
+    fn commit(mut self, base: &mut ChainState) -> Result<(), BlockExecutionErrorV1> {
+        let burned_delta = self
+            .state
+            .burned_fees
+            .checked_sub(self.captured_burned_fees)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        let validator_fee_delta = self
+            .state
+            .validator_fee_pool
+            .checked_sub(self.captured_validator_fee_pool)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        let merged_burned_fees = base
+            .burned_fees
+            .checked_add(burned_delta)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        let merged_validator_fee_pool = base
+            .validator_fee_pool
+            .checked_add(validator_fee_delta)
+            .ok_or(BlockExecutionErrorV1::InvalidState)?;
         let commit_unbonding = self
             .writes
             .iter()
@@ -283,8 +308,9 @@ impl SparseExecutionStateV1 {
         if commit_unbonding {
             base.unbonding = self.state.unbonding;
         }
-        base.burned_fees = self.state.burned_fees;
-        base.validator_fee_pool = self.state.validator_fee_pool;
+        base.burned_fees = merged_burned_fees;
+        base.validator_fee_pool = merged_validator_fee_pool;
+        Ok(())
     }
 }
 
@@ -730,6 +756,8 @@ impl ChainState {
         let SparseExecutionStateV1 {
             state: mut parent,
             writes,
+            captured_burned_fees,
+            captured_validator_fee_pool,
         } = SparseExecutionStateV1::capture(
             self,
             &transaction.access_list.read_only,
@@ -794,8 +822,10 @@ impl ChainState {
         SparseExecutionStateV1 {
             state: selected,
             writes,
+            captured_burned_fees,
+            captured_validator_fee_pool,
         }
-        .commit(self);
+        .commit(self)?;
         Ok(ExecutedTransactionV1 { receipt })
     }
 }
@@ -2781,6 +2811,84 @@ mod tests {
     }
 
     #[test]
+    fn non_default_lane_reward_claim_records_the_credited_account() {
+        let sender = Keypair::from_seed([1; 32]);
+        let lane = AuthorizationLaneId::new(Hash256([0x56; 32]));
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![ActionV1::native(Operation::ClaimValidatorRewards)],
+            FeeBid {
+                gas_limit: 5_000,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("lane reward transaction builds");
+        transaction
+            .sign(&sender)
+            .expect("lane reward transaction signs");
+        let mut state = funded_state(&sender, None);
+        state.authorization_lanes.insert(
+            (sender.address(), lane),
+            AuthorizationLane::new(sender.address(), lane, Amount::from_units(30_000)),
+        );
+        state.validators.insert(
+            sender.address(),
+            Validator {
+                operator: sender.address(),
+                consensus_key: sender.public_key(),
+                self_stake: Amount::ZERO,
+                delegated_stake: Amount::ZERO,
+                commission_bps: 0,
+                status: ValidatorStatus::PendingActivation,
+                bootstrap: false,
+                accumulated_rewards: Amount::from_units(50),
+            },
+        );
+        state.minted_supply = Amount::from_units(50_050);
+        state.inflation_year_start_supply = state.minted_supply;
+        let prepared = prepared(&state, transaction);
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("non-default lane reward claim executes")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            Amount::from_units(20_050)
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 0);
+        assert_eq!(
+            state.authorization_lanes[&(sender.address(), lane)].fee_balance,
+            Amount::from_units(15_000)
+        );
+        assert_eq!(
+            state.authorization_lanes[&(sender.address(), lane)].next_nonce,
+            Nonce::new(1)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("lane reward claim supply report")
+                .balanced
+        );
+    }
+
+    #[test]
     fn sponsored_failure_charges_sponsor_and_advances_grant() {
         let sender = Keypair::from_seed([1; 32]);
         let first = Keypair::from_seed([2; 32]);
@@ -2976,6 +3084,33 @@ mod tests {
             overlay.writes.len(),
             transaction.access_list.read_write.len()
         );
+    }
+
+    #[test]
+    fn independent_fee_overlays_merge_additive_global_deltas() {
+        let first_payer = Keypair::from_seed([31; 32]).address();
+        let second_payer = Keypair::from_seed([32; 32]).address();
+        let mut base = ChainState {
+            burned_fees: Amount::from_units(100),
+            validator_fee_pool: Amount::from_units(200),
+            ..ChainState::default()
+        };
+        let mut first =
+            SparseExecutionStateV1::capture(&base, &[], &[StateKey::fee_accumulator(first_payer)])
+                .expect("first fee overlay captures");
+        let mut second =
+            SparseExecutionStateV1::capture(&base, &[], &[StateKey::fee_accumulator(second_payer)])
+                .expect("second fee overlay captures from same snapshot");
+        first.state.burned_fees = Amount::from_units(103);
+        first.state.validator_fee_pool = Amount::from_units(204);
+        second.state.burned_fees = Amount::from_units(105);
+        second.state.validator_fee_pool = Amount::from_units(206);
+
+        first.commit(&mut base).expect("first delta commits");
+        second.commit(&mut base).expect("second delta merges");
+
+        assert_eq!(base.burned_fees, Amount::from_units(108));
+        assert_eq!(base.validator_fee_pool, Amount::from_units(210));
     }
 
     #[test]

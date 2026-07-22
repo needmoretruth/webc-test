@@ -95,7 +95,9 @@ pub use staking::{
 pub use state::{
     AccountStateProof, ChainConfig, ChainState, Event, Receipt, SupplyInvariantReport,
 };
-pub use state_key::{ProtocolStateKey, StateKey, StateKeyKind, MAX_TRANSACTION_STATE_KEYS};
+pub use state_key::{
+    ProtocolStateKey, StateConflictKey, StateKey, StateKeyKind, MAX_TRANSACTION_STATE_KEYS,
+};
 pub use transaction::{AccessList, FeeBid, Operation, Transaction};
 pub use transaction_v5::{
     ActionProgramV1, ActionScopeV1, ActionV1, CancelV1, FeePaymentV1, SponsorGrantId,
