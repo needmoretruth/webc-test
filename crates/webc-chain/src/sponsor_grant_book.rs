@@ -121,9 +121,9 @@ impl SponsorGrantBookV1 {
 
     /// Validates all grant identities materialized by one atomic transaction.
     ///
-    /// Checking entries separately is unsafe near a full bucket: each could
-    /// observe different immutable grants under one replay key. This method
-    /// deduplicates exact repeats and rejects conflicting digest/expiry pairs.
+    /// Checking entries separately is unsafe because two actions can name
+    /// different immutable grants under one replay key. This method deduplicates
+    /// exact repeats and rejects conflicting digest/expiry pairs.
     pub(crate) fn ensure_can_set_batch<I>(&self, entries: I) -> Result<(), SponsorGrantBookError>
     where
         I: IntoIterator<Item = (SponsorGrantKey, SponsorGrantStateV1)>,
@@ -188,8 +188,8 @@ impl SponsorGrantBookV1 {
     /// Removes expired entries in canonical expiry/sponsor/id order.
     ///
     /// A grant remains valid through `valid_until_height`, so only records with
-    /// an expiry strictly below `current_height` are removed. Work is bounded by
-    /// the same cap enforced on each expiry bucket.
+    /// an expiry strictly below `current_height` are removed. The global
+    /// per-block limit bounds cleanup even when one expiry has a large backlog.
     pub(crate) fn prune_expired(
         &mut self,
         current_height: BlockHeight,
@@ -291,13 +291,13 @@ impl<'de> Deserialize<'de> for SponsorGrantBookV1 {
     }
 }
 
-/// Internal failure proving primary/index state is invalid or over capacity.
+/// Internal failure proving primary/index state or one atomic batch is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SponsorGrantBookError {
     /// A primary record violates digest or replay-counter invariants.
     #[error("sponsor grant state record is invalid")]
     InvalidRecord,
-    /// A derived expiry tuple/count disagrees with its primary record.
+    /// A derived expiry tuple disagrees with its primary record.
     #[error("sponsor grant expiry index is inconsistent")]
     InvalidIndex,
     /// One transaction assigned different immutable grants to one replay key.
@@ -367,8 +367,8 @@ mod tests {
         let sponsor = Keypair::from_seed([1; 32]).address();
         let expiry = BlockHeight::new(50);
         let mut book = SponsorGrantBookV1::default();
-        let past_removed_admission_cap = 1_025;
-        for ordinal in 0..past_removed_admission_cap {
+        let record_count_beyond_removed_cap = 1_025;
+        for ordinal in 0..record_count_beyond_removed_cap {
             let mut id = [0_u8; 32];
             let ordinal = u64::try_from(ordinal).expect("test cap fits u64");
             id[..8].copy_from_slice(&ordinal.to_le_bytes());
@@ -386,15 +386,15 @@ mod tests {
         );
         assert_eq!(
             book.len(),
-            past_removed_admission_cap - MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1
+            record_count_beyond_removed_cap - MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1
         );
         let mut removed = MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1;
-        while removed < past_removed_admission_cap {
+        while removed < record_count_beyond_removed_cap {
             removed += book
                 .prune_expired(BlockHeight::new(52))
                 .expect("bounded follow-up prune");
         }
-        assert_eq!(removed, past_removed_admission_cap);
+        assert_eq!(removed, record_count_beyond_removed_cap);
         assert!(book.is_empty());
     }
 

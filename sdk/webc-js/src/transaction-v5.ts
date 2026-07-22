@@ -741,6 +741,7 @@ async function validateSignedRevocationBindings(
   transaction: UnsignedTransactionV5Json | SignedTransactionV5Json,
 ): Promise<boolean> {
   if (!("Actions" in transaction.kind)) return true;
+  const verified = new Set<string>();
   for (const action of transaction.kind.Actions.actions) {
     if (!("RevokeSignedSponsorGrant" in action)) continue;
     const grant = action.RevokeSignedSponsorGrant.grant;
@@ -748,9 +749,13 @@ async function validateSignedRevocationBindings(
       grant.sponsor !== transaction.sender
       || grant.chain_id !== transaction.chain_id
       || grant.protocol_version !== transaction.protocol_version
-      || !(await verifySponsorGrantV1(grant))
     ) {
       return false;
+    }
+    const digest = await sponsorGrantV1DigestHex(grant);
+    if (!verified.has(digest)) {
+      if (!(await verifySponsorGrantV1(grant))) return false;
+      verified.add(digest);
     }
   }
   return true;

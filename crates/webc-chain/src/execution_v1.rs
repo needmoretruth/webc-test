@@ -3163,6 +3163,128 @@ mod tests {
     }
 
     #[test]
+    fn sponsored_cancellation_charges_exact_bookkeeping_units() {
+        let sender = Keypair::from_seed([1; 32]);
+        let sponsor = Keypair::from_seed([3; 32]);
+        let mut sender_paid = TransactionV5::for_cancel_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            FeeBid {
+                gas_limit: crate::CANCEL_V1_REQUIRED_UNITS,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        );
+        sender_paid
+            .sign(&sender)
+            .expect("sender cancellation signs");
+        let sponsored = sponsor_transaction(sender_paid, &sender, &sponsor);
+        let FeePaymentV1::Sponsored(use_record) = &sponsored.fee_payment else {
+            panic!("sponsored cancellation")
+        };
+        let grant_key = (sponsor.address(), use_record.grant.grant_id);
+        let mut state = funded_state(&sender, Some(&sponsor));
+        state
+            .accounts
+            .get_mut(&sponsor.address())
+            .expect("sponsor account")
+            .balance = Amount::from_units(2_000_000);
+
+        let prepared = prepared(&state, sponsored);
+        assert_eq!(
+            prepared.required_units(),
+            GasUnits::new(crate::CANCEL_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+        );
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("sponsored cancellation executes")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(
+            receipt.fee_summary.units_consumed,
+            GasUnits::new(crate::CANCEL_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+        );
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(300_150));
+        assert_eq!(
+            state
+                .sponsor_grants
+                .get(&grant_key)
+                .expect("cancellation materializes grant")
+                .total_charged,
+            Amount::from_units(300_150)
+        );
+    }
+
+    #[test]
+    fn later_action_failure_discards_child_revocation_but_records_fee_grant() {
+        let grant_sponsor = Keypair::from_seed([3; 32]);
+        let outer_sponsor = Keypair::from_seed([4; 32]);
+        let scoped_sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let scoped = sponsored_fixture(&scoped_sender, &recipient, &grant_sponsor, true);
+        let FeePaymentV1::Sponsored(scoped_use) = scoped.fee_payment else {
+            panic!("scoped sponsor fixture")
+        };
+        let inner_key = (grant_sponsor.address(), scoped_use.grant.grant_id);
+        let sender_paid = sender_actions_fixture(
+            &grant_sponsor,
+            vec![
+                ActionV1::revoke_signed_sponsor_grant(scoped_use.grant),
+                ActionV1::native(Operation::Transfer {
+                    to: recipient.address(),
+                    amount: Amount::from_units(30_000),
+                }),
+            ],
+            REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS + 500,
+        );
+        let sponsored = sponsor_transaction(sender_paid, &grant_sponsor, &outer_sponsor);
+        let FeePaymentV1::Sponsored(outer_use) = &sponsored.fee_payment else {
+            panic!("outer sponsor fixture")
+        };
+        let outer_key = (outer_sponsor.address(), outer_use.grant.grant_id);
+        let mut state = funded_state(&grant_sponsor, Some(&outer_sponsor));
+        state
+            .accounts
+            .get_mut(&outer_sponsor.address())
+            .expect("outer sponsor account")
+            .balance = Amount::from_units(2_000_000);
+
+        let prepared = prepared(&state, sponsored);
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+            )
+            .expect("chargeable later action failure executes")
+            .into_receipt();
+
+        assert!(matches!(receipt.status, ReceiptStatusV1::Failed { .. }));
+        assert!(receipt.events.is_empty());
+        assert!(!state.sponsor_grants.contains_key(&inner_key));
+        assert_eq!(
+            state
+                .sponsor_grants
+                .get(&outer_key)
+                .expect("fee grant advances in parent")
+                .uses,
+            SponsorUseCount::new(1)
+        );
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(601_500));
+    }
+
+    #[test]
     fn revocation_blocks_later_sponsored_preparation() {
         let sponsor = Keypair::from_seed([3; 32]);
         let sender = Keypair::from_seed([1; 32]);

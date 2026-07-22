@@ -1969,6 +1969,91 @@ mod tests {
             Err(TransactionValidationErrorV1::SponsorBindingMismatch)
         );
 
+        let duplicate = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sponsor.address(),
+            sponsor.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![
+                ActionV1::revoke_signed_sponsor_grant(grant.clone()),
+                ActionV1::revoke_signed_sponsor_grant(grant.clone()),
+            ],
+            FeeBid {
+                gas_limit: REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS * 2,
+                max_fee_per_unit: 1,
+                priority_fee_per_unit: 0,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("duplicate immutable identity builds");
+        duplicate
+            .validate_structure()
+            .expect("exact duplicate identity is unambiguous");
+
+        let signed_revoke_kind = duplicate.kind.clone();
+        let fee_bid = FeeBid {
+            gas_limit: REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS * 2
+                + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+            max_fee_per_unit: 1,
+            priority_fee_per_unit: 0,
+        };
+        let mut conflicting_fee_grant = SponsorGrantV1 {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            grant_id: grant.grant_id,
+            sponsor: sponsor.address(),
+            sponsor_public_key: sponsor.public_key(),
+            payer_lane: AuthorizationLaneId::DEFAULT,
+            sender: sponsor.address(),
+            site_namespace: None,
+            application_namespace: None,
+            action_scope: ActionScopeV1::exact(
+                signed_revoke_kind.digest().expect("revoke action digest"),
+            ),
+            validity: ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            max_fee_per_transaction: Amount::from_units(300_000),
+            max_cumulative_fee: Amount::from_units(300_000),
+            max_uses: 1,
+            sponsor_signature: None,
+        };
+        conflicting_fee_grant
+            .sign(&sponsor)
+            .expect("conflicting fee grant signs independently");
+        let conflicting_use = SponsorUseV1::for_transaction(
+            conflicting_fee_grant,
+            SponsorUseNonce::new(0),
+            &signed_revoke_kind,
+            fee_bid,
+        )
+        .expect("conflicting fee use builds");
+        let cross_source_conflict = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sponsor.address(),
+            sponsor.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            match signed_revoke_kind {
+                TransactionKindV1::Actions(program) => program.actions,
+                TransactionKindV1::Cancel(_) => panic!("fixture is an action program"),
+            },
+            fee_bid,
+            FeePaymentV1::Sponsored(Box::new(conflicting_use)),
+        )
+        .expect("cross-source conflict remains representable");
+        assert_eq!(
+            cross_source_conflict.validate_structure(),
+            Err(TransactionValidationErrorV1::SponsorBindingMismatch)
+        );
+
         let mut wrong_owner = TransactionV5::for_actions_unsigned(
             ChainId::devnet(),
             sender.address(),

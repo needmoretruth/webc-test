@@ -260,6 +260,59 @@ describe("V5 cross-language transaction fixtures", () => {
     const valid = await signRevocation(grant);
     expect(await verifySignedTransactionV5(valid, "webc-devnet-1")).toBe(true);
 
+    const duplicateKind: TransactionKindV1Json = {
+      Actions: {
+        actions: [
+          revokeSignedSponsorGrantActionV1(grant),
+          revokeSignedSponsorGrantActionV1(grant),
+        ],
+      },
+    };
+    const duplicate = await signTransactionV5(sponsor, {
+      chainId: "webc-devnet-1",
+      authorization: { lane: DEFAULT_LANE, policy_revision: "0", nonce: "0" },
+      validity: { valid_from_height: "10", valid_until_height: "20" },
+      kind: duplicateKind,
+      accessList,
+      feeBid: { gas_limit: "200000", max_fee_per_unit: "1", priority_fee_per_unit: "0" },
+      feePayment: "SenderLane",
+    });
+    expect(await verifySignedTransactionV5(duplicate, "webc-devnet-1")).toBe(true);
+
+    const crossSourceFeeBid = {
+      gas_limit: "300000",
+      max_fee_per_unit: "1",
+      priority_fee_per_unit: "0",
+    };
+    const conflictingFeeGrant = await signSponsorGrantV1(sponsor, {
+      chain_id: grant.chain_id,
+      grant_id: grant.grant_id,
+      payer_lane: DEFAULT_LANE,
+      sender: SPONSOR,
+      site_namespace: null,
+      application_namespace: null,
+      action_scope: { exact_action_digest: await transactionKindV1DigestHex(duplicateKind) },
+      validity: { valid_from_height: "10", valid_until_height: "20" },
+      max_fee_per_transaction: "300000",
+      max_cumulative_fee: "300000",
+      max_uses: "1",
+    });
+    const conflictingFeeUse = await createSponsorUseV1(
+      conflictingFeeGrant,
+      "0",
+      duplicateKind,
+      crossSourceFeeBid,
+    );
+    await expect(signTransactionV5(sponsor, {
+      chainId: "webc-devnet-1",
+      authorization: { lane: DEFAULT_LANE, policy_revision: "0", nonce: "0" },
+      validity: { valid_from_height: "10", valid_until_height: "20" },
+      kind: duplicateKind,
+      accessList,
+      feeBid: crossSourceFeeBid,
+      feePayment: { Sponsored: conflictingFeeUse },
+    })).rejects.toThrow("conflicting V5 sponsor grant identities");
+
     await expect(signRevocation({
       ...grant,
       sponsor_signature: `00${grant.sponsor_signature?.slice(2)}`,
