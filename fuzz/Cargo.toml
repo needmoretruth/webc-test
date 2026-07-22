@@ -49,3 +49,17 @@ path = "fuzz_targets/mempool_admission.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "v5_transaction_decode"
+path = "fuzz_targets/v5_transaction_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "receipt_v1_decode"
+path = "fuzz_targets/receipt_v1_decode.rs"
+test = false
+doc = false
+bench = false
