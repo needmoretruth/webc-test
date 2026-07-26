@@ -34,7 +34,8 @@ pub use mempool_v1::{
 pub use node::{Node, NodeError};
 pub use runtime_v1::{
     NodeHandle, NodeRuntime, NodeRuntimeError, V5RuntimeStats, V5SubmitReceipt,
-    DEFAULT_V5_RUNTIME_QUEUE_CAPACITY,
+    DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY, DEFAULT_V5_RUNTIME_QUEUE_CAPACITY,
+    MAX_V5_LIFECYCLE_QUERY_IDS,
 };
 pub use service::{
     ApiError, FaucetConfig, NetworkAdmission, NodeService, NodeServiceOptions, API_VERSION,

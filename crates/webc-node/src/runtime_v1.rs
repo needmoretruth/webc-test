@@ -19,8 +19,10 @@
 //! and a failed durable write leaves memory unchanged. Local time affects only
 //! retention and never enters consensus state.
 
-use tokio::sync::{mpsc, oneshot};
-use webc_chain::{BlockHeight, TransactionId, TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use webc_chain::{
+    BlockHeight, ReceiptV1, TransactionId, TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION,
+};
 use webc_storage::{
     KvStore, LocalDropReasonV1, LocalTimestampMs, LocalTransactionObservationV1,
     PendingAdmissionOutcomeV1, StorageError, TransactionLifecycleV1,
@@ -31,6 +33,10 @@ use crate::{Node, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError};
 
 /// Default maximum number of commands waiting for the single runtime owner.
 pub const DEFAULT_V5_RUNTIME_QUEUE_CAPACITY: usize = 1_024;
+/// Retained live lifecycle snapshots before a slow subscriber is disconnected.
+pub const DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY: usize = 1_024;
+/// Maximum transaction IDs read by one actor lifecycle snapshot command.
+pub const MAX_V5_LIFECYCLE_QUERY_IDS: usize = 64;
 
 /// Successful protocol-2 submission result returned after durable admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +80,9 @@ pub enum NodeRuntimeError {
     /// No block height exists after the committed tip.
     #[error("protocol-2 runtime cannot advance beyond the maximum block height")]
     HeightExhausted,
+    /// A lifecycle snapshot request exceeded its fixed transaction-ID cap.
+    #[error("protocol-2 lifecycle query exceeds the {MAX_V5_LIFECYCLE_QUERY_IDS}-ID limit")]
+    TooManyLifecycleIds,
     /// Durable storage failed; the current in-memory mutation was not applied.
     #[error("protocol-2 runtime storage error: {0}")]
     Storage(#[from] StorageError),
@@ -98,6 +107,7 @@ impl NodeRuntimeError {
 #[derive(Clone)]
 pub struct NodeHandle {
     sender: mpsc::Sender<Command>,
+    lifecycle_events: broadcast::Sender<TransactionLifecycleV1>,
 }
 
 impl NodeHandle {
@@ -146,6 +156,51 @@ impl NodeHandle {
         receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
     }
 
+    /// Returns one actor-consistent snapshot for up to 64 transaction IDs.
+    ///
+    /// The result preserves input order. Callers creating a live subscription
+    /// should first call [`Self::subscribe_lifecycle`], then request this snapshot
+    /// and discard queued events whose sequence is not newer than the snapshot.
+    pub async fn lifecycles(
+        &self,
+        transaction_ids: Vec<TransactionId>,
+    ) -> Result<Vec<Option<TransactionLifecycleV1>>, NodeRuntimeError> {
+        if transaction_ids.len() > MAX_V5_LIFECYCLE_QUERY_IDS {
+            return Err(NodeRuntimeError::TooManyLifecycleIds);
+        }
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Command::Lifecycles {
+                transaction_ids,
+                response,
+            })
+            .map_err(map_send_error)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Returns a finalized receipt record, or `None` until finality is durable.
+    pub async fn receipt(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<ReceiptV1>, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Command::Receipt {
+                transaction_id,
+                response,
+            })
+            .map_err(map_send_error)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Subscribes to bounded live durable lifecycle snapshots.
+    ///
+    /// Broadcast lag is explicit: receivers get `Lagged` and must disconnect or
+    /// resnapshot rather than buffering without limit.
+    pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<TransactionLifecycleV1> {
+        self.lifecycle_events.subscribe()
+    }
+
     /// Durably expires every retained entry whose local TTL elapsed by `now_ms`.
     ///
     /// Each deletion commits before the corresponding in-memory removal. The
@@ -188,6 +243,14 @@ enum Command {
         transaction_id: TransactionId,
         response: oneshot::Sender<Result<Option<TransactionLifecycleV1>, NodeRuntimeError>>,
     },
+    Lifecycles {
+        transaction_ids: Vec<TransactionId>,
+        response: oneshot::Sender<Result<Vec<Option<TransactionLifecycleV1>>, NodeRuntimeError>>,
+    },
+    Receipt {
+        transaction_id: TransactionId,
+        response: oneshot::Sender<Result<Option<ReceiptV1>, NodeRuntimeError>>,
+    },
     Expire {
         now_ms: LocalTimestampMs,
         response: oneshot::Sender<Result<usize, NodeRuntimeError>>,
@@ -201,6 +264,7 @@ enum Command {
 pub struct NodeRuntime<K: KvStore> {
     node: Node<K>,
     mempool: V5Mempool,
+    lifecycle_events: broadcast::Sender<TransactionLifecycleV1>,
 }
 
 impl<K> NodeRuntime<K>
@@ -232,9 +296,20 @@ where
         tokio::runtime::Handle::try_current().map_err(|_| NodeRuntimeError::NoAsyncRuntime)?;
         let mempool = recover_pending(&mut node, mempool_config, recovery_now_ms)?;
         let (sender, receiver) = mpsc::channel(queue_capacity);
-        let runtime = Self { node, mempool };
+        let (lifecycle_events, _) = broadcast::channel(DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY);
+        let runtime = Self {
+            node,
+            mempool,
+            lifecycle_events: lifecycle_events.clone(),
+        };
         let task = tokio::spawn(runtime.run(receiver));
-        Ok((NodeHandle { sender }, task))
+        Ok((
+            NodeHandle {
+                sender,
+                lifecycle_events,
+            },
+            task,
+        ))
     }
 
     async fn run(mut self, mut receiver: mpsc::Receiver<Command>) -> Result<(), NodeRuntimeError> {
@@ -266,6 +341,32 @@ where
                         .node
                         .store()
                         .transaction_lifecycle_v1(transaction_id)
+                        .map_err(NodeRuntimeError::from);
+                    let _response_canceled = response.send(result);
+                }
+                Command::Lifecycles {
+                    transaction_ids,
+                    response,
+                } => {
+                    let result = transaction_ids
+                        .into_iter()
+                        .map(|transaction_id| {
+                            self.node
+                                .store()
+                                .transaction_lifecycle_v1(transaction_id)
+                                .map_err(NodeRuntimeError::from)
+                        })
+                        .collect();
+                    let _response_canceled = response.send(result);
+                }
+                Command::Receipt {
+                    transaction_id,
+                    response,
+                } => {
+                    let result = self
+                        .node
+                        .store()
+                        .finalized_receipt_v1(transaction_id)
                         .map_err(NodeRuntimeError::from);
                     let _response_canceled = response.send(result);
                 }
@@ -371,6 +472,16 @@ where
         // memory never lags a successful disk commit.
         self.mempool.apply_committed(plan);
         validate_durable_outcome(outcome, transaction_id, &queued, &replaced, &evicted)?;
+        let mut events = replaced
+            .iter()
+            .chain(evicted.iter())
+            .map(|lifecycle| lifecycle.as_ref().clone())
+            .chain(std::iter::once(queued.clone()))
+            .collect::<Vec<_>>();
+        events.sort_by_key(|lifecycle| lifecycle.sequence);
+        for lifecycle in events {
+            let _no_live_subscribers = self.lifecycle_events.send(lifecycle);
+        }
         Ok(V5SubmitReceipt {
             transaction_id,
             outcome,
@@ -402,12 +513,11 @@ where
                     observed_at_ms: now_ms,
                 },
             )?;
-            if lifecycle.is_none() {
-                return Err(NodeRuntimeError::Inconsistent(
-                    "expired in-memory transaction has no durable lifecycle",
-                ));
-            }
+            let lifecycle = lifecycle.ok_or(NodeRuntimeError::Inconsistent(
+                "expired in-memory transaction has no durable lifecycle",
+            ))?;
             self.mempool.remove_committed(transaction_id);
+            let _no_live_subscribers = self.lifecycle_events.send(lifecycle);
             removed = removed
                 .checked_add(1)
                 .ok_or(NodeRuntimeError::Inconsistent(
@@ -644,6 +754,7 @@ mod tests {
         let transaction_id = transaction
             .transaction_id()
             .expect("test transaction has an ID");
+        let mut events = handle.subscribe_lifecycle();
 
         let first = handle
             .submit(transaction.clone(), LocalTimestampMs::new(NOW))
@@ -656,6 +767,10 @@ mod tests {
             first.lifecycle.local_observation,
             Some(LocalTransactionObservationV1::Queued { .. })
         ));
+        assert_eq!(
+            events.try_recv().expect("queued lifecycle is published"),
+            first.lifecycle
+        );
 
         let duplicate = handle
             .submit(transaction, LocalTimestampMs::new(NOW + 1))
@@ -664,6 +779,10 @@ mod tests {
         assert_eq!(duplicate.outcome, V5InsertOutcome::DuplicateKnown);
         assert_eq!(duplicate.lifecycle, first.lifecycle);
         assert_eq!(duplicate.mempool_size, 1);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
         assert_eq!(
             handle
                 .lifecycle(transaction_id)
@@ -671,6 +790,21 @@ mod tests {
                 .expect("lifecycle query succeeds"),
             Some(first.lifecycle)
         );
+        assert_eq!(
+            handle
+                .lifecycles(vec![
+                    transaction_id,
+                    TransactionId::new(webc_crypto::Hash256([9; 32]))
+                ])
+                .await
+                .expect("bounded lifecycle snapshot succeeds"),
+            vec![Some(duplicate.lifecycle), None]
+        );
+        assert!(handle
+            .receipt(transaction_id)
+            .await
+            .expect("receipt query succeeds")
+            .is_none());
         let stats = handle.stats().await.expect("stats query succeeds");
         assert_eq!(stats.committed_height, BlockHeight::new(0));
         assert_eq!(stats.mempool_size, 1);
@@ -966,7 +1100,11 @@ mod tests {
         let alice = Keypair::from_seed([37; 32]);
         let bob = Keypair::from_seed([38; 32]);
         let (sender, _receiver) = mpsc::channel(1);
-        let handle = NodeHandle { sender };
+        let (lifecycle_events, _) = broadcast::channel(1);
+        let handle = NodeHandle {
+            sender,
+            lifecycle_events,
+        };
         let (response, _held_response) = oneshot::channel();
         handle
             .sender
