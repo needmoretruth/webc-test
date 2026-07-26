@@ -63,12 +63,18 @@ pub enum Table {
     FinalizedTransactionIndex,
     /// Finalized V1 receipt records keyed by transaction ID.
     FinalizedReceiptIndex,
+    /// Protocol-2 V4-header/V5-transaction blocks keyed by big-endian height.
+    BlocksV2,
+    /// Protocol-2 V4 block-hash to big-endian height index.
+    BlockV4HashIndex,
+    /// Protocol-2 finality authority sets keyed by big-endian epoch.
+    FinalityAuthoritySets,
 }
 
 impl Table {
     /// Stable ordered list of every table. Backends iterate this to allocate
     /// one physical namespace per table; tests iterate it to assert coverage.
-    pub const ALL: [Table; 12] = [
+    pub const ALL: [Table; 15] = [
         Table::Meta,
         Table::Blocks,
         Table::StateSnapshots,
@@ -81,6 +87,9 @@ impl Table {
         Table::TransactionLifecycle,
         Table::FinalizedTransactionIndex,
         Table::FinalizedReceiptIndex,
+        Table::BlocksV2,
+        Table::BlockV4HashIndex,
+        Table::FinalityAuthoritySets,
     ];
 
     /// A stable, compact byte tag identifying the table in a serialized batch.
@@ -102,6 +111,9 @@ impl Table {
             Table::TransactionLifecycle => 9,
             Table::FinalizedTransactionIndex => 10,
             Table::FinalizedReceiptIndex => 11,
+            Table::BlocksV2 => 12,
+            Table::BlockV4HashIndex => 13,
+            Table::FinalityAuthoritySets => 14,
         }
     }
 }

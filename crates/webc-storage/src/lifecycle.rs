@@ -21,8 +21,12 @@
 //! malformed sequence, conflicting slot, or partial index is corruption or an
 //! inconsistency; it is never repaired by guessing.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use webc_chain::{AuthorizationLaneId, BlockPositionV1, Nonce, TransactionId, TransactionV5};
+use webc_chain::{
+    AuthorizationLaneId, BlockPositionV1, BlockV4, Nonce, ReceiptV1, TransactionId, TransactionV5,
+};
 use webc_crypto::Address;
 
 use crate::chainstore::ChainStore;
@@ -37,7 +41,7 @@ pub const TRANSACTION_LIFECYCLE_RECORD_V1: u16 = 1;
 pub const MAX_PENDING_TRANSACTION_SCAN_V1: usize = 8_192;
 
 /// Meta key holding the latest allocated lifecycle observation sequence.
-const META_LIFECYCLE_SEQUENCE: &[u8] = b"transaction_lifecycle_sequence_v1";
+pub(crate) const META_LIFECYCLE_SEQUENCE: &[u8] = b"transaction_lifecycle_sequence_v1";
 
 /// Version byte prefixed to every pending-slot key.
 const PENDING_SLOT_KEY_V1: u8 = 1;
@@ -134,7 +138,7 @@ impl PendingSlotV1 {
 }
 
 /// Typed reason a node stopped retaining a pending transaction locally.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum LocalDropReasonV1 {
     /// A more valuable newcomer displaced the transaction under bounded policy.
@@ -145,6 +149,8 @@ pub enum LocalDropReasonV1 {
     UnsupportedProtocolVersion,
     /// An operator explicitly removed the local pending copy.
     OperatorRequest,
+    /// Another transaction for this slot finalized before the local occupant.
+    FinalizedSlotConflict,
 }
 
 /// Node-local observation, which never overrides an authoritative finality fact.
@@ -299,6 +305,67 @@ impl PendingTransactionRecordV1 {
                 "stored pending transaction failed validation: {error}"
             ))
         })
+    }
+}
+
+/// Durable transaction-ID to finalized block-position index record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizedTransactionIndexV1 {
+    /// Must equal [`TRANSACTION_LIFECYCLE_RECORD_V1`].
+    pub version: u16,
+    /// Finalized transaction ID used as the table key.
+    pub transaction_id: TransactionId,
+    /// Exact position inside the stored protocol-2 block.
+    pub position: BlockPositionV1,
+}
+
+impl FinalizedTransactionIndexV1 {
+    fn validate(&self) -> Result<(), StorageError> {
+        if self.version != TRANSACTION_LIFECYCLE_RECORD_V1 {
+            return Err(StorageError::Corruption(format!(
+                "unsupported finalized transaction index version {}",
+                self.version
+            )));
+        }
+        if self.position.height.get() == 0 {
+            return Err(StorageError::Corruption(
+                "finalized transaction index names genesis height zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Durable finalized V1 receipt record keyed by transaction ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizedReceiptRecordV1 {
+    /// Must equal [`TRANSACTION_LIFECYCLE_RECORD_V1`].
+    pub version: u16,
+    /// Finalized transaction ID used as the table key.
+    pub transaction_id: TransactionId,
+    /// Complete independently reconcilable finalized receipt.
+    pub receipt: ReceiptV1,
+}
+
+impl FinalizedReceiptRecordV1 {
+    fn validate(&self) -> Result<(), StorageError> {
+        if self.version != TRANSACTION_LIFECYCLE_RECORD_V1 {
+            return Err(StorageError::Corruption(format!(
+                "unsupported finalized receipt record version {}",
+                self.version
+            )));
+        }
+        self.receipt.validate().map_err(|error| {
+            StorageError::Corruption(format!("stored finalized receipt is invalid: {error}"))
+        })?;
+        if self.receipt.transaction_id != self.transaction_id {
+            return Err(StorageError::Corruption(
+                "finalized receipt record transaction ID mismatch".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -604,6 +671,223 @@ impl<K: KvStore> ChainStore<K> {
         Ok(LifecycleSequence::new(u64::from_be_bytes(raw)))
     }
 
+    /// Returns a finalized transaction position by ID, validating the table key.
+    pub fn finalized_transaction_index_v1(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<FinalizedTransactionIndexV1>, StorageError> {
+        let Some(bytes) = self.backend().get(
+            Table::FinalizedTransactionIndex,
+            &transaction_key(transaction_id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let index: FinalizedTransactionIndexV1 =
+            decode(StoredRecordKind::FinalizedTransactionIndex, &bytes)?;
+        index.validate()?;
+        if index.transaction_id != transaction_id {
+            return Err(StorageError::Corruption(
+                "finalized transaction index does not match its table key".into(),
+            ));
+        }
+        Ok(Some(index))
+    }
+
+    /// Returns one finalized V1 receipt by transaction ID.
+    pub fn finalized_receipt_v1(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<ReceiptV1>, StorageError> {
+        let Some(bytes) = self.backend().get(
+            Table::FinalizedReceiptIndex,
+            &transaction_key(transaction_id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let record: FinalizedReceiptRecordV1 =
+            decode(StoredRecordKind::FinalizedReceiptIndex, &bytes)?;
+        record.validate()?;
+        if record.transaction_id != transaction_id {
+            return Err(StorageError::Corruption(
+                "finalized receipt record does not match its table key".into(),
+            ));
+        }
+        Ok(Some(record.receipt))
+    }
+
+    /// Resolves a finalized V5 transaction through its position and stored block.
+    pub fn finalized_transaction_v1(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionV5>, StorageError> {
+        let Some(index) = self.finalized_transaction_index_v1(transaction_id)? else {
+            return Ok(None);
+        };
+        let block = self
+            .block_v4_by_height(index.position.height)?
+            .ok_or_else(|| {
+                StorageError::Inconsistent(
+                    "finalized transaction index names a missing protocol-2 block".into(),
+                )
+            })?;
+        let position = usize::try_from(index.position.transaction_index.get()).map_err(|_| {
+            StorageError::Corruption(
+                "finalized transaction index cannot fit memory position".into(),
+            )
+        })?;
+        let transaction = block.transactions.get(position).ok_or_else(|| {
+            StorageError::Corruption(
+                "finalized transaction index lies outside its protocol-2 block".into(),
+            )
+        })?;
+        if transaction.transaction_id().map_err(|error| {
+            StorageError::Corruption(format!("stored finalized transaction is invalid: {error}"))
+        })? != transaction_id
+        {
+            return Err(StorageError::Corruption(
+                "finalized transaction index points at another transaction".into(),
+            ));
+        }
+        Ok(Some(transaction.clone()))
+    }
+
+    /// Stages every transaction/receipt lifecycle mutation for one finalized block.
+    ///
+    /// The caller must commit `batch` together with the block, post-state,
+    /// authority sets, certificate, and tip. This helper never commits by itself.
+    pub(crate) fn stage_finalized_block_v1(
+        &self,
+        batch: &mut WriteBatch,
+        block: &BlockV4,
+    ) -> Result<(), StorageError> {
+        let initial_sequence = self.latest_lifecycle_sequence_v1()?;
+        let mut sequence = initial_sequence;
+        let mut finalized_slots = BTreeSet::new();
+        for (transaction, receipt) in block.transactions.iter().zip(&block.receipts) {
+            let transaction_id = transaction.transaction_id().map_err(|error| {
+                StorageError::InvalidRecord(format!(
+                    "cannot identify finalized V5 transaction: {error}"
+                ))
+            })?;
+            if self
+                .finalized_transaction_index_v1(transaction_id)?
+                .is_some()
+                || self.finalized_receipt_v1(transaction_id)?.is_some()
+            {
+                return Err(StorageError::Inconsistent(
+                    "transaction ID already has a finalized index".into(),
+                ));
+            }
+
+            let slot = PendingSlotV1::for_transaction(transaction);
+            if !finalized_slots.insert(slot) {
+                return Err(StorageError::InvalidRecord(
+                    "protocol-2 block finalizes the same authorization slot twice".into(),
+                ));
+            }
+            let occupant = self.pending_id_for_slot_v1(slot)?;
+            let exact_pending = self.pending_transaction_v1(transaction_id)?;
+            if exact_pending.is_some() && occupant != Some(transaction_id) {
+                return Err(StorageError::Inconsistent(
+                    "finalizing pending transaction is not its slot occupant".into(),
+                ));
+            }
+            if let Some(occupant_id) = occupant {
+                let occupant_record =
+                    self.pending_transaction_v1(occupant_id)?.ok_or_else(|| {
+                        StorageError::Inconsistent(
+                            "pending slot occupant has no transaction record".into(),
+                        )
+                    })?;
+                if occupant_record.slot != slot {
+                    return Err(StorageError::Inconsistent(
+                        "pending slot occupant record names another slot".into(),
+                    ));
+                }
+                if occupant_id == transaction_id && occupant_record.transaction != *transaction {
+                    return Err(StorageError::Corruption(
+                        "pending transaction bytes differ from the finalized transaction".into(),
+                    ));
+                }
+                batch.delete(Table::PendingTransactions, transaction_key(occupant_id));
+                batch.delete(Table::PendingBySlot, slot.key());
+
+                if occupant_id != transaction_id {
+                    sequence = next_sequence(sequence)?;
+                    let displaced = self.lifecycle_with_local_v1(
+                        occupant_id,
+                        sequence,
+                        LocalTransactionObservationV1::Dropped {
+                            reason: LocalDropReasonV1::FinalizedSlotConflict,
+                            observed_at_ms: LocalTimestampMs::new(block.header.timestamp_ms),
+                        },
+                    )?;
+                    batch.put(
+                        Table::TransactionLifecycle,
+                        transaction_key(occupant_id),
+                        encode(StoredRecordKind::TransactionLifecycle, &displaced)?,
+                    );
+                }
+            }
+
+            sequence = next_sequence(sequence)?;
+            let previous = self.transaction_lifecycle_v1(transaction_id)?;
+            if previous
+                .as_ref()
+                .and_then(|lifecycle| lifecycle.consensus_fact)
+                .is_some()
+            {
+                return Err(StorageError::Inconsistent(
+                    "transaction already has a finalized consensus fact".into(),
+                ));
+            }
+            let lifecycle = TransactionLifecycleV1 {
+                version: TRANSACTION_LIFECYCLE_RECORD_V1,
+                transaction_id,
+                sequence,
+                local_observation: previous.and_then(|value| value.local_observation),
+                consensus_fact: Some(TransactionConsensusFactV1::Finalized {
+                    position: receipt.position,
+                }),
+            };
+            let position_index = FinalizedTransactionIndexV1 {
+                version: TRANSACTION_LIFECYCLE_RECORD_V1,
+                transaction_id,
+                position: receipt.position,
+            };
+            let receipt_record = FinalizedReceiptRecordV1 {
+                version: TRANSACTION_LIFECYCLE_RECORD_V1,
+                transaction_id,
+                receipt: receipt.clone(),
+            };
+            batch.put(
+                Table::FinalizedTransactionIndex,
+                transaction_key(transaction_id),
+                encode(StoredRecordKind::FinalizedTransactionIndex, &position_index)?,
+            );
+            batch.put(
+                Table::FinalizedReceiptIndex,
+                transaction_key(transaction_id),
+                encode(StoredRecordKind::FinalizedReceiptIndex, &receipt_record)?,
+            );
+            batch.put(
+                Table::TransactionLifecycle,
+                transaction_key(transaction_id),
+                encode(StoredRecordKind::TransactionLifecycle, &lifecycle)?,
+            );
+        }
+        if sequence != initial_sequence {
+            batch.put(
+                Table::Meta,
+                META_LIFECYCLE_SEQUENCE,
+                sequence.get().to_be_bytes().to_vec(),
+            );
+        }
+        Ok(())
+    }
+
     fn lifecycle_with_local_v1(
         &self,
         transaction_id: TransactionId,
@@ -623,7 +907,7 @@ impl<K: KvStore> ChainStore<K> {
     }
 }
 
-fn next_sequence(current: LifecycleSequence) -> Result<LifecycleSequence, StorageError> {
+pub(crate) fn next_sequence(current: LifecycleSequence) -> Result<LifecycleSequence, StorageError> {
     current
         .get()
         .checked_add(1)
@@ -631,7 +915,7 @@ fn next_sequence(current: LifecycleSequence) -> Result<LifecycleSequence, Storag
         .ok_or_else(|| StorageError::Inconsistent("lifecycle sequence exhausted".into()))
 }
 
-fn transaction_key(transaction_id: TransactionId) -> Vec<u8> {
+pub(crate) fn transaction_key(transaction_id: TransactionId) -> Vec<u8> {
     transaction_id.digest().0.to_vec()
 }
 
@@ -645,13 +929,19 @@ fn transaction_id_from_key(bytes: &[u8]) -> Result<TransactionId, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webc_chain::{
-        ActionV1, Amount, AuthorizationPolicyRevision, BlockHeight, ChainId, FeeBid, FeePaymentV1,
-        Operation, TransactionAuthorizationV1, ValidityWindowV1,
-    };
-    use webc_crypto::Keypair;
+    use std::collections::BTreeMap;
 
-    use crate::{KvEntry, MemoryKvStore, RedbKvStore};
+    use webc_chain::{
+        calculate_fee_summary_v1, evidence_root, receipt_root_v1, transaction_root_v1, ActionV1,
+        Amount, AuthorizationPolicyRevision, BlockHeaderV4, BlockHeight, ChainId, ChainState,
+        Epoch, FeeBid, FeePayerV1, FeePaymentV1, FeeRate, FinalityAuthoritySetV1,
+        FinalityCertificate, GasUnits, Operation, ReceiptStatusV1, SignedVote,
+        TransactionAuthorizationV1, TransactionIndex, ValidatorPower, ValidatorSet,
+        ValidityWindowV1, Vote, VoteType, RECEIPT_V1, TRANSACTION_V5_PROTOCOL_VERSION,
+    };
+    use webc_crypto::{Hash256, Keypair};
+
+    use crate::{BlockV4Commit, KvEntry, MemoryKvStore, RedbKvStore};
 
     const NOW: u64 = 1_700_000_000_000;
 
@@ -686,6 +976,135 @@ mod tests {
 
     fn open_memory() -> ChainStore<MemoryKvStore> {
         ChainStore::open(MemoryKvStore::new(), &ChainId::devnet()).unwrap()
+    }
+
+    struct ProtocolTwoFixture {
+        state: ChainState,
+        block: BlockV4,
+        authority_set: FinalityAuthoritySetV1,
+        certificate: FinalityCertificate,
+    }
+
+    fn initialize_protocol_two<K: KvStore>(store: &mut ChainStore<K>) {
+        let genesis = ChainState {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            ..ChainState::default()
+        };
+        store.initialize_genesis(&genesis).unwrap();
+    }
+
+    fn authority_fixture(seed: u8) -> (Keypair, ValidatorSet, FinalityAuthoritySetV1) {
+        let consensus_key = Keypair::from_seed([seed; 32]);
+        let validator = consensus_key.address();
+        let validator_set = ValidatorSet {
+            validators: BTreeMap::from([(
+                validator,
+                ValidatorPower {
+                    validator,
+                    power: Amount::from_units(100),
+                    consensus_key: consensus_key.public_key(),
+                },
+            )]),
+            total_power: Amount::from_units(100),
+        };
+        let authority_set = FinalityAuthoritySetV1::from_validator_set(
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            Epoch::new(0),
+            &validator_set,
+        )
+        .unwrap();
+        (consensus_key, validator_set, authority_set)
+    }
+
+    fn successful_receipt(transaction: &TransactionV5, index: u32) -> ReceiptV1 {
+        ReceiptV1 {
+            version: RECEIPT_V1,
+            position: BlockPositionV1::new(BlockHeight::new(1), TransactionIndex::new(index)),
+            transaction_id: transaction.transaction_id().unwrap(),
+            sender: transaction.sender,
+            status: ReceiptStatusV1::Succeeded,
+            fee_summary: calculate_fee_summary_v1(
+                FeePayerV1 {
+                    address: transaction.sender,
+                    lane: transaction.authorization.lane,
+                },
+                GasUnits::new(transaction.fee_bid.gas_limit),
+                GasUnits::new(transaction.required_units().unwrap()),
+                FeeRate::new(1),
+                FeeRate::new(transaction.fee_bid.max_fee_per_unit),
+                FeeRate::new(transaction.fee_bid.priority_fee_per_unit),
+            )
+            .unwrap(),
+            events: Vec::new(),
+        }
+    }
+
+    fn finalized_fixture(transaction: TransactionV5) -> ProtocolTwoFixture {
+        let (consensus_key, validator_set, authority_set) = authority_fixture(100);
+        let receipt = successful_receipt(&transaction, 0);
+        let state = ChainState {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            current_height: 1,
+            ..ChainState::default()
+        };
+        let authority_root = authority_set.commitment().unwrap();
+        let block = BlockV4 {
+            header: BlockHeaderV4 {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height: BlockHeight::new(1),
+                epoch: Epoch::new(0),
+                previous_hash: Hash256::ZERO,
+                state_root: state.state_root().unwrap(),
+                account_root: state.account_root().unwrap(),
+                tx_root: transaction_root_v1(
+                    BlockHeight::new(1),
+                    std::slice::from_ref(&transaction),
+                )
+                .unwrap(),
+                receipt_root: receipt_root_v1(std::slice::from_ref(&receipt)).unwrap(),
+                evidence_root: evidence_root(&[]).unwrap(),
+                finality_authority_set_root: authority_root,
+                next_finality_authority_set_root: authority_root,
+                proposer: consensus_key.address(),
+                timestamp_ms: NOW,
+                base_fee_per_unit: 1,
+            },
+            transactions: vec![transaction],
+            receipts: vec![receipt],
+            evidence: Vec::new(),
+        };
+        let block_hash = block.hash().unwrap();
+        let vote = SignedVote::sign(
+            Vote {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height: 1,
+                round: 0,
+                vote_type: VoteType::Precommit,
+                block_hash,
+                validator: consensus_key.address(),
+            },
+            &consensus_key,
+        )
+        .unwrap();
+        let certificate = FinalityCertificate::build(
+            &validator_set,
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            1,
+            0,
+            block_hash,
+            &[vote],
+        )
+        .unwrap();
+        ProtocolTwoFixture {
+            state,
+            block,
+            authority_set,
+            certificate,
+        }
     }
 
     #[derive(Debug, Default)]
@@ -947,6 +1366,278 @@ mod tests {
         let store = open_memory();
         assert!(matches!(
             store.pending_transactions_v1(MAX_PENDING_TRANSACTION_SCAN_V1 + 1),
+            Err(StorageError::InvalidRecord(_))
+        ));
+    }
+
+    #[test]
+    fn certified_finalization_survives_restart_with_every_v1_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("finalized-v4.redb");
+        let pending = PendingTransactionRecordV1::new(
+            signed_transfer(11, 0, 5),
+            LocalTimestampMs::new(NOW - 1),
+        )
+        .unwrap();
+        let fixture = finalized_fixture(pending.transaction.clone());
+        let block_hash = fixture.block.hash().unwrap();
+        let position = fixture.block.receipts[0].position;
+        {
+            let backend = RedbKvStore::open(&path).unwrap();
+            let mut store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+            initialize_protocol_two(&mut store);
+            store.store_pending_v1(&pending, None).unwrap();
+            store
+                .commit_block_v4(BlockV4Commit {
+                    block: &fixture.block,
+                    state: &fixture.state,
+                    current_authority_set: &fixture.authority_set,
+                    next_authority_set: &fixture.authority_set,
+                    certificate: &fixture.certificate,
+                })
+                .unwrap();
+        }
+
+        let backend = RedbKvStore::open(&path).unwrap();
+        let reopened = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        assert_eq!(reopened.tip().unwrap().unwrap().height, 1);
+        assert_eq!(
+            reopened.block_v4_by_height(BlockHeight::new(1)).unwrap(),
+            Some(fixture.block.clone())
+        );
+        assert_eq!(
+            reopened.block_v4_by_hash(&block_hash).unwrap(),
+            Some(fixture.block.clone())
+        );
+        assert_eq!(
+            reopened
+                .finalized_transaction_v1(pending.transaction_id)
+                .unwrap(),
+            Some(pending.transaction.clone())
+        );
+        assert_eq!(
+            reopened
+                .finalized_receipt_v1(pending.transaction_id)
+                .unwrap(),
+            Some(fixture.block.receipts[0].clone())
+        );
+        assert_eq!(
+            reopened
+                .finalized_transaction_index_v1(pending.transaction_id)
+                .unwrap()
+                .unwrap()
+                .position,
+            position
+        );
+        let lifecycle = reopened
+            .transaction_lifecycle_v1(pending.transaction_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lifecycle.consensus_fact,
+            Some(TransactionConsensusFactV1::Finalized { position })
+        );
+        assert!(matches!(
+            lifecycle.local_observation,
+            Some(LocalTransactionObservationV1::Queued { .. })
+        ));
+        assert!(reopened
+            .pending_transaction_v1(pending.transaction_id)
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .pending_id_for_slot_v1(pending.slot)
+            .unwrap()
+            .is_none());
+        assert_eq!(reopened.latest_lifecycle_sequence_v1().unwrap().get(), 2);
+        assert_eq!(reopened.certificate(1).unwrap(), Some(fixture.certificate));
+        assert_eq!(
+            reopened.finality_authority_set_v1(Epoch::new(0)).unwrap(),
+            Some(fixture.authority_set)
+        );
+        assert_eq!(reopened.latest_state().unwrap(), Some(fixture.state));
+    }
+
+    #[test]
+    fn finalized_consensus_fact_displaces_a_local_replacement() {
+        let mut store = open_memory();
+        initialize_protocol_two(&mut store);
+        let old = PendingTransactionRecordV1::new(
+            signed_transfer(12, 0, 5),
+            LocalTimestampMs::new(NOW - 2),
+        )
+        .unwrap();
+        let replacement = PendingTransactionRecordV1::new(
+            signed_transfer(12, 0, 6),
+            LocalTimestampMs::new(NOW - 1),
+        )
+        .unwrap();
+        store.store_pending_v1(&old, None).unwrap();
+        store
+            .store_pending_v1(&replacement, Some(old.transaction_id))
+            .unwrap();
+        let fixture = finalized_fixture(old.transaction.clone());
+
+        store
+            .commit_block_v4(BlockV4Commit {
+                block: &fixture.block,
+                state: &fixture.state,
+                current_authority_set: &fixture.authority_set,
+                next_authority_set: &fixture.authority_set,
+                certificate: &fixture.certificate,
+            })
+            .unwrap();
+
+        assert!(store
+            .pending_transaction_v1(replacement.transaction_id)
+            .unwrap()
+            .is_none());
+        assert!(store.pending_id_for_slot_v1(old.slot).unwrap().is_none());
+        let displaced = store
+            .transaction_lifecycle_v1(replacement.transaction_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            displaced.local_observation,
+            Some(LocalTransactionObservationV1::Dropped {
+                reason: LocalDropReasonV1::FinalizedSlotConflict,
+                ..
+            })
+        ));
+        let finalized = store
+            .transaction_lifecycle_v1(old.transaction_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            finalized.local_observation,
+            Some(LocalTransactionObservationV1::Replaced {
+                replacement_id,
+                ..
+            }) if replacement_id == replacement.transaction_id
+        ));
+        assert!(matches!(
+            finalized.consensus_fact,
+            Some(TransactionConsensusFactV1::Finalized { .. })
+        ));
+        assert!(finalized.sequence > displaced.sequence);
+    }
+
+    #[test]
+    fn invalid_certificate_and_authority_root_leave_pending_state_unchanged() {
+        let mut store = open_memory();
+        initialize_protocol_two(&mut store);
+        let pending = PendingTransactionRecordV1::new(
+            signed_transfer(13, 0, 5),
+            LocalTimestampMs::new(NOW - 1),
+        )
+        .unwrap();
+        store.store_pending_v1(&pending, None).unwrap();
+        let fixture = finalized_fixture(pending.transaction.clone());
+        let mut wrong_certificate = fixture.certificate.clone();
+        wrong_certificate.block_hash = Hash256([9; 32]);
+
+        assert!(matches!(
+            store.commit_block_v4(BlockV4Commit {
+                block: &fixture.block,
+                state: &fixture.state,
+                current_authority_set: &fixture.authority_set,
+                next_authority_set: &fixture.authority_set,
+                certificate: &wrong_certificate,
+            }),
+            Err(StorageError::InvalidRecord(_))
+        ));
+        let (_, _, wrong_authority) = authority_fixture(101);
+        assert!(matches!(
+            store.commit_block_v4(BlockV4Commit {
+                block: &fixture.block,
+                state: &fixture.state,
+                current_authority_set: &wrong_authority,
+                next_authority_set: &wrong_authority,
+                certificate: &fixture.certificate,
+            }),
+            Err(StorageError::InvalidRecord(_))
+        ));
+        assert_eq!(store.tip().unwrap().unwrap().height, 0);
+        assert_eq!(
+            store
+                .pending_transaction_v1(pending.transaction_id)
+                .unwrap(),
+            Some(pending.clone())
+        );
+        assert!(store
+            .finalized_transaction_index_v1(pending.transaction_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .block_v4_by_height(BlockHeight::new(1))
+            .unwrap()
+            .is_none());
+        assert_eq!(store.latest_lifecycle_sequence_v1().unwrap().get(), 1);
+    }
+
+    #[test]
+    fn backend_failure_rolls_back_block_tip_and_lifecycle_as_one_unit() {
+        let backend = FailNextCommitStore::default();
+        let mut store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        initialize_protocol_two(&mut store);
+        let pending = PendingTransactionRecordV1::new(
+            signed_transfer(14, 0, 5),
+            LocalTimestampMs::new(NOW - 1),
+        )
+        .unwrap();
+        store.store_pending_v1(&pending, None).unwrap();
+        let fixture = finalized_fixture(pending.transaction.clone());
+        store.backend_mut().fail_next = true;
+
+        assert!(matches!(
+            store.commit_block_v4(BlockV4Commit {
+                block: &fixture.block,
+                state: &fixture.state,
+                current_authority_set: &fixture.authority_set,
+                next_authority_set: &fixture.authority_set,
+                certificate: &fixture.certificate,
+            }),
+            Err(StorageError::Io(_))
+        ));
+        assert_eq!(store.tip().unwrap().unwrap().height, 0);
+        assert_eq!(
+            store
+                .pending_transaction_v1(pending.transaction_id)
+                .unwrap(),
+            Some(pending.clone())
+        );
+        assert_eq!(store.latest_lifecycle_sequence_v1().unwrap().get(), 1);
+        assert!(store
+            .finalized_transaction_v1(pending.transaction_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .finalized_receipt_v1(pending.transaction_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .block_v4_by_height(BlockHeight::new(1))
+            .unwrap()
+            .is_none());
+        assert!(store.certificate(1).unwrap().is_none());
+        assert!(store
+            .finality_authority_set_v1(Epoch::new(0))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn finalization_rejects_two_transactions_for_one_authorization_slot() {
+        let store = open_memory();
+        let first = signed_transfer(15, 0, 5);
+        let second = signed_transfer(15, 0, 6);
+        let mut fixture = finalized_fixture(first);
+        fixture.block.receipts.push(successful_receipt(&second, 1));
+        fixture.block.transactions.push(second);
+        let mut batch = WriteBatch::new();
+
+        assert!(matches!(
+            store.stage_finalized_block_v1(&mut batch, &fixture.block),
             Err(StorageError::InvalidRecord(_))
         ));
     }

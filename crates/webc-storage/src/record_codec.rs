@@ -54,6 +54,14 @@ pub(crate) enum StoredRecordKind {
     PendingTransaction,
     /// One local/consensus lifecycle projection for a transaction ID.
     TransactionLifecycle,
+    /// One protocol-2 V4 block (maximum encoded bytes: 4 MiB).
+    BlockV4,
+    /// One protocol-2 finality authority set (maximum encoded bytes: 16 MiB).
+    FinalityAuthoritySetV1,
+    /// One finalized transaction position index record.
+    FinalizedTransactionIndex,
+    /// One finalized V1 receipt index record.
+    FinalizedReceiptIndex,
 }
 
 impl StoredRecordKind {
@@ -69,6 +77,10 @@ impl StoredRecordKind {
             Self::ConsensusWal => "consensus WAL",
             Self::PendingTransaction => "pending transaction",
             Self::TransactionLifecycle => "transaction lifecycle",
+            Self::BlockV4 => "protocol-2 block",
+            Self::FinalityAuthoritySetV1 => "finality authority set",
+            Self::FinalizedTransactionIndex => "finalized transaction index",
+            Self::FinalizedReceiptIndex => "finalized receipt index",
         }
     }
 
@@ -84,6 +96,10 @@ impl StoredRecordKind {
             Self::ConsensusWal => 64 * MIB,
             Self::PendingTransaction => 512 * KIB,
             Self::TransactionLifecycle => 4 * KIB,
+            Self::BlockV4 => 4 * MIB,
+            Self::FinalityAuthoritySetV1 => 16 * MIB,
+            Self::FinalizedTransactionIndex => 512,
+            Self::FinalizedReceiptIndex => 512 * KIB,
         }
     }
 }

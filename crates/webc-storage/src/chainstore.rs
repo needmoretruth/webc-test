@@ -29,7 +29,9 @@
 use serde::{Deserialize, Serialize};
 
 use webc_chain::{
-    Block, BlockHeader, ChainId, ChainState, ConsensusWalRecord, FinalityCertificate, ValidatorSet,
+    Block, BlockHeader, BlockHeaderV4, BlockHeight, BlockV4, ChainId, ChainState,
+    ConsensusWalRecord, Epoch, FinalityAuthoritySetV1, FinalityCertificate, ValidatorSet,
+    CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::Hash256;
 
@@ -87,6 +89,26 @@ pub struct BlockCommit<'a> {
     /// Optional finality certificate proving this block was BFT-finalized, stored
     /// under the block height so a node can serve it during state sync.
     pub certificate: Option<&'a FinalityCertificate>,
+}
+
+/// Everything one certified protocol-2 V4 block contributes to durable storage.
+///
+/// Both authority sets are explicit so the commit can verify the header's
+/// outgoing/current and incoming/next commitments before it verifies the
+/// certificate against the outgoing set. The certificate is mandatory: unlike
+/// the legacy development auto-sealer, this path never labels an uncertified
+/// block finalized.
+pub struct BlockV4Commit<'a> {
+    /// Fully validated protocol-2 block containing V5 transactions and V1 receipts.
+    pub block: &'a BlockV4,
+    /// Chain state after this block; becomes the latest snapshot.
+    pub state: &'a ChainState,
+    /// Authority set whose votes certify this exact V4 header.
+    pub current_authority_set: &'a FinalityAuthoritySetV1,
+    /// Authority set permitted to certify the next height.
+    pub next_authority_set: &'a FinalityAuthoritySetV1,
+    /// Mandatory quorum certificate for this exact V4 block hash.
+    pub certificate: &'a FinalityCertificate,
 }
 
 /// Big-endian 8-byte key for a height or epoch, so byte order equals numeric order.
@@ -245,15 +267,32 @@ impl<K: KvStore> ChainStore<K> {
         // For any real block (height > 0) the block must exist and its header
         // hash must equal the tip's recorded block hash.
         if tip.height > 0 {
-            let block = self.block_by_height(tip.height)?.ok_or_else(|| {
-                StorageError::Inconsistent(format!(
-                    "tip names block height {} but no block is stored",
-                    tip.height
-                ))
-            })?;
-            let header_hash = block
-                .hash()
-                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            let header_hash = if state.protocol_version == CURRENT_PROTOCOL_VERSION {
+                self.block_by_height(tip.height)?
+                    .ok_or_else(|| {
+                        StorageError::Inconsistent(format!(
+                            "tip names legacy block height {} but no block is stored",
+                            tip.height
+                        ))
+                    })?
+                    .hash()
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?
+            } else if state.protocol_version == TRANSACTION_V5_PROTOCOL_VERSION {
+                self.block_v4_by_height(BlockHeight::new(tip.height))?
+                    .ok_or_else(|| {
+                        StorageError::Inconsistent(format!(
+                            "tip names protocol-2 block height {} but no block is stored",
+                            tip.height
+                        ))
+                    })?
+                    .hash()
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?
+            } else {
+                return Err(StorageError::Corruption(format!(
+                    "tip state uses unsupported protocol version {}",
+                    state.protocol_version.get()
+                )));
+            };
             if Some(header_hash) != tip.block_hash {
                 return Err(StorageError::Corruption(format!(
                     "stored block at height {} does not match the tip block hash",
@@ -310,6 +349,14 @@ impl<K: KvStore> ChainStore<K> {
             StorageError::Inconsistent("chain is not initialized; call initialize_genesis".into())
         })?;
         let header = &commit.block.header;
+
+        if header.protocol_version != CURRENT_PROTOCOL_VERSION
+            || commit.state.protocol_version != CURRENT_PROTOCOL_VERSION
+        {
+            return Err(StorageError::InvalidRecord(
+                "legacy block commit accepts protocol version 1 only".into(),
+            ));
+        }
 
         // Contiguity: the only acceptable next height is tip + 1. This single
         // check rejects both replays (<= tip) and gaps (> tip + 1).
@@ -396,6 +443,198 @@ impl<K: KvStore> ChainStore<K> {
         self.store.commit(batch)
     }
 
+    /// Atomically commits one certified protocol-2 block and all lifecycle indexes.
+    ///
+    /// The single backend transaction contains V4 block bytes/hash index, latest
+    /// state replacement, current/next authority sets, mandatory certificate,
+    /// pending deletions, finalized transaction/receipt indexes, lifecycle facts,
+    /// lifecycle sequence, consensus-WAL deletion, and the new tip. Any validation,
+    /// serialization, or database error leaves every prior record untouched.
+    pub fn commit_block_v4(&mut self, commit: BlockV4Commit<'_>) -> Result<(), StorageError> {
+        let tip = self.tip()?.ok_or_else(|| {
+            StorageError::Inconsistent("chain is not initialized; call initialize_genesis".into())
+        })?;
+        commit.block.validate().map_err(|error| {
+            StorageError::InvalidRecord(format!("invalid protocol-2 block: {error}"))
+        })?;
+        commit.current_authority_set.validate().map_err(|error| {
+            StorageError::InvalidRecord(format!("invalid current authority set: {error}"))
+        })?;
+        commit.next_authority_set.validate().map_err(|error| {
+            StorageError::InvalidRecord(format!("invalid next authority set: {error}"))
+        })?;
+
+        let header = &commit.block.header;
+        let expected_height = tip.height.checked_add(1).ok_or_else(|| {
+            StorageError::Inconsistent("committed chain height is exhausted".into())
+        })?;
+        if header.height.get() != expected_height {
+            return Err(StorageError::Inconsistent(format!(
+                "next protocol-2 block height must be {expected_height}, got {}",
+                header.height.get()
+            )));
+        }
+        if let Some(parent_hash) = tip.block_hash {
+            if header.previous_hash != parent_hash {
+                return Err(StorageError::Inconsistent(
+                    "protocol-2 block previous_hash does not match the current tip".into(),
+                ));
+            }
+        }
+        if commit.state.protocol_version != TRANSACTION_V5_PROTOCOL_VERSION
+            || commit.state.chain_id != header.chain_id
+            || commit.state.current_height != header.height.get()
+            || self.chain_id()? != header.chain_id
+        {
+            return Err(StorageError::InvalidRecord(
+                "protocol-2 post-state version, chain, or height disagrees with the header".into(),
+            ));
+        }
+        let state_root = commit
+            .state
+            .state_root()
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        let account_root = commit
+            .state
+            .account_root()
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        if state_root != header.state_root || account_root != header.account_root {
+            return Err(StorageError::InvalidRecord(
+                "protocol-2 post-state roots disagree with the V4 header".into(),
+            ));
+        }
+
+        if commit.current_authority_set.protocol_version != header.protocol_version
+            || commit.current_authority_set.chain_id != header.chain_id
+            || commit.current_authority_set.epoch != header.epoch
+            || commit.next_authority_set.protocol_version != header.protocol_version
+            || commit.next_authority_set.chain_id != header.chain_id
+        {
+            return Err(StorageError::InvalidRecord(
+                "protocol-2 authority set domain disagrees with the V4 header".into(),
+            ));
+        }
+        let current_root = commit.current_authority_set.commitment().map_err(|error| {
+            StorageError::InvalidRecord(format!("cannot commit current authority set: {error}"))
+        })?;
+        let next_root = commit.next_authority_set.commitment().map_err(|error| {
+            StorageError::InvalidRecord(format!("cannot commit next authority set: {error}"))
+        })?;
+        if current_root != header.finality_authority_set_root
+            || next_root != header.next_finality_authority_set_root
+        {
+            return Err(StorageError::InvalidRecord(
+                "protocol-2 authority commitment disagrees with the V4 header".into(),
+            ));
+        }
+        for authority_set in [commit.current_authority_set, commit.next_authority_set] {
+            if let Some(stored) = self.finality_authority_set_v1(authority_set.epoch)? {
+                if stored != *authority_set {
+                    return Err(StorageError::Inconsistent(format!(
+                        "authority set for epoch {} is already committed with different contents",
+                        authority_set.epoch.get()
+                    )));
+                }
+            }
+        }
+        let next_epoch = commit.next_authority_set.epoch.get();
+        let current_epoch = header.epoch.get();
+        if next_epoch == current_epoch {
+            if commit.next_authority_set != commit.current_authority_set {
+                return Err(StorageError::InvalidRecord(
+                    "authority set cannot change without advancing its epoch".into(),
+                ));
+            }
+        } else if next_epoch
+            != current_epoch
+                .checked_add(1)
+                .ok_or_else(|| StorageError::InvalidRecord("authority epoch is exhausted".into()))?
+        {
+            return Err(StorageError::InvalidRecord(
+                "next authority epoch must equal current epoch or advance by one".into(),
+            ));
+        }
+
+        let block_hash = commit.block.hash().map_err(|error| {
+            StorageError::InvalidRecord(format!("invalid V4 block hash: {error}"))
+        })?;
+        if commit.certificate.protocol_version != TRANSACTION_V5_PROTOCOL_VERSION
+            || commit.certificate.chain_id != header.chain_id
+            || commit.certificate.height != header.height.get()
+            || commit.certificate.block_hash != block_hash
+        {
+            return Err(StorageError::InvalidRecord(
+                "finality certificate does not identify the exact V4 block".into(),
+            ));
+        }
+        let verifier = commit
+            .current_authority_set
+            .to_validator_set()
+            .map_err(|error| {
+                StorageError::InvalidRecord(format!("cannot build finality verifier: {error}"))
+            })?;
+        commit
+            .certificate
+            .verify(&verifier, TRANSACTION_V5_PROTOCOL_VERSION, &header.chain_id)
+            .map_err(|error| {
+                StorageError::InvalidRecord(format!("V4 finality certificate is invalid: {error}"))
+            })?;
+
+        let block_bytes = encode(StoredRecordKind::BlockV4, commit.block)?;
+        let state_bytes = encode_schema_v2(commit.state)?;
+        let new_tip = ChainTip {
+            height: header.height.get(),
+            block_hash: Some(block_hash),
+            state_root,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Table::BlocksV2,
+            be(header.height.get()).to_vec(),
+            block_bytes,
+        );
+        batch.put(
+            Table::BlockV4HashIndex,
+            block_hash.0.to_vec(),
+            be(header.height.get()).to_vec(),
+        );
+        batch.put(
+            Table::StateSnapshots,
+            be(header.height.get()).to_vec(),
+            state_bytes,
+        );
+        batch.delete(Table::StateSnapshots, be(tip.height).to_vec());
+        batch.put(
+            Table::FinalityAuthoritySets,
+            be(commit.current_authority_set.epoch.get()).to_vec(),
+            encode(
+                StoredRecordKind::FinalityAuthoritySetV1,
+                commit.current_authority_set,
+            )?,
+        );
+        batch.put(
+            Table::FinalityAuthoritySets,
+            be(commit.next_authority_set.epoch.get()).to_vec(),
+            encode(
+                StoredRecordKind::FinalityAuthoritySetV1,
+                commit.next_authority_set,
+            )?,
+        );
+        batch.put(
+            Table::Certificates,
+            be(header.height.get()).to_vec(),
+            encode(StoredRecordKind::FinalityCertificate, commit.certificate)?,
+        );
+        batch.delete(Table::ConsensusWal, be(header.height.get()).to_vec());
+        self.stage_finalized_block_v1(&mut batch, commit.block)?;
+        batch.put(
+            Table::Meta,
+            META_TIP,
+            encode(StoredRecordKind::ChainTip, &new_tip)?,
+        );
+        self.store.commit(batch)
+    }
+
     /// Returns the current committed tip, or `None` before genesis initialization.
     pub fn tip(&self) -> Result<Option<ChainTip>, StorageError> {
         match self.store.get(Table::Meta, META_TIP)? {
@@ -409,6 +648,85 @@ impl<K: KvStore> ChainStore<K> {
         match self.store.get(Table::Blocks, &be(height))? {
             None => Ok(None),
             Some(bytes) => Ok(Some(decode(StoredRecordKind::Block, &bytes)?)),
+        }
+    }
+
+    /// Returns a finalized protocol-2 block at `height`, validating all bindings.
+    pub fn block_v4_by_height(&self, height: BlockHeight) -> Result<Option<BlockV4>, StorageError> {
+        match self.store.get(Table::BlocksV2, &be(height.get()))? {
+            None => Ok(None),
+            Some(bytes) => {
+                let block: BlockV4 = decode(StoredRecordKind::BlockV4, &bytes)?;
+                block.validate().map_err(|error| {
+                    StorageError::Corruption(format!(
+                        "stored protocol-2 block failed validation: {error}"
+                    ))
+                })?;
+                if block.header.height != height {
+                    return Err(StorageError::Corruption(
+                        "stored protocol-2 block does not match its height key".into(),
+                    ));
+                }
+                Ok(Some(block))
+            }
+        }
+    }
+
+    /// Returns a finalized protocol-2 block through its V4 header hash index.
+    pub fn block_v4_by_hash(&self, hash: &Hash256) -> Result<Option<BlockV4>, StorageError> {
+        let Some(height_bytes) = self.store.get(Table::BlockV4HashIndex, &hash.0)? else {
+            return Ok(None);
+        };
+        let height = decode_u64(&height_bytes).ok_or_else(|| {
+            StorageError::Corruption("V4 block-hash index holds a malformed height".into())
+        })?;
+        let block = self.block_v4_by_height(BlockHeight::new(height))?;
+        if let Some(block) = &block {
+            let actual = block.hash().map_err(|error| {
+                StorageError::Corruption(format!("stored V4 block hash is invalid: {error}"))
+            })?;
+            if &actual != hash {
+                return Err(StorageError::Corruption(
+                    "V4 block-hash index points at another block".into(),
+                ));
+            }
+        }
+        Ok(block)
+    }
+
+    /// Returns only the V4 header at a finalized protocol-2 height.
+    pub fn header_v4_by_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHeaderV4>, StorageError> {
+        Ok(self.block_v4_by_height(height)?.map(|block| block.header))
+    }
+
+    /// Returns the versioned finality authority set stored for `epoch`.
+    pub fn finality_authority_set_v1(
+        &self,
+        epoch: Epoch,
+    ) -> Result<Option<FinalityAuthoritySetV1>, StorageError> {
+        match self
+            .store
+            .get(Table::FinalityAuthoritySets, &be(epoch.get()))?
+        {
+            None => Ok(None),
+            Some(bytes) => {
+                let authority_set: FinalityAuthoritySetV1 =
+                    decode(StoredRecordKind::FinalityAuthoritySetV1, &bytes)?;
+                authority_set.validate().map_err(|error| {
+                    StorageError::Corruption(format!(
+                        "stored finality authority set failed validation: {error}"
+                    ))
+                })?;
+                if authority_set.epoch != epoch {
+                    return Err(StorageError::Corruption(
+                        "stored finality authority set does not match its epoch key".into(),
+                    ));
+                }
+                Ok(Some(authority_set))
+            }
         }
     }
 

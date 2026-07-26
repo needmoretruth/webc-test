@@ -54,6 +54,9 @@ fn table_def(table: Table) -> TableDefinition<'static, &'static [u8], &'static [
         Table::TransactionLifecycle => "webc_transaction_lifecycle",
         Table::FinalizedTransactionIndex => "webc_finalized_transaction_index",
         Table::FinalizedReceiptIndex => "webc_finalized_receipt_index",
+        Table::BlocksV2 => "webc_blocks_v2",
+        Table::BlockV4HashIndex => "webc_block_v4_hash_index",
+        Table::FinalityAuthoritySets => "webc_finality_authority_sets",
     };
     TableDefinition::new(name)
 }
