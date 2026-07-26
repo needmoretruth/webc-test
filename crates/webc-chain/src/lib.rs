@@ -10,6 +10,7 @@ pub mod authorization;
 pub mod authorization_policy;
 pub mod block;
 pub mod block_builder;
+pub mod block_v4;
 pub mod bridge;
 pub mod canonical;
 pub mod consensus;
@@ -60,6 +61,10 @@ pub use block::{Block, BlockHeader};
 pub use block_builder::{
     apply_block, build_block, evidence_root, receipt_root, transaction_root, BlockBuildInput,
     MAX_BLOCK_SLASHING_EVIDENCE,
+};
+pub use block_v4::{
+    BlockHeaderV4, BlockV4, BlockV4Error, BLOCK_HEADER_V4_DOMAIN, MAX_BLOCK_V4_CANONICAL_BYTES,
+    MAX_BLOCK_V4_TRANSACTIONS,
 };
 pub use bridge::{
     AssetId, BridgeConfig, BridgeEvent, BridgeMessage, ExternalChain, MAX_BRIDGE_RECIPIENT_BYTES,

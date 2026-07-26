@@ -8,10 +8,13 @@
  */
 
 import { canonicalJsonHashHex } from "./canonical.js";
-import type { BlockHeaderJson, HexString } from "./types.js";
+import type { BlockHeaderJson, BlockHeaderV4Json, HexString } from "./types.js";
 
 /** Domain separator for the PoH-free authoritative block-header schema. */
 export const BLOCK_HEADER_DOMAIN = "WEBC_BLOCK_HEADER_V3";
+
+/** Domain separator for protocol-2 V4 block headers. */
+export const BLOCK_HEADER_V4_DOMAIN = "WEBC_BLOCK_HEADER_V4";
 
 /**
  * Computes the SHA-256 block identifier committed and signed by validators.
@@ -24,4 +27,11 @@ export function blockHeaderHashHex(
   header: BlockHeaderJson,
 ): Promise<HexString> {
   return canonicalJsonHashHex({ domain: BLOCK_HEADER_DOMAIN, header });
+}
+
+/** Computes the exact protocol-2 V4 header identifier verified by Rust. */
+export function blockHeaderV4HashHex(
+  header: BlockHeaderV4Json,
+): Promise<HexString> {
+  return canonicalJsonHashHex({ domain: BLOCK_HEADER_V4_DOMAIN, header });
 }

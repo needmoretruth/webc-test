@@ -159,6 +159,40 @@ export interface BlockHeaderJson {
   base_fee_per_unit: number;
 }
 
+/** Protocol-2 V4 header; wide integers are exact decimal strings. */
+export interface BlockHeaderV4Json {
+  /** Must be exactly 2. */
+  protocol_version: 2;
+  /** Replay-protection network identifier fixed by genesis. */
+  chain_id: string;
+  /** Monotonic block height. */
+  height: string;
+  /** Authority snapshot epoch. */
+  epoch: string;
+  /** Hash of the immediately preceding authoritative block. */
+  previous_hash: HexString;
+  /** Root of every consensus state subtree after execution. */
+  state_root: HexString;
+  /** Account-only root used by lightweight balance proofs. */
+  account_root: HexString;
+  /** Ordered, position-bound root of V5 transactions. */
+  tx_root: HexString;
+  /** Ordered root of position-bound V1 receipts. */
+  receipt_root: HexString;
+  /** Ordered objective-evidence root. */
+  evidence_root: HexString;
+  /** Commitment to the outgoing authority set certifying this block. */
+  finality_authority_set_root: HexString;
+  /** Commitment to the authority set allowed at the next height. */
+  next_finality_authority_set_root: HexString;
+  /** Validator operator selected to propose this block. */
+  proposer: WebcAddress;
+  /** Consensus-supplied Unix timestamp in milliseconds. */
+  timestamp_ms: string;
+  /** Native base units charged per execution unit. */
+  base_fee_per_unit: string;
+}
+
 /**
  * A fully signed transaction ready for submission to the node.
  *

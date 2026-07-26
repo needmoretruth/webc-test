@@ -1001,9 +1001,24 @@ storage Clippy and all 62 storage tests pass.
 Exact next item: add the finalized position/receipt record codecs and stage their
 indexes, pending deletion, authoritative consensus fact, and sequence allocation
 inside the same atomic batch as the finalized protocol-2 block/state/certificate/
-tip commit. Do not model protocol 2 through the frozen V3/V4 block container;
+tip commit. Do not model protocol 2 through the frozen protocol-1 `Block`
+(V3 header plus V4 transactions);
 introduce the explicit V4-header/V5-block storage boundary needed to keep legacy
 protocol-1 blocks readable without reinterpretation.
+
+The prerequisite block boundary is now frozen: `webc-chain::BlockHeaderV4`
+uses `WEBC_BLOCK_HEADER_V4`, exact decimal-string wide integers, and separate
+current/next finality-authority commitments, while `BlockV4` owns bounded V5
+transactions, V1 receipts, and objective evidence. Validation checks collection
+and 4 MiB byte caps, every sender/sponsor signature and signed height window,
+transaction/receipt positional binding, duplicate IDs, and the three shared
+roots. The old `Block` and `WEBC_BLOCK_HEADER_V3` are untouched. Rust and
+TypeScript freeze the V4 header hash as
+`9855e491949296206f38c03e12a5f4aa82ca332170d1e42bb9dc1dfab5bb9949`.
+
+Exact next item remains the atomic finalized storage batch, now using this
+explicit `BlockV4` boundary rather than extending or reinterpreting the legacy
+container.
 
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
