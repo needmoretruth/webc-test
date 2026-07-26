@@ -10,6 +10,7 @@ pub mod authorization;
 pub mod authorization_policy;
 pub mod block;
 pub mod block_builder;
+pub mod block_builder_v1;
 pub mod block_v4;
 pub mod bridge;
 pub mod canonical;
@@ -62,6 +63,9 @@ pub use block::{Block, BlockHeader};
 pub use block_builder::{
     apply_block, build_block, evidence_root, receipt_root, transaction_root, BlockBuildInput,
     MAX_BLOCK_SLASHING_EVIDENCE,
+};
+pub use block_builder_v1::{
+    apply_block_v4, build_block_v4, BlockBuildInputV1, BlockV4ExecutionError,
 };
 pub use block_v4::{
     BlockHeaderV4, BlockV4, BlockV4Error, BLOCK_HEADER_V4_DOMAIN, MAX_BLOCK_V4_CANONICAL_BYTES,

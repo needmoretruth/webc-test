@@ -54,7 +54,6 @@ use crate::session_key::{
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
 };
-#[cfg(test)]
 use crate::sponsor_grant_book::SponsorGrantBookError;
 use crate::sponsorship::{
     sponsor_state_key_hash, AppSponsor, SponsorshipConfig, SPONSOR_LEAF_DOMAIN,
@@ -1673,7 +1672,6 @@ impl ChainState {
     /// units bound ingress while the derived expiry index limits deterministic
     /// cleanup to a fixed number per block. The caller's whole-block overlay
     /// supplies rollback if this detects corrupted durable state.
-    #[cfg(test)]
     pub(crate) fn prune_expired_sponsor_grants_v1(
         &mut self,
         height: crate::BlockHeight,
