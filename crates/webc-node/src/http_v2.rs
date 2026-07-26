@@ -37,6 +37,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::{broadcast, Semaphore};
 use webc_chain::{BlockPositionV1, ReceiptV1, TransactionId, TransactionV5};
+use webc_net::{NetMessage, NetworkHandle};
 use webc_storage::{
     LifecycleSequence, LocalDropReasonV1, LocalTimestampMs, LocalTransactionObservationV1,
     TransactionConsensusFactV1, TransactionLifecycleV1,
@@ -467,6 +468,7 @@ pub struct V2TransportConfigError;
 
 struct V2AppInner {
     runtime: NodeHandle,
+    network: Option<NetworkHandle>,
     submission_slots: Arc<Semaphore>,
     websocket_slots: Arc<Semaphore>,
     peer_rate_limiter: Mutex<PeerRateLimiter>,
@@ -476,7 +478,12 @@ struct V2AppInner {
 impl V2AppState {
     /// Creates bounded transport state over the one protocol-2 runtime handle.
     pub fn new(runtime: NodeHandle) -> Self {
-        Self::from_validated_limits(runtime, V2TransportLimits::default())
+        Self::from_validated_limits(runtime, None, V2TransportLimits::default())
+    }
+
+    /// Creates default-limited transport state that gossips new local admissions.
+    pub fn with_network(runtime: NodeHandle, network: NetworkHandle) -> Self {
+        Self::from_validated_limits(runtime, Some(network), V2TransportLimits::default())
     }
 
     /// Creates transport state with explicit replaceable node-local limits.
@@ -492,13 +499,35 @@ impl V2AppState {
         {
             return Err(V2TransportConfigError);
         }
-        Ok(Self::from_validated_limits(runtime, limits))
+        Ok(Self::from_validated_limits(runtime, None, limits))
     }
 
-    fn from_validated_limits(runtime: NodeHandle, limits: V2TransportLimits) -> Self {
+    /// Creates explicitly limited transport state with optional V5 gossip.
+    pub fn with_network_and_limits(
+        runtime: NodeHandle,
+        network: Option<NetworkHandle>,
+        limits: V2TransportLimits,
+    ) -> Result<Self, V2TransportConfigError> {
+        if limits.concurrent_submissions == 0
+            || limits.websocket_subscriptions == 0
+            || limits.per_ip_burst == 0
+            || limits.per_ip_refill_ms == 0
+            || limits.max_tracked_ips == 0
+        {
+            return Err(V2TransportConfigError);
+        }
+        Ok(Self::from_validated_limits(runtime, network, limits))
+    }
+
+    fn from_validated_limits(
+        runtime: NodeHandle,
+        network: Option<NetworkHandle>,
+        limits: V2TransportLimits,
+    ) -> Self {
         Self {
             inner: Arc::new(V2AppInner {
                 runtime,
+                network,
                 submission_slots: Arc::new(Semaphore::new(limits.concurrent_submissions)),
                 websocket_slots: Arc::new(Semaphore::new(limits.websocket_subscriptions)),
                 peer_rate_limiter: Mutex::new(PeerRateLimiter::new(limits)),
@@ -654,12 +683,21 @@ async fn submit_transaction(
 ) -> Result<Json<V2SubmitResponse>, V2ApiRejection> {
     let transaction = TransactionV5::decode_json(&body)
         .map_err(|_| state.reject(V2ApiError::InvalidTransaction))?;
+    let gossip_copy = transaction.clone();
     let receipt = state
         .inner
         .runtime
         .submit(transaction, LocalTimestampMs::new(crate::http::now_ms()))
         .await
         .map_err(|error| state.reject(V2ApiError::Runtime(error)))?;
+    if receipt.outcome != V5InsertOutcome::DuplicateKnown {
+        if let Some(network) = &state.inner.network {
+            // The durable actor transition already succeeded. Gossip is
+            // best-effort availability and cannot roll it back or change the
+            // client result if the network worker is stopping.
+            let _ = network.broadcast(NetMessage::TransactionV5(Box::new(gossip_copy)));
+        }
+    }
     Ok(Json(receipt.into()))
 }
 

@@ -10,7 +10,9 @@
 //! defines what a single frame's bytes mean.
 
 use serde::{Deserialize, Serialize};
-use webc_chain::{Block, FinalityCertificate, SignedProposal, SignedVote, Transaction};
+use webc_chain::{
+    Block, FinalityCertificate, SignedProposal, SignedVote, Transaction, TransactionV5,
+};
 use webc_crypto::Hash256;
 
 use crate::codec::{
@@ -41,7 +43,12 @@ pub const NET_PROTOCOL_MAGIC: [u8; 4] = *b"WEBC";
 /// layout of every frame and of the bincode handshake frames, so a v3 node cannot
 /// parse a v4 body. The handshake pins this version: a v3 and a v4 node detect the
 /// mismatch and refuse to peer rather than misparse.
-pub const NET_PROTOCOL_VERSION: u16 = 4;
+///
+/// v5 (transaction protocol 2): `NetMessage` gained the V5 signed-transaction
+/// variant. It is appended to preserve the earlier enum discriminants, but a v4
+/// peer cannot interpret the new variant and therefore must fail the versioned
+/// handshake rather than silently drop or misparse protocol-2 gossip.
+pub const NET_PROTOCOL_VERSION: u16 = 5;
 
 /// Length of the clear frame header: the fixed magic followed by the
 /// little-endian wire version. These bytes are never compressed, so
@@ -80,6 +87,8 @@ pub enum NetMessage {
     },
     /// A state-sync response carrying one certified finalized block.
     BlockResponse(Box<CertifiedBlock>),
+    /// A signed protocol-2 V5 transaction propagated between bounded mempools.
+    TransactionV5(Box<TransactionV5>),
 }
 
 /// A finalized block bundled with the certificate that proves its finality, sent
@@ -189,6 +198,40 @@ mod tests {
         transaction_with_amount(Amount::from_webc(1))
     }
 
+    fn sample_transaction_v5() -> TransactionV5 {
+        use webc_chain::{
+            ActionV1, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainId,
+            FeePaymentV1, Nonce, TransactionAuthorizationV1, ValidityWindowV1,
+        };
+
+        let sender = Keypair::from_seed([11; 32]);
+        let recipient = Keypair::from_seed([12; 32]);
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(1), BlockHeight::new(20)),
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            })],
+            FeeBid {
+                gas_limit: 1_000,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("sample V5 shape is valid");
+        transaction.sign(&sender).expect("sample V5 signs");
+        transaction
+    }
+
     /// WEBC §15.14 on the wire: an `Amount` is now variable-length, so a
     /// transaction moving a tiny amount serializes in strictly fewer bytes than
     /// the same transaction moving a near-maximal amount. Under the old fixed-int
@@ -233,6 +276,22 @@ mod tests {
             panic!("expected a transaction message");
         };
         assert_eq!(tx.hash().unwrap(), sample_transaction().hash().unwrap());
+    }
+
+    #[test]
+    fn round_trips_a_v5_transaction_message_without_changing_its_id() {
+        let transaction = sample_transaction_v5();
+        let expected_id = transaction.transaction_id().expect("sample V5 has an ID");
+        let message = NetMessage::TransactionV5(Box::new(transaction));
+        let encoded = encode_message(&message).expect("V5 frame encodes");
+        let decoded = decode_message(&encoded).expect("V5 frame decodes");
+        let NetMessage::TransactionV5(transaction) = decoded else {
+            panic!("expected a V5 transaction message");
+        };
+        assert_eq!(
+            transaction.transaction_id().expect("decoded V5 has an ID"),
+            expected_id
+        );
     }
 
     fn sample_block(proposer: webc_crypto::Address) -> webc_chain::Block {
@@ -509,20 +568,18 @@ mod tests {
         ));
     }
 
-    /// A frame carrying the previous wire version (v3, the last fixed-int format)
-    /// is rejected at the clear header before its varint body is ever decoded, so
-    /// a v3 and a v4 node cleanly refuse to peer rather than misparse (WEBC §15.14
-    /// encoding change gated behind the `NET_PROTOCOL_VERSION` 3 → 4 bump).
+    /// A frame carrying wire version 4 is rejected at the clear header before a
+    /// newly-added V5 transaction discriminant can ever be decoded.
     #[test]
     fn rejects_the_previous_wire_version() {
-        assert_eq!(NET_PROTOCOL_VERSION, 4, "this test pins the v3 → v4 bump");
+        assert_eq!(NET_PROTOCOL_VERSION, 5, "this test pins the v4 to v5 bump");
         let message = NetMessage::Transaction(Box::new(sample_transaction()));
         let mut encoded = encode_message(&message).unwrap();
-        // Stamp the little-endian version field (bytes 4..6) back to 3.
-        encoded[4..6].copy_from_slice(&3u16.to_le_bytes());
+        // Stamp the little-endian version field (bytes 4..6) back to 4.
+        encoded[4..6].copy_from_slice(&4u16.to_le_bytes());
         assert!(matches!(
             decode_message(&encoded).unwrap_err(),
-            NetError::UnsupportedVersion { actual: 3 }
+            NetError::UnsupportedVersion { actual: 4 }
         ));
     }
 

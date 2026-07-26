@@ -553,6 +553,9 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
                     .insert(*tx, self.node.state(), self.node.config(), now_ms());
                 return Ok(());
             }
+            // Protocol-2 transactions are consumed by the V5 runtime pump. The
+            // frozen protocol-1 driver must never reinterpret them.
+            NetMessage::TransactionV5(_) => return Ok(()),
             NetMessage::Proposal(proposal) => {
                 // C1 (`valid(v)`): only a proposal whose block re-executes
                 // cleanly at this exact chain position may reach the machine.

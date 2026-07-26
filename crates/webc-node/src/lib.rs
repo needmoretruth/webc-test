@@ -26,7 +26,7 @@ pub mod runtime_v1;
 pub mod service;
 
 pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverExit, DriverTimeouts};
-pub use gossip::run_gossip_pump;
+pub use gossip::{run_gossip_pump, run_v5_gossip_pump};
 pub use http::{router, serve, AppState, BlockEvent};
 pub use http_v2::{
     router_v2, serve_v2, V2AppState, V2DropReason, V2ErrorBody, V2InsertOutcome,

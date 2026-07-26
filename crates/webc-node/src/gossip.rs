@@ -13,9 +13,10 @@
 
 use tokio::sync::mpsc;
 use webc_net::{InboundMessage, NetMessage};
-use webc_storage::KvStore;
+use webc_storage::{KvStore, LocalTimestampMs};
 
 use crate::http::{now_ms, AppState};
+use crate::NodeHandle;
 
 /// Drains inbound gossip into the node's mempool until the network stops.
 ///
@@ -41,7 +42,25 @@ where
             | NetMessage::Vote(_)
             | NetMessage::Certificate(_)
             | NetMessage::BlockRequest { .. }
-            | NetMessage::BlockResponse(_) => {}
+            | NetMessage::BlockResponse(_)
+            | NetMessage::TransactionV5(_) => {}
+        }
+    }
+}
+
+/// Drains protocol-2 V5 gossip into the single bounded node runtime.
+///
+/// The authenticated transport already re-flooded each newly seen frame. This
+/// consumer therefore performs no broadcast: it awaits durable actor admission
+/// and silently drops invalid, duplicate, saturated, or stopped-runtime input.
+/// Legacy transactions and consensus artifacts belong to their versioned
+/// drivers and are ignored here.
+pub async fn run_v5_gossip_pump(runtime: NodeHandle, mut inbound: mpsc::Receiver<InboundMessage>) {
+    while let Some(message) = inbound.recv().await {
+        if let NetMessage::TransactionV5(transaction) = message.message {
+            let _ = runtime
+                .submit(*transaction, LocalTimestampMs::new(now_ms()))
+                .await;
         }
     }
 }
