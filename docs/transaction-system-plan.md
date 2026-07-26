@@ -1060,6 +1060,26 @@ replacement/expiry/eviction policy, and keep the protocol-1 runtime behavior
 unchanged. Then expose the resulting lifecycle through the bounded V2 HTTP and
 WebSocket APIs before starting finalized checkpoint/proof/browser verification.
 
+The first half of that item is durable in commit `ec8e84f`.
+`webc-node::V5Mempool` is a separate protocol-2 policy boundary, leaving the
+frozen V4 pool unchanged. Pure admission plans enforce the 64 MiB canonical-byte
+budget, 8,192 global count, 64 per sender/lane, future nonce/start bounds, and
+10% replacement bump before constructing a pending record. Immediately runnable
+transactions pass full state preparation; bounded future nonces are parked and
+cannot evict a runnable transaction regardless of their nominal bid. Capacity
+eviction is deterministic, exact duplicates are idempotent, expiry plans no
+memory mutation before durable deletion, and restart reconstruction checks
+signatures, IDs, slots, record version, duplicates, bytes, and every cap. Strict
+node Clippy, all 66 node-library tests, 21 node integration/binary tests, Rust
+formatting, and node documentation generation pass.
+
+Exact next item is the persist-before-memory runtime half: extend one storage
+batch to support capacity eviction plus insertion, then add the bounded
+`NodeRuntime` actor and cloneable `NodeHandle`. The actor must recover durable
+records, revalidate or durably drop them before re-gossip, commit admission/
+replacement/eviction before applying the corresponding `V5Mempool` plan, and
+prove queue backpressure plus database-failure rollback.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
