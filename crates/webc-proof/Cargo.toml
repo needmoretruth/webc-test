@@ -14,9 +14,10 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+webc-chain = { path = "../webc-chain" }
 webc-crypto = { path = "../webc-crypto" }
 
 [dev-dependencies]
 proptest = { version = "1.6", default-features = false, features = ["std"] }
-serde_json.workspace = true
