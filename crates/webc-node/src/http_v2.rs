@@ -21,14 +21,15 @@
 //! correlation IDs but never storage paths, signed request contents, or internal
 //! invariant details.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -55,6 +56,14 @@ pub const MAX_V2_WS_SUBSCRIPTIONS: usize = 256;
 pub const MAX_V2_WS_MESSAGE_BYTES: usize = 16 * 1024;
 /// Time allowed for a connected socket to provide its bounded subscription.
 pub const V2_WS_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default request burst allowed for one observed peer IP.
+pub const DEFAULT_V2_PER_IP_BURST: u64 = 120;
+/// Default local refill interval per request token (10 requests/second).
+pub const DEFAULT_V2_PER_IP_REFILL_MS: u64 = 100;
+/// Maximum peer-IP buckets retained to keep rate-limit memory bounded.
+pub const DEFAULT_V2_MAX_TRACKED_IPS: usize = 4_096;
+/// Idle peer bucket retention before bounded table cleanup.
+pub const DEFAULT_V2_IP_BUCKET_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Public typed reason for a local lifecycle drop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -275,6 +284,8 @@ enum V2ApiError {
     BodyTooLarge,
     SubmissionLimit,
     WebSocketLimit,
+    RateLimited,
+    RateLimiterUnavailable,
     Runtime(NodeRuntimeError),
 }
 
@@ -321,6 +332,18 @@ impl IntoResponse for V2ApiRejection {
                 "websocket_limit",
                 "too many lifecycle subscriptions are active",
                 false,
+            ),
+            V2ApiError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "request rate exceeds the per-peer limit",
+                false,
+            ),
+            V2ApiError::RateLimiterUnavailable => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal server error",
+                true,
             ),
             V2ApiError::Runtime(error) => classify_runtime_error(error),
         };
@@ -417,6 +440,12 @@ pub struct V2TransportLimits {
     pub concurrent_submissions: usize,
     /// Maximum live lifecycle WebSocket connections.
     pub websocket_subscriptions: usize,
+    /// Request tokens available in a burst for one observed socket IP.
+    pub per_ip_burst: u64,
+    /// Local milliseconds that replenish one request token.
+    pub per_ip_refill_ms: u64,
+    /// Maximum peer-IP buckets retained in memory.
+    pub max_tracked_ips: usize,
 }
 
 impl Default for V2TransportLimits {
@@ -424,6 +453,9 @@ impl Default for V2TransportLimits {
         Self {
             concurrent_submissions: MAX_V2_CONCURRENT_SUBMISSIONS,
             websocket_subscriptions: MAX_V2_WS_SUBSCRIPTIONS,
+            per_ip_burst: DEFAULT_V2_PER_IP_BURST,
+            per_ip_refill_ms: DEFAULT_V2_PER_IP_REFILL_MS,
+            max_tracked_ips: DEFAULT_V2_MAX_TRACKED_IPS,
         }
     }
 }
@@ -437,6 +469,7 @@ struct V2AppInner {
     runtime: NodeHandle,
     submission_slots: Arc<Semaphore>,
     websocket_slots: Arc<Semaphore>,
+    peer_rate_limiter: Mutex<PeerRateLimiter>,
     correlation_sequence: AtomicU64,
 }
 
@@ -451,7 +484,12 @@ impl V2AppState {
         runtime: NodeHandle,
         limits: V2TransportLimits,
     ) -> Result<Self, V2TransportConfigError> {
-        if limits.concurrent_submissions == 0 || limits.websocket_subscriptions == 0 {
+        if limits.concurrent_submissions == 0
+            || limits.websocket_subscriptions == 0
+            || limits.per_ip_burst == 0
+            || limits.per_ip_refill_ms == 0
+            || limits.max_tracked_ips == 0
+        {
             return Err(V2TransportConfigError);
         }
         Ok(Self::from_validated_limits(runtime, limits))
@@ -463,6 +501,7 @@ impl V2AppState {
                 runtime,
                 submission_slots: Arc::new(Semaphore::new(limits.concurrent_submissions)),
                 websocket_slots: Arc::new(Semaphore::new(limits.websocket_subscriptions)),
+                peer_rate_limiter: Mutex::new(PeerRateLimiter::new(limits)),
                 correlation_sequence: AtomicU64::new(1),
             }),
         }
@@ -487,6 +526,63 @@ impl V2AppState {
     }
 }
 
+struct PeerBucket {
+    tokens: u64,
+    last_refill: Instant,
+    last_seen: Instant,
+}
+
+struct PeerRateLimiter {
+    buckets: BTreeMap<IpAddr, PeerBucket>,
+    burst: u64,
+    refill_ms: u64,
+    max_tracked_ips: usize,
+}
+
+impl PeerRateLimiter {
+    fn new(limits: V2TransportLimits) -> Self {
+        Self {
+            buckets: BTreeMap::new(),
+            burst: limits.per_ip_burst,
+            refill_ms: limits.per_ip_refill_ms,
+            max_tracked_ips: limits.max_tracked_ips,
+        }
+    }
+
+    fn allow(&mut self, peer: IpAddr, now: Instant) -> bool {
+        if !self.buckets.contains_key(&peer) && self.buckets.len() >= self.max_tracked_ips {
+            self.buckets.retain(|_, bucket| {
+                now.saturating_duration_since(bucket.last_seen) < DEFAULT_V2_IP_BUCKET_IDLE_TTL
+            });
+            if self.buckets.len() >= self.max_tracked_ips {
+                return false;
+            }
+        }
+        let bucket = self.buckets.entry(peer).or_insert(PeerBucket {
+            tokens: self.burst,
+            last_refill: now,
+            last_seen: now,
+        });
+        let refill_intervals = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_millis()
+            / u128::from(self.refill_ms);
+        if refill_intervals > 0 {
+            let refilled = u64::try_from(refill_intervals).unwrap_or(u64::MAX);
+            bucket.tokens = bucket.tokens.saturating_add(refilled).min(self.burst);
+            // Resetting to `now` discards a fractional interval. This is safely
+            // stricter than carrying attacker-controlled fractional timing.
+            bucket.last_refill = now;
+        }
+        bucket.last_seen = now;
+        if bucket.tokens == 0 {
+            return false;
+        }
+        bucket.tokens -= 1;
+        true
+    }
+}
+
 /// Builds only the protocol-2 transaction routes over an existing runtime.
 pub fn router_v2(state: V2AppState) -> Router {
     Router::new()
@@ -499,7 +595,38 @@ pub fn router_v2(state: V2AppState) -> Router {
             state.clone(),
             reserve_submission_before_body,
         ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_by_peer_ip,
+        ))
         .with_state(state)
+}
+
+async fn rate_limit_by_peer_ip(
+    State(state): State<V2AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Trust only the socket address injected by axum's connect-info service;
+    // spoofable forwarding headers are deliberately ignored. Router-only tests
+    // share one unspecified bucket when no socket extension exists.
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0.ip())
+        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+    let allowed = match state.inner.peer_rate_limiter.lock() {
+        Ok(mut limiter) => limiter.allow(peer, Instant::now()),
+        Err(_) => {
+            return state
+                .reject(V2ApiError::RateLimiterUnavailable)
+                .into_response();
+        }
+    };
+    if !allowed {
+        return state.reject(V2ApiError::RateLimited).into_response();
+    }
+    next.run(request).await
 }
 
 async fn reserve_submission_before_body(
@@ -783,7 +910,11 @@ async fn send_ws_message(socket: &mut WebSocket, message: &V2WsServerMessage) ->
 /// Serves only protocol-2 transaction routes with devnet CORS policy.
 pub async fn serve_v2(listener: tokio::net::TcpListener, state: V2AppState) -> std::io::Result<()> {
     let app = router_v2(state).layer(tower_http::cors::CorsLayer::permissive());
-    axum::serve(listener, app).await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -810,5 +941,24 @@ mod tests {
         assert_eq!(body["message"], "internal server error");
         assert_eq!(body["request_id"], "v2-test");
         assert!(!body.to_string().contains("secret database path"));
+    }
+
+    #[test]
+    fn peer_rate_limiter_bounds_identity_memory_and_refills_without_float_math() {
+        let limits = V2TransportLimits {
+            per_ip_burst: 1,
+            per_ip_refill_ms: 10,
+            max_tracked_ips: 1,
+            ..V2TransportLimits::default()
+        };
+        let mut limiter = PeerRateLimiter::new(limits);
+        let start = Instant::now();
+        let first = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        let second = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        assert!(limiter.allow(first, start));
+        assert!(!limiter.allow(first, start));
+        assert!(!limiter.allow(second, start));
+        assert!(limiter.allow(first, start + Duration::from_millis(10)));
+        assert_eq!(limiter.buckets.len(), 1);
     }
 }

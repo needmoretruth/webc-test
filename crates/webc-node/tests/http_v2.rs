@@ -250,6 +250,7 @@ async fn submission_slot_is_reserved_before_a_streaming_body_is_read() {
         V2TransportLimits {
             concurrent_submissions: 1,
             websocket_subscriptions: 1,
+            ..V2TransportLimits::default()
         },
     )
     .expect("test limits are non-zero");
@@ -287,6 +288,52 @@ async fn submission_slot_is_reserved_before_a_streaming_body_is_read() {
     assert_eq!(json_body(response).await["code"], "submission_limit");
 
     first.abort();
+    handle.shutdown().await.expect("runtime shuts down");
+    task.await
+        .expect("runtime does not panic")
+        .expect("runtime exits cleanly");
+}
+
+#[tokio::test]
+async fn per_peer_bucket_rate_limits_before_route_work() {
+    let (handle, task, _alice, _bob) = runtime();
+    let state = V2AppState::with_limits(
+        handle.clone(),
+        V2TransportLimits {
+            per_ip_burst: 1,
+            per_ip_refill_ms: 60_000,
+            max_tracked_ips: 4,
+            ..V2TransportLimits::default()
+        },
+    )
+    .expect("test limits are non-zero");
+    let app = router_v2(state);
+    let unknown = webc_chain::TransactionId::new(webc_crypto::Hash256([0x77; 32]));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v2/transactions/{unknown}"))
+                .body(Body::empty())
+                .expect("first request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v2/transactions/{unknown}"))
+                .body(Body::empty())
+                .expect("second request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json_body(response).await["code"], "rate_limited");
+
     handle.shutdown().await.expect("runtime shuts down");
     task.await
         .expect("runtime does not panic")
