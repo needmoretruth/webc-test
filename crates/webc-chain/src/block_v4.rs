@@ -19,7 +19,12 @@
 //! and binds each typed receipt to its exact position. The two authority roots
 //! are signed header data; later proof code verifies the committed set contents.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::{fmt, marker::PhantomData};
+
+use serde::{
+    de::{SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use webc_crypto::{Address, Hash256};
 
 use crate::{
@@ -123,10 +128,13 @@ pub struct BlockV4 {
     /// V4 header and all execution/finality commitments.
     pub header: BlockHeaderV4,
     /// Signed V5 transactions in canonical execution order.
+    #[serde(deserialize_with = "bounded_transactions::deserialize")]
     pub transactions: Vec<TransactionV5>,
     /// Typed V1 result corresponding one-to-one with each transaction.
+    #[serde(deserialize_with = "bounded_receipts::deserialize")]
     pub receipts: Vec<ReceiptV1>,
     /// Objective signed slashing artifacts applied before user actions.
+    #[serde(deserialize_with = "bounded_evidence::deserialize")]
     pub evidence: Vec<SlashingEvidence>,
 }
 
@@ -202,6 +210,84 @@ impl BlockV4 {
     pub fn hash(&self) -> Result<Hash256, BlockV4Error> {
         self.validate()?;
         self.header.hash()
+    }
+}
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVisitor<T, const MAX: usize>(PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVisitor<T, MAX>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "a protocol-2 block array with at most {MAX} entries"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence.size_hint().is_some_and(|hint| hint > MAX) {
+                return Err(serde::de::Error::custom(
+                    "protocol-2 block collection exceeds its entry limit",
+                ));
+            }
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == MAX {
+                    return Err(serde::de::Error::custom(
+                        "protocol-2 block collection exceeds its entry limit",
+                    ));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVisitor::<T, MAX>(PhantomData))
+}
+
+mod bounded_transactions {
+    use super::*;
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<TransactionV5>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, TransactionV5, MAX_BLOCK_V4_TRANSACTIONS>(deserializer)
+    }
+}
+
+mod bounded_receipts {
+    use super::*;
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<ReceiptV1>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, ReceiptV1, MAX_BLOCK_V4_TRANSACTIONS>(deserializer)
+    }
+}
+
+mod bounded_evidence {
+    use super::*;
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<SlashingEvidence>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, SlashingEvidence, MAX_BLOCK_SLASHING_EVIDENCE>(deserializer)
     }
 }
 
@@ -444,5 +530,32 @@ mod tests {
             BlockV4::decode_json(&vec![b' '; MAX_BLOCK_V4_CANONICAL_BYTES + 1]),
             Err(BlockV4Error::BlockTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn hostile_binary_collection_length_fails_before_decoding_elements() {
+        #[derive(Debug, Deserialize)]
+        struct TransactionList {
+            #[serde(deserialize_with = "bounded_transactions::deserialize")]
+            #[allow(dead_code)]
+            values: Vec<TransactionV5>,
+        }
+        #[derive(Serialize)]
+        struct HostileList {
+            values: Vec<u8>,
+        }
+
+        // These bytes are deliberately not transactions. The advertised count
+        // alone is enough to fail; no element decode or large typed allocation
+        // is attempted after trusting a hostile bincode length prefix.
+        let bytes = bincode::serialize(&HostileList {
+            values: vec![0; MAX_BLOCK_V4_TRANSACTIONS + 1],
+        })
+        .expect("hostile list encodes");
+        let error = bincode::deserialize::<TransactionList>(&bytes)
+            .expect_err("oversized block collection must fail");
+        assert!(error
+            .to_string()
+            .contains("protocol-2 block collection exceeds its entry limit"));
     }
 }
