@@ -23,8 +23,8 @@
 //! wasm fuel is reconciled into gas so total metered work — compute plus host
 //! effects — is bounded by the caller's gas limit.
 
-use wasmi::core::{Trap, TrapCode};
-use wasmi::{Caller, Extern, Linker, Memory, Store, StoreLimits, StoreLimitsBuilder};
+use wasmi::core::TrapCode;
+use wasmi::{Caller, Error, Extern, Linker, Memory, Store, StoreLimits, StoreLimitsBuilder};
 use webc_crypto::Hash256;
 
 use crate::error::VmError;
@@ -34,6 +34,13 @@ use crate::validate::{compile_checked, HOST_MODULE};
 
 /// The wasm linear-memory page size, in bytes (fixed by the wasm spec).
 const WASM_PAGE_BYTES: usize = 64 * 1024;
+
+/// Protocol-level fuel charged for entering and leaving one VM invocation.
+///
+/// `wasmi` may combine guest instructions as its interpreter evolves. Keeping
+/// call setup outside the engine's private cost model prevents an otherwise
+/// empty or heavily optimized invocation from becoming free after an upgrade.
+const VM_INVOCATION_FUEL: u64 = 2;
 
 /// Mutable per-invocation state owned by the wasm [`Store`] and reachable from
 /// every host function via [`Caller`].
@@ -103,9 +110,15 @@ pub fn execute<H: VmHost>(
     // Enforce the linear-memory page budget at run time, not just at validation:
     // a module with no declared memory maximum cannot grow past the cap.
     store.limiter(|state| &mut state.limiter);
-    // Fuel metering is enabled in the engine config; seed the budget.
+    // Charge the version-stable invocation cost before handing the remaining
+    // budget to wasmi's instruction meter. A too-small budget fails before any
+    // guest or host side effect can occur.
+    let engine_fuel = limits
+        .fuel
+        .checked_sub(VM_INVOCATION_FUEL)
+        .ok_or(VmError::OutOfGas)?;
     store
-        .add_fuel(limits.fuel)
+        .set_fuel(engine_fuel)
         .map_err(|err| VmError::InstantiationFailed(err.to_string()))?;
 
     let mut linker: Linker<VmState<H>> = Linker::new(&engine);
@@ -124,16 +137,21 @@ pub fn execute<H: VmHost>(
         .get_typed_func::<(), ()>(&store, "webc_call")
         .map_err(|_| VmError::MissingExport("webc_call".to_string()))?;
 
-    if let Err(trap) = entry.call(&mut store, ()) {
+    if let Err(error) = entry.call(&mut store, ()) {
         // A host function may have recorded a precise reason before trapping.
         if let Some(reason) = store.data_mut().trap_reason.take() {
             return Err(reason);
         }
-        return Err(map_run_error(&trap));
+        return Err(map_run_error(&error));
     }
 
     // Reconcile consumed compute fuel into gas so the meter accounts for it.
-    let consumed_fuel = store.fuel_consumed().unwrap_or(0);
+    let remaining_fuel = store
+        .get_fuel()
+        .map_err(|err| VmError::Trap(err.to_string()))?;
+    let consumed_fuel = VM_INVOCATION_FUEL
+        .checked_add(engine_fuel.saturating_sub(remaining_fuel))
+        .ok_or(VmError::OutOfGas)?;
     let gas = limits.reconcile_fuel(consumed_fuel);
     if gas > 0 {
         store.data_mut().host.charge_gas(gas)?;
@@ -156,7 +174,7 @@ fn register_host<H: VmHost>(linker: &mut Linker<VmState<H>>) -> Result<(), VmErr
         linker.func_wrap(
             HOST_MODULE,
             "webc_input_read",
-            |mut caller: Caller<'_, VmState<H>>, ptr: i32| -> Result<(), Trap> {
+            |mut caller: Caller<'_, VmState<H>>, ptr: i32| -> Result<(), Error> {
                 let (base, per) = {
                     let l = caller.data().limits;
                     (l.gas_input_base, l.gas_input_per_byte)
@@ -185,7 +203,7 @@ fn register_host<H: VmHost>(linker: &mut Linker<VmState<H>>) -> Result<(), VmErr
              key_len: i32,
              out_ptr: i32,
              out_cap: i32|
-             -> Result<i32, Trap> {
+             -> Result<i32, Error> {
                 if key_len != KEY_LEN_I32 {
                     let reported = usize::try_from(key_len).unwrap_or(0);
                     return Err(abort(&mut caller, VmError::KeyLengthInvalid(reported)));
@@ -241,7 +259,7 @@ fn register_host<H: VmHost>(linker: &mut Linker<VmState<H>>) -> Result<(), VmErr
              key_len: i32,
              val_ptr: i32,
              val_len: i32|
-             -> Result<i32, Trap> {
+             -> Result<i32, Error> {
                 if key_len != KEY_LEN_I32 {
                     let reported = usize::try_from(key_len).unwrap_or(0);
                     return Err(abort(&mut caller, VmError::KeyLengthInvalid(reported)));
@@ -290,7 +308,7 @@ fn register_host<H: VmHost>(linker: &mut Linker<VmState<H>>) -> Result<(), VmErr
         linker.func_wrap(
             HOST_MODULE,
             "webc_epoch",
-            |mut caller: Caller<'_, VmState<H>>| -> Result<i64, Trap> {
+            |mut caller: Caller<'_, VmState<H>>| -> Result<i64, Error> {
                 let cost = caller.data().limits.gas_epoch;
                 charge(&mut caller, cost)?;
                 let epoch = caller.data().host.epoch();
@@ -301,7 +319,7 @@ fn register_host<H: VmHost>(linker: &mut Linker<VmState<H>>) -> Result<(), VmErr
         linker.func_wrap(
             HOST_MODULE,
             "webc_output",
-            |mut caller: Caller<'_, VmState<H>>, ptr: i32, len: i32| -> Result<(), Trap> {
+            |mut caller: Caller<'_, VmState<H>>, ptr: i32, len: i32| -> Result<(), Error> {
                 let olen = match usize::try_from(len) {
                     Ok(v) => v,
                     Err(_) => return Err(abort(&mut caller, VmError::MemoryOutOfBounds)),
@@ -340,14 +358,14 @@ fn register_host<H: VmHost>(linker: &mut Linker<VmState<H>>) -> Result<(), VmErr
 /// `KEY_LEN` as an `i32` for guest-supplied length comparisons.
 const KEY_LEN_I32: i32 = KEY_LEN as i32;
 
-/// Records `err` as the guest's abort reason and returns a wasm trap to unwind.
-fn abort<H: VmHost>(caller: &mut Caller<'_, VmState<H>>, err: VmError) -> Trap {
+/// Records `err` as the guest's abort reason and returns a wasm error to unwind.
+fn abort<H: VmHost>(caller: &mut Caller<'_, VmState<H>>, err: VmError) -> Error {
     caller.data_mut().trap_reason = Some(err);
-    Trap::new("webc: host aborted execution")
+    Error::new("webc: host aborted execution")
 }
 
 /// Charges host-op gas through the [`VmHost`], aborting the guest on failure.
-fn charge<H: VmHost>(caller: &mut Caller<'_, VmState<H>>, units: u64) -> Result<(), Trap> {
+fn charge<H: VmHost>(caller: &mut Caller<'_, VmState<H>>, units: u64) -> Result<(), Error> {
     match caller.data_mut().host.charge_gas(units) {
         Ok(()) => Ok(()),
         Err(err) => Err(abort(caller, err)),
@@ -355,7 +373,7 @@ fn charge<H: VmHost>(caller: &mut Caller<'_, VmState<H>>, units: u64) -> Result<
 }
 
 /// Resolves the guest's exported `memory`, aborting if it is absent.
-fn memory_export<H: VmHost>(caller: &mut Caller<'_, VmState<H>>) -> Result<Memory, Trap> {
+fn memory_export<H: VmHost>(caller: &mut Caller<'_, VmState<H>>) -> Result<Memory, Error> {
     match caller.get_export("memory").and_then(Extern::into_memory) {
         Some(memory) => Ok(memory),
         None => Err(abort(caller, VmError::MissingExport("memory".to_string()))),
@@ -378,26 +396,23 @@ fn read_guest(data: &[u8], ptr: i32, len: usize) -> Option<Vec<u8>> {
 /// Maps a start-function error: fuel exhaustion is [`VmError::OutOfGas`],
 /// anything else is an instantiation failure.
 fn map_start_error(err: wasmi::Error) -> VmError {
-    if let wasmi::Error::Trap(trap) = &err {
-        if trap_is_out_of_fuel(trap) {
-            return VmError::OutOfGas;
-        }
+    if error_is_out_of_fuel(&err) {
+        return VmError::OutOfGas;
     }
     VmError::InstantiationFailed(err.to_string())
 }
 
 /// Maps a run trap: fuel exhaustion is [`VmError::OutOfGas`], any other trap is
 /// [`VmError::Trap`].
-fn map_run_error(trap: &Trap) -> VmError {
-    if trap_is_out_of_fuel(trap) {
+fn map_run_error(error: &Error) -> VmError {
+    if error_is_out_of_fuel(error) {
         VmError::OutOfGas
     } else {
-        VmError::Trap(trap.to_string())
+        VmError::Trap(error.to_string())
     }
 }
 
-/// Whether a trap is the fuel-exhaustion trap. `TrapCode` does not implement
-/// `PartialEq`, so the code is matched structurally.
-fn trap_is_out_of_fuel(trap: &Trap) -> bool {
-    matches!(trap.trap_code(), Some(TrapCode::OutOfFuel))
+/// Whether an engine error represents deterministic fuel exhaustion.
+fn error_is_out_of_fuel(error: &Error) -> bool {
+    matches!(error.as_trap_code(), Some(TrapCode::OutOfFuel))
 }

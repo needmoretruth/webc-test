@@ -14,7 +14,7 @@
 //! Every node must compute identical results, so the engine is stripped of all
 //! sources of divergence:
 //!
-//! - **Interpreter, not JIT.** Execution uses `wasmi` `0.31` (a pure-Rust
+//! - **Interpreter, not JIT.** Execution uses `wasmi` `0.46` (a pure-Rust
 //!   interpreter), which is deterministic by construction — no codegen, no
 //!   platform-specific behavior.
 //! - **Fuel, not time.** Metering is fuel-based (per executed instruction), never

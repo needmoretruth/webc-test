@@ -31,8 +31,9 @@ pub struct VmLimits {
     /// Maximum bytes the guest may submit via `webc_output`.
     pub max_output_bytes: usize,
 
-    /// Total wasm fuel budget. Fuel is charged per executed instruction by the
-    /// interpreter; exhaustion fails closed as [`crate::VmError::OutOfGas`].
+    /// Total wasm fuel budget. Two units pay the version-stable invocation
+    /// entry/exit cost; the remainder is charged per executed instruction by
+    /// the interpreter. Exhaustion fails closed as [`crate::VmError::OutOfGas`].
     pub fuel: u64,
     /// Fuel units that reconcile to one gas unit at the end of a run. Consumed
     /// fuel is divided by this (rounding up) and charged through
