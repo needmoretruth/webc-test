@@ -16,6 +16,7 @@
 //! storage logic stay independent of them.
 
 pub mod consensus_driver;
+pub mod consensus_driver_v1;
 pub mod gossip;
 pub mod http;
 pub mod http_v2;
@@ -26,6 +27,7 @@ pub mod runtime_v1;
 pub mod service;
 
 pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverExit, DriverTimeouts};
+pub use consensus_driver_v1::{ConsensusDriverV1, DriverExitV1};
 pub use gossip::{run_gossip_pump, run_v5_gossip_pump};
 pub use http::{router, serve, AppState, BlockEvent};
 pub use http_v2::{

@@ -98,7 +98,7 @@ impl Default for DriverTimeouts {
 impl DriverTimeouts {
     /// The wait for `kind` at `round`: `base(kind) + round·increment`
     /// (saturating, so a pathological round can never panic on overflow).
-    fn for_kind(&self, kind: TimeoutKind, round: u32) -> Duration {
+    pub(crate) fn for_kind(&self, kind: TimeoutKind, round: u32) -> Duration {
         let base = match kind {
             TimeoutKind::Propose => self.propose,
             TimeoutKind::Prevote => self.prevote,
@@ -189,7 +189,7 @@ pub struct ConsensusDriver<K: KvStore> {
 }
 
 /// Maximum blocks requested per state-sync round.
-const SYNC_BATCH: u32 = 16;
+pub(crate) const SYNC_BATCH: u32 = 16;
 
 /// Maximum milliseconds a proposed block's timestamp may lead this node's local
 /// clock before the proposal is rejected (E2 future-drift bound).
@@ -200,11 +200,11 @@ const SYNC_BATCH: u32 = 16;
 /// gross drift. Unlike timestamp *monotonicity* — a deterministic state rule
 /// enforced by `apply_block` — this compares against the local wall clock, so it
 /// lives in the driver, not the state machine.
-const MAX_BLOCK_TIMESTAMP_DRIFT_MS: u64 = 30_000;
+pub(crate) const MAX_BLOCK_TIMESTAMP_DRIFT_MS: u64 = 30_000;
 
 /// Returns whether a proposed block timestamp is within the accepted future
 /// drift of the local clock (E2). Pure so it is unit-testable without a clock.
-fn timestamp_within_future_drift(block_timestamp_ms: u64, now_ms: u64) -> bool {
+pub(crate) fn timestamp_within_future_drift(block_timestamp_ms: u64, now_ms: u64) -> bool {
     block_timestamp_ms <= now_ms.saturating_add(MAX_BLOCK_TIMESTAMP_DRIFT_MS)
 }
 
