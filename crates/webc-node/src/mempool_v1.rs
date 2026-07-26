@@ -1,7 +1,8 @@
 //! Protocol-2 V5 pending-transaction policy and in-memory indexes.
 //!
 //! Purpose: decide bounded V5 admission, replacement, capacity eviction,
-//! expiry, and restart reconstruction without performing durable writes.
+//! expiry, deterministic runnable selection, and restart reconstruction without
+//! performing durable writes.
 //! Responsibilities: validate hostile signed transactions, fully prepare an
 //! immediately runnable transaction against one state view, bound parked future
 //! nonces, and produce a mutation plan that can be persisted before memory is
@@ -17,13 +18,17 @@
 //! byte, and sender/lane limits are checked before constructing a durable
 //! record. A future-nonce entry is only parked within the configured gap and is
 //! never considered runnable until full state preparation succeeds later.
+//! Selection simulates ordered execution on a private state clone so a
+//! chargeable failure can advance its nonce while a stale queue head cannot
+//! poison candidate construction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 use webc_chain::{
-    Amount, AuthorizationLaneId, BlockHeight, ChainConfig, ChainState, FeePaymentV1, Nonce,
-    TransactionId, TransactionPreparationErrorV1, TransactionV5, TransactionValidationErrorV1,
-    ValidatedTransactionV1, TRANSACTION_V5_PROTOCOL_VERSION,
+    Amount, AuthorizationLaneId, BlockExecutionErrorV1, BlockHeight, BlockPositionV1, ChainConfig,
+    ChainState, FeePaymentV1, Nonce, TransactionId, TransactionIndex,
+    TransactionPreparationErrorV1, TransactionV5, TransactionValidationErrorV1,
+    ValidatedTransactionV1, MAX_BLOCK_V4_TRANSACTIONS, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::Address;
 use webc_storage::{
@@ -169,6 +174,12 @@ pub enum V5MempoolError {
     /// Restart data contains duplicate IDs/slots or exceeds configured bounds.
     #[error("durable protocol-2 pending records are inconsistent")]
     InconsistentRecovery,
+    /// Candidate simulation hit an invariant-level execution failure.
+    #[error("protocol-2 mempool selection hit a block execution invariant: {0}")]
+    SelectionExecution(#[source] Box<BlockExecutionErrorV1>),
+    /// A selected transaction position cannot fit the V1 receipt index.
+    #[error("protocol-2 mempool selection exhausted the transaction index")]
+    SelectionIndexOverflow,
 }
 
 #[derive(Clone, Debug)]
@@ -411,6 +422,174 @@ impl V5Mempool {
             .collect()
     }
 
+    /// Selects a deterministic fee-prioritized V5 candidate under block bounds.
+    ///
+    /// Each `(sender, lane)` contributes only its contiguous nonce run beginning
+    /// at committed state. Across runs, the highest effective fee is considered
+    /// first with a stable sender/lane tie-break. Every chosen transaction is
+    /// prepared and executed on a private clone in exact candidate order; a
+    /// chargeable action failure remains selected and advances the simulated
+    /// nonce, while an ordinary stale preparation stops only that lane's run.
+    ///
+    /// `now_ms` is node-local retention policy and never enters the block. This
+    /// method mutates neither pending indexes nor committed chain state.
+    pub fn select_block(
+        &self,
+        state: &ChainState,
+        config: &ChainConfig,
+        height: BlockHeight,
+        now_ms: LocalTimestampMs,
+    ) -> Result<Vec<TransactionV5>, V5MempoolError> {
+        let mut runs: BTreeMap<SenderLane, Vec<&V5Entry>> = BTreeMap::new();
+        for (slot, transaction_id) in &self.by_slot {
+            let entry = self
+                .by_id
+                .get(transaction_id)
+                .ok_or(V5MempoolError::InconsistentRecovery)?;
+            if now_ms
+                .get()
+                .saturating_sub(entry.record.admitted_at_ms.get())
+                >= self.config.ttl_ms
+                || !entry.record.transaction.validity.contains(height)
+            {
+                continue;
+            }
+            let Some(expected) = expected_nonce(state, slot.sender, slot.lane) else {
+                continue;
+            };
+            let run = runs.entry((slot.sender, slot.lane)).or_default();
+            let offset =
+                u64::try_from(run.len()).map_err(|_| V5MempoolError::SelectionIndexOverflow)?;
+            let wanted = expected
+                .get()
+                .checked_add(offset)
+                .map(Nonce::new)
+                .ok_or(V5MempoolError::SelectionIndexOverflow)?;
+            if slot.nonce == wanted {
+                run.push(entry);
+            }
+        }
+
+        struct Candidate<'a> {
+            effective_fee: u64,
+            key: SenderLane,
+            index: usize,
+            entry: &'a V5Entry,
+        }
+        impl PartialEq for Candidate<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                self.effective_fee == other.effective_fee && self.key == other.key
+            }
+        }
+        impl Eq for Candidate<'_> {}
+        impl Ord for Candidate<'_> {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.effective_fee
+                    .cmp(&other.effective_fee)
+                    .then_with(|| self.key.cmp(&other.key))
+            }
+        }
+        impl PartialOrd for Candidate<'_> {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let effective_fee = |entry: &V5Entry| {
+            entry
+                .record
+                .transaction
+                .fee_bid
+                .max_fee_per_unit
+                .checked_sub(state.current_base_fee_per_unit)
+                .map(|room| {
+                    state.current_base_fee_per_unit.saturating_add(
+                        entry
+                            .record
+                            .transaction
+                            .fee_bid
+                            .priority_fee_per_unit
+                            .min(room),
+                    )
+                })
+        };
+        let mut heap = BinaryHeap::new();
+        for (key, run) in &runs {
+            if let Some(first) = run.first() {
+                if let Some(fee) = effective_fee(first) {
+                    heap.push(Candidate {
+                        effective_fee: fee,
+                        key: *key,
+                        index: 0,
+                        entry: first,
+                    });
+                }
+            }
+        }
+
+        let mut scratch = state.clone();
+        let mut selected = Vec::new();
+        let mut maximum_units = 0_u64;
+        let mut transaction_bytes = 0_u64;
+        while let Some(candidate) = heap.pop() {
+            if selected.len() >= MAX_BLOCK_V4_TRANSACTIONS {
+                break;
+            }
+            let transaction = &candidate.entry.record.transaction;
+            let required = transaction.required_units()?;
+            let Some(projected_units) = maximum_units.checked_add(required) else {
+                continue;
+            };
+            if projected_units > config.fee_policy.max_block_units {
+                continue;
+            }
+            let entry_bytes = u64::try_from(candidate.entry.canonical_bytes)
+                .map_err(|_| V5MempoolError::Capacity)?;
+            let Some(projected_bytes) = transaction_bytes.checked_add(entry_bytes) else {
+                continue;
+            };
+            if projected_bytes > config.max_block_bytes {
+                continue;
+            }
+
+            let validated =
+                ValidatedTransactionV1::validate(transaction.clone(), &config.chain_id)?;
+            let Ok(prepared) = scratch.prepare_transaction_v1(validated, height, config) else {
+                // Later nonces in this lane cannot pass until its head does.
+                continue;
+            };
+            let index = u32::try_from(selected.len())
+                .map(TransactionIndex::new)
+                .map_err(|_| V5MempoolError::SelectionIndexOverflow)?;
+            scratch
+                .execute_prepared_transaction_v1(
+                    prepared,
+                    BlockPositionV1::new(height, index),
+                    config,
+                )
+                .map_err(|error| V5MempoolError::SelectionExecution(Box::new(error)))?;
+            selected.push(transaction.clone());
+            maximum_units = projected_units;
+            transaction_bytes = projected_bytes;
+
+            let next_index = candidate
+                .index
+                .checked_add(1)
+                .ok_or(V5MempoolError::SelectionIndexOverflow)?;
+            if let Some(next_entry) = runs[&candidate.key].get(next_index) {
+                if let Some(fee) = effective_fee(next_entry) {
+                    heap.push(Candidate {
+                        effective_fee: fee,
+                        key: candidate.key,
+                        index: next_index,
+                        entry: next_entry,
+                    });
+                }
+            }
+        }
+        Ok(selected)
+    }
+
     fn fits_without_removal(&self, slot: PendingSlotV1, canonical_bytes: usize) -> bool {
         let sender_lane = (slot.sender, slot.lane);
         self.by_id.len() < self.config.max_transactions
@@ -608,6 +787,24 @@ mod tests {
         max_fee: u64,
         priority_fee: u64,
     ) -> TransactionV5 {
+        transfer_amount(
+            sender,
+            recipient,
+            nonce,
+            max_fee,
+            priority_fee,
+            Amount::from_units(1),
+        )
+    }
+
+    fn transfer_amount(
+        sender: &Keypair,
+        recipient: &Keypair,
+        nonce: u64,
+        max_fee: u64,
+        priority_fee: u64,
+        amount: Amount,
+    ) -> TransactionV5 {
         let mut transaction = TransactionV5::for_actions_unsigned(
             ChainId::devnet(),
             sender.address(),
@@ -620,7 +817,7 @@ mod tests {
             ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
             vec![ActionV1::native(Operation::Transfer {
                 to: recipient.address(),
-                amount: Amount::from_units(1),
+                amount,
             })],
             FeeBid {
                 gas_limit: 1_000,
@@ -833,5 +1030,72 @@ mod tests {
         assert_eq!(pool.len(), 1, "durable deletion must happen first");
         pool.remove_committed(transaction_id);
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn selection_executes_chargeable_failure_then_advances_the_same_lane() {
+        let alice = Keypair::from_seed([13; 32]);
+        let recipient = Keypair::from_seed([14; 32]);
+        let (state, config) = state_and_config(&[&alice]);
+        let mut pool = V5Mempool::new(V5MempoolConfig::default()).unwrap();
+        let failing = transfer_amount(&alice, &recipient, 0, 5, 1, Amount::from_units(20_000_000));
+        let following = transfer(&alice, &recipient, 1, 5, 1);
+        for (offset, transaction) in [failing.clone(), following.clone()].into_iter().enumerate() {
+            let plan = pool
+                .plan_admission(
+                    transaction,
+                    &state,
+                    &config,
+                    BlockHeight::new(10),
+                    LocalTimestampMs::new(NOW + u64::try_from(offset).unwrap()),
+                )
+                .unwrap();
+            pool.apply_committed(plan);
+        }
+
+        let selected = pool
+            .select_block(
+                &state,
+                &config,
+                BlockHeight::new(10),
+                LocalTimestampMs::new(NOW + 2),
+            )
+            .expect("selection simulation succeeds");
+        assert_eq!(selected, vec![failing, following]);
+        assert_eq!(pool.len(), 2, "selection is a pure pending-index read");
+    }
+
+    #[test]
+    fn selection_prioritizes_fees_and_stops_at_a_nonce_gap() {
+        let alice = Keypair::from_seed([15; 32]);
+        let bob = Keypair::from_seed([16; 32]);
+        let recipient = Keypair::from_seed([17; 32]);
+        let (state, config) = state_and_config(&[&alice, &bob]);
+        let mut pool = V5Mempool::new(V5MempoolConfig::default()).unwrap();
+        let low = transfer(&alice, &recipient, 0, 5, 1);
+        let high = transfer(&bob, &recipient, 0, 9, 7);
+        let gap = transfer(&alice, &recipient, 2, 50, 48);
+        for (offset, transaction) in [low.clone(), high.clone(), gap].into_iter().enumerate() {
+            let plan = pool
+                .plan_admission(
+                    transaction,
+                    &state,
+                    &config,
+                    BlockHeight::new(10),
+                    LocalTimestampMs::new(NOW + u64::try_from(offset).unwrap()),
+                )
+                .unwrap();
+            pool.apply_committed(plan);
+        }
+
+        let selected = pool
+            .select_block(
+                &state,
+                &config,
+                BlockHeight::new(10),
+                LocalTimestampMs::new(NOW + 3),
+            )
+            .expect("selection succeeds");
+        assert_eq!(selected, vec![high, low]);
     }
 }
