@@ -11,7 +11,8 @@ use webc_chain::{
 use webc_crypto::{Address, Hash256, Keypair, PublicKeyBytes};
 use webc_net::{spawn_network, NetworkConfig};
 use webc_node::{
-    run_gossip_pump, AppState, FaucetConfig, MempoolConfig, Node, NodeService, NodeServiceOptions,
+    run_gossip_pump, start_protocol2, AppState, FaucetConfig, MempoolConfig, Node, NodeService,
+    NodeServiceOptions, Protocol2RunConfig,
 };
 use webc_storage::{MemoryKvStore, RedbKvStore};
 
@@ -52,6 +53,15 @@ enum Command {
         /// Peer address to dial and gossip with (repeatable).
         #[arg(long = "peer")]
         peers: Vec<String>,
+        /// Protocol-2 genesis JSON. When present, `run` starts the V5/V4
+        /// transaction, actor, consensus, sync, and `/v2` stack instead of the
+        /// frozen legacy development auto-sealer.
+        #[arg(long)]
+        protocol2_genesis: Option<PathBuf>,
+        /// Protected protocol-2 validator credential JSON. Omit to run as a
+        /// non-voting observer. The seed is read only from this file.
+        #[arg(long, requires = "protocol2_genesis")]
+        validator_key_file: Option<PathBuf>,
     },
     /// Register the local devnet key as a validator (drives Operation::RegisterValidator).
     StakeRegister {
@@ -127,7 +137,16 @@ fn main() -> Result<()> {
             listen,
             p2p_listen,
             peers,
-        } => run(data_dir, listen, p2p_listen, peers),
+            protocol2_genesis,
+            validator_key_file,
+        } => run(
+            data_dir,
+            listen,
+            p2p_listen,
+            peers,
+            protocol2_genesis,
+            validator_key_file,
+        ),
         Command::StakeRegister {
             self_stake,
             commission_bps,
@@ -167,14 +186,34 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Runs a single-proposer devnet node backed by durable redb storage.
+/// Selects the explicit protocol-2 public stack or frozen legacy developer stack.
 ///
-/// The node recovers its latest committed state from `data_dir` on start (or
-/// initializes a devnet genesis on first run), serves the versioned HTTP/WebSocket
-/// API, and auto-seals a block every two seconds (the devnet block target) when
-/// the mempool has pending transactions. The faucet identity is a fixed devnet
-/// seed and its funds are valueless test units.
+/// Supplying `protocol2_genesis` starts the single-owner V5 runtime, V4 BFT
+/// consensus/state sync, and `/v2` API. Omitting it preserves the existing
+/// protocol-1 auto-sealer for compatibility; it never labels itself protocol 2.
 fn run(
+    data_dir: PathBuf,
+    listen: String,
+    p2p_listen: Option<String>,
+    peers: Vec<String>,
+    protocol2_genesis: Option<PathBuf>,
+    validator_key_file: Option<PathBuf>,
+) -> Result<()> {
+    if let Some(genesis_path) = protocol2_genesis {
+        return run_protocol2_node(
+            data_dir,
+            listen,
+            p2p_listen,
+            peers,
+            genesis_path,
+            validator_key_file,
+        );
+    }
+    run_legacy(data_dir, listen, p2p_listen, peers)
+}
+
+/// Runs the frozen protocol-1 developer API and transaction-only auto-sealer.
+fn run_legacy(
     data_dir: PathBuf,
     listen: String,
     p2p_listen: Option<String>,
@@ -279,6 +318,61 @@ fn run(
 
         webc_node::serve(listener, state).await?;
         Ok::<(), anyhow::Error>(())
+    })
+}
+
+/// Runs the public protocol-2 actor/network/consensus/V2 API assembly.
+fn run_protocol2_node(
+    data_dir: PathBuf,
+    listen: String,
+    p2p_listen: Option<String>,
+    peers: Vec<String>,
+    genesis_path: PathBuf,
+    validator_key_path: Option<PathBuf>,
+) -> Result<()> {
+    let api_listen = listen
+        .parse()
+        .context("invalid protocol-2 --listen address")?;
+    let p2p_listen = p2p_listen
+        .map(|address| {
+            address
+                .parse()
+                .context("invalid protocol-2 --p2p-listen address")
+        })
+        .transpose()?;
+    let bootstrap_peers = peers
+        .iter()
+        .map(|address| address.parse().context("invalid protocol-2 --peer address"))
+        .collect::<Result<Vec<_>>>()?;
+    let validator_mode = validator_key_path.is_some();
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let node = start_protocol2(Protocol2RunConfig {
+            data_dir: data_dir.clone(),
+            api_listen,
+            p2p_listen,
+            bootstrap_peers,
+            genesis_path,
+            validator_key_path,
+        })
+        .await?;
+        println!("WEBC protocol-2 devnet node");
+        println!(
+            "  mode:           {}",
+            if validator_mode {
+                "validator"
+            } else {
+                "observer"
+            }
+        );
+        println!("  data dir:       {}", data_dir.display());
+        println!("  API base:       http://{}/v2", node.api_addr());
+        println!("  health:         http://{}/v2/health", node.api_addr());
+        println!("  p2p identity:   {}", node.peer_id());
+        if let Some(address) = node.p2p_addr() {
+            println!("  p2p listen:     {address}");
+        }
+        node.wait().await
     })
 }
 
@@ -960,6 +1054,42 @@ mod tests {
 
     fn amount_string(whole: u64) -> String {
         Amount::from_webc(whole).0.to_string()
+    }
+
+    #[test]
+    fn run_accepts_protocol2_files_without_putting_a_seed_in_argv() {
+        let cli = Cli::try_parse_from([
+            "webc-node",
+            "run",
+            "--protocol2-genesis",
+            "genesis.json",
+            "--validator-key-file",
+            "validator-key.json",
+        ])
+        .expect("protocol-2 run arguments parse");
+        let Command::Run {
+            protocol2_genesis,
+            validator_key_file,
+            ..
+        } = cli.command
+        else {
+            panic!("run subcommand expected");
+        };
+        assert_eq!(protocol2_genesis, Some(PathBuf::from("genesis.json")));
+        assert_eq!(
+            validator_key_file,
+            Some(PathBuf::from("validator-key.json"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "webc-node",
+                "run",
+                "--validator-key-file",
+                "validator-key.json",
+            ])
+            .is_err(),
+            "a key file without an explicit protocol-2 genesis is rejected"
+        );
     }
 
     #[test]

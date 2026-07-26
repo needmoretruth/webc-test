@@ -23,9 +23,12 @@ webc-storage = { path = "../webc-storage" }
 webc-net = { path = "../webc-net" }
 thiserror.workspace = true
 hex.workspace = true
+# Consensus credentials erase their retained seed on drop. zeroize is
+# MIT OR Apache-2.0 and already arrives transitively through the crypto stack.
+zeroize.workspace = true
 # HTTP/WebSocket developer API. axum (MIT) + tokio (MIT) are Apache-2.0-compatible.
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 # Permissive CORS for the devnet developer API so a browser demo on any origin
 # can call the node. tower-http is MIT (Apache-2.0-compatible).
 tower-http = { version = "0.6", features = ["cors"] }

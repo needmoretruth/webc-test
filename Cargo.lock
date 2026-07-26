@@ -1493,6 +1493,7 @@ dependencies = [
  "webc-crypto",
  "webc-net",
  "webc-storage",
+ "zeroize",
 ]
 
 [[package]]

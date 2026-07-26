@@ -23,15 +23,16 @@ pub mod http_v2;
 pub mod mempool;
 pub mod mempool_v1;
 pub mod node;
+pub mod run_v1;
 pub mod runtime_v1;
 pub mod service;
 
 pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverExit, DriverTimeouts};
-pub use consensus_driver_v1::{ConsensusDriverV1, DriverExitV1};
+pub use consensus_driver_v1::{ConsensusCredentialsV1, ConsensusDriverV1, DriverExitV1};
 pub use gossip::{run_gossip_pump, run_v5_gossip_pump};
 pub use http::{router, serve, AppState, BlockEvent};
 pub use http_v2::{
-    router_v2, serve_v2, V2AppState, V2DropReason, V2ErrorBody, V2InsertOutcome,
+    router_v2, serve_v2, V2AppState, V2DropReason, V2ErrorBody, V2HealthResponse, V2InsertOutcome,
     V2LifecycleResponse, V2SubmitResponse, V2TransactionStatus, V2TransportConfigError,
     V2TransportLimits, V2WsServerMessage, DEFAULT_V2_IP_BUCKET_IDLE_TTL,
     DEFAULT_V2_MAX_TRACKED_IPS, DEFAULT_V2_PER_IP_BURST, DEFAULT_V2_PER_IP_REFILL_MS,
@@ -43,6 +44,10 @@ pub use mempool_v1::{
     V5AdmissionPlan, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError,
 };
 pub use node::{Node, NodeError, V4FinalizationResult};
+pub use run_v1::{
+    load_consensus_credentials, load_protocol2_genesis, start_protocol2, Protocol2Node,
+    Protocol2RunConfig,
+};
 pub use runtime_v1::{
     CertifiedBlockSnapshotV1, ConsensusContextV1, NodeHandle, NodeRuntime, NodeRuntimeError,
     V5RuntimeStats, V5SubmitReceipt, DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY,

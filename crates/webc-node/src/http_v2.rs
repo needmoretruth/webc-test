@@ -36,7 +36,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::{broadcast, Semaphore};
-use webc_chain::{BlockPositionV1, ReceiptV1, TransactionId, TransactionV5};
+use webc_chain::{
+    BlockPositionV1, ReceiptV1, TransactionId, TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION,
+};
 use webc_net::{NetMessage, NetworkHandle};
 use webc_storage::{
     LifecycleSequence, LocalDropReasonV1, LocalTimestampMs, LocalTransactionObservationV1,
@@ -616,6 +618,7 @@ impl PeerRateLimiter {
 /// Builds only the protocol-2 transaction routes over an existing runtime.
 pub fn router_v2(state: V2AppState) -> Router {
     Router::new()
+        .route("/v2/health", get(protocol2_health))
         .route("/v2/transactions", post(submit_transaction))
         .route("/v2/transactions/{id}", get(transaction_lifecycle))
         .route("/v2/transactions/{id}/receipt", get(transaction_receipt))
@@ -630,6 +633,41 @@ pub fn router_v2(state: V2AppState) -> Router {
             rate_limit_by_peer_ip,
         ))
         .with_state(state)
+}
+
+/// Public protocol-2 liveness and finalized-tip projection.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2HealthResponse {
+    /// Active transaction/consensus protocol version (exactly 2).
+    pub protocol_version: webc_chain::ProtocolVersion,
+    /// Chain replay-protection domain served by this runtime.
+    pub chain_id: webc_chain::ChainId,
+    /// Highest atomically finalized V4 height; zero means genesis only.
+    pub finalized_height: u64,
+    /// Authority-set commitment that may certify the next height.
+    pub current_finality_authority_set_root: webc_crypto::Hash256,
+}
+
+async fn protocol2_health(
+    State(state): State<V2AppState>,
+) -> Result<Json<V2HealthResponse>, V2ApiRejection> {
+    let context = state
+        .inner
+        .runtime
+        .consensus_context_v1()
+        .await
+        .map_err(|error| state.reject(V2ApiError::Runtime(error)))?;
+    let authority_root = context
+        .current_authority_set
+        .commitment()
+        .map_err(|error| state.reject(V2ApiError::Runtime(NodeRuntimeError::Node(error.into()))))?;
+    Ok(Json(V2HealthResponse {
+        protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+        chain_id: context.current_authority_set.chain_id,
+        finalized_height: context.height.get().saturating_sub(1),
+        current_finality_authority_set_root: authority_root,
+    }))
 }
 
 async fn rate_limit_by_peer_ip(

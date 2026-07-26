@@ -34,6 +34,7 @@ use webc_chain::{
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_net::{CertifiedBlockV4, InboundMessage, NetError, NetMessage, NetworkHandle};
 use webc_storage::{LocalTimestampMs, StorageError};
+use zeroize::Zeroizing;
 
 use crate::consensus_driver::{
     timestamp_within_future_drift, CommitInfo, DriverTimeouts, SYNC_BATCH,
@@ -84,12 +85,48 @@ pub enum DriverExitV1 {
     },
 }
 
+/// In-process protocol-2 validator credentials loaded from a protected file.
+///
+/// The operator identity and consensus key are deliberately separate: genesis
+/// may register a dedicated consensus public key that is not the operator's
+/// account key. The seed is never exposed, logged, serialized, cloned, or
+/// debug-formatted and is erased when these credentials are dropped.
+pub struct ConsensusCredentialsV1 {
+    operator: Address,
+    consensus_seed: Zeroizing<[u8; 32]>,
+}
+
+impl ConsensusCredentialsV1 {
+    /// Takes ownership of one validated operator/consensus seed pair.
+    pub fn new(operator: Address, consensus_seed: [u8; 32]) -> Self {
+        Self {
+            operator,
+            consensus_seed: Zeroizing::new(consensus_seed),
+        }
+    }
+
+    /// Public operator address represented by these credentials.
+    pub fn operator(&self) -> Address {
+        self.operator
+    }
+
+    fn identity_for(&self, set: &webc_chain::ValidatorSet) -> Option<ValidatorIdentity> {
+        let consensus_key = Keypair::from_seed(*self.consensus_seed);
+        if set.consensus_key_of(self.operator)? != consensus_key.public_key() {
+            return None;
+        }
+        Some(ValidatorIdentity {
+            address: self.operator,
+            consensus_key,
+        })
+    }
+}
+
 /// Protocol-2 consensus/network adapter over the single node actor.
 pub struct ConsensusDriverV1 {
     runtime: NodeHandle,
     network: NetworkHandle,
-    consensus_seed: Option<[u8; 32]>,
-    consensus_address: Option<Address>,
+    credentials: Option<ConsensusCredentialsV1>,
     timeouts: DriverTimeouts,
     pending_evidence: BTreeMap<Hash256, SlashingEvidence>,
     checked_proposal_rounds: BTreeSet<u32>,
@@ -105,12 +142,28 @@ impl ConsensusDriverV1 {
         consensus_seed: Option<[u8; 32]>,
         timeouts: DriverTimeouts,
     ) -> Self {
-        let consensus_address = consensus_seed.map(|seed| Keypair::from_seed(seed).address());
+        let credentials = consensus_seed.map(|seed| {
+            let operator = Keypair::from_seed(seed).address();
+            ConsensusCredentialsV1::new(operator, seed)
+        });
+        Self::new_with_credentials(runtime, network, credentials, timeouts)
+    }
+
+    /// Creates a V4 driver with an explicit operator and dedicated consensus key.
+    ///
+    /// Use this constructor for operator-loaded credentials. `None` runs a
+    /// non-voting observer. At every height the driver confirms that the current
+    /// authority set maps `operator` to the seed's public key before it signs.
+    pub fn new_with_credentials(
+        runtime: NodeHandle,
+        network: NetworkHandle,
+        credentials: Option<ConsensusCredentialsV1>,
+        timeouts: DriverTimeouts,
+    ) -> Self {
         Self {
             runtime,
             network,
-            consensus_seed,
-            consensus_address,
+            credentials,
             timeouts,
             pending_evidence: BTreeMap::new(),
             checked_proposal_rounds: BTreeSet::new(),
@@ -568,7 +621,8 @@ impl ConsensusDriverV1 {
                     });
                 }
                 ConsensusActionV1::NeedProposalBlock { round } => {
-                    let Some(proposer) = self.consensus_address else {
+                    let Some(proposer) = self.credentials.as_ref().map(|value| value.operator)
+                    else {
                         continue;
                     };
                     let evidence = self
@@ -613,13 +667,7 @@ impl ConsensusDriverV1 {
     }
 
     fn identity_for(&self, set: &webc_chain::ValidatorSet) -> Option<ValidatorIdentity> {
-        let seed = self.consensus_seed?;
-        let address = self.consensus_address?;
-        set.consensus_key_of(address)?;
-        Some(ValidatorIdentity {
-            address,
-            consensus_key: Keypair::from_seed(seed),
-        })
+        self.credentials.as_ref()?.identity_for(set)
     }
 
     async fn report_commit(
@@ -645,5 +693,47 @@ fn to_net_message_v1(message: ConsensusMessageV1) -> NetMessage {
     match message {
         ConsensusMessageV1::Proposal(proposal) => NetMessage::ProposalV4(proposal),
         ConsensusMessageV1::Vote(vote) => NetMessage::Vote(Box::new(vote)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use webc_chain::{Amount, ValidatorPower, ValidatorSet};
+
+    #[test]
+    fn dedicated_consensus_key_is_bound_to_the_operator_snapshot() {
+        let operator_key = Keypair::from_seed([0x41; 32]);
+        let consensus_key = Keypair::from_seed([0x42; 32]);
+        let operator = operator_key.address();
+        let power = Amount::from_webc(100);
+        let set = ValidatorSet {
+            validators: BTreeMap::from([(
+                operator,
+                ValidatorPower {
+                    validator: operator,
+                    power,
+                    consensus_key: consensus_key.public_key(),
+                },
+            )]),
+            total_power: power,
+        };
+
+        let credentials = ConsensusCredentialsV1::new(operator, [0x42; 32]);
+        let identity = credentials
+            .identity_for(&set)
+            .expect("registered dedicated key authorizes the operator");
+        assert_eq!(identity.address, operator);
+        assert_eq!(
+            identity.consensus_key.public_key(),
+            consensus_key.public_key()
+        );
+
+        let wrong = ConsensusCredentialsV1::new(operator, [0x43; 32]);
+        assert!(
+            wrong.identity_for(&set).is_none(),
+            "an unregistered secret must never produce a voting identity"
+        );
     }
 }
