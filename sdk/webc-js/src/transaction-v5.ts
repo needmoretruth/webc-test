@@ -168,6 +168,9 @@ export function transactionV5RequiredUnits(
 ): bigint {
   validateKind(kind);
   validateFeePaymentShape(feePayment);
+  if (feePayment !== "SenderLane" && !transactionKindV1IsSponsorable(kind)) {
+    throw new Error("V5 sponsorship permits exactly one native transfer action");
+  }
   let units = "Cancel" in kind
     ? CANCEL_V1_REQUIRED_UNITS
     : kind.Actions.actions.reduce((total, action) => {
@@ -304,6 +307,19 @@ export function actionProgramV1(operations: OperationJson[]): TransactionKindV1J
       actions: operations.map((operation) => ({ Native: { operation } })),
     },
   };
+}
+
+/** Returns whether protocol sponsorship may pay for this exact V5 form. */
+export function transactionKindV1IsSponsorable(kind: TransactionKindV1Json): boolean {
+  validateKind(kind);
+  if (!("Actions" in kind) || kind.Actions.actions.length !== 1) return false;
+  const action = kind.Actions.actions[0];
+  if (action === undefined || !("Native" in action)) return false;
+  const operation = action.Native.operation;
+  return typeof operation === "object"
+    && operation !== null
+    && Object.keys(operation).length === 1
+    && "Transfer" in operation;
 }
 
 /**
@@ -583,6 +599,9 @@ export async function createSponsorUseV1(
 ): Promise<SponsorUseV1Json> {
   validateSponsorGrant(grant, true);
   requireU64(useNonce, "sponsor use nonce");
+  if (!transactionKindV1IsSponsorable(kind)) {
+    throw new Error("V5 sponsorship permits exactly one native transfer action");
+  }
   return {
     grant,
     grant_digest: await sponsorGrantV1DigestHex(grant),
@@ -673,6 +692,10 @@ export function validateTransactionV5Structure(
   validateFeeBid(value.fee_bid);
   validateFeePaymentShape(value.fee_payment);
   if (value.fee_payment !== "SenderLane"
+    && !transactionKindV1IsSponsorable(value.kind)) {
+    throw new Error("V5 sponsorship permits exactly one native transfer action");
+  }
+  if (value.fee_payment !== "SenderLane"
     && value.fee_payment.Sponsored.grant.application_namespace !== null
     && !kindMatchesApplicationNamespace(
       value.kind,
@@ -692,6 +715,7 @@ async function validateFeePaymentBinding(
   transaction: UnsignedTransactionV5Json | SignedTransactionV5Json,
 ): Promise<boolean> {
   if (transaction.fee_payment === "SenderLane") return true;
+  if (!transactionKindV1IsSponsorable(transaction.kind)) return false;
   const use = transaction.fee_payment.Sponsored;
   if (!(await verifySponsorGrantV1(use.grant))) return false;
   if (

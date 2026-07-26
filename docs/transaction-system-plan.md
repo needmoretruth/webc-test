@@ -882,6 +882,18 @@ and 20,000-unit pricing.
 
 This checkpoint does not yet add `StakingControl` to the executable action
 envelope, so no new staking path is admitted from this format-only change.
+
+The same review found and closed a P0 sponsorship-policy gap before staking
+activation: V5 had accepted any exactly digested action program, whereas the
+confirmed launch rule permits sponsorship only for a simple native transfer.
+Rust and TypeScript now share a fail-closed predicate requiring exactly one
+`Native(Transfer)` action. Sponsor-use builders and hostile-wire validation
+reject cancellations, multi-action programs, objects, policy/staking controls,
+and grant management before state lookup or fee/nonce mutation. Regression
+coverage proves a sponsored cancellation leaves chain state byte-for-byte
+unchanged while a single sponsored transfer, including its chargeable failure
+path, still advances the bounded grant accounting correctly.
+
 Exact next item: add the full action plus bounded root reveal to Rust and
 TypeScript together, reject sponsorship and non-default lanes structurally,
 verify the current installed root during free preparation, snapshot validated

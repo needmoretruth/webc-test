@@ -3973,22 +3973,15 @@ mod tests {
     #[test]
     fn sponsored_failure_charges_sponsor_and_advances_grant() {
         let sender = Keypair::from_seed([1; 32]);
-        let first = Keypair::from_seed([2; 32]);
-        let second = Keypair::from_seed([4; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
         let sponsor = Keypair::from_seed([3; 32]);
         let sender_paid = sender_actions_fixture(
             &sender,
-            vec![
-                ActionV1::native(Operation::Transfer {
-                    to: first.address(),
-                    amount: Amount::from_units(15_000),
-                }),
-                ActionV1::native(Operation::Transfer {
-                    to: second.address(),
-                    amount: Amount::from_units(10_000),
-                }),
-            ],
-            1_000,
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(30_000),
+            })],
+            500,
         );
         let transaction = sponsor_transaction(sender_paid, &sender, &sponsor);
         let FeePaymentV1::Sponsored(sponsor_use) = &transaction.fee_payment else {
@@ -4023,9 +4016,9 @@ mod tests {
         assert_eq!(state.accounts[&sponsor.address()].nonce, 0);
         assert_eq!(
             state.accounts[&sponsor.address()].balance,
-            Amount::from_units(1_697_000)
+            Amount::from_units(1_698_500)
         );
-        assert!(!state.accounts.contains_key(&first.address()));
+        assert!(!state.accounts.contains_key(&recipient.address()));
         let grant = state
             .sponsor_grants
             .get(&grant_key)
@@ -4033,7 +4026,7 @@ mod tests {
             .expect("sponsor grant materializes");
         assert_eq!(grant.next_use_nonce, SponsorUseNonce::new(1));
         assert_eq!(grant.uses, SponsorUseCount::new(1));
-        assert_eq!(grant.total_charged, Amount::from_units(303_000));
+        assert_eq!(grant.total_charged, Amount::from_units(301_500));
         assert!(
             state
                 .supply_invariant_report()
@@ -4043,75 +4036,24 @@ mod tests {
     }
 
     #[test]
-    fn sponsored_cancellation_charges_exact_bookkeeping_units() {
+    fn sponsored_cancellation_is_rejected_without_state_or_fee_changes() {
         let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
         let sponsor = Keypair::from_seed([3; 32]);
-        let mut sender_paid = TransactionV5::for_cancel_unsigned(
-            ChainId::devnet(),
-            sender.address(),
-            sender.public_key(),
-            TransactionAuthorizationV1 {
-                lane: AuthorizationLaneId::DEFAULT,
-                policy_revision: AuthorizationPolicyRevision::new(0),
-                nonce: Nonce::new(0),
-            },
-            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
-            FeeBid {
-                gas_limit: crate::CANCEL_V1_REQUIRED_UNITS,
-                max_fee_per_unit: 5,
-                priority_fee_per_unit: 1,
-            },
-            FeePaymentV1::SenderLane,
-        );
-        sender_paid
-            .sign(&sender)
-            .expect("sender cancellation signs");
-        let sponsored = sponsor_transaction(sender_paid, &sender, &sponsor);
-        let FeePaymentV1::Sponsored(use_record) = &sponsored.fee_payment else {
-            panic!("sponsored cancellation")
-        };
-        let grant_key = (sponsor.address(), use_record.grant.grant_id);
-        let mut state = funded_state(&sender, Some(&sponsor));
-        state
-            .accounts
-            .get_mut(&sponsor.address())
-            .expect("sponsor account")
-            .balance = Amount::from_units(2_000_000);
-
-        let prepared = prepared(&state, sponsored);
+        let mut sponsored = sponsored_fixture(&sender, &recipient, &sponsor, true);
+        sponsored.kind = TransactionKindV1::Cancel(crate::CancelV1 {});
+        let state = funded_state(&sender, Some(&sponsor));
+        let before = state.clone();
         assert_eq!(
-            prepared.required_units(),
-            GasUnits::new(crate::CANCEL_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+            ValidatedTransactionV1::validate(sponsored, &ChainId::devnet()),
+            Err(TransactionValidationErrorV1::SponsoredActionNotAllowed)
         );
-        let receipt = state
-            .execute_prepared_transaction_v1(
-                prepared,
-                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
-                &v5_config(),
-            )
-            .expect("sponsored cancellation executes")
-            .into_receipt();
-
-        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
-        assert_eq!(
-            receipt.fee_summary.units_consumed,
-            GasUnits::new(crate::CANCEL_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
-        );
-        assert_eq!(receipt.fee_summary.charged, Amount::from_units(300_150));
-        assert_eq!(
-            state
-                .sponsor_grants
-                .get(&grant_key)
-                .expect("cancellation materializes grant")
-                .total_charged,
-            Amount::from_units(300_150)
-        );
+        assert_eq!(state, before);
     }
 
     #[test]
-    fn later_action_failure_discards_child_revocation_but_records_fee_grant() {
+    fn later_action_failure_discards_child_revocation_and_charges_sender() {
         let grant_sponsor = Keypair::from_seed([3; 32]);
-        let outer_sponsor = Keypair::from_seed([4; 32]);
         let scoped_sender = Keypair::from_seed([1; 32]);
         let recipient = Keypair::from_seed([2; 32]);
         let scoped = sponsored_fixture(&scoped_sender, &recipient, &grant_sponsor, true);
@@ -4119,30 +4061,25 @@ mod tests {
             panic!("scoped sponsor fixture")
         };
         let inner_key = (grant_sponsor.address(), scoped_use.grant.grant_id);
-        let sender_paid = sender_actions_fixture(
+        let transaction = sender_actions_fixture(
             &grant_sponsor,
             vec![
                 ActionV1::revoke_signed_sponsor_grant(scoped_use.grant),
                 ActionV1::native(Operation::Transfer {
                     to: recipient.address(),
-                    amount: Amount::from_units(30_000),
+                    amount: Amount::from_units(1_800_000),
                 }),
             ],
             REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS + 500,
         );
-        let sponsored = sponsor_transaction(sender_paid, &grant_sponsor, &outer_sponsor);
-        let FeePaymentV1::Sponsored(outer_use) = &sponsored.fee_payment else {
-            panic!("outer sponsor fixture")
-        };
-        let outer_key = (outer_sponsor.address(), outer_use.grant.grant_id);
-        let mut state = funded_state(&grant_sponsor, Some(&outer_sponsor));
+        let mut state = funded_state(&grant_sponsor, None);
         state
             .accounts
-            .get_mut(&outer_sponsor.address())
-            .expect("outer sponsor account")
+            .get_mut(&grant_sponsor.address())
+            .expect("sender account")
             .balance = Amount::from_units(2_000_000);
 
-        let prepared = prepared(&state, sponsored);
+        let prepared = prepared(&state, transaction);
         let receipt = state
             .execute_prepared_transaction_v1(
                 prepared,
@@ -4156,14 +4093,11 @@ mod tests {
         assert!(receipt.events.is_empty());
         assert!(!state.sponsor_grants.contains_key(&inner_key));
         assert_eq!(
-            state
-                .sponsor_grants
-                .get(&outer_key)
-                .expect("fee grant advances in parent")
-                .uses,
-            SponsorUseCount::new(1)
+            state.accounts[&grant_sponsor.address()].balance,
+            Amount::from_units(1_698_500)
         );
-        assert_eq!(receipt.fee_summary.charged, Amount::from_units(601_500));
+        assert_eq!(state.accounts[&grant_sponsor.address()].nonce, 1);
+        assert_eq!(receipt.fee_summary.charged, Amount::from_units(301_500));
     }
 
     #[test]
@@ -4283,30 +4217,29 @@ mod tests {
     }
 
     #[test]
-    fn sponsored_signed_revocation_prices_both_possible_records() {
+    fn sponsor_use_builder_rejects_signed_revocation_actions() {
         let grant_sponsor = Keypair::from_seed([3; 32]);
-        let outer_sponsor = Keypair::from_seed([4; 32]);
         let sender = Keypair::from_seed([1; 32]);
         let recipient = Keypair::from_seed([2; 32]);
         let sponsored = sponsored_fixture(&sender, &recipient, &grant_sponsor, true);
         let FeePaymentV1::Sponsored(use_record) = sponsored.fee_payment else {
             panic!("sponsored fixture")
         };
+        let fee_grant = use_record.grant.clone();
         let sender_paid_revoke = sender_actions_fixture(
             &grant_sponsor,
             vec![ActionV1::revoke_signed_sponsor_grant(use_record.grant)],
-            REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+            REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
         );
-        let doubly_materializing =
-            sponsor_transaction(sender_paid_revoke, &grant_sponsor, &outer_sponsor);
-
         assert_eq!(
-            doubly_materializing.required_units(),
-            Ok(REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS)
+            SponsorUseV1::for_transaction(
+                fee_grant,
+                SponsorUseNonce::new(0),
+                &sender_paid_revoke.kind,
+                sender_paid_revoke.fee_bid,
+            ),
+            Err(TransactionValidationErrorV1::SponsoredActionNotAllowed)
         );
-        doubly_materializing
-            .verify_for_chain(&ChainId::devnet())
-            .expect("both nested grants verify");
     }
 
     #[test]

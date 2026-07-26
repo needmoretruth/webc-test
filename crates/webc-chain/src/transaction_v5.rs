@@ -75,7 +75,7 @@ pub const REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS: u64 = 100_000;
 /// Fixed units charged to every sponsored transaction for grant bookkeeping.
 ///
 /// A first use creates one durable replay/budget record, including when the
-/// sponsored transaction is a 50-unit cancellation or later action failure.
+/// sponsored transfer reaches a chargeable insufficient-balance failure.
 /// Charging every use is deliberately conservative until storage deposits and
 /// benchmark-backed dynamic state costs are available.
 pub const SPONSOR_GRANT_USE_V1_REQUIRED_UNITS: u64 = 100_000;
@@ -158,6 +158,9 @@ pub enum TransactionValidationErrorV1 {
     /// A sponsor use does not bind the transaction's chain, sender, actions, or fee bid.
     #[error("V5 sponsor use does not match the transaction")]
     SponsorBindingMismatch,
+    /// Protocol sponsorship is restricted to one ordinary native transfer.
+    #[error("V5 sponsorship permits exactly one native transfer action")]
+    SponsoredActionNotAllowed,
 }
 
 /// Stable identity of a complete signed V5 transaction.
@@ -750,6 +753,24 @@ impl TransactionKindV1 {
         }
     }
 
+    /// Returns whether protocol sponsorship may pay for this exact action form.
+    ///
+    /// Launch sponsorship is deliberately limited to one ordinary native
+    /// transfer (WEBC definition section 15.35). Cancellation, multi-action
+    /// programs, policy/lane changes, objects, staking, and grant management
+    /// all fail closed even when a grant digest otherwise matches. Keeping the
+    /// rule here makes grant builders, wallet validation, and node admission
+    /// share one immutable allowlist.
+    pub fn is_sponsorable(&self) -> bool {
+        let Self::Actions(program) = self else {
+            return false;
+        };
+        match program.actions.as_slice() {
+            [ActionV1::Native { operation }] => operation.is_sponsorable(),
+            _ => false,
+        }
+    }
+
     /// Computes a domain-separated digest of the exact ordered form.
     pub fn digest(&self) -> Result<Hash256, TransactionValidationErrorV1> {
         #[derive(Serialize)]
@@ -980,6 +1001,9 @@ impl SponsorUseV1 {
         kind: &TransactionKindV1,
         fee_bid: FeeBid,
     ) -> Result<Self, TransactionValidationErrorV1> {
+        if !kind.is_sponsorable() {
+            return Err(TransactionValidationErrorV1::SponsoredActionNotAllowed);
+        }
         let grant_digest = grant.digest()?;
         Ok(Self {
             grant,
@@ -1384,6 +1408,9 @@ impl TransactionV5 {
         let FeePaymentV1::Sponsored(sponsor_use) = &self.fee_payment else {
             return Ok(());
         };
+        if !self.kind.is_sponsorable() {
+            return Err(TransactionValidationErrorV1::SponsoredActionNotAllowed);
+        }
         sponsor_use.grant.validate_structure()?;
         if sponsor_use.grant.sponsor_signature.is_none() {
             return Err(TransactionValidationErrorV1::MissingSponsorSignature);
@@ -1794,6 +1821,39 @@ mod tests {
                 amount: Amount::from_units(amount),
             },
         )]))
+    }
+
+    #[test]
+    fn sponsorship_allows_exactly_one_native_transfer() {
+        let recipient = Keypair::from_seed([2; 32]);
+        assert!(transfer_kind(recipient.address(), 1).is_sponsorable());
+        assert!(!TransactionKindV1::Cancel(CancelV1 {}).is_sponsorable());
+        assert!(!TransactionKindV1::Actions(ActionProgramV1::new(vec![
+            ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            }),
+            ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(2),
+            }),
+        ]))
+        .is_sponsorable());
+        assert!(
+            !TransactionKindV1::Actions(ActionProgramV1::new(vec![ActionV1::native(
+                Operation::RegisterValidator {
+                    consensus_key: recipient.public_key(),
+                    self_stake: Amount::from_webc(20),
+                    commission_bps: 1_000,
+                    bootstrap: false,
+                }
+            ),]))
+            .is_sponsorable()
+        );
+        assert!(!TransactionKindV1::Actions(ActionProgramV1::new(vec![
+            ActionV1::revoke_sponsor_grant(SponsorGrantId::new(Hash256([7; 32]))),
+        ]))
+        .is_sponsorable());
     }
 
     fn unsigned_sender_paid(
@@ -2293,65 +2353,6 @@ mod tests {
         duplicate
             .validate_structure()
             .expect("exact duplicate identity is unambiguous");
-
-        let signed_revoke_kind = duplicate.kind.clone();
-        let fee_bid = FeeBid {
-            gas_limit: REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS * 2
-                + SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
-            max_fee_per_unit: 1,
-            priority_fee_per_unit: 0,
-        };
-        let mut conflicting_fee_grant = SponsorGrantV1 {
-            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
-            chain_id: ChainId::devnet(),
-            grant_id: grant.grant_id,
-            sponsor: sponsor.address(),
-            sponsor_public_key: sponsor.public_key(),
-            payer_lane: AuthorizationLaneId::DEFAULT,
-            sender: sponsor.address(),
-            site_namespace: None,
-            application_namespace: None,
-            action_scope: ActionScopeV1::exact(
-                signed_revoke_kind.digest().expect("revoke action digest"),
-            ),
-            validity: ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
-            max_fee_per_transaction: Amount::from_units(300_000),
-            max_cumulative_fee: Amount::from_units(300_000),
-            max_uses: 1,
-            sponsor_signature: None,
-        };
-        conflicting_fee_grant
-            .sign(&sponsor)
-            .expect("conflicting fee grant signs independently");
-        let conflicting_use = SponsorUseV1::for_transaction(
-            conflicting_fee_grant,
-            SponsorUseNonce::new(0),
-            &signed_revoke_kind,
-            fee_bid,
-        )
-        .expect("conflicting fee use builds");
-        let cross_source_conflict = TransactionV5::for_actions_unsigned(
-            ChainId::devnet(),
-            sponsor.address(),
-            sponsor.public_key(),
-            TransactionAuthorizationV1 {
-                lane: AuthorizationLaneId::DEFAULT,
-                policy_revision: AuthorizationPolicyRevision::new(0),
-                nonce: Nonce::new(0),
-            },
-            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
-            match signed_revoke_kind {
-                TransactionKindV1::Actions(program) => program.actions,
-                TransactionKindV1::Cancel(_) => panic!("fixture is an action program"),
-            },
-            fee_bid,
-            FeePaymentV1::Sponsored(Box::new(conflicting_use)),
-        )
-        .expect("cross-source conflict remains representable");
-        assert_eq!(
-            cross_source_conflict.validate_structure(),
-            Err(TransactionValidationErrorV1::SponsorBindingMismatch)
-        );
 
         let mut wrong_owner = TransactionV5::for_actions_unsigned(
             ChainId::devnet(),

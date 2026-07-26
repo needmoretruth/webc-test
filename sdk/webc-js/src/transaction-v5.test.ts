@@ -31,6 +31,7 @@ import {
   transactionV5RequiredUnits,
   transactionV5IdHex,
   transactionV5SigningBytes,
+  validateTransactionV5Structure,
   verifySignedTransactionV5,
   verifySponsorGrantV1,
 } from "./transaction-v5";
@@ -293,7 +294,9 @@ describe("V5 cross-language transaction fixtures", () => {
     expect(canonicalJson(kind)).toBe(SIGNED_REVOKE_KIND_JSON);
     expect(await transactionKindV1DigestHex(kind)).toBe(SIGNED_REVOKE_KIND_DIGEST);
     expect(transactionV5RequiredUnits(kind, "SenderLane")).toBe(100_000n);
-    expect(transactionV5RequiredUnits(kind, sponsoredFixture().fee_payment)).toBe(200_000n);
+    expect(() => transactionV5RequiredUnits(kind, sponsoredFixture().fee_payment)).toThrow(
+      "exactly one native transfer",
+    );
     const accessList = {
       read_only: [
         { version: 1 as const, kind: { AuthorizationPolicy: { owner: SPONSOR } } },
@@ -342,40 +345,6 @@ describe("V5 cross-language transaction fixtures", () => {
       feePayment: "SenderLane",
     });
     expect(await verifySignedTransactionV5(duplicate, "webc-devnet-1")).toBe(true);
-
-    const crossSourceFeeBid = {
-      gas_limit: "300000",
-      max_fee_per_unit: "1",
-      priority_fee_per_unit: "0",
-    };
-    const conflictingFeeGrant = await signSponsorGrantV1(sponsor, {
-      chain_id: grant.chain_id,
-      grant_id: grant.grant_id,
-      payer_lane: DEFAULT_LANE,
-      sender: SPONSOR,
-      site_namespace: null,
-      application_namespace: null,
-      action_scope: { exact_action_digest: await transactionKindV1DigestHex(duplicateKind) },
-      validity: { valid_from_height: "10", valid_until_height: "20" },
-      max_fee_per_transaction: "300000",
-      max_cumulative_fee: "300000",
-      max_uses: "1",
-    });
-    const conflictingFeeUse = await createSponsorUseV1(
-      conflictingFeeGrant,
-      "0",
-      duplicateKind,
-      crossSourceFeeBid,
-    );
-    await expect(signTransactionV5(sponsor, {
-      chainId: "webc-devnet-1",
-      authorization: { lane: DEFAULT_LANE, policy_revision: "0", nonce: "0" },
-      validity: { valid_from_height: "10", valid_until_height: "20" },
-      kind: duplicateKind,
-      accessList,
-      feeBid: crossSourceFeeBid,
-      feePayment: { Sponsored: conflictingFeeUse },
-    })).rejects.toThrow("conflicting V5 sponsor grant identities");
 
     await expect(signRevocation({
       ...grant,
@@ -471,6 +440,51 @@ describe("V5 cross-language transaction fixtures", () => {
     expect(await verifySignedTransactionV5(transaction)).toBe(true);
     expect(await transactionV5IdHex(transaction)).toBe(SPONSORED_ID);
     expect(canonicalJson(transaction)).toBe(SPONSORED_FULL_JSON);
+  });
+
+  it("rejects sponsored cancellation, multi-action, and privileged actions", async () => {
+    const grant = sponsorGrantFixture();
+    const feeBid = senderPaidFixture().fee_bid;
+    const invalidKinds: TransactionKindV1Json[] = [
+      { Cancel: {} },
+      {
+        Actions: {
+          actions: [
+            { Native: { operation: { Transfer: { to: RECIPIENT, amount: "1" } } } },
+            { Native: { operation: { Transfer: { to: RECIPIENT, amount: "2" } } } },
+          ],
+        },
+      },
+      {
+        Actions: {
+          actions: [{
+            Native: {
+              operation: {
+                DeleteObject: {
+                  object_id: "22".repeat(32),
+                  namespace: "33".repeat(32),
+                  expected_version: 1,
+                },
+              },
+            },
+          }],
+        },
+      },
+    ];
+    for (const kind of invalidKinds) {
+      await expect(createSponsorUseV1(grant, "0", kind, feeBid)).rejects.toThrow(
+        "exactly one native transfer",
+      );
+      expect(() => transactionV5RequiredUnits(kind, sponsoredFixture().fee_payment)).toThrow(
+        "exactly one native transfer",
+      );
+      const hostile = sponsoredFixture();
+      hostile.kind = kind;
+      expect(() => validateTransactionV5Structure(hostile)).toThrow(
+        "exactly one native transfer",
+      );
+      expect(await verifySignedTransactionV5(hostile)).toBe(false);
+    }
   });
 
   it("fails closed on tampered signatures, amounts, sponsor bindings, and chain", async () => {
