@@ -50,6 +50,8 @@ pub(crate) enum StoredRecordKind {
     FinalityCertificate,
     /// One validator's own per-height consensus journal (maximum encoded bytes: 64 MiB).
     ConsensusWal,
+    /// One validator's protocol-2 V4 consensus journal (maximum encoded bytes: 64 MiB).
+    ConsensusWalV1,
     /// One complete signed V5 transaction plus its local admission metadata.
     PendingTransaction,
     /// One local/consensus lifecycle projection for a transaction ID.
@@ -75,6 +77,7 @@ impl StoredRecordKind {
             Self::ValidatorSet => "validator set",
             Self::FinalityCertificate => "finality certificate",
             Self::ConsensusWal => "consensus WAL",
+            Self::ConsensusWalV1 => "protocol-2 consensus WAL",
             Self::PendingTransaction => "pending transaction",
             Self::TransactionLifecycle => "transaction lifecycle",
             Self::BlockV4 => "protocol-2 block",
@@ -94,6 +97,7 @@ impl StoredRecordKind {
             Self::ValidatorSet => 16 * MIB,
             Self::FinalityCertificate => 4 * MIB,
             Self::ConsensusWal => 64 * MIB,
+            Self::ConsensusWalV1 => 64 * MIB,
             Self::PendingTransaction => 512 * KIB,
             Self::TransactionLifecycle => 4 * KIB,
             Self::BlockV4 => 4 * MIB,

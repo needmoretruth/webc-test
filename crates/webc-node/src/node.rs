@@ -28,10 +28,10 @@ use std::collections::BTreeSet;
 use webc_chain::{
     apply_block, apply_block_v4, build_block, build_block_v4_with_derived_authority, Block,
     BlockBuildInput, BlockBuildInputV1, BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4,
-    ChainConfig, ChainError, ChainState, ConsensusWalRecord, Epoch, FinalityAuthoritySetErrorV1,
-    FinalityAuthoritySetV1, FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction,
-    TransactionId, TransactionV5, TransactionValidationErrorV1, ValidatorSet,
-    CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
+    ChainConfig, ChainError, ChainState, ConsensusWalRecord, ConsensusWalRecordV1, Epoch,
+    FinalityAuthoritySetErrorV1, FinalityAuthoritySetV1, FinalityCertificate, GenesisConfig,
+    SlashingEvidence, Transaction, TransactionId, TransactionV5, TransactionValidationErrorV1,
+    ValidatorSet, CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Hash256};
 use webc_storage::{BlockCommit, BlockV4Commit, ChainStore, KvStore, PendingSlotV1, StorageError};
@@ -250,6 +250,24 @@ impl<K: KvStore> Node<K> {
     /// node signed nothing at that height (or the height already committed).
     pub fn consensus_wal(&self, height: u64) -> Result<Option<ConsensusWalRecord>, NodeError> {
         Ok(self.store.consensus_wal(height)?)
+    }
+
+    /// Durably journals protocol-2 V4 proposals, votes, and lock state.
+    ///
+    /// This uses a disjoint storage record from the frozen legacy WAL and must
+    /// complete before any newly signed V4 consensus message is broadcast.
+    pub fn persist_consensus_wal_v1(
+        &mut self,
+        record: &ConsensusWalRecordV1,
+    ) -> Result<(), NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        Ok(self.store.put_consensus_wal_v1(record)?)
+    }
+
+    /// Returns the protocol-2 crash journal for an unfinished height.
+    pub fn consensus_wal_v1(&self, height: u64) -> Result<Option<ConsensusWalRecordV1>, NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        Ok(self.store.consensus_wal_v1(height)?)
     }
 
     /// Returns a finalized block together with its stored finality certificate,

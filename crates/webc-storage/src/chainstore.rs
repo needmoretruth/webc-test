@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use webc_chain::{
     Block, BlockHeader, BlockHeaderV4, BlockHeight, BlockV4, ChainId, ChainState,
-    ConsensusWalRecord, Epoch, FinalityAuthoritySetV1, FinalityCertificate, ValidatorSet,
-    CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
+    ConsensusWalRecord, ConsensusWalRecordV1, Epoch, FinalityAuthoritySetV1, FinalityCertificate,
+    ValidatorSet, CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::Hash256;
 
@@ -57,6 +57,9 @@ const META_TIP: &[u8] = b"tip";
 /// for (finding ST1). A schema-stamped store must carry it, and a later open
 /// must present the same chain id, or the store is rejected.
 const META_CHAIN_ID: &[u8] = b"chain_id";
+
+/// Prefix separating protocol-2 journals from frozen legacy height keys.
+const CONSENSUS_WAL_V1_PREFIX: &[u8; 2] = b"p2";
 
 /// The latest committed point of the chain.
 ///
@@ -114,6 +117,13 @@ pub struct BlockV4Commit<'a> {
 /// Big-endian 8-byte key for a height or epoch, so byte order equals numeric order.
 fn be(value: u64) -> [u8; 8] {
     value.to_be_bytes()
+}
+
+fn consensus_wal_v1_key(height: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CONSENSUS_WAL_V1_PREFIX.len() + 8);
+    key.extend_from_slice(CONSENSUS_WAL_V1_PREFIX);
+    key.extend_from_slice(&be(height));
+    key
 }
 
 /// Typed, backend-agnostic chain storage over any [`KvStore`].
@@ -626,6 +636,10 @@ impl<K: KvStore> ChainStore<K> {
             encode(StoredRecordKind::FinalityCertificate, commit.certificate)?,
         );
         batch.delete(Table::ConsensusWal, be(header.height.get()).to_vec());
+        batch.delete(
+            Table::ConsensusWal,
+            consensus_wal_v1_key(header.height.get()),
+        );
         self.stage_finalized_block_v1(&mut batch, commit.block)?;
         batch.put(
             Table::Meta,
@@ -815,6 +829,38 @@ impl<K: KvStore> ChainStore<K> {
         match self.store.get(Table::ConsensusWal, &be(height))? {
             None => Ok(None),
             Some(bytes) => Ok(Some(decode(StoredRecordKind::ConsensusWal, &bytes)?)),
+        }
+    }
+
+    /// Durably records the protocol-2 validator journal before V4 broadcast.
+    ///
+    /// A disjoint key prefix and record kind prevent a protocol-1 decoder from
+    /// ever reinterpreting V4 proposal/value bytes. The journal is deleted in
+    /// the same atomic batch that finalizes its height.
+    pub fn put_consensus_wal_v1(
+        &mut self,
+        record: &ConsensusWalRecordV1,
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Table::ConsensusWal,
+            consensus_wal_v1_key(record.height),
+            encode(StoredRecordKind::ConsensusWalV1, record)?,
+        );
+        self.store.commit(batch)
+    }
+
+    /// Returns the protocol-2 journal for `height`, or `None` after finality.
+    pub fn consensus_wal_v1(
+        &self,
+        height: u64,
+    ) -> Result<Option<ConsensusWalRecordV1>, StorageError> {
+        match self
+            .store
+            .get(Table::ConsensusWal, &consensus_wal_v1_key(height))?
+        {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(decode(StoredRecordKind::ConsensusWalV1, &bytes)?)),
         }
     }
 
@@ -1417,6 +1463,32 @@ mod tests {
             valid_round: None,
             valid_value: None,
         }
+    }
+
+    fn wal_record_v1(height: u64) -> ConsensusWalRecordV1 {
+        ConsensusWalRecordV1 {
+            height,
+            proposals: Vec::new(),
+            votes: Vec::new(),
+            locked_round: None,
+            locked_value: None,
+            valid_round: None,
+            valid_value: None,
+        }
+    }
+
+    #[test]
+    fn protocol2_consensus_wal_uses_a_disjoint_bounded_record() {
+        let mut store = ChainStore::open(MemoryKvStore::new(), &ChainId::devnet()).unwrap();
+        let record = wal_record_v1(7);
+        store.put_consensus_wal_v1(&record).unwrap();
+        assert_eq!(store.consensus_wal_v1(7).unwrap(), Some(record));
+        assert!(store.consensus_wal(7).unwrap().is_none());
+        assert!(store
+            .backend()
+            .get(Table::ConsensusWal, &consensus_wal_v1_key(7))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
