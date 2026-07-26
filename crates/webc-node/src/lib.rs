@@ -40,7 +40,7 @@ pub use mempool::{InsertOutcome, Mempool, MempoolConfig, MempoolError};
 pub use mempool_v1::{
     V5AdmissionPlan, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError,
 };
-pub use node::{Node, NodeError};
+pub use node::{Node, NodeError, V4FinalizationResult};
 pub use runtime_v1::{
     NodeHandle, NodeRuntime, NodeRuntimeError, V5RuntimeStats, V5SubmitReceipt,
     DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY, DEFAULT_V5_RUNTIME_QUEUE_CAPACITY,

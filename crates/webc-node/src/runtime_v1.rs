@@ -3,9 +3,10 @@
 //! Purpose: bind the pure [`crate::V5Mempool`] policy to durable lifecycle
 //! storage without locks or split ownership. Responsibilities: bounded command
 //! admission, persist-before-memory ordering, idempotent submission, local
-//! expiry, and deterministic restart reconstruction. Non-responsibilities:
-//! HTTP/WebSocket encoding, peer gossip, block selection, execution, consensus,
-//! and finality; those layers must call this actor through [`NodeHandle`].
+//! expiry, deterministic restart reconstruction, candidate construction, and
+//! certified finalization. Non-responsibilities: HTTP/WebSocket encoding, peer
+//! transport, consensus voting/round logic, or certificate creation; those
+//! layers call this actor through [`NodeHandle`].
 //!
 //! Data flow: a caller queues a command on a bounded Tokio channel; the sole
 //! [`NodeRuntime`] task plans against its committed state, commits the complete
@@ -21,7 +22,9 @@
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 use webc_chain::{
-    BlockHeight, ReceiptV1, TransactionId, TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION,
+    BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4, FinalityAuthoritySetV1,
+    FinalityCertificate, ReceiptV1, SlashingEvidence, TransactionId, TransactionV5,
+    TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_storage::{
     KvStore, LocalDropReasonV1, LocalTimestampMs, LocalTransactionObservationV1,
@@ -29,7 +32,10 @@ use webc_storage::{
     MAX_PENDING_TRANSACTION_SCAN_V1,
 };
 
-use crate::{Node, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError};
+use crate::{
+    Node, NodeError, V4FinalizationResult, V5InsertOutcome, V5Mempool, V5MempoolConfig,
+    V5MempoolError,
+};
 
 /// Default maximum number of commands waiting for the single runtime owner.
 pub const DEFAULT_V5_RUNTIME_QUEUE_CAPACITY: usize = 1_024;
@@ -89,6 +95,9 @@ pub enum NodeRuntimeError {
     /// Transaction admission or restart revalidation failed.
     #[error("protocol-2 runtime mempool error: {0}")]
     Mempool(#[from] V5MempoolError),
+    /// Candidate construction or certified block import failed atomically.
+    #[error("protocol-2 runtime node error: {0}")]
+    Node(#[from] NodeError),
     /// Disk and memory violated a single-owner invariant; the actor stops closed.
     #[error("protocol-2 runtime invariant failed: {0}")]
     Inconsistent(&'static str),
@@ -213,6 +222,55 @@ impl NodeHandle {
         receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
     }
 
+    /// Selects pending transactions and builds one uncommitted V4 candidate.
+    ///
+    /// `now_ms` only filters locally expired pending copies. `timestamp_ms` is
+    /// the consensus header time and is monotonically clamped by the node. The
+    /// current and derived next authority sets come from the single actor-owned
+    /// committed state.
+    pub async fn build_candidate_v4(
+        &self,
+        proposer: webc_crypto::Address,
+        timestamp_ms: u64,
+        now_ms: LocalTimestampMs,
+        evidence: Vec<SlashingEvidence>,
+    ) -> Result<BuiltBlockV4, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Command::BuildCandidateV4 {
+                proposer,
+                timestamp_ms,
+                now_ms,
+                evidence,
+                response,
+            })
+            .map_err(map_send_error)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Atomically commits one certified V4 block and updates pending memory.
+    ///
+    /// Success means block, post-state, authority sets, certificate, indexes,
+    /// receipts, lifecycle facts, pending removals, WAL cleanup, and tip are all
+    /// durable before the actor removes any corresponding in-memory entries.
+    pub async fn finalize_v4(
+        &self,
+        block: BlockV4,
+        next_authority_set: FinalityAuthoritySetV1,
+        certificate: FinalityCertificate,
+    ) -> Result<V4FinalizationResult, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Command::FinalizeV4 {
+                block: Box::new(block),
+                next_authority_set: Box::new(next_authority_set),
+                certificate: Box::new(certificate),
+                response,
+            })
+            .map_err(map_send_error)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
     /// Requests an orderly actor exit after all earlier queued commands.
     pub async fn shutdown(&self) -> Result<(), NodeRuntimeError> {
         let (response, receiver) = oneshot::channel();
@@ -254,6 +312,19 @@ enum Command {
     Expire {
         now_ms: LocalTimestampMs,
         response: oneshot::Sender<Result<usize, NodeRuntimeError>>,
+    },
+    BuildCandidateV4 {
+        proposer: webc_crypto::Address,
+        timestamp_ms: u64,
+        now_ms: LocalTimestampMs,
+        evidence: Vec<SlashingEvidence>,
+        response: oneshot::Sender<Result<BuiltBlockV4, NodeRuntimeError>>,
+    },
+    FinalizeV4 {
+        block: Box<BlockV4>,
+        next_authority_set: Box<FinalityAuthoritySetV1>,
+        certificate: Box<FinalityCertificate>,
+        response: oneshot::Sender<Result<V4FinalizationResult, NodeRuntimeError>>,
     },
     Shutdown {
         response: oneshot::Sender<()>,
@@ -372,6 +443,39 @@ where
                 }
                 Command::Expire { now_ms, response } => {
                     let result = self.expire(now_ms);
+                    let fatal = result
+                        .as_ref()
+                        .err()
+                        .and_then(NodeRuntimeError::fatal_invariant);
+                    let _response_canceled = response.send(result);
+                    if let Some(message) = fatal {
+                        return Err(NodeRuntimeError::Inconsistent(message));
+                    }
+                }
+                Command::BuildCandidateV4 {
+                    proposer,
+                    timestamp_ms,
+                    now_ms,
+                    evidence,
+                    response,
+                } => {
+                    let result = self.build_candidate_v4(proposer, timestamp_ms, now_ms, evidence);
+                    let fatal = result
+                        .as_ref()
+                        .err()
+                        .and_then(NodeRuntimeError::fatal_invariant);
+                    let _response_canceled = response.send(result);
+                    if let Some(message) = fatal {
+                        return Err(NodeRuntimeError::Inconsistent(message));
+                    }
+                }
+                Command::FinalizeV4 {
+                    block,
+                    next_authority_set,
+                    certificate,
+                    response,
+                } => {
+                    let result = self.finalize_v4(*block, *next_authority_set, *certificate);
                     let fatal = result
                         .as_ref()
                         .err()
@@ -526,6 +630,77 @@ where
         }
         Ok(removed)
     }
+
+    fn build_candidate_v4(
+        &self,
+        proposer: webc_crypto::Address,
+        timestamp_ms: u64,
+        now_ms: LocalTimestampMs,
+        evidence: Vec<SlashingEvidence>,
+    ) -> Result<BuiltBlockV4, NodeRuntimeError> {
+        let height = next_height(&self.node)?;
+        let mut transactions =
+            self.mempool
+                .select_block(self.node.state(), self.node.config(), height, now_ms)?;
+        loop {
+            match self.node.build_candidate_v4(
+                transactions.clone(),
+                evidence.clone(),
+                proposer,
+                timestamp_ms,
+            ) {
+                Ok(candidate) => return Ok(candidate),
+                Err(NodeError::BlockV4(error))
+                    if matches!(error.as_ref(), BlockV4ExecutionError::BlockTooLarge)
+                        && !transactions.is_empty() =>
+                {
+                    // Receipt/event bytes are known only after execution. Drop
+                    // the lowest-priority tail and retry against the same state;
+                    // each iteration strictly reduces bounded input.
+                    let reduced_len = transactions.len() / 2;
+                    transactions.truncate(reduced_len);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn finalize_v4(
+        &mut self,
+        block: BlockV4,
+        next_authority_set: FinalityAuthoritySetV1,
+        certificate: FinalityCertificate,
+    ) -> Result<V4FinalizationResult, NodeRuntimeError> {
+        let result =
+            self.node
+                .import_finalized_block_v4(block, &next_authority_set, &certificate)?;
+
+        // The complete backend batch is durable. Memory removals are now
+        // infallible and must happen before any fallible lifecycle read.
+        for transaction_id in &result.removed_pending_ids {
+            self.mempool.remove_committed(*transaction_id);
+        }
+        let mut affected = result
+            .finalized_transaction_ids
+            .iter()
+            .chain(result.removed_pending_ids.iter())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|transaction_id| {
+                self.node
+                    .store()
+                    .transaction_lifecycle_v1(transaction_id)
+                    .ok()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        affected.sort_by_key(|lifecycle| lifecycle.sequence);
+        for lifecycle in affected {
+            let _no_live_subscribers = self.lifecycle_events.send(lifecycle);
+        }
+        Ok(result)
+    }
 }
 
 fn next_height<K: KvStore>(node: &Node<K>) -> Result<BlockHeight, NodeRuntimeError> {
@@ -675,8 +850,8 @@ mod tests {
     use super::*;
     use webc_chain::{
         ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, ChainConfig, ChainId,
-        FeeBid, FeePaymentV1, GenesisAccount, GenesisConfig, Nonce, Operation,
-        TransactionAuthorizationV1, ValidityWindowV1,
+        FeeBid, FeePaymentV1, GenesisAccount, GenesisConfig, GenesisValidator, Nonce, Operation,
+        SignedVote, TransactionAuthorizationV1, ValidatorSet, ValidityWindowV1, Vote, VoteType,
     };
     use webc_crypto::Keypair;
     use webc_storage::{KvEntry, MemoryKvStore, RedbKvStore, Table, WriteBatch};
@@ -702,6 +877,61 @@ mod tests {
                 .collect(),
             validators: Vec::new(),
         }
+    }
+
+    fn genesis_with_validator(validator: &Keypair) -> GenesisConfig {
+        GenesisConfig {
+            chain: ChainConfig {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                ..ChainConfig::default()
+            },
+            accounts: vec![GenesisAccount {
+                address: validator.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: vec![GenesisValidator {
+                operator: validator.address(),
+                consensus_key: validator.public_key(),
+                self_stake: Amount::from_webc(100),
+                commission_bps: 500,
+                bootstrap: false,
+            }],
+        }
+    }
+
+    fn certificate_for(
+        genesis: &GenesisConfig,
+        validator: &Keypair,
+        block: &BlockV4,
+    ) -> FinalityCertificate {
+        let state = webc_chain::ChainState::from_genesis_v1(genesis)
+            .expect("certificate fixture genesis builds");
+        let validator_set =
+            ValidatorSet::from_state(&state).expect("certificate fixture snapshot builds");
+        let block_hash = block.hash().expect("candidate block hashes");
+        let vote = SignedVote::sign(
+            Vote {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                chain_id: genesis.chain.chain_id.clone(),
+                height: block.header.height.get(),
+                round: 0,
+                vote_type: VoteType::Precommit,
+                block_hash,
+                validator: validator.address(),
+            },
+            validator,
+        )
+        .expect("certificate fixture vote signs");
+        FinalityCertificate::build(
+            &validator_set,
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            genesis.chain.chain_id.clone(),
+            block.header.height.get(),
+            0,
+            block_hash,
+            &[vote],
+        )
+        .expect("single-validator certificate reaches quorum")
     }
 
     fn transfer(
@@ -996,6 +1226,161 @@ mod tests {
             .expect("same transaction can be retried after failed disk write");
         assert_eq!(retry.outcome, V5InsertOutcome::Added);
         assert_eq!(retry.mempool_size, 1);
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn certified_v4_finalization_is_disk_first_and_retriable() {
+        let validator = Keypair::from_seed([0x51; 32]);
+        let recipient = Keypair::from_seed([0x52; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let fail_next_commit = Arc::new(AtomicBool::new(false));
+        let backend = FailSwitchStore {
+            inner: MemoryKvStore::new(),
+            fail_next_commit: Arc::clone(&fail_next_commit),
+        };
+        let node = Node::open(backend, &genesis).expect("validator node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+        let transaction = transfer(&validator, &recipient, 0, 5);
+        let transaction_id = transaction
+            .transaction_id()
+            .expect("test transaction has an ID");
+        handle
+            .submit(transaction, LocalTimestampMs::new(NOW))
+            .await
+            .expect("pending transaction commits");
+
+        let candidate = handle
+            .build_candidate_v4(
+                validator.address(),
+                NOW + 1,
+                LocalTimestampMs::new(NOW + 1),
+                Vec::new(),
+            )
+            .await
+            .expect("runtime selects and builds V4 candidate");
+        assert_eq!(candidate.block.transactions.len(), 1);
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+
+        fail_next_commit.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            handle
+                .finalize_v4(
+                    candidate.block.clone(),
+                    candidate.next_authority_set.clone(),
+                    certificate.clone(),
+                )
+                .await,
+            Err(NodeRuntimeError::Node(NodeError::Storage(
+                StorageError::Io(_)
+            )))
+        ));
+        let after_failure = handle.stats().await.expect("runtime remains responsive");
+        assert_eq!(after_failure.committed_height, BlockHeight::new(0));
+        assert_eq!(after_failure.mempool_size, 1);
+        assert!(handle
+            .receipt(transaction_id)
+            .await
+            .expect("receipt query succeeds")
+            .is_none());
+
+        let finalized = handle
+            .finalize_v4(candidate.block, candidate.next_authority_set, certificate)
+            .await
+            .expect("identical certified block retries successfully");
+        assert_eq!(finalized.height, BlockHeight::new(1));
+        assert_eq!(finalized.finalized_transaction_ids, vec![transaction_id]);
+        assert_eq!(finalized.removed_pending_ids, vec![transaction_id]);
+        let after_commit = handle
+            .stats()
+            .await
+            .expect("committed stats query succeeds");
+        assert_eq!(after_commit.committed_height, BlockHeight::new(1));
+        assert_eq!(after_commit.mempool_size, 0);
+        assert!(handle
+            .receipt(transaction_id)
+            .await
+            .expect("finalized receipt query succeeds")
+            .is_some());
+        assert!(matches!(
+            handle
+                .lifecycle(transaction_id)
+                .await
+                .expect("lifecycle query succeeds")
+                .and_then(|lifecycle| lifecycle.consensus_fact),
+            Some(webc_storage::TransactionConsensusFactV1::Finalized { .. })
+        ));
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn external_finality_drops_the_local_slot_competitor_after_disk_commit() {
+        let validator = Keypair::from_seed([0x53; 32]);
+        let recipient = Keypair::from_seed([0x54; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let node = Node::open(MemoryKvStore::new(), &genesis).expect("validator node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+        let local = transfer(&validator, &recipient, 0, 5);
+        let local_id = local.transaction_id().expect("local transaction ID");
+        handle
+            .submit(local, LocalTimestampMs::new(NOW))
+            .await
+            .expect("local occupant commits");
+
+        let external = transfer(&validator, &recipient, 0, 6);
+        let external_id = external.transaction_id().expect("external transaction ID");
+        let proposer = Node::open(MemoryKvStore::new(), &genesis).expect("peer node opens");
+        let candidate = proposer
+            .build_candidate_v4(vec![external], Vec::new(), validator.address(), NOW + 1)
+            .expect("peer builds competing candidate");
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+
+        let finalized = handle
+            .finalize_v4(candidate.block, candidate.next_authority_set, certificate)
+            .await
+            .expect("external certified transaction finalizes");
+        assert_eq!(finalized.finalized_transaction_ids, vec![external_id]);
+        assert_eq!(finalized.removed_pending_ids, vec![local_id]);
+        assert_eq!(handle.stats().await.expect("stats query").mempool_size, 0);
+        assert!(matches!(
+            handle
+                .lifecycle(local_id)
+                .await
+                .expect("local lifecycle query")
+                .and_then(|lifecycle| lifecycle.local_observation),
+            Some(LocalTransactionObservationV1::Dropped {
+                reason: LocalDropReasonV1::FinalizedSlotConflict,
+                ..
+            })
+        ));
+        assert!(matches!(
+            handle
+                .lifecycle(external_id)
+                .await
+                .expect("finalized lifecycle query")
+                .and_then(|lifecycle| lifecycle.consensus_fact),
+            Some(webc_storage::TransactionConsensusFactV1::Finalized { .. })
+        ));
 
         handle.shutdown().await.expect("shutdown is acknowledged");
         task.await

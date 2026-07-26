@@ -413,6 +413,7 @@ fn classify_runtime_error(
         | NodeRuntimeError::NoAsyncRuntime
         | NodeRuntimeError::HeightExhausted
         | NodeRuntimeError::Storage(_)
+        | NodeRuntimeError::Node(_)
         | NodeRuntimeError::Inconsistent(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",

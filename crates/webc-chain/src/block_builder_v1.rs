@@ -53,6 +53,19 @@ pub struct BlockBuildInputV1 {
     pub timestamp_ms: u64,
 }
 
+/// Locally built candidate plus the authority snapshot committed for its successor.
+///
+/// The next set is derived from post-state rather than accepted as an opaque
+/// caller choice. Consensus transports it with an epoch-changing proposal, and
+/// storage persists it atomically with the certified block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltBlockV4 {
+    /// Deterministically executed V4 candidate.
+    pub block: BlockV4,
+    /// Authority set whose commitment authorizes the next height.
+    pub next_authority_set: FinalityAuthoritySetV1,
+}
+
 /// Fail-closed errors from protocol-2 whole-block construction or replay.
 #[derive(Debug, thiserror::Error)]
 pub enum BlockV4ExecutionError {
@@ -170,17 +183,47 @@ pub fn build_block_v4(
     current_authority_set: &FinalityAuthoritySetV1,
     next_authority_set: &FinalityAuthoritySetV1,
 ) -> Result<BlockV4, BlockV4ExecutionError> {
-    let (block, next_state) = execute_block_v4(
+    let (block, next_state, _) = execute_block_v4(
         state,
         config,
         input,
         transactions,
         evidence,
         current_authority_set,
-        next_authority_set,
+        Some(next_authority_set),
     )?;
     *state = next_state;
     Ok(block)
+}
+
+/// Builds a candidate while deriving its successor authority set from post-state.
+///
+/// At an ordinary height the outgoing set is carried forward unchanged. At an
+/// epoch boundary the post-transition active validators become the next epoch's
+/// set. Returning the concrete snapshot avoids duplicating epoch execution in a
+/// proposer merely to predict the header commitment.
+pub fn build_block_v4_with_derived_authority(
+    state: &mut ChainState,
+    config: &ChainConfig,
+    input: BlockBuildInputV1,
+    transactions: Vec<TransactionV5>,
+    evidence: Vec<SlashingEvidence>,
+    current_authority_set: &FinalityAuthoritySetV1,
+) -> Result<BuiltBlockV4, BlockV4ExecutionError> {
+    let (block, next_state, next_authority_set) = execute_block_v4(
+        state,
+        config,
+        input,
+        transactions,
+        evidence,
+        current_authority_set,
+        None,
+    )?;
+    *state = next_state;
+    Ok(BuiltBlockV4 {
+        block,
+        next_authority_set,
+    })
 }
 
 /// Re-executes a received V4 block and atomically adopts it only on exact match.
@@ -205,14 +248,14 @@ pub fn apply_block_v4(
         proposer: block.header.proposer,
         timestamp_ms: block.header.timestamp_ms,
     };
-    let (rebuilt, next_state) = execute_block_v4(
+    let (rebuilt, next_state, _) = execute_block_v4(
         state,
         config,
         input,
         block.transactions.clone(),
         block.evidence.clone(),
         current_authority_set,
-        next_authority_set,
+        Some(next_authority_set),
     )?;
     if rebuilt != *block {
         return Err(BlockV4ExecutionError::ImportedBlockMismatch);
@@ -229,15 +272,17 @@ fn execute_block_v4(
     transactions: Vec<TransactionV5>,
     evidence: Vec<SlashingEvidence>,
     current_authority_set: &FinalityAuthoritySetV1,
-    next_authority_set: &FinalityAuthoritySetV1,
-) -> Result<(BlockV4, ChainState), BlockV4ExecutionError> {
+    declared_next_authority_set: Option<&FinalityAuthoritySetV1>,
+) -> Result<(BlockV4, ChainState, FinalityAuthoritySetV1), BlockV4ExecutionError> {
     validate_block_context(state, config, &input, current_authority_set)?;
-    validate_declared_next_authority_set(
-        config,
-        &input,
-        current_authority_set,
-        next_authority_set,
-    )?;
+    if let Some(next_authority_set) = declared_next_authority_set {
+        validate_declared_next_authority_set(
+            config,
+            &input,
+            current_authority_set,
+            next_authority_set,
+        )?;
+    }
     if transactions.len() > MAX_BLOCK_V4_TRANSACTIONS {
         return Err(BlockV4ExecutionError::TooManyTransactions);
     }
@@ -328,13 +373,11 @@ fn execute_block_v4(
         next_state.distribute_epoch_rewards(config)?;
     }
     let next_epoch = Epoch::new(next_state.current_epoch);
-    validate_next_authority_set(
-        &next_state,
-        &input,
-        current_authority_set,
-        next_authority_set,
-        next_epoch,
-    )?;
+    let next_authority_set =
+        derive_next_authority_set(&next_state, &input, current_authority_set, next_epoch)?;
+    if declared_next_authority_set.is_some_and(|declared| declared != &next_authority_set) {
+        return Err(BlockV4ExecutionError::NextAuthoritySetMismatch);
+    }
     if !next_state.supply_invariant_report()?.balanced {
         return Err(BlockV4ExecutionError::State(
             ChainError::SupplyInvariantViolation,
@@ -370,7 +413,7 @@ fn execute_block_v4(
     if actual_bytes > byte_limit {
         return Err(BlockV4ExecutionError::BlockTooLarge);
     }
-    Ok((block, next_state))
+    Ok((block, next_state, next_authority_set))
 }
 
 fn validate_block_context(
@@ -455,39 +498,25 @@ fn validate_declared_next_authority_set(
     Ok(())
 }
 
-fn validate_next_authority_set(
+fn derive_next_authority_set(
     next_state: &ChainState,
     input: &BlockBuildInputV1,
     current_authority_set: &FinalityAuthoritySetV1,
-    next_authority_set: &FinalityAuthoritySetV1,
     next_epoch: Epoch,
-) -> Result<(), BlockV4ExecutionError> {
-    next_authority_set.validate()?;
-    if next_authority_set.protocol_version != TRANSACTION_V5_PROTOCOL_VERSION
-        || next_authority_set.chain_id != input.chain_id
-        || next_authority_set.epoch != next_epoch
-    {
-        return Err(BlockV4ExecutionError::NextAuthoritySetMismatch);
-    }
+) -> Result<FinalityAuthoritySetV1, BlockV4ExecutionError> {
     if next_epoch == input.epoch {
-        if next_authority_set != current_authority_set {
-            return Err(BlockV4ExecutionError::NextAuthoritySetMismatch);
-        }
-        return Ok(());
+        return Ok(current_authority_set.clone());
     }
     if input.epoch.checked_next() != Some(next_epoch) {
         return Err(BlockV4ExecutionError::NextAuthoritySetMismatch);
     }
-    let expected = FinalityAuthoritySetV1::from_validator_set(
+    FinalityAuthoritySetV1::from_validator_set(
         TRANSACTION_V5_PROTOCOL_VERSION,
         input.chain_id.clone(),
         next_epoch,
         &ValidatorSet::from_state(next_state)?,
-    )?;
-    if &expected != next_authority_set {
-        return Err(BlockV4ExecutionError::NextAuthoritySetMismatch);
-    }
-    Ok(())
+    )
+    .map_err(BlockV4ExecutionError::from)
 }
 
 fn preflight_body_size(
@@ -886,19 +915,19 @@ mod tests {
         let block_input = input(&state, validator.address());
         let mut producer = state;
 
-        let block = build_block_v4(
+        let built = build_block_v4_with_derived_authority(
             &mut producer,
             &config,
             block_input,
             Vec::new(),
             Vec::new(),
             &current,
-            &next,
         )
         .expect("epoch boundary builds with next snapshot");
         assert_eq!(producer.current_epoch, 1);
+        assert_eq!(built.next_authority_set, next);
         assert_eq!(
-            block.header.next_finality_authority_set_root,
+            built.block.header.next_finality_authority_set_root,
             next.commitment().expect("next commitment")
         );
     }

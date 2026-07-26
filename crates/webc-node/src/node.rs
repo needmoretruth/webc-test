@@ -8,9 +8,10 @@
 //! than reimplementing either.
 //!
 //! Boundaries: it holds no networking, no mempool, and no API surface (those are
-//! separate modules). It performs no consensus voting; a single local proposer
-//! drives block production for Phase 3. Wall-clock time is supplied by the caller
-//! (`timestamp_ms`), so the state transition itself never reads a clock.
+//! separate modules). It performs no consensus voting. Legacy local production
+//! remains isolated from protocol-2 V4 candidate/replay/finality methods.
+//! Wall-clock time is supplied by the caller (`timestamp_ms`), so deterministic
+//! state transitions never read a clock.
 //!
 //! Recovery: [`Node::open`] loads the latest committed state from storage, or
 //! initializes genesis on a fresh store. Because the store advances its tip in
@@ -22,13 +23,18 @@
 //! durable-write failure therefore leaves the in-memory state exactly where it
 //! was, so memory and disk never disagree.
 
+use std::collections::BTreeSet;
+
 use webc_chain::{
-    apply_block, build_block, Block, BlockBuildInput, ChainConfig, ChainError, ChainState,
-    ConsensusWalRecord, FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction,
-    ValidatorSet, CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
+    apply_block, apply_block_v4, build_block, build_block_v4_with_derived_authority, Block,
+    BlockBuildInput, BlockBuildInputV1, BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4,
+    ChainConfig, ChainError, ChainState, ConsensusWalRecord, Epoch, FinalityAuthoritySetErrorV1,
+    FinalityAuthoritySetV1, FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction,
+    TransactionId, TransactionV5, TransactionValidationErrorV1, ValidatorSet,
+    CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Hash256};
-use webc_storage::{BlockCommit, ChainStore, KvStore, StorageError};
+use webc_storage::{BlockCommit, BlockV4Commit, ChainStore, KvStore, PendingSlotV1, StorageError};
 
 /// Errors returned by the node runtime.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +52,36 @@ pub enum NodeError {
     /// A legacy block-format method was called on a protocol-2 node.
     #[error("legacy block API is inactive under protocol 2")]
     LegacyBlockApiInactive,
+    /// A protocol-2-only method was called on a legacy node.
+    #[error("protocol-2 block API is inactive under the legacy protocol")]
+    ProtocolTwoBlockApiInactive,
+    /// Protocol-2 whole-block execution or replay failed atomically.
+    #[error("protocol-2 block execution error: {0}")]
+    BlockV4(#[source] Box<BlockV4ExecutionError>),
+    /// A supposedly validated V5 transaction could not reproduce its identity.
+    #[error("protocol-2 transaction identity is invalid: {0}")]
+    TransactionV5(#[from] TransactionValidationErrorV1),
+    /// A persisted or genesis-derived protocol-2 authority snapshot is invalid.
+    #[error("protocol-2 authority set is invalid: {0}")]
+    Authority(#[from] FinalityAuthoritySetErrorV1),
+}
+
+impl From<BlockV4ExecutionError> for NodeError {
+    fn from(error: BlockV4ExecutionError) -> Self {
+        Self::BlockV4(Box::new(error))
+    }
+}
+
+/// Durable effects the single-owner runtime must mirror after V4 finalization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V4FinalizationResult {
+    /// Finalized block height.
+    pub height: BlockHeight,
+    /// Finalized V5 identities in exact block order.
+    pub finalized_transaction_ids: Vec<TransactionId>,
+    /// Pending identities deleted atomically, including finalized IDs and local
+    /// competitors that occupied a finalized `(sender, lane, nonce)` slot.
+    pub removed_pending_ids: Vec<TransactionId>,
 }
 
 /// A single-proposer, restartable WEBC node over any storage backend.
@@ -341,10 +377,145 @@ impl<K: KvStore> Node<K> {
         Ok(())
     }
 
+    /// Returns the immutable authority snapshot certifying the next V4 block.
+    ///
+    /// Once any protocol-2 block has committed, the set must exist in storage
+    /// under the current epoch. Genesis is the sole exception: its initial set is
+    /// derived from genesis stake and is persisted by the first certified block.
+    pub fn current_finality_authority_set_v1(&self) -> Result<FinalityAuthoritySetV1, NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        let epoch = Epoch::new(self.state.current_epoch);
+        if let Some(stored) = self.store.finality_authority_set_v1(epoch)? {
+            return Ok(stored);
+        }
+        let tip = self.store.tip()?.ok_or_else(|| {
+            StorageError::Inconsistent("chain store has no initialized genesis tip".into())
+        })?;
+        if tip.height != 0 {
+            return Err(StorageError::Inconsistent(format!(
+                "protocol-2 authority set for committed epoch {} is missing",
+                epoch.get()
+            ))
+            .into());
+        }
+        Ok(FinalityAuthoritySetV1::from_validator_set(
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            self.config.chain_id.clone(),
+            epoch,
+            &ValidatorSet::from_state(&self.state)?,
+        )?)
+    }
+
+    /// Builds the next protocol-2 candidate without changing live state or disk.
+    ///
+    /// Height, parent hash, epoch, and the current authority set come from the
+    /// single committed node view. The supplied timestamp is monotonically
+    /// clamped for honest local production; a received block is never clamped.
+    pub fn build_candidate_v4(
+        &self,
+        transactions: Vec<TransactionV5>,
+        evidence: Vec<SlashingEvidence>,
+        proposer: Address,
+        timestamp_ms: u64,
+    ) -> Result<BuiltBlockV4, NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        let tip = self.store.tip()?.ok_or_else(|| {
+            StorageError::Inconsistent("chain store has no initialized genesis tip".into())
+        })?;
+        let height = tip
+            .height
+            .checked_add(1)
+            .map(BlockHeight::new)
+            .ok_or_else(|| StorageError::Inconsistent("chain height is exhausted".into()))?;
+        let current_authority_set = self.current_finality_authority_set_v1()?;
+        let input = BlockBuildInputV1 {
+            chain_id: self.config.chain_id.clone(),
+            height,
+            epoch: Epoch::new(self.state.current_epoch),
+            previous_hash: tip.block_hash.unwrap_or(Hash256::ZERO),
+            proposer,
+            timestamp_ms: self.monotonic_timestamp(timestamp_ms),
+        };
+        let mut candidate_state = self.state.clone();
+        Ok(build_block_v4_with_derived_authority(
+            &mut candidate_state,
+            &self.config,
+            input,
+            transactions,
+            evidence,
+            &current_authority_set,
+        )?)
+    }
+
+    /// Replays and atomically commits one certified protocol-2 V4 block.
+    ///
+    /// The store transaction includes block/state/authority/certificate/tip,
+    /// pending deletions, finalized indexes, receipts, and lifecycle facts. Live
+    /// state is adopted only after that batch succeeds. The returned pending IDs
+    /// let the owning actor perform its infallible memory removals afterwards.
+    pub fn import_finalized_block_v4(
+        &mut self,
+        block: BlockV4,
+        next_authority_set: &FinalityAuthoritySetV1,
+        certificate: &FinalityCertificate,
+    ) -> Result<V4FinalizationResult, NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        if block.header.chain_id != self.config.chain_id {
+            return Err(NodeError::ChainIdMismatch);
+        }
+        let current_authority_set = self.current_finality_authority_set_v1()?;
+        let mut next_state = self.state.clone();
+        apply_block_v4(
+            &mut next_state,
+            &self.config,
+            &block,
+            &current_authority_set,
+            next_authority_set,
+        )?;
+
+        let mut finalized_transaction_ids = Vec::with_capacity(block.transactions.len());
+        let mut removed_pending_ids = BTreeSet::new();
+        for transaction in &block.transactions {
+            let transaction_id = transaction.transaction_id()?;
+            finalized_transaction_ids.push(transaction_id);
+            if self.store.pending_transaction_v1(transaction_id)?.is_some() {
+                removed_pending_ids.insert(transaction_id);
+            }
+            let slot = PendingSlotV1::for_transaction(transaction);
+            if let Some(occupant) = self.store.pending_id_for_slot_v1(slot)? {
+                removed_pending_ids.insert(occupant);
+            }
+        }
+
+        self.store.commit_block_v4(BlockV4Commit {
+            block: &block,
+            state: &next_state,
+            current_authority_set: &current_authority_set,
+            next_authority_set,
+            certificate,
+        })?;
+        self.state = next_state;
+        Ok(V4FinalizationResult {
+            height: block.header.height,
+            finalized_transaction_ids,
+            removed_pending_ids: removed_pending_ids.into_iter().collect(),
+        })
+    }
+
     /// Stops V3-header/legacy-transaction methods from writing a protocol-2 store.
     fn ensure_legacy_block_api(&self) -> Result<(), NodeError> {
         if self.config.protocol_version != CURRENT_PROTOCOL_VERSION {
             return Err(NodeError::LegacyBlockApiInactive);
+        }
+        Ok(())
+    }
+
+    /// Stops protocol-2 block methods from interpreting legacy state or storage.
+    fn ensure_protocol_two_block_api(&self) -> Result<(), NodeError> {
+        if self.config.protocol_version != TRANSACTION_V5_PROTOCOL_VERSION
+            || self.state.protocol_version != TRANSACTION_V5_PROTOCOL_VERSION
+        {
+            return Err(NodeError::ProtocolTwoBlockApiInactive);
         }
         Ok(())
     }
