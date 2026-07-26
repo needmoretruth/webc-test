@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use webc_crypto::{Address, Hash256};
 
 use crate::{
@@ -58,7 +59,8 @@ pub struct BlockBuildInputV1 {
 /// The next set is derived from post-state rather than accepted as an opaque
 /// caller choice. Consensus transports it with an epoch-changing proposal, and
 /// storage persists it atomically with the certified block.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuiltBlockV4 {
     /// Deterministically executed V4 candidate.
     pub block: BlockV4,

@@ -144,8 +144,9 @@ pub use receipt_v1::{
     TRANSACTION_LEAF_V1_DOMAIN,
 };
 pub use round::{
-    ConsensusAction, ConsensusEvent, ConsensusMachine, ConsensusMessage, ConsensusWalRecord, Step,
-    TimeoutKind, ValidatorIdentity, MAX_FUTURE_ROUNDS, MAX_PAST_ROUNDS,
+    ConsensusAction, ConsensusActionV1, ConsensusEvent, ConsensusEventV1, ConsensusMachine,
+    ConsensusMachineV1, ConsensusMessage, ConsensusMessageV1, ConsensusWalRecord,
+    ConsensusWalRecordV1, Step, TimeoutKind, ValidatorIdentity, MAX_FUTURE_ROUNDS, MAX_PAST_ROUNDS,
 };
 pub use scheduler::parallel_batches;
 pub use service_registry::{
@@ -685,6 +686,8 @@ pub enum ChainError {
     ConsensusProofOfLockInvalid,
     #[error("consensus proposal block hash does not match its carried block")]
     ConsensusProposalBlockMismatch,
+    #[error("protocol-2 consensus proposal is invalid")]
+    ConsensusProtocol2ProposalInvalid,
     #[error("consensus message came from a validator absent from the height's snapshot")]
     ConsensusValidatorNotInSet,
     #[error("consensus message signature is invalid for the registered consensus key")]

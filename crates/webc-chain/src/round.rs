@@ -57,11 +57,13 @@
 //! of this safety core.
 
 use crate::{
-    Block, ChainError, ChainId, DoubleVoteEvidence, FinalityCertificate, ProtocolVersion,
-    SignedProposal, SignedVote, ValidatorSet, Vote, VoteType,
+    Block, BuiltBlockV4, ChainError, ChainId, DoubleVoteEvidence, FinalityAuthoritySetV1,
+    FinalityCertificate, Proposal, ProtocolVersion, SignedProposal, SignedProposalV1, SignedVote,
+    ValidatorSet, Vote, VoteType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
 use webc_crypto::{Address, Hash256, Keypair};
 
 /// The reserved sentinel identifying a nil vote (a vote for "no block").
@@ -121,20 +123,20 @@ pub struct ValidatorIdentity {
     pub consensus_key: Keypair,
 }
 
-/// A consensus message exchanged between nodes for one height.
+/// Version-parameterized consensus message exchanged for one height.
 #[derive(Clone, Debug)]
-pub enum ConsensusMessage {
+pub enum ConsensusMessageCore<P> {
     /// The scheduled leader's signed block proposal.
-    Proposal(Box<SignedProposal>),
+    Proposal(Box<P>),
     /// A signed prevote or precommit (nil is the all-zero sentinel hash).
     Vote(SignedVote),
 }
 
-/// An input to the machine: a received message or a fired timeout.
+/// Version-parameterized input to a machine.
 #[derive(Clone, Debug)]
-pub enum ConsensusEvent {
+pub enum ConsensusEventCore<P> {
     /// A message received from a peer (or produced locally).
-    Message(ConsensusMessage),
+    Message(ConsensusMessageCore<P>),
     /// A timeout the driver previously armed has fired.
     Timeout {
         /// Which timeout fired.
@@ -144,11 +146,11 @@ pub enum ConsensusEvent {
     },
 }
 
-/// An instruction the driver must carry out on the machine's behalf.
+/// Version-parameterized instruction emitted by the safety core.
 #[derive(Clone, Debug)]
-pub enum ConsensusAction {
+pub enum ConsensusActionCore<P, B> {
     /// Gossip this message to peers (it has already been applied locally).
-    Broadcast(ConsensusMessage),
+    Broadcast(ConsensusMessageCore<P>),
     /// Arm this timeout; fire it back as a [`ConsensusEvent::Timeout`] on expiry.
     ScheduleTimeout {
         /// Which timeout to arm.
@@ -158,7 +160,7 @@ pub enum ConsensusAction {
     },
     /// This node is the proposer for `round` and has no locked value to
     /// re-propose: the driver should build a candidate block and hand it back via
-    /// [`ConsensusMachine::provide_block`].
+    /// the matching machine's `provide_block` method.
     NeedProposalBlock {
         /// The round the block is needed for.
         round: u32,
@@ -166,7 +168,7 @@ pub enum ConsensusAction {
     /// Finalize this block; its certificate independently proves quorum.
     Commit {
         /// The finalized block.
-        block: Box<Block>,
+        block: Box<B>,
         /// The proof that strictly over two thirds precommitted it.
         certificate: Box<FinalityCertificate>,
     },
@@ -189,22 +191,222 @@ pub enum ConsensusAction {
 /// `(round, vote_type)` with different block hashes — `restore` rejects such a
 /// journal as corrupt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConsensusWalRecord {
+pub struct ConsensusWalRecordCore<P, B> {
     /// The single consensus height this journal covers.
     pub height: u64,
     /// Every proposal this validator signed at this height, in signing order.
-    pub proposals: Vec<SignedProposal>,
+    pub proposals: Vec<P>,
     /// Every vote this validator signed at this height, in signing order.
     pub votes: Vec<SignedVote>,
     /// The round this node locked in, if any (present iff `locked_value` is).
     pub locked_round: Option<u32>,
     /// The block this node locked (precommitted), if any.
-    pub locked_value: Option<Block>,
+    pub locked_value: Option<B>,
     /// The round of the latest observed prevote quorum, if any (present iff
     /// `valid_value` is).
     pub valid_round: Option<u32>,
     /// The latest block observed to reach a prevote quorum, if any.
-    pub valid_value: Option<Block>,
+    pub valid_value: Option<B>,
+}
+
+/// Frozen protocol-1 consensus message.
+pub type ConsensusMessage = ConsensusMessageCore<SignedProposal>;
+/// Protocol-2 V4 consensus message.
+pub type ConsensusMessageV1 = ConsensusMessageCore<SignedProposalV1>;
+/// Frozen protocol-1 consensus event.
+pub type ConsensusEvent = ConsensusEventCore<SignedProposal>;
+/// Protocol-2 V4 consensus event.
+pub type ConsensusEventV1 = ConsensusEventCore<SignedProposalV1>;
+/// Frozen protocol-1 consensus action.
+pub type ConsensusAction = ConsensusActionCore<SignedProposal, Block>;
+/// Protocol-2 V4 consensus action.
+pub type ConsensusActionV1 = ConsensusActionCore<SignedProposalV1, BuiltBlockV4>;
+/// Frozen protocol-1 crash-safety record.
+pub type ConsensusWalRecord = ConsensusWalRecordCore<SignedProposal, Block>;
+/// Protocol-2 V4 crash-safety record.
+pub type ConsensusWalRecordV1 = ConsensusWalRecordCore<SignedProposalV1, BuiltBlockV4>;
+
+/// Adapter between the shared BFT safety core and a versioned proposal format.
+///
+/// Implementations own proposal signing/verification and value hashing; round,
+/// lock, vote, quorum, timeout, equivocation, and WAL rules remain one code path.
+#[doc(hidden)]
+pub trait ConsensusProposalScheme {
+    /// Full value retained while locked and returned on finality.
+    type Value: Clone + Debug + PartialEq + Eq;
+    /// Signed proposal envelope exchanged with peers.
+    type SignedProposal: Clone + Debug + PartialEq + Eq;
+    /// Immutable proposal verification context for this height.
+    type Context: Clone;
+
+    /// Returns the common signed metadata used by the safety rules.
+    fn payload(proposal: &Self::SignedProposal) -> &Proposal;
+    /// Reconstructs the full consensus value carried by a proposal.
+    fn value(proposal: &Self::SignedProposal) -> Self::Value;
+    /// Returns the independently signed proof-of-lock votes.
+    fn proof_of_lock(proposal: &Self::SignedProposal) -> &[SignedVote];
+    /// Computes the value identifier votes certify.
+    fn value_hash(value: &Self::Value) -> Result<Hash256, ChainError>;
+    /// Verifies a received proposal against this height's immutable context.
+    fn verify(
+        proposal: &Self::SignedProposal,
+        set: &ValidatorSet,
+        protocol_version: ProtocolVersion,
+        chain_id: &ChainId,
+        context: &Self::Context,
+    ) -> Result<(), ChainError>;
+    /// Signs a proposal using the version-specific envelope and domain.
+    #[allow(clippy::too_many_arguments)]
+    fn sign(
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        height: u64,
+        round: u32,
+        valid_round: Option<u32>,
+        value: Self::Value,
+        proposer: Address,
+        consensus_key: &Keypair,
+        proof_of_lock: Vec<SignedVote>,
+        context: &Self::Context,
+    ) -> Result<Self::SignedProposal, ChainError>;
+}
+
+type MachineActions<S> = Vec<
+    ConsensusActionCore<
+        <S as ConsensusProposalScheme>::SignedProposal,
+        <S as ConsensusProposalScheme>::Value,
+    >,
+>;
+
+/// Adapter preserving the frozen legacy proposal behavior and bytes.
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct LegacyConsensusScheme;
+
+impl ConsensusProposalScheme for LegacyConsensusScheme {
+    type Value = Block;
+    type SignedProposal = SignedProposal;
+    type Context = ();
+
+    fn payload(proposal: &Self::SignedProposal) -> &Proposal {
+        &proposal.payload
+    }
+
+    fn value(proposal: &Self::SignedProposal) -> Self::Value {
+        proposal.block.clone()
+    }
+
+    fn proof_of_lock(proposal: &Self::SignedProposal) -> &[SignedVote] {
+        &proposal.proof_of_lock
+    }
+
+    fn value_hash(value: &Self::Value) -> Result<Hash256, ChainError> {
+        value.hash()
+    }
+
+    fn verify(
+        proposal: &Self::SignedProposal,
+        set: &ValidatorSet,
+        protocol_version: ProtocolVersion,
+        chain_id: &ChainId,
+        _context: &Self::Context,
+    ) -> Result<(), ChainError> {
+        proposal.verify_in_set(set, protocol_version, chain_id)
+    }
+
+    fn sign(
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        height: u64,
+        round: u32,
+        valid_round: Option<u32>,
+        value: Self::Value,
+        proposer: Address,
+        consensus_key: &Keypair,
+        proof_of_lock: Vec<SignedVote>,
+        _context: &Self::Context,
+    ) -> Result<Self::SignedProposal, ChainError> {
+        SignedProposal::sign_with_proof_of_lock(
+            protocol_version,
+            chain_id,
+            height,
+            round,
+            valid_round,
+            value,
+            proposer,
+            consensus_key,
+            proof_of_lock,
+        )
+    }
+}
+
+/// Adapter binding the shared BFT rules to V4 proposal/authority semantics.
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct Protocol2ConsensusScheme;
+
+impl ConsensusProposalScheme for Protocol2ConsensusScheme {
+    type Value = BuiltBlockV4;
+    type SignedProposal = SignedProposalV1;
+    type Context = FinalityAuthoritySetV1;
+
+    fn payload(proposal: &Self::SignedProposal) -> &Proposal {
+        &proposal.payload
+    }
+
+    fn value(proposal: &Self::SignedProposal) -> Self::Value {
+        BuiltBlockV4 {
+            block: proposal.block.clone(),
+            next_authority_set: proposal.next_authority_set.clone(),
+        }
+    }
+
+    fn proof_of_lock(proposal: &Self::SignedProposal) -> &[SignedVote] {
+        &proposal.proof_of_lock
+    }
+
+    fn value_hash(value: &Self::Value) -> Result<Hash256, ChainError> {
+        value
+            .block
+            .header
+            .hash()
+            .map_err(|_| ChainError::ConsensusProtocol2ProposalInvalid)
+    }
+
+    fn verify(
+        proposal: &Self::SignedProposal,
+        _set: &ValidatorSet,
+        _protocol_version: ProtocolVersion,
+        _chain_id: &ChainId,
+        context: &Self::Context,
+    ) -> Result<(), ChainError> {
+        proposal
+            .verify_in_authority_set(context)
+            .map_err(|_| ChainError::ConsensusProtocol2ProposalInvalid)
+    }
+
+    fn sign(
+        _protocol_version: ProtocolVersion,
+        _chain_id: ChainId,
+        _height: u64,
+        round: u32,
+        valid_round: Option<u32>,
+        value: Self::Value,
+        _proposer: Address,
+        consensus_key: &Keypair,
+        proof_of_lock: Vec<SignedVote>,
+        _context: &Self::Context,
+    ) -> Result<Self::SignedProposal, ChainError> {
+        SignedProposalV1::sign_with_proof_of_lock(
+            round,
+            valid_round,
+            value.block,
+            value.next_authority_set,
+            consensus_key,
+            proof_of_lock,
+        )
+        .map_err(|_| ChainError::ConsensusProtocol2ProposalInvalid)
+    }
 }
 
 /// Which votes a power tally counts: any hash, or exactly one hash.
@@ -225,25 +427,26 @@ enum Guard {
 }
 
 /// A single-height, multi-round Tendermint-style BFT state machine.
-pub struct ConsensusMachine {
+pub struct ConsensusMachineCore<S: ConsensusProposalScheme> {
     protocol_version: ProtocolVersion,
     chain_id: ChainId,
     set: ValidatorSet,
     height: u64,
     identity: Option<ValidatorIdentity>,
+    proposal_context: S::Context,
 
     round: u32,
     step: Step,
 
     /// The value this node precommitted and the round it did so (its lock).
-    locked_value: Option<Block>,
+    locked_value: Option<S::Value>,
     locked_round: Option<u32>,
     /// The latest value this node saw reach a prevote quorum, and its round.
-    valid_value: Option<Block>,
+    valid_value: Option<S::Value>,
     valid_round: Option<u32>,
 
     /// One accepted proposal per round, from that round's scheduled leader.
-    proposals: BTreeMap<u32, SignedProposal>,
+    proposals: BTreeMap<u32, S::SignedProposal>,
     /// First prevote per `(round, validator)`.
     prevotes: BTreeMap<(u32, Address), SignedVote>,
     /// First precommit per `(round, validator)`.
@@ -257,7 +460,7 @@ pub struct ConsensusMachine {
 
     /// Every proposal this node signed at this height, in signing order — the
     /// proposal half of the crash-safety journal (see [`ConsensusWalRecord`]).
-    own_proposals: Vec<SignedProposal>,
+    own_proposals: Vec<S::SignedProposal>,
     /// Every vote this node signed at this height, in signing order — the vote
     /// half of the crash-safety journal.
     own_votes: Vec<SignedVote>,
@@ -266,8 +469,13 @@ pub struct ConsensusMachine {
     restored: bool,
 
     /// The finalized block and its certificate, once decided.
-    decision: Option<(Block, FinalityCertificate)>,
+    decision: Option<(S::Value, FinalityCertificate)>,
 }
+
+/// Frozen protocol-1 BFT machine.
+pub type ConsensusMachine = ConsensusMachineCore<LegacyConsensusScheme>;
+/// Protocol-2 V4 BFT machine using the identical round/lock/quorum core.
+pub type ConsensusMachineV1 = ConsensusMachineCore<Protocol2ConsensusScheme>;
 
 impl ConsensusMachine {
     /// Creates a machine for `height` over the immutable snapshot `set`.
@@ -281,12 +489,52 @@ impl ConsensusMachine {
         height: u64,
         identity: Option<ValidatorIdentity>,
     ) -> Self {
+        Self::new_core(protocol_version, chain_id, set, height, identity, ())
+    }
+}
+
+impl ConsensusMachineV1 {
+    /// Creates a protocol-2 machine from the exact outgoing authority snapshot.
+    ///
+    /// The snapshot supplies protocol, chain, epoch commitment context, leader
+    /// schedule, and vote keys. Proposal execution remains a driver concern.
+    pub fn new(
+        current_authority_set: FinalityAuthoritySetV1,
+        height: u64,
+        identity: Option<ValidatorIdentity>,
+    ) -> Result<Self, ChainError> {
+        let protocol_version = current_authority_set.protocol_version;
+        let chain_id = current_authority_set.chain_id.clone();
+        let set = current_authority_set
+            .to_validator_set()
+            .map_err(|_| ChainError::ConsensusProtocol2ProposalInvalid)?;
+        Ok(Self::new_core(
+            protocol_version,
+            chain_id,
+            set,
+            height,
+            identity,
+            current_authority_set,
+        ))
+    }
+}
+
+impl<S: ConsensusProposalScheme> ConsensusMachineCore<S> {
+    fn new_core(
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        set: ValidatorSet,
+        height: u64,
+        identity: Option<ValidatorIdentity>,
+        proposal_context: S::Context,
+    ) -> Self {
         Self {
             protocol_version,
             chain_id,
             set,
             height,
             identity,
+            proposal_context,
             round: 0,
             step: Step::Propose,
             locked_value: None,
@@ -314,10 +562,10 @@ impl ConsensusMachine {
     /// the next (fresh) round if the network cannot re-complete the journaled
     /// one. Never re-proposing or re-voting a journaled step is exactly the
     /// anti-self-equivocation guarantee of the journal.
-    pub fn start(&mut self) -> Result<Vec<ConsensusAction>, ChainError> {
+    pub fn start(&mut self) -> Result<MachineActions<S>, ChainError> {
         let mut actions = Vec::new();
         if self.restored {
-            actions.push(ConsensusAction::ScheduleTimeout {
+            actions.push(ConsensusActionCore::ScheduleTimeout {
                 kind: TimeoutKind::Precommit,
                 round: self.round,
             });
@@ -331,8 +579,8 @@ impl ConsensusMachine {
     /// Snapshot of everything this node has signed at this height plus its lock
     /// state — the crash-safety journal a driver must persist durably before
     /// each own broadcast. See [`ConsensusWalRecord`].
-    pub fn wal_record(&self) -> ConsensusWalRecord {
-        ConsensusWalRecord {
+    pub fn wal_record(&self) -> ConsensusWalRecordCore<S::SignedProposal, S::Value> {
+        ConsensusWalRecordCore {
             height: self.height,
             proposals: self.own_proposals.clone(),
             votes: self.own_votes.clone(),
@@ -357,7 +605,10 @@ impl ConsensusMachine {
     /// caller must then fail closed (run the height without a voting identity),
     /// because a journal that cannot be trusted means the node no longer knows
     /// what it already signed.
-    pub fn restore(&mut self, record: ConsensusWalRecord) -> Result<(), ChainError> {
+    pub fn restore(
+        &mut self,
+        record: ConsensusWalRecordCore<S::SignedProposal, S::Value>,
+    ) -> Result<(), ChainError> {
         // Only a machine that has done nothing yet can be restored: replaying
         // into a live machine could erase signing guards.
         if self.restored
@@ -381,12 +632,17 @@ impl ConsensusMachine {
         // Validate everything before mutating anything, so a corrupt journal
         // leaves the machine untouched.
         for proposal in &record.proposals {
-            if proposal.payload.height != self.height
-                || proposal.payload.proposer != identity_address
-            {
+            let payload = S::payload(proposal);
+            if payload.height != self.height || payload.proposer != identity_address {
                 return Err(ChainError::ConsensusWalMismatch);
             }
-            proposal.verify_in_set(&self.set, self.protocol_version, &self.chain_id)?;
+            S::verify(
+                proposal,
+                &self.set,
+                self.protocol_version,
+                &self.chain_id,
+                &self.proposal_context,
+            )?;
         }
         let mut first_hash_per_step: BTreeMap<(u32, VoteType), Hash256> = BTreeMap::new();
         for vote in &record.votes {
@@ -421,12 +677,11 @@ impl ConsensusMachine {
         let mut max_round = 0u32;
         let mut any_activity = false;
         for proposal in record.proposals {
-            max_round = max_round.max(proposal.payload.round);
+            let round = S::payload(&proposal).round;
+            max_round = max_round.max(round);
             any_activity = true;
             self.own_proposals.push(proposal.clone());
-            self.proposals
-                .entry(proposal.payload.round)
-                .or_insert(proposal);
+            self.proposals.entry(round).or_insert(proposal);
         }
         for vote in record.votes {
             let round = vote.payload.round;
@@ -482,7 +737,7 @@ impl ConsensusMachine {
     }
 
     /// The finalized block, once decided.
-    pub fn decided_block(&self) -> Option<&Block> {
+    pub fn decided_block(&self) -> Option<&S::Value> {
         self.decision.as_ref().map(|(block, _)| block)
     }
 
@@ -491,14 +746,14 @@ impl ConsensusMachine {
         self.decision.as_ref().map(|(_, cert)| cert)
     }
 
-    /// The driver's response to [`ConsensusAction::NeedProposalBlock`]: supplies a
+    /// The driver's response to `NeedProposalBlock`: supplies a
     /// freshly built candidate block for `round`, which the machine signs,
     /// broadcasts, and applies. A stale or unsolicited block is ignored.
     pub fn provide_block(
         &mut self,
         round: u32,
-        block: Block,
-    ) -> Result<Vec<ConsensusAction>, ChainError> {
+        block: S::Value,
+    ) -> Result<MachineActions<S>, ChainError> {
         let mut actions = Vec::new();
         if self.decision.is_some()
             || round != self.round
@@ -518,31 +773,37 @@ impl ConsensusMachine {
     /// Messages for another height are ignored. A message for this height that
     /// fails verification returns an error so the driver can penalize the peer.
     /// Once the height is decided, further events are ignored.
-    pub fn on_event(&mut self, event: ConsensusEvent) -> Result<Vec<ConsensusAction>, ChainError> {
+    pub fn on_event(
+        &mut self,
+        event: ConsensusEventCore<S::SignedProposal>,
+    ) -> Result<MachineActions<S>, ChainError> {
         let mut actions = Vec::new();
         if self.decision.is_some() {
             return Ok(actions);
         }
         match event {
-            ConsensusEvent::Message(ConsensusMessage::Proposal(signed)) => {
-                if signed.payload.height != self.height
-                    || self.beyond_future_horizon(signed.payload.round)
-                {
+            ConsensusEventCore::Message(ConsensusMessageCore::Proposal(signed)) => {
+                let payload = S::payload(&signed);
+                if payload.height != self.height || self.beyond_future_horizon(payload.round) {
                     return Ok(actions);
                 }
-                signed.verify_in_set(&self.set, self.protocol_version, &self.chain_id)?;
+                S::verify(
+                    &signed,
+                    &self.set,
+                    self.protocol_version,
+                    &self.chain_id,
+                    &self.proposal_context,
+                )?;
                 // C5: a re-proposal carries a verified proof-of-lock — the 2f+1
                 // prevotes for its `valid_round`. Absorb them into this node's
                 // own prevote tally (they are already snapshot-verified) so a
                 // node that missed those prevotes can now satisfy the rule-28
                 // guard and follow the lock instead of prevoting nil forever.
-                self.absorb_proof_of_lock(&signed.proof_of_lock);
+                self.absorb_proof_of_lock(S::proof_of_lock(&signed));
                 // Keep one proposal per round (the first from its valid leader).
-                self.proposals
-                    .entry(signed.payload.round)
-                    .or_insert(*signed);
+                self.proposals.entry(payload.round).or_insert(*signed);
             }
-            ConsensusEvent::Message(ConsensusMessage::Vote(vote)) => {
+            ConsensusEventCore::Message(ConsensusMessageCore::Vote(vote)) => {
                 if vote.payload.height != self.height
                     || self.beyond_future_horizon(vote.payload.round)
                 {
@@ -551,10 +812,10 @@ impl ConsensusMachine {
                 self.set
                     .verify_vote(&vote, self.protocol_version, &self.chain_id)?;
                 if let Some(evidence) = self.record_vote(vote) {
-                    actions.push(ConsensusAction::Equivocation(Box::new(evidence)));
+                    actions.push(ConsensusActionCore::Equivocation(Box::new(evidence)));
                 }
             }
-            ConsensusEvent::Timeout { kind, round } => {
+            ConsensusEventCore::Timeout { kind, round } => {
                 self.on_timeout(kind, round, &mut actions)?;
             }
         }
@@ -590,7 +851,7 @@ impl ConsensusMachine {
     fn start_round(
         &mut self,
         round: u32,
-        actions: &mut Vec<ConsensusAction>,
+        actions: &mut MachineActions<S>,
     ) -> Result<(), ChainError> {
         self.round = round;
         self.step = Step::Propose;
@@ -604,10 +865,10 @@ impl ConsensusMachine {
                     self.emit_proposal(round, value, valid_round, actions)?;
                 }
                 // No value to re-propose: ask the driver for a fresh candidate.
-                None => actions.push(ConsensusAction::NeedProposalBlock { round }),
+                None => actions.push(ConsensusActionCore::NeedProposalBlock { round }),
             }
         } else {
-            actions.push(ConsensusAction::ScheduleTimeout {
+            actions.push(ConsensusActionCore::ScheduleTimeout {
                 kind: TimeoutKind::Propose,
                 round,
             });
@@ -626,15 +887,15 @@ impl ConsensusMachine {
     fn emit_proposal(
         &mut self,
         round: u32,
-        block: Block,
+        block: S::Value,
         valid_round: Option<u32>,
-        actions: &mut Vec<ConsensusAction>,
+        actions: &mut MachineActions<S>,
     ) -> Result<(), ChainError> {
         let identity = self
             .identity
             .as_ref()
             .ok_or(ChainError::ConsensusProposalNotFromLeader)?;
-        let block_hash = block.hash()?;
+        let block_hash = S::value_hash(&block)?;
         // Assemble the proof-of-lock for a re-proposal. `valid_round` is a round
         // this node observed reach a prevote quorum, so it holds the prevotes.
         let (valid_round, proof_of_lock) = match valid_round {
@@ -650,7 +911,7 @@ impl ConsensusMachine {
             }
             None => (None, Vec::new()),
         };
-        let signed = SignedProposal::sign_with_proof_of_lock(
+        let signed = S::sign(
             self.protocol_version,
             self.chain_id.clone(),
             self.height,
@@ -660,14 +921,15 @@ impl ConsensusMachine {
             identity.address,
             &identity.consensus_key,
             proof_of_lock,
+            &self.proposal_context,
         )?;
         // Journal before queueing the broadcast: the driver persists
         // `wal_record()` durably before this message reaches the wire.
         self.own_proposals.push(signed.clone());
         self.proposals.insert(round, signed.clone());
-        actions.push(ConsensusAction::Broadcast(ConsensusMessage::Proposal(
-            Box::new(signed),
-        )));
+        actions.push(ConsensusActionCore::Broadcast(
+            ConsensusMessageCore::Proposal(Box::new(signed)),
+        ));
         Ok(())
     }
 
@@ -719,7 +981,7 @@ impl ConsensusMachine {
         &mut self,
         kind: TimeoutKind,
         round: u32,
-        actions: &mut Vec<ConsensusAction>,
+        actions: &mut MachineActions<S>,
     ) -> Result<(), ChainError> {
         if round != self.round {
             return Ok(());
@@ -746,7 +1008,7 @@ impl ConsensusMachine {
     /// Rules are checked in the paper's order. A round advance (from a precommit
     /// timeout or catch-up) re-arms the per-round guards, so the loop terminates
     /// because rounds only ever increase.
-    fn drive(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<(), ChainError> {
+    fn drive(&mut self, actions: &mut MachineActions<S>) -> Result<(), ChainError> {
         let mut passes = 0;
         loop {
             passes += 1;
@@ -771,15 +1033,16 @@ impl ConsensusMachine {
 
     /// Rules 22 and 28: on the current round's proposal while in Propose, prevote
     /// the block (subject to the lock) or nil, and move to Prevote.
-    fn rule_propose(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+    fn rule_propose(&mut self, actions: &mut MachineActions<S>) -> Result<bool, ChainError> {
         if self.step != Step::Propose {
             return Ok(false);
         }
         let Some(proposal) = self.proposals.get(&self.round).cloned() else {
             return Ok(false);
         };
-        let block_hash = proposal.payload.block_hash;
-        match proposal.payload.valid_round {
+        let payload = S::payload(&proposal);
+        let block_hash = payload.block_hash;
+        match payload.valid_round {
             // Rule 22: a fresh proposal.
             None => {
                 let prevote = if self.locked_round.is_none()
@@ -815,7 +1078,7 @@ impl ConsensusMachine {
 
     /// Rule 34: once a prevote quorum (any value) forms for the current round in
     /// the Prevote step, arm the prevote timeout (once).
-    fn rule_prevote_timeout(&mut self, actions: &mut Vec<ConsensusAction>) -> bool {
+    fn rule_prevote_timeout(&mut self, actions: &mut MachineActions<S>) -> bool {
         if self.step != Step::Prevote
             || self.guard_set(Guard::PrevoteTimeoutScheduled)
             || !self.has_prevote_quorum(self.round, HashFilter::Any)
@@ -823,7 +1086,7 @@ impl ConsensusMachine {
             return false;
         }
         self.set_guard(Guard::PrevoteTimeoutScheduled);
-        actions.push(ConsensusAction::ScheduleTimeout {
+        actions.push(ConsensusActionCore::ScheduleTimeout {
             kind: TimeoutKind::Prevote,
             round: self.round,
         });
@@ -833,27 +1096,24 @@ impl ConsensusMachine {
     /// Rule 36: on the current round's proposal plus a prevote quorum for its
     /// block while in Prevote or later — lock and precommit it (if still in
     /// Prevote) and record it as the valid value.
-    fn rule_prevote_quorum(
-        &mut self,
-        actions: &mut Vec<ConsensusAction>,
-    ) -> Result<bool, ChainError> {
+    fn rule_prevote_quorum(&mut self, actions: &mut MachineActions<S>) -> Result<bool, ChainError> {
         if self.step == Step::Propose || self.guard_set(Guard::ValidValueUpdated) {
             return Ok(false);
         }
         let Some(proposal) = self.proposals.get(&self.round).cloned() else {
             return Ok(false);
         };
-        let block_hash = proposal.payload.block_hash;
+        let block_hash = S::payload(&proposal).block_hash;
         if !self.has_prevote_quorum(self.round, HashFilter::Exactly(block_hash)) {
             return Ok(false);
         }
         if self.step == Step::Prevote {
-            self.locked_value = Some(proposal.block.clone());
+            self.locked_value = Some(S::value(&proposal));
             self.locked_round = Some(self.round);
             self.cast_precommit(block_hash, actions)?;
             self.step = Step::Precommit;
         }
-        self.valid_value = Some(proposal.block.clone());
+        self.valid_value = Some(S::value(&proposal));
         self.valid_round = Some(self.round);
         self.set_guard(Guard::ValidValueUpdated);
         Ok(true)
@@ -861,7 +1121,7 @@ impl ConsensusMachine {
 
     /// Rule 44: on a prevote quorum for nil in the current round while in Prevote,
     /// precommit nil and move to Precommit.
-    fn rule_prevote_nil(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+    fn rule_prevote_nil(&mut self, actions: &mut MachineActions<S>) -> Result<bool, ChainError> {
         if self.step != Step::Prevote
             || !self.has_prevote_quorum(self.round, HashFilter::Exactly(NIL))
         {
@@ -874,14 +1134,14 @@ impl ConsensusMachine {
 
     /// Rule 47: once a precommit quorum (any value) forms for the current round,
     /// arm the precommit timeout (once).
-    fn rule_precommit_timeout(&mut self, actions: &mut Vec<ConsensusAction>) -> bool {
+    fn rule_precommit_timeout(&mut self, actions: &mut MachineActions<S>) -> bool {
         if self.guard_set(Guard::PrecommitTimeoutScheduled)
             || !self.has_precommit_quorum(self.round, HashFilter::Any)
         {
             return false;
         }
         self.set_guard(Guard::PrecommitTimeoutScheduled);
-        actions.push(ConsensusAction::ScheduleTimeout {
+        actions.push(ConsensusActionCore::ScheduleTimeout {
             kind: TimeoutKind::Precommit,
             round: self.round,
         });
@@ -890,24 +1150,27 @@ impl ConsensusMachine {
 
     /// Rule 49: for any round whose proposal has a precommit quorum for its block,
     /// decide that block. This can finalize a block proposed in an earlier round.
-    fn rule_decide(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+    fn rule_decide(&mut self, actions: &mut MachineActions<S>) -> Result<bool, ChainError> {
         if self.decision.is_some() {
             return Ok(false);
         }
         // Find a round whose proposed block has a precommit quorum.
         let rounds: Vec<u32> = self.proposals.keys().copied().collect();
         for round in rounds {
-            let proposal = self.proposals.get(&round).cloned().expect("round present");
-            let block_hash = proposal.payload.block_hash;
+            let Some(proposal) = self.proposals.get(&round).cloned() else {
+                continue;
+            };
+            let block_hash = S::payload(&proposal).block_hash;
             if !self.has_precommit_quorum(round, HashFilter::Exactly(block_hash)) {
                 continue;
             }
             let Some(certificate) = self.build_certificate(round, block_hash) else {
                 continue;
             };
-            self.decision = Some((proposal.block.clone(), certificate.clone()));
-            actions.push(ConsensusAction::Commit {
-                block: Box::new(proposal.block),
+            let value = S::value(&proposal);
+            self.decision = Some((value.clone(), certificate.clone()));
+            actions.push(ConsensusActionCore::Commit {
+                block: Box::new(value),
                 certificate: Box::new(certificate),
             });
             return Ok(true);
@@ -918,7 +1181,7 @@ impl ConsensusMachine {
     /// Rule 55: if more than one third of the power has sent any message for a
     /// round greater than the current one, jump to that round (an honest node is
     /// necessarily among a `f+1` set, so this cannot be forced by faults alone).
-    fn rule_catch_up(&mut self, actions: &mut Vec<ConsensusAction>) -> Result<bool, ChainError> {
+    fn rule_catch_up(&mut self, actions: &mut MachineActions<S>) -> Result<bool, ChainError> {
         // Highest future round with f+1 total participation.
         let mut target: Option<u32> = None;
         let mut future: BTreeSet<u32> = BTreeSet::new();
@@ -980,7 +1243,7 @@ impl ConsensusMachine {
     fn cast_prevote(
         &mut self,
         block_hash: Hash256,
-        actions: &mut Vec<ConsensusAction>,
+        actions: &mut MachineActions<S>,
     ) -> Result<(), ChainError> {
         self.cast_vote(VoteType::Prevote, Guard::PrevoteSent, block_hash, actions)
     }
@@ -989,7 +1252,7 @@ impl ConsensusMachine {
     fn cast_precommit(
         &mut self,
         block_hash: Hash256,
-        actions: &mut Vec<ConsensusAction>,
+        actions: &mut MachineActions<S>,
     ) -> Result<(), ChainError> {
         self.cast_vote(
             VoteType::Precommit,
@@ -1006,7 +1269,7 @@ impl ConsensusMachine {
         vote_type: VoteType,
         guard: Guard,
         block_hash: Hash256,
-        actions: &mut Vec<ConsensusAction>,
+        actions: &mut MachineActions<S>,
     ) -> Result<(), ChainError> {
         if self.guard_set(guard) {
             return Ok(());
@@ -1036,7 +1299,9 @@ impl ConsensusMachine {
         self.own_votes.push(vote.clone());
         // Count our own vote locally so single-validator sets can reach quorum.
         let _ = self.record_vote(vote.clone());
-        actions.push(ConsensusAction::Broadcast(ConsensusMessage::Vote(vote)));
+        actions.push(ConsensusActionCore::Broadcast(ConsensusMessageCore::Vote(
+            vote,
+        )));
         Ok(())
     }
 
@@ -1044,7 +1309,9 @@ impl ConsensusMachine {
     fn locked_value_hash(&self) -> Option<Hash256> {
         // The locked value equals the proposal it was locked from; its hash is the
         // block hash. Recomputing is cheap and avoids storing it separately.
-        self.locked_value.as_ref().and_then(|b| b.hash().ok())
+        self.locked_value
+            .as_ref()
+            .and_then(|value| S::value_hash(value).ok())
     }
 
     /// Whether prevotes at `round` matching `filter` exceed two thirds of power.
@@ -1140,7 +1407,10 @@ impl ConsensusMachine {
 mod tests {
     use super::*;
     use crate::consensus::ValidatorPower;
-    use crate::{Amount, BlockHeader, CURRENT_PROTOCOL_VERSION};
+    use crate::{
+        Amount, BlockHeader, BlockHeaderV4, BlockHeight, Epoch, CURRENT_PROTOCOL_VERSION,
+        TRANSACTION_V5_PROTOCOL_VERSION,
+    };
     use std::collections::BTreeMap as Map;
 
     fn set_with_keys(members: &[(&Keypair, u128)]) -> ValidatorSet {
@@ -1185,6 +1455,50 @@ mod tests {
             transactions: Vec::new(),
             receipts: Vec::new(),
             evidence: Vec::new(),
+        }
+    }
+
+    fn authority_v1(set: &ValidatorSet) -> FinalityAuthoritySetV1 {
+        FinalityAuthoritySetV1::from_validator_set(
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            Epoch::new(0),
+            set,
+        )
+        .expect("protocol-2 authority fixture validates")
+    }
+
+    fn candidate_v1(
+        authority: &FinalityAuthoritySetV1,
+        proposer: Address,
+        height: u64,
+        salt: u8,
+    ) -> BuiltBlockV4 {
+        let commitment = authority.commitment().expect("authority commits");
+        BuiltBlockV4 {
+            block: crate::BlockV4 {
+                header: BlockHeaderV4 {
+                    protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                    chain_id: ChainId::devnet(),
+                    height: BlockHeight::new(height),
+                    epoch: Epoch::new(0),
+                    previous_hash: Hash256::ZERO,
+                    state_root: Hash256([salt; 32]),
+                    account_root: Hash256([salt.wrapping_add(1); 32]),
+                    tx_root: Hash256::ZERO,
+                    receipt_root: Hash256::ZERO,
+                    evidence_root: Hash256::ZERO,
+                    finality_authority_set_root: commitment,
+                    next_finality_authority_set_root: commitment,
+                    proposer,
+                    timestamp_ms: u64::from(salt) + 1,
+                    base_fee_per_unit: 1,
+                },
+                transactions: Vec::new(),
+                receipts: Vec::new(),
+                evidence: Vec::new(),
+            },
+            next_authority_set: authority.clone(),
         }
     }
 
@@ -1406,6 +1720,88 @@ mod tests {
             )
             .is_ok());
         assert!(machine.decided_block().is_some());
+    }
+
+    #[test]
+    fn protocol2_single_validator_uses_shared_core_and_finalizes_v4() {
+        let validator = Keypair::from_seed([1; 32]);
+        let set = set_with_keys(&[(&validator, 1)]);
+        let authority = authority_v1(&set);
+        let mut machine = ConsensusMachineV1::new(authority.clone(), 1, Some(identity(&validator)))
+            .expect("protocol-2 machine builds");
+        let initial = machine.start().expect("machine starts");
+        assert!(matches!(
+            initial.first(),
+            Some(ConsensusActionV1::NeedProposalBlock { round: 0 })
+        ));
+        let candidate = candidate_v1(&authority, validator.address(), 1, 7);
+        let expected_hash = candidate.block.header.hash().expect("candidate hashes");
+        let actions = machine
+            .provide_block(0, candidate)
+            .expect("shared core accepts V4 value");
+        let (committed, certificate) = actions
+            .iter()
+            .find_map(|action| match action {
+                ConsensusActionV1::Commit { block, certificate } => {
+                    Some(((**block).clone(), (**certificate).clone()))
+                }
+                _ => None,
+            })
+            .expect("single validator finalizes V4");
+        assert_eq!(committed.block.header.hash().unwrap(), expected_hash);
+        certificate
+            .verify(&set, TRANSACTION_V5_PROTOCOL_VERSION, &ChainId::devnet())
+            .expect("protocol-2 certificate verifies");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ConsensusActionV1::Broadcast(ConsensusMessageV1::Proposal(proposal))
+                if proposal.payload.block_hash == expected_hash
+        )));
+    }
+
+    #[test]
+    fn protocol2_wal_restart_replays_without_resigning_the_round() {
+        let keys = [
+            Keypair::from_seed([1; 32]),
+            Keypair::from_seed([2; 32]),
+            Keypair::from_seed([3; 32]),
+        ];
+        let set = set_with_keys(&[(&keys[0], 1), (&keys[1], 1), (&keys[2], 1)]);
+        let authority = authority_v1(&set);
+        let proposer = set.proposer_for(1, 0).expect("round has proposer");
+        let proposer_key = keys
+            .iter()
+            .find(|key| key.address() == proposer)
+            .expect("proposer key exists");
+        let mut original =
+            ConsensusMachineV1::new(authority.clone(), 1, Some(identity(proposer_key)))
+                .expect("machine builds");
+        assert!(matches!(
+            original.start().unwrap().first(),
+            Some(ConsensusActionV1::NeedProposalBlock { round: 0 })
+        ));
+        let actions = original
+            .provide_block(0, candidate_v1(&authority, proposer, 1, 9))
+            .expect("leader proposes");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ConsensusActionV1::Broadcast(ConsensusMessageV1::Proposal(_))
+        )));
+        let record = original.wal_record();
+        assert_eq!(record.proposals.len(), 1);
+        assert_eq!(record.votes.len(), 1);
+
+        let bytes = bincode::serialize(&record).expect("protocol-2 WAL serializes");
+        let decoded: ConsensusWalRecordV1 =
+            bincode::deserialize(&bytes).expect("protocol-2 WAL decodes");
+        let mut restarted = ConsensusMachineV1::new(authority, 1, Some(identity(proposer_key)))
+            .expect("restart machine builds");
+        restarted.restore(decoded).expect("valid WAL restores");
+        let restart_actions = restarted.start().expect("restored machine starts");
+        assert!(restart_actions
+            .iter()
+            .all(|action| !matches!(action, ConsensusActionV1::Broadcast(_))));
+        assert_eq!(restarted.wal_record(), record);
     }
 
     #[test]
