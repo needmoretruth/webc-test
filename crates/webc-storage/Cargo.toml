@@ -26,4 +26,5 @@ redb = "4.1.0"
 zstd = "0.13"
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = "3"

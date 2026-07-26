@@ -447,6 +447,15 @@ impl<K: KvStore> ChainStore<K> {
         }
     }
 
+    /// Returns the immutable network identifier this database is bound to.
+    pub fn chain_id(&self) -> Result<ChainId, StorageError> {
+        let bytes = self
+            .store
+            .get(Table::Meta, META_CHAIN_ID)?
+            .ok_or_else(|| StorageError::Corruption("stored chain id is missing".into()))?;
+        decode(StoredRecordKind::ChainId, &bytes)
+    }
+
     /// Returns the validator-set snapshot recorded for `epoch`, or `None`.
     pub fn validator_set(&self, epoch: u64) -> Result<Option<ValidatorSet>, StorageError> {
         match self.store.get(Table::ValidatorSets, &be(epoch))? {
@@ -495,6 +504,14 @@ impl<K: KvStore> ChainStore<K> {
     /// not wrap, and for tests).
     pub fn backend(&self) -> &K {
         &self.store
+    }
+
+    /// Mutably borrows the backend for focused sibling storage modules.
+    ///
+    /// This remains crate-private so callers cannot bypass typed record codecs or
+    /// assemble partial batches outside the storage layer.
+    pub(crate) fn backend_mut(&mut self) -> &mut K {
+        &mut self.store
     }
 }
 

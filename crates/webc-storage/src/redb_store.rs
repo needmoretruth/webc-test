@@ -49,6 +49,11 @@ fn table_def(table: Table) -> TableDefinition<'static, &'static [u8], &'static [
         Table::ValidatorSets => "webc_validator_sets",
         Table::Certificates => "webc_certificates",
         Table::ConsensusWal => "webc_consensus_wal",
+        Table::PendingBySlot => "webc_pending_by_slot",
+        Table::PendingTransactions => "webc_pending_transactions",
+        Table::TransactionLifecycle => "webc_transaction_lifecycle",
+        Table::FinalizedTransactionIndex => "webc_finalized_transaction_index",
+        Table::FinalizedReceiptIndex => "webc_finalized_receipt_index",
     };
     TableDefinition::new(name)
 }

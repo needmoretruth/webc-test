@@ -974,6 +974,37 @@ the mempool and node runtime with versioned HTTP/WebSocket APIs. The V4 paths
 must remain byte-compatible and active under protocol 1 while protocol 2 is
 explicitly configured in tests/devnet fixtures.
 
+### Durable pending-lifecycle checkpoint (2026-07-27)
+
+The first storage-lifecycle slice is implemented without coupling storage to
+mempool policy. Schema 2 reserves distinct physical tables for the pending slot
+index, pending V5 bytes, lifecycle projection, finalized position index, and
+finalized receipt index. Stable table tags 0 through 6 remain unchanged.
+
+`webc-storage::lifecycle` now owns versioned records for the exact
+`(sender, authorization lane, nonce)` slot, complete signed V5 transaction,
+canonical transaction ID, local admission timestamp, local observation,
+separate consensus fact, and durable monotonically increasing sequence. JSON
+exposes timestamp/sequence `u64` values as strict decimal strings. Pending
+record reads repeat the bounded V5 signature/ID/slot checks and cross-check the
+table key and slot index; a record for another chain is rejected before writing.
+
+Admission commits the transaction, slot index, new lifecycle, optional replaced
+lifecycle/deletion, and sequence marker in one `KvStore` batch. Duplicate IDs
+are idempotent. Expiry/drop removal deletes both pending indexes while retaining
+the lifecycle. A merely proposed `Included` observation deliberately retains the
+pending bytes because the candidate may fail to finalize. Redb reopen proves the
+transaction bytes, slot, lifecycle, and sequence survive restart. An injected
+commit failure proves no partial index or sequence becomes visible. Strict
+storage Clippy and all 62 storage tests pass.
+
+Exact next item: add the finalized position/receipt record codecs and stage their
+indexes, pending deletion, authoritative consensus fact, and sequence allocation
+inside the same atomic batch as the finalized protocol-2 block/state/certificate/
+tip commit. Do not model protocol 2 through the frozen V3/V4 block container;
+introduce the explicit V4-header/V5-block storage boundary needed to keep legacy
+protocol-1 blocks readable without reinterpretation.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at

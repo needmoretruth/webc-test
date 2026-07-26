@@ -33,6 +33,7 @@ mod chainstore;
 mod codec;
 mod error;
 mod kv;
+mod lifecycle;
 mod memory;
 mod record_codec;
 mod redb_store;
@@ -41,5 +42,10 @@ mod state_record;
 pub use chainstore::{BlockCommit, ChainStore, ChainTip, CHAIN_STORE_SCHEMA_VERSION};
 pub use error::StorageError;
 pub use kv::{KvEntry, KvStore, Table, WriteBatch, WriteOp};
+pub use lifecycle::{
+    LifecycleSequence, LocalDropReasonV1, LocalTimestampMs, LocalTransactionObservationV1,
+    PendingAdmissionOutcomeV1, PendingSlotV1, PendingTransactionRecordV1,
+    TransactionConsensusFactV1, TransactionLifecycleV1, TRANSACTION_LIFECYCLE_RECORD_V1,
+};
 pub use memory::MemoryKvStore;
 pub use redb_store::RedbKvStore;

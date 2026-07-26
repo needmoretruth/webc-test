@@ -53,12 +53,22 @@ pub enum Table {
     /// height, persisted before each broadcast so a crash-restart can never
     /// re-sign a conflicting message (objective self-equivocation).
     ConsensusWal,
+    /// Protocol-2 pending slot index keyed by sender, lane, and nonce.
+    PendingBySlot,
+    /// Protocol-2 pending V5 transaction records keyed by transaction ID.
+    PendingTransactions,
+    /// Durable local observations and authoritative consensus facts keyed by ID.
+    TransactionLifecycle,
+    /// Finalized transaction ID to block-position index.
+    FinalizedTransactionIndex,
+    /// Finalized V1 receipt records keyed by transaction ID.
+    FinalizedReceiptIndex,
 }
 
 impl Table {
     /// Stable ordered list of every table. Backends iterate this to allocate
     /// one physical namespace per table; tests iterate it to assert coverage.
-    pub const ALL: [Table; 7] = [
+    pub const ALL: [Table; 12] = [
         Table::Meta,
         Table::Blocks,
         Table::StateSnapshots,
@@ -66,6 +76,11 @@ impl Table {
         Table::ValidatorSets,
         Table::Certificates,
         Table::ConsensusWal,
+        Table::PendingBySlot,
+        Table::PendingTransactions,
+        Table::TransactionLifecycle,
+        Table::FinalizedTransactionIndex,
+        Table::FinalizedReceiptIndex,
     ];
 
     /// A stable, compact byte tag identifying the table in a serialized batch.
@@ -82,6 +97,11 @@ impl Table {
             Table::ValidatorSets => 4,
             Table::Certificates => 5,
             Table::ConsensusWal => 6,
+            Table::PendingBySlot => 7,
+            Table::PendingTransactions => 8,
+            Table::TransactionLifecycle => 9,
+            Table::FinalizedTransactionIndex => 10,
+            Table::FinalizedReceiptIndex => 11,
         }
     }
 }

@@ -31,6 +31,10 @@ pub enum StorageError {
     /// A value could not be encoded to or decoded from its stored representation.
     #[error("storage serialization failed: {0}")]
     Serialization(String),
+    /// A caller attempted to persist a structurally invalid or contradictory
+    /// typed record. No write is performed.
+    #[error("invalid storage record: {0}")]
+    InvalidRecord(String),
     /// The on-disk schema version is not one this build understands. Refusing to
     /// proceed prevents interpreting a future layout with today's rules.
     #[error("unsupported storage schema version {found} (this build expects {expected})")]
