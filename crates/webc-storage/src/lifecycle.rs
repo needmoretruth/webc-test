@@ -379,7 +379,9 @@ pub enum PendingAdmissionOutcomeV1 {
         /// Latest lifecycle for the newly queued transaction.
         queued: TransactionLifecycleV1,
         /// Latest lifecycle for the replaced transaction, when replacement occurred.
-        replaced: Option<TransactionLifecycleV1>,
+        replaced: Option<Box<TransactionLifecycleV1>>,
+        /// Latest lifecycle for a capacity-evicted transaction, when one was removed.
+        evicted: Option<Box<TransactionLifecycleV1>>,
     },
 }
 
@@ -395,6 +397,29 @@ impl<K: KvStore> ChainStore<K> {
         record: &PendingTransactionRecordV1,
         replaced_id: Option<TransactionId>,
     ) -> Result<PendingAdmissionOutcomeV1, StorageError> {
+        self.store_pending_transition_v1(record, replaced_id, None)
+    }
+
+    /// Atomically stores one pending transaction while capacity-evicting another.
+    ///
+    /// The evicted ID must name a complete pending record and matching slot index
+    /// in a different slot. Its typed `Dropped(CapacityEviction)` lifecycle,
+    /// pending deletions, the new queued record/index/lifecycle, and the shared
+    /// sequence marker commit in one backend transaction.
+    pub fn store_pending_with_eviction_v1(
+        &mut self,
+        record: &PendingTransactionRecordV1,
+        evicted_id: TransactionId,
+    ) -> Result<PendingAdmissionOutcomeV1, StorageError> {
+        self.store_pending_transition_v1(record, None, Some(evicted_id))
+    }
+
+    fn store_pending_transition_v1(
+        &mut self,
+        record: &PendingTransactionRecordV1,
+        replaced_id: Option<TransactionId>,
+        evicted_id: Option<TransactionId>,
+    ) -> Result<PendingAdmissionOutcomeV1, StorageError> {
         record.validate_for_write()?;
         if record.transaction.chain_id != self.chain_id()? {
             return Err(StorageError::InvalidRecord(
@@ -404,6 +429,11 @@ impl<K: KvStore> ChainStore<K> {
 
         if let Some(existing) = self.transaction_lifecycle_v1(record.transaction_id)? {
             return Ok(PendingAdmissionOutcomeV1::DuplicateKnown(existing));
+        }
+        if replaced_id.is_some() && evicted_id.is_some() {
+            return Err(StorageError::InvalidRecord(
+                "pending admission cannot replace and capacity-evict simultaneously".into(),
+            ));
         }
 
         let slot_key = record.slot.key();
@@ -449,7 +479,49 @@ impl<K: KvStore> ChainStore<K> {
                     transaction_key(old_id),
                     encode(StoredRecordKind::TransactionLifecycle, &lifecycle)?,
                 );
-                Some(lifecycle)
+                Some(Box::new(lifecycle))
+            }
+        };
+        let evicted = match evicted_id {
+            None => None,
+            Some(old_id) => {
+                if old_id == record.transaction_id {
+                    return Err(StorageError::InvalidRecord(
+                        "a pending transaction cannot capacity-evict itself".into(),
+                    ));
+                }
+                let old = self.pending_transaction_v1(old_id)?.ok_or_else(|| {
+                    StorageError::Inconsistent(
+                        "capacity eviction names a missing pending transaction".into(),
+                    )
+                })?;
+                if old.slot == record.slot {
+                    return Err(StorageError::InvalidRecord(
+                        "capacity eviction cannot substitute for slot replacement".into(),
+                    ));
+                }
+                if self.pending_id_for_slot_v1(old.slot)? != Some(old_id) {
+                    return Err(StorageError::Inconsistent(
+                        "capacity-evicted transaction has no matching slot index".into(),
+                    ));
+                }
+                next = next_sequence(next)?;
+                let lifecycle = self.lifecycle_with_local_v1(
+                    old_id,
+                    next,
+                    LocalTransactionObservationV1::Dropped {
+                        reason: LocalDropReasonV1::CapacityEviction,
+                        observed_at_ms: record.admitted_at_ms,
+                    },
+                )?;
+                batch.delete(Table::PendingTransactions, transaction_key(old_id));
+                batch.delete(Table::PendingBySlot, old.slot.key());
+                batch.put(
+                    Table::TransactionLifecycle,
+                    transaction_key(old_id),
+                    encode(StoredRecordKind::TransactionLifecycle, &lifecycle)?,
+                );
+                Some(Box::new(lifecycle))
             }
         };
 
@@ -485,7 +557,11 @@ impl<K: KvStore> ChainStore<K> {
         );
         self.backend_mut().commit(batch)?;
 
-        Ok(PendingAdmissionOutcomeV1::Stored { queued, replaced })
+        Ok(PendingAdmissionOutcomeV1::Stored {
+            queued,
+            replaced,
+            evicted,
+        })
     }
 
     /// Atomically removes a pending transaction and records a typed local status.
@@ -1152,10 +1228,16 @@ mod tests {
                 .unwrap();
 
         let first = store.store_pending_v1(&record, None).unwrap();
-        let PendingAdmissionOutcomeV1::Stored { queued, replaced } = first else {
+        let PendingAdmissionOutcomeV1::Stored {
+            queued,
+            replaced,
+            evicted,
+        } = first
+        else {
             panic!("first admission must store");
         };
         assert!(replaced.is_none());
+        assert!(evicted.is_none());
         assert_eq!(queued.sequence, LifecycleSequence::new(1));
         assert_eq!(
             store.pending_id_for_slot_v1(record.slot).unwrap(),
@@ -1187,9 +1269,15 @@ mod tests {
         let outcome = store
             .store_pending_v1(&new, Some(old.transaction_id))
             .unwrap();
-        let PendingAdmissionOutcomeV1::Stored { queued, replaced } = outcome else {
+        let PendingAdmissionOutcomeV1::Stored {
+            queued,
+            replaced,
+            evicted,
+        } = outcome
+        else {
             panic!("replacement must store");
         };
+        assert!(evicted.is_none());
         let replaced = replaced.unwrap();
         assert_eq!(replaced.sequence.get(), 2);
         assert_eq!(queued.sequence.get(), 3);
@@ -1206,6 +1294,96 @@ mod tests {
             store.pending_id_for_slot_v1(new.slot).unwrap(),
             Some(new.transaction_id)
         );
+    }
+
+    #[test]
+    fn capacity_eviction_and_new_admission_share_one_durable_batch() {
+        let mut store = open_memory();
+        let victim =
+            PendingTransactionRecordV1::new(signed_transfer(21, 0, 5), LocalTimestampMs::new(NOW))
+                .unwrap();
+        store.store_pending_v1(&victim, None).unwrap();
+        let newcomer = PendingTransactionRecordV1::new(
+            signed_transfer(22, 0, 9),
+            LocalTimestampMs::new(NOW + 1),
+        )
+        .unwrap();
+
+        let outcome = store
+            .store_pending_with_eviction_v1(&newcomer, victim.transaction_id)
+            .unwrap();
+        let PendingAdmissionOutcomeV1::Stored {
+            queued,
+            replaced,
+            evicted,
+        } = outcome
+        else {
+            panic!("capacity eviction must store");
+        };
+        assert!(replaced.is_none());
+        assert_eq!(queued.sequence.get(), 3);
+        let evicted = evicted.unwrap();
+        assert_eq!(evicted.sequence.get(), 2);
+        assert!(matches!(
+            evicted.local_observation,
+            Some(LocalTransactionObservationV1::Dropped {
+                reason: LocalDropReasonV1::CapacityEviction,
+                ..
+            })
+        ));
+        assert!(store
+            .pending_transaction_v1(victim.transaction_id)
+            .unwrap()
+            .is_none());
+        assert!(store.pending_id_for_slot_v1(victim.slot).unwrap().is_none());
+        assert_eq!(
+            store
+                .pending_transaction_v1(newcomer.transaction_id)
+                .unwrap(),
+            Some(newcomer.clone())
+        );
+        assert_eq!(
+            store.pending_id_for_slot_v1(newcomer.slot).unwrap(),
+            Some(newcomer.transaction_id)
+        );
+    }
+
+    #[test]
+    fn failed_capacity_eviction_keeps_the_old_pending_record() {
+        let backend = FailNextCommitStore::default();
+        let mut store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        let victim =
+            PendingTransactionRecordV1::new(signed_transfer(23, 0, 5), LocalTimestampMs::new(NOW))
+                .unwrap();
+        store.store_pending_v1(&victim, None).unwrap();
+        let newcomer = PendingTransactionRecordV1::new(
+            signed_transfer(24, 0, 9),
+            LocalTimestampMs::new(NOW + 1),
+        )
+        .unwrap();
+        store.backend_mut().fail_next = true;
+
+        assert!(matches!(
+            store.store_pending_with_eviction_v1(&newcomer, victim.transaction_id),
+            Err(StorageError::Io(_))
+        ));
+        assert_eq!(
+            store.pending_transaction_v1(victim.transaction_id).unwrap(),
+            Some(victim.clone())
+        );
+        assert_eq!(
+            store.pending_id_for_slot_v1(victim.slot).unwrap(),
+            Some(victim.transaction_id)
+        );
+        assert!(store
+            .pending_transaction_v1(newcomer.transaction_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .pending_id_for_slot_v1(newcomer.slot)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.latest_lifecycle_sequence_v1().unwrap().get(), 1);
     }
 
     #[test]
