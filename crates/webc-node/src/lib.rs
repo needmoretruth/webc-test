@@ -18,6 +18,7 @@
 pub mod consensus_driver;
 pub mod gossip;
 pub mod http;
+pub mod http_v2;
 pub mod mempool;
 pub mod mempool_v1;
 pub mod node;
@@ -27,6 +28,13 @@ pub mod service;
 pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverExit, DriverTimeouts};
 pub use gossip::run_gossip_pump;
 pub use http::{router, serve, AppState, BlockEvent};
+pub use http_v2::{
+    router_v2, serve_v2, V2AppState, V2DropReason, V2ErrorBody, V2InsertOutcome,
+    V2LifecycleResponse, V2SubmitResponse, V2TransactionStatus, V2TransportConfigError,
+    V2TransportLimits, V2WsServerMessage, MAX_V2_CONCURRENT_SUBMISSIONS, MAX_V2_HTTP_BODY_BYTES,
+    MAX_V2_WS_MESSAGE_BYTES, MAX_V2_WS_SUBSCRIPTIONS, TRANSACTION_API_VERSION_V2,
+    V2_WS_SUBSCRIBE_TIMEOUT,
+};
 pub use mempool::{InsertOutcome, Mempool, MempoolConfig, MempoolError};
 pub use mempool_v1::{
     V5AdmissionPlan, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError,
