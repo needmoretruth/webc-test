@@ -1173,6 +1173,78 @@ storage retry, and a three-validator HTTP-to-gossip-to-consensus-to-finalized-
 receipt flow before wiring the public run command. Never reinterpret the legacy
 proposal bytes.
 
+### Protocol-2 consensus and public-runtime checkpoint (2026-07-27)
+
+Commits `454fe06`, `88fd46d`, `7f881cc`, `9aae82f`, `89609a2`, `afbcb66`,
+and `3f34ef2` close the distinct protocol-2 consensus path without changing the
+legacy wire format. Authenticated V4 proposals bind the chain, epoch, round,
+scheduled proposer, current authority commitment, complete block, and derived
+next authority set. Hostile outer and binary collection lengths are bounded
+before allocation. V5 network frames carry separate V4 proposal and state-sync
+variants, while the shared pure BFT state machine uses the protocol-2 signing
+domain and preserves a locked value across reproposal. Every locally signed
+proposal, prevote, and precommit is persisted in the existing bounded WAL before
+broadcast; restart restores the lock and refuses to sign a conflicting value.
+
+`NodeRuntime` remains the only state/mempool owner. Its actor commands build a
+candidate, replay proposal validity against committed state, and atomically
+finalize a certified V4 block. Commit `bd2dcf8` adds the asynchronous driver over
+only `NodeHandle` plus authenticated gossip: it verifies peer identity and
+signatures before replay accounting, deduplicates bounded rounds, synchronizes
+certified missing blocks, and retries transient finalization failures. A real
+three-validator TCP test submits V5 over HTTP, propagates it through V5 gossip,
+runs V4 proposal/vote consensus, and observes the finalized V1 receipt.
+
+Commit `3be828f` red-teams recovery rather than only the happy path. A real redb
+restart in the middle of a height proves that the validator never emits a
+conflicting signed message. Injected transient finalization I/O is retried and
+survives; persistent I/O exits with a typed error after the bounded retry budget.
+Commit `30d14a2` makes network rate limiting charge expanded work in 16 KiB
+units using the greater encoded or declared-decoded frame size before hashing,
+decompression, decoding, or reflooding. Locally compressed zstd frames declare
+their content size, and an attacker hiding it is charged the full 8 MiB budget.
+
+Commit `cb54931` exposes this stack through `webc-node run
+--protocol2-genesis <path>` while leaving the no-flag legacy command unchanged.
+The public process loads and validates the bounded protocol-2 genesis, starts one
+redb actor, authenticated network, V4 driver, V2 transaction API, lifecycle
+WebSocket, and `/v2/health`, and shuts the stack down cleanly. A distinct
+consensus signing key is supported but may enter only through a bounded keystore
+file. Secret bytes are retained in a zeroizing container and are never accepted
+through argv, environment variables, `Debug`, serialization, or logs. Unix
+permissions are checked on the same opened handle; Windows ACL hardening remains
+an explicit operator responsibility.
+
+The public assembly test starts the actual database, actor, P2P network, driver,
+and HTTP server. Node library/CLI/integration suites, strict Clippy, Rustdoc, V1
+network convergence/resilience, and the focused restart and retry suites pass.
+Commit `d31423f` additionally upgrades the deterministic interpreter to stable
+`wasmi` 0.46 (MIT OR Apache-2.0), removes the unmaintained transitive `paste`
+crate (`RUSTSEC-2024-0436`), and keeps a protocol-owned invocation fuel floor so
+engine optimization cannot silently make tiny-budget calls free. All VM tests,
+549 chain unit tests plus invariant/parallel integration tests, and
+`cargo deny check advisories licenses bans sources` pass.
+
+This checkpoint completes the planned V4 driver and public assembly, not the
+transaction system as a whole. A late-joining validator still needs a dedicated
+V4 state-sync integration test. The public API returns a finalized receipt but
+does not yet assemble a transaction/receipt inclusion proof or a signed
+authority checkpoint, so a browser must still trust the queried node. Localized
+multi-namespace receipt pricing remains a separately versioned follow-up, and
+Windows validator-key ACLs require deployment enforcement.
+
+Exact next item: implement finalized checkpoint and proof verification without
+inventing another Merkle tree. Extend `webc-proof` around the existing indexed
+Merkle proof, define bounded versioned authority checkpoints/transitions, and
+assemble a finalized transaction plus receipt proof from the atomically stored
+V4 block, receipt index, certificate, and authority snapshots. Expose it through
+a bounded V2 route, then add byte-identical TypeScript verification so the
+browser verifies block roots, certificate quorum, authority transitions, and
+the requested transaction/receipt binding independently of the serving node.
+Include tampered position/sibling/root, duplicate/foreign signer, wrong chain or
+epoch, skipped authority transition, hostile length, stale checkpoint, and
+cross-language fixture tests before calling the proof path complete.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
