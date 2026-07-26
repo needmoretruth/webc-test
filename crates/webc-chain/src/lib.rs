@@ -15,6 +15,7 @@ pub mod block_v4;
 pub mod bridge;
 pub mod canonical;
 pub mod consensus;
+pub mod consensus_v1;
 pub mod contract;
 pub mod dex;
 pub mod execution_v1;
@@ -78,8 +79,9 @@ pub use bridge::{
 pub use consensus::{
     detect_double_votes, DoubleVoteEvidence, FinalityCertificate, Proposal, SignedProposal,
     SignedVote, ValidatorPower, ValidatorSet, Vote, VoteType, CONSENSUS_PROPOSAL_DOMAIN,
-    CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN,
+    CONSENSUS_VOTE_DOMAIN, LEADER_SCHEDULE_DOMAIN, MAX_CONSENSUS_VOTES_PER_PROOF,
 };
+pub use consensus_v1::{ProposalV1Error, SignedProposalV1, CONSENSUS_PROPOSAL_V2_DOMAIN};
 pub use contract::{
     builtin_contract, kv_command, BuiltinContract, Contract, ContractContext, ContractError,
     ContractManifest, ContractRuntimeConfig, ContractStateValue, GasMeter, KeyValueContract,

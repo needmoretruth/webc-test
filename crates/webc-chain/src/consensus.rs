@@ -23,6 +23,15 @@ pub const LEADER_SCHEDULE_DOMAIN: &str = "WEBC_LEADER_SCHEDULE_V1";
 /// Domain separator for version-1 signed block proposals.
 pub const CONSENSUS_PROPOSAL_DOMAIN: &str = "WEBC_CONSENSUS_PROPOSAL_V1";
 
+/// Maximum independently signed votes accepted in one proof or certificate.
+///
+/// A valid proof never needs more entries than the maximum finality-authority
+/// set. Enforcing the same ceiling while deserializing prevents a hostile
+/// length prefix from reserving an attacker-chosen collection and bounds the
+/// later signature-verification loop.
+pub const MAX_CONSENSUS_VOTES_PER_PROOF: usize =
+    crate::finality_authority::MAX_FINALITY_AUTHORITIES_V1;
+
 /// Voting power assigned to one validator for BFT consensus.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorPower {
@@ -400,6 +409,7 @@ pub struct SignedProposal {
     /// still follow the lock instead of prevoting nil forever (the C5 liveness
     /// fix).
     #[serde(default)]
+    #[serde(deserialize_with = "bounded_votes::deserialize")]
     pub proof_of_lock: Vec<SignedVote>,
 }
 
@@ -515,47 +525,75 @@ impl SignedProposal {
         expected_protocol_version: ProtocolVersion,
         expected_chain_id: &ChainId,
     ) -> Result<(), ChainError> {
-        match self.payload.valid_round {
-            None => {
-                if self.proof_of_lock.is_empty() {
-                    Ok(())
-                } else {
-                    // A first proposal has nothing to prove; a non-empty set is
-                    // a malformed proposal.
-                    Err(ChainError::ConsensusProofOfLockInvalid)
-                }
-            }
-            Some(valid_round) => {
-                if valid_round >= self.payload.round {
-                    return Err(ChainError::ConsensusProofOfLockInvalid);
-                }
-                let mut seen = BTreeSet::new();
-                let mut power = Amount::ZERO;
-                for vote in &self.proof_of_lock {
-                    if vote.payload.vote_type != VoteType::Prevote
-                        || vote.payload.height != self.payload.height
-                        || vote.payload.round != valid_round
-                        || vote.payload.block_hash != self.payload.block_hash
-                        || vote.payload.protocol_version != expected_protocol_version
-                        || &vote.payload.chain_id != expected_chain_id
-                    {
-                        return Err(ChainError::ConsensusProofOfLockInvalid);
-                    }
-                    set.verify_vote(vote, expected_protocol_version, expected_chain_id)
-                        .map_err(|_| ChainError::ConsensusProofOfLockInvalid)?;
-                    if !seen.insert(vote.payload.validator) {
-                        // A duplicated validator cannot pad the lock power.
-                        return Err(ChainError::ConsensusProofOfLockInvalid);
-                    }
-                    power = power
-                        .checked_add(set.power_of(vote.payload.validator))
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                if !set.has_two_thirds_power(power) {
-                    return Err(ChainError::ConsensusProofOfLockInvalid);
-                }
+        verify_proof_of_lock(
+            set,
+            expected_protocol_version,
+            expected_chain_id,
+            self.payload.height,
+            self.payload.round,
+            self.payload.valid_round,
+            self.payload.block_hash,
+            &self.proof_of_lock,
+        )
+    }
+}
+
+/// Verifies the proof-of-lock rule shared by legacy and protocol-2 proposals.
+///
+/// The proposal containers and their signing domains remain version-specific;
+/// only this Tendermint safety rule is shared so the V4 path cannot drift from
+/// the already-tested quorum semantics.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_proof_of_lock(
+    set: &ValidatorSet,
+    expected_protocol_version: ProtocolVersion,
+    expected_chain_id: &ChainId,
+    height: u64,
+    proposal_round: u32,
+    valid_round: Option<u32>,
+    block_hash: Hash256,
+    proof_of_lock: &[SignedVote],
+) -> Result<(), ChainError> {
+    if proof_of_lock.len() > MAX_CONSENSUS_VOTES_PER_PROOF {
+        return Err(ChainError::ConsensusProofOfLockInvalid);
+    }
+    match valid_round {
+        None => {
+            if proof_of_lock.is_empty() {
                 Ok(())
+            } else {
+                Err(ChainError::ConsensusProofOfLockInvalid)
             }
+        }
+        Some(valid_round) => {
+            if valid_round >= proposal_round {
+                return Err(ChainError::ConsensusProofOfLockInvalid);
+            }
+            let mut seen = BTreeSet::new();
+            let mut power = Amount::ZERO;
+            for vote in proof_of_lock {
+                if vote.payload.vote_type != VoteType::Prevote
+                    || vote.payload.height != height
+                    || vote.payload.round != valid_round
+                    || vote.payload.block_hash != block_hash
+                    || vote.payload.protocol_version != expected_protocol_version
+                    || &vote.payload.chain_id != expected_chain_id
+                {
+                    return Err(ChainError::ConsensusProofOfLockInvalid);
+                }
+                set.verify_vote(vote, expected_protocol_version, expected_chain_id)
+                    .map_err(|_| ChainError::ConsensusProofOfLockInvalid)?;
+                if !seen.insert(vote.payload.validator) {
+                    return Err(ChainError::ConsensusProofOfLockInvalid);
+                }
+                power = power
+                    .checked_add(set.power_of(vote.payload.validator))
+                    .ok_or(ChainError::ArithmeticOverflow)?;
+            }
+            if !set.has_two_thirds_power(power) {
+                return Err(ChainError::ConsensusProofOfLockInvalid);
+            }
+            Ok(())
         }
     }
 }
@@ -579,6 +617,7 @@ pub struct FinalityCertificate {
     /// Finalized block hash.
     pub block_hash: Hash256,
     /// Precommit votes, each for exactly this height/round/block.
+    #[serde(deserialize_with = "bounded_votes::deserialize")]
     pub precommits: Vec<SignedVote>,
 }
 
@@ -649,6 +688,9 @@ impl FinalityCertificate {
         {
             return Err(ChainError::ConsensusConfigMismatch);
         }
+        if self.precommits.len() > MAX_CONSENSUS_VOTES_PER_PROOF {
+            return Err(ChainError::FinalityQuorumNotReached);
+        }
         let mut seen = BTreeSet::new();
         let mut power = Amount::ZERO;
         for vote in &self.precommits {
@@ -674,6 +716,59 @@ impl FinalityCertificate {
             return Err(ChainError::FinalityQuorumNotReached);
         }
         Ok(())
+    }
+}
+
+/// Serde visitor that enforces the vote-count ceiling before retaining entries.
+pub(crate) mod bounded_votes {
+    use std::{fmt, marker::PhantomData};
+
+    use serde::de::{SeqAccess, Visitor};
+    use serde::Deserializer;
+
+    use super::{SignedVote, MAX_CONSENSUS_VOTES_PER_PROOF};
+
+    /// Deserializes a vote sequence without trusting its advertised length.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<SignedVote>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VotesVisitor(PhantomData<SignedVote>);
+
+        impl<'de> Visitor<'de> for VotesVisitor {
+            type Value = Vec<SignedVote>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded consensus vote array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|hint| hint > MAX_CONSENSUS_VOTES_PER_PROOF)
+                {
+                    return Err(serde::de::Error::custom("too many consensus votes"));
+                }
+                let mut votes = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or(0)
+                        .min(MAX_CONSENSUS_VOTES_PER_PROOF),
+                );
+                while let Some(vote) = sequence.next_element()? {
+                    if votes.len() == MAX_CONSENSUS_VOTES_PER_PROOF {
+                        return Err(serde::de::Error::custom("too many consensus votes"));
+                    }
+                    votes.push(vote);
+                }
+                Ok(votes)
+            }
+        }
+
+        deserializer.deserialize_seq(VotesVisitor(PhantomData))
     }
 }
 
@@ -704,6 +799,32 @@ mod tests {
     use crate::{Amount, Validator};
     use proptest::prelude::*;
     use webc_crypto::{Keypair, PublicKeyBytes};
+
+    #[test]
+    fn bounded_vote_decoder_rejects_declared_oversize_before_elements() {
+        #[derive(Debug, Deserialize)]
+        struct VoteList {
+            #[serde(deserialize_with = "bounded_votes::deserialize")]
+            #[allow(dead_code)]
+            votes: Vec<SignedVote>,
+        }
+        #[derive(Serialize)]
+        struct HostileList {
+            votes: Vec<u8>,
+        }
+
+        // The element bytes intentionally are not SignedVote values. A bounded
+        // visitor rejects the advertised count before attempting to decode even
+        // the first element; without the size-hint check this would fail later
+        // only after trusting the hostile collection length.
+        let bytes = bincode::serialize(&HostileList {
+            votes: vec![0; MAX_CONSENSUS_VOTES_PER_PROOF + 1],
+        })
+        .expect("hostile sequence encodes");
+        let error = bincode::deserialize::<VoteList>(&bytes)
+            .expect_err("oversized declared vote sequence must fail");
+        assert!(error.to_string().contains("too many consensus votes"));
+    }
 
     proptest! {
         // C8: the overflow-safe threshold matches the naive reference across the
