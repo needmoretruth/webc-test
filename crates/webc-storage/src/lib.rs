@@ -48,7 +48,7 @@ pub use lifecycle::{
     FinalizedReceiptRecordV1, FinalizedTransactionIndexV1, LifecycleSequence, LocalDropReasonV1,
     LocalTimestampMs, LocalTransactionObservationV1, PendingAdmissionOutcomeV1, PendingSlotV1,
     PendingTransactionRecordV1, TransactionConsensusFactV1, TransactionLifecycleV1,
-    TRANSACTION_LIFECYCLE_RECORD_V1,
+    MAX_PENDING_TRANSACTION_SCAN_V1, TRANSACTION_LIFECYCLE_RECORD_V1,
 };
 pub use memory::MemoryKvStore;
 pub use redb_store::RedbKvStore;

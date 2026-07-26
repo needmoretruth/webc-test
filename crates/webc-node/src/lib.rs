@@ -21,6 +21,7 @@ pub mod http;
 pub mod mempool;
 pub mod mempool_v1;
 pub mod node;
+pub mod runtime_v1;
 pub mod service;
 
 pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverExit, DriverTimeouts};
@@ -31,6 +32,10 @@ pub use mempool_v1::{
     V5AdmissionPlan, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError,
 };
 pub use node::{Node, NodeError};
+pub use runtime_v1::{
+    NodeHandle, NodeRuntime, NodeRuntimeError, V5RuntimeStats, V5SubmitReceipt,
+    DEFAULT_V5_RUNTIME_QUEUE_CAPACITY,
+};
 pub use service::{
     ApiError, FaucetConfig, NetworkAdmission, NodeService, NodeServiceOptions, API_VERSION,
 };

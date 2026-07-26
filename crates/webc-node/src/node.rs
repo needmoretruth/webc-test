@@ -25,7 +25,7 @@
 use webc_chain::{
     apply_block, build_block, Block, BlockBuildInput, ChainConfig, ChainError, ChainState,
     ConsensusWalRecord, FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction,
-    ValidatorSet,
+    ValidatorSet, CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Hash256};
 use webc_storage::{BlockCommit, ChainStore, KvStore, StorageError};
@@ -43,6 +43,9 @@ pub enum NodeError {
     /// The persisted chain belongs to a different network than the genesis config.
     #[error("stored chain id does not match the genesis configuration")]
     ChainIdMismatch,
+    /// A legacy block-format method was called on a protocol-2 node.
+    #[error("legacy block API is inactive under protocol 2")]
+    LegacyBlockApiInactive,
 }
 
 /// A single-proposer, restartable WEBC node over any storage backend.
@@ -75,7 +78,11 @@ impl<K: KvStore> Node<K> {
                 existing
             }
             None => {
-                let genesis_state = ChainState::from_genesis(genesis)?;
+                let genesis_state = if config.protocol_version == TRANSACTION_V5_PROTOCOL_VERSION {
+                    ChainState::from_genesis_v1(genesis)?
+                } else {
+                    ChainState::from_genesis(genesis)?
+                };
                 store.initialize_genesis(&genesis_state)?;
                 genesis_state
             }
@@ -121,6 +128,16 @@ impl<K: KvStore> Node<K> {
         &self.store
     }
 
+    /// Mutable storage access for crate-internal single-owner orchestration.
+    ///
+    /// This is deliberately not public outside `webc-node`: the protocol-2
+    /// runtime must persist a pending transition before updating its in-memory
+    /// index, while API and networking callers may only reach that path through
+    /// the bounded actor handle.
+    pub(crate) fn store_mut(&mut self) -> &mut ChainStore<K> {
+        &mut self.store
+    }
+
     /// Produces, executes, and durably commits the next block.
     ///
     /// `transactions` are executed in order against a clone of the current state;
@@ -136,6 +153,7 @@ impl<K: KvStore> Node<K> {
         proposer: Address,
         timestamp_ms: u64,
     ) -> Result<Block, NodeError> {
+        self.ensure_legacy_block_api()?;
         let height = self.height() + 1;
         // A zero parent hash marks the genesis parent for block 1; the store's
         // parent-linkage check only enforces equality once a real parent exists.
@@ -205,6 +223,7 @@ impl<K: KvStore> Node<K> {
         &self,
         height: u64,
     ) -> Result<Option<(Block, FinalityCertificate)>, NodeError> {
+        self.ensure_legacy_block_api()?;
         let Some(block) = self.store.block_by_height(height)? else {
             return Ok(None);
         };
@@ -229,6 +248,7 @@ impl<K: KvStore> Node<K> {
         proposer: Address,
         timestamp_ms: u64,
     ) -> Result<Block, NodeError> {
+        self.ensure_legacy_block_api()?;
         let height = self.height() + 1;
         let previous_hash = self.tip_hash().unwrap_or(Hash256([0u8; 32]));
         let epoch = self.state.current_epoch;
@@ -291,6 +311,7 @@ impl<K: KvStore> Node<K> {
         block: Block,
         certificate: Option<&FinalityCertificate>,
     ) -> Result<(), NodeError> {
+        self.ensure_legacy_block_api()?;
         if block.header.chain_id != self.config.chain_id {
             return Err(NodeError::ChainIdMismatch);
         }
@@ -317,6 +338,14 @@ impl<K: KvStore> Node<K> {
             certificate,
         })?;
         self.state = next_state;
+        Ok(())
+    }
+
+    /// Stops V3-header/legacy-transaction methods from writing a protocol-2 store.
+    fn ensure_legacy_block_api(&self) -> Result<(), NodeError> {
+        if self.config.protocol_version != CURRENT_PROTOCOL_VERSION {
+            return Err(NodeError::LegacyBlockApiInactive);
+        }
         Ok(())
     }
 }
@@ -366,6 +395,33 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn protocol_two_node_opens_but_legacy_block_methods_fail_closed() {
+        let alice = Keypair::from_seed([0x81; 32]);
+        let genesis = GenesisConfig {
+            chain: ChainConfig {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                ..ChainConfig::default()
+            },
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: Amount::from_units(100_000),
+            }],
+            validators: Vec::new(),
+        };
+        let mut node =
+            Node::open(MemoryKvStore::new(), &genesis).expect("protocol-2 state and schema open");
+        assert_eq!(
+            node.state().protocol_version,
+            TRANSACTION_V5_PROTOCOL_VERSION
+        );
+        assert!(matches!(
+            node.produce_block(Vec::new(), Vec::new(), alice.address(), 1),
+            Err(NodeError::LegacyBlockApiInactive)
+        ));
+        assert_eq!(node.height(), 0);
     }
 
     #[test]

@@ -1708,7 +1708,34 @@ impl ChainState {
     /// partially constructed state and returns a typed error. Phase 1 adds full
     /// supply reconciliation and prevents stake from being counted twice.
     pub fn from_genesis(genesis: &GenesisConfig) -> Result<Self, ChainError> {
-        let mut state = Self::new(&genesis.chain)?;
+        let state = Self::new(&genesis.chain)?;
+        Self::populate_genesis(state, genesis)
+    }
+
+    /// Builds protocol-2 initial state from the shared versioned genesis shape.
+    ///
+    /// Protocol 2 deliberately has a separate constructor so legacy callers of
+    /// [`Self::new`] and [`Self::from_genesis`] cannot silently opt into V5
+    /// semantics. Allocation, staking, configuration, and total-supply checks
+    /// remain one shared implementation, preventing versioned genesis paths from
+    /// drifting economically. Unknown and legacy versions fail closed.
+    pub fn from_genesis_v1(genesis: &GenesisConfig) -> Result<Self, ChainError> {
+        if genesis.chain.protocol_version != crate::TRANSACTION_V5_PROTOCOL_VERSION {
+            return Err(ChainError::UnsupportedProtocolVersion {
+                actual: genesis.chain.protocol_version,
+            });
+        }
+        let state = Self {
+            protocol_version: genesis.chain.protocol_version,
+            chain_id: genesis.chain.chain_id.clone(),
+            current_base_fee_per_unit: genesis.chain.fee_policy.min_base_fee_per_unit,
+            ..Self::default()
+        };
+        Self::populate_genesis(state, genesis)
+    }
+
+    /// Applies the version-independent, consensus-critical genesis allocation.
+    fn populate_genesis(mut state: Self, genesis: &GenesisConfig) -> Result<Self, ChainError> {
         // Storage pricing is immutable genesis state. Reject an impossible
         // refund share now rather than allowing object creation and discovering
         // the malformed policy only when a later owner attempts deletion.
@@ -12613,6 +12640,42 @@ mod tests {
             ChainState::new(&config),
             Err(ChainError::UnsupportedProtocolVersion { actual })
                 if actual == ProtocolVersion::new(2)
+        ));
+    }
+
+    #[test]
+    fn protocol_two_genesis_uses_shared_supply_and_configuration_checks() {
+        let alice = Keypair::from_seed([0x91; 32]);
+        let declared = Amount::from_units(50_000);
+        let genesis = GenesisConfig {
+            chain: ChainConfig {
+                protocol_version: crate::TRANSACTION_V5_PROTOCOL_VERSION,
+                expected_total_supply: Some(declared),
+                ..ChainConfig::default()
+            },
+            accounts: vec![GenesisAccount {
+                address: alice.address(),
+                balance: declared,
+            }],
+            validators: Vec::new(),
+        };
+
+        let state = ChainState::from_genesis_v1(&genesis)
+            .expect("an exactly funded protocol-2 genesis is accepted");
+        assert_eq!(
+            state.protocol_version,
+            crate::TRANSACTION_V5_PROTOCOL_VERSION
+        );
+        assert_eq!(state.chain_id, genesis.chain.chain_id);
+        assert_eq!(state.minted_supply, declared);
+        assert!(state.supply_invariant_report().unwrap().balanced);
+
+        let mut wrong_total = genesis;
+        wrong_total.chain.expected_total_supply = Some(Amount::from_units(50_001));
+        assert!(matches!(
+            ChainState::from_genesis_v1(&wrong_total),
+            Err(ChainError::GenesisSupplyMismatch { expected, actual })
+                if expected == Amount::from_units(50_001) && actual == declared
         ));
     }
 
