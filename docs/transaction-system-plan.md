@@ -1031,6 +1031,35 @@ and TypeScript freeze commitment
 This closes the prerequisite for checking a V4 header's current authority root
 before accepting its finality certificate in the atomic storage batch.
 
+### Atomic finalized-lifecycle checkpoint (2026-07-27)
+
+Commit `db55f65` completes the protocol-2 storage finalization unit. One backend
+transaction now persists the validated V4 block and hash index, latest schema-2
+state, immutable current/next authority sets, mandatory exact-block finality
+certificate, consensus-WAL deletion, pending-slot/transaction deletions,
+finalized transaction-position and complete V1 receipt indexes, authoritative
+consensus lifecycle facts, lifecycle sequence, and new tip. The frozen
+protocol-1 `Block` path now rejects protocol 2 rather than reinterpreting it.
+
+The failure coverage is adversarial rather than happy-path only: a redb reopen
+restores the block, state, certificate, authority set, transaction, receipt,
+position, lifecycle, and sequence; a certified older transaction displaces a
+conflicting local replacement without letting the local observation override
+finality; invalid certificate and authority commitments leave the pending state
+unchanged; an injected backend failure exposes none of the staged block/tip/
+index writes; an epoch's authority set cannot be rewritten; and one block cannot
+finalize two transaction IDs for the same `(sender, lane, nonce)` slot. Strict
+storage Clippy, all 67 storage tests, focused restart/rollback tests, Rust
+formatting, and storage documentation generation pass.
+
+Exact next item: integrate the durable V5 records with a protocol-2 mempool and
+the single `NodeRuntime` actor/handle boundary from ADR-0016. Admission must
+prepare/validate against one state view, durably commit before acknowledging or
+gossiping, rebuild bounded in-memory indexes after restart, apply deterministic
+replacement/expiry/eviction policy, and keep the protocol-1 runtime behavior
+unchanged. Then expose the resulting lifecycle through the bounded V2 HTTP and
+WebSocket APIs before starting finalized checkpoint/proof/browser verification.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
