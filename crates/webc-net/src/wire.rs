@@ -11,7 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 use webc_chain::{
-    Block, FinalityCertificate, SignedProposal, SignedVote, Transaction, TransactionV5,
+    Block, BlockHeight, BlockV4, FinalityAuthoritySetV1, FinalityCertificate, SignedProposal,
+    SignedProposalV1, SignedVote, Transaction, TransactionV5,
 };
 use webc_crypto::Hash256;
 
@@ -48,7 +49,11 @@ pub const NET_PROTOCOL_MAGIC: [u8; 4] = *b"WEBC";
 /// variant. It is appended to preserve the earlier enum discriminants, but a v4
 /// peer cannot interpret the new variant and therefore must fail the versioned
 /// handshake rather than silently drop or misparse protocol-2 gossip.
-pub const NET_PROTOCOL_VERSION: u16 = 5;
+///
+/// v6 (protocol-2 consensus): distinct V4 proposal and state-sync variants were
+/// appended. A v5 node must reject the handshake because it cannot authenticate
+/// or route V4 block bytes and their successor authority snapshots.
+pub const NET_PROTOCOL_VERSION: u16 = 6;
 
 /// Length of the clear frame header: the fixed magic followed by the
 /// little-endian wire version. These bytes are never compressed, so
@@ -58,10 +63,11 @@ const FRAME_HEADER_LEN: usize = NET_PROTOCOL_MAGIC.len() + 2;
 
 /// Maximum size of a single decoded frame payload, in bytes.
 ///
-/// This bounds the memory a single peer can force the node to allocate for one
-/// message. It is generous enough for a full block's worth of transactions but
-/// small enough that a hostile peer cannot exhaust memory with one frame.
-pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Protocol-2 proposals and sync replies carry a bounded V4 block plus an
+/// authority snapshot and, for sync, a certificate. Eight MiB matches the
+/// checkpoint envelope ceiling in ADR-0016 while the codec and transport still
+/// reject both compressed and expanded payloads beyond this exact budget.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// One gossiped peer-to-peer message.
 ///
@@ -89,6 +95,17 @@ pub enum NetMessage {
     BlockResponse(Box<CertifiedBlock>),
     /// A signed protocol-2 V5 transaction propagated between bounded mempools.
     TransactionV5(Box<TransactionV5>),
+    /// A protocol-2 leader proposal carrying a V4 block and successor set.
+    ProposalV4(Box<SignedProposalV1>),
+    /// A protocol-2 request for finalized V4 blocks from one typed height.
+    BlockRequestV4 {
+        /// First protocol-2 height requested, inclusive.
+        from_height: BlockHeight,
+        /// Maximum number of consecutive responses requested.
+        max: u32,
+    },
+    /// One certified V4 block returned directly to a syncing peer.
+    BlockResponseV4(Box<CertifiedBlockV4>),
 }
 
 /// A finalized block bundled with the certificate that proves its finality, sent
@@ -98,6 +115,21 @@ pub struct CertifiedBlock {
     /// The finalized block.
     pub block: Block,
     /// The certificate proving strictly over two thirds precommitted it.
+    pub certificate: FinalityCertificate,
+}
+
+/// One finalized protocol-2 block and the data needed to import its successor.
+///
+/// The receiver verifies `certificate` against its already-trusted current set,
+/// replays `block`, checks the next-set commitment, and only then persists all
+/// three atomically. Merely decoding this transport container grants no trust.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertifiedBlockV4 {
+    /// Exact finalized V4 block.
+    pub block: BlockV4,
+    /// Concrete set committed to authorize the following height.
+    pub next_authority_set: FinalityAuthoritySetV1,
+    /// Precommit quorum over the exact V4 header hash.
     pub certificate: FinalityCertificate,
 }
 
@@ -172,7 +204,12 @@ pub fn message_id(encoded_frame: &[u8]) -> Hash256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webc_chain::{Amount, FeeBid, Operation, Transaction};
+    use std::collections::BTreeMap;
+
+    use webc_chain::{
+        Amount, BlockHeaderV4, ChainId, Epoch, FeeBid, Operation, ProtocolVersion, ValidatorPower,
+        ValidatorSet, Vote, VoteType, TRANSACTION_V5_PROTOCOL_VERSION,
+    };
     use webc_crypto::Keypair;
 
     fn transaction_with_amount(amount: Amount) -> Transaction {
@@ -333,6 +370,78 @@ mod tests {
         .unwrap()
     }
 
+    fn sample_v4_fixture() -> (Keypair, FinalityAuthoritySetV1, BlockV4) {
+        let leader = Keypair::from_seed([21; 32]);
+        let validator_set = ValidatorSet {
+            validators: BTreeMap::from([(
+                leader.address(),
+                ValidatorPower {
+                    validator: leader.address(),
+                    power: Amount::from_units(1),
+                    consensus_key: leader.public_key(),
+                },
+            )]),
+            total_power: Amount::from_units(1),
+        };
+        let authority_set = FinalityAuthoritySetV1::from_validator_set(
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            Epoch::new(0),
+            &validator_set,
+        )
+        .expect("V4 authority fixture validates");
+        let commitment = authority_set.commitment().expect("authority commits");
+        let block = BlockV4 {
+            header: BlockHeaderV4 {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height: BlockHeight::new(1),
+                epoch: Epoch::new(0),
+                previous_hash: Hash256::digest(b"v4-parent"),
+                state_root: Hash256::digest(b"v4-state"),
+                account_root: Hash256::digest(b"v4-accounts"),
+                tx_root: Hash256::ZERO,
+                receipt_root: Hash256::ZERO,
+                evidence_root: Hash256::ZERO,
+                finality_authority_set_root: commitment,
+                next_finality_authority_set_root: commitment,
+                proposer: leader.address(),
+                timestamp_ms: 1,
+                base_fee_per_unit: 1,
+            },
+            transactions: Vec::new(),
+            receipts: Vec::new(),
+            evidence: Vec::new(),
+        };
+        block.validate().expect("empty V4 fixture validates");
+        (leader, authority_set, block)
+    }
+
+    fn sample_v4_certificate(leader: &Keypair, block: &BlockV4) -> FinalityCertificate {
+        let block_hash = block.header.hash().expect("V4 block hashes");
+        let vote = SignedVote::sign(
+            Vote {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height: block.header.height.get(),
+                round: 0,
+                vote_type: VoteType::Precommit,
+                block_hash,
+                validator: leader.address(),
+            },
+            leader,
+        )
+        .expect("V4 precommit signs");
+        FinalityCertificate {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            chain_id: ChainId::devnet(),
+            height: block.header.height.get(),
+            round: 0,
+            block_hash,
+            precommits: vec![vote],
+        }
+    }
+
     #[test]
     fn round_trips_a_proposal_message() {
         let leader = Keypair::from_seed([1u8; 32]);
@@ -353,6 +462,25 @@ mod tests {
             panic!("expected a proposal message");
         };
         assert_eq!(got.payload.block_hash, proposal.payload.block_hash);
+    }
+
+    #[test]
+    fn round_trips_a_distinct_v4_proposal_message() {
+        let (leader, authority_set, block) = sample_v4_fixture();
+        let expected_hash = block.header.hash().expect("V4 block hashes");
+        let proposal = SignedProposalV1::sign(0, block, authority_set.clone(), &leader)
+            .expect("V4 proposal signs");
+        let encoded = encode_message(&NetMessage::ProposalV4(Box::new(proposal)))
+            .expect("V4 proposal frame encodes");
+        let decoded = decode_message(&encoded).expect("V4 proposal frame decodes");
+        let NetMessage::ProposalV4(proposal) = decoded else {
+            panic!("expected a protocol-2 proposal message");
+        };
+        assert_eq!(proposal.payload.protocol_version, ProtocolVersion::new(2));
+        assert_eq!(proposal.payload.block_hash, expected_hash);
+        proposal
+            .verify_in_authority_set(&authority_set)
+            .expect("decoded V4 proposal authenticates");
     }
 
     #[test]
@@ -404,6 +532,48 @@ mod tests {
             panic!("expected a block response message");
         };
         assert_eq!(got.block.hash().unwrap(), block.hash().unwrap());
+    }
+
+    #[test]
+    fn round_trips_protocol2_block_request_and_certified_response() {
+        let request = NetMessage::BlockRequestV4 {
+            from_height: BlockHeight::new(9),
+            max: 16,
+        };
+        let decoded = decode_message(&encode_message(&request).expect("request encodes"))
+            .expect("request decodes");
+        assert!(matches!(
+            decoded,
+            NetMessage::BlockRequestV4 {
+                from_height,
+                max: 16
+            } if from_height == BlockHeight::new(9)
+        ));
+
+        let (leader, next_authority_set, block) = sample_v4_fixture();
+        let expected_hash = block.header.hash().expect("V4 block hashes");
+        let response = NetMessage::BlockResponseV4(Box::new(CertifiedBlockV4 {
+            certificate: sample_v4_certificate(&leader, &block),
+            block,
+            next_authority_set,
+        }));
+        let decoded = decode_message(&encode_message(&response).expect("response encodes"))
+            .expect("response decodes");
+        let NetMessage::BlockResponseV4(response) = decoded else {
+            panic!("expected a protocol-2 block response");
+        };
+        assert_eq!(
+            response.block.header.hash().expect("decoded block hashes"),
+            expected_hash
+        );
+        assert_eq!(response.certificate.block_hash, expected_hash);
+        assert_eq!(
+            response
+                .next_authority_set
+                .commitment()
+                .expect("decoded set commits"),
+            response.block.header.next_finality_authority_set_root
+        );
     }
 
     #[test]
@@ -568,18 +738,18 @@ mod tests {
         ));
     }
 
-    /// A frame carrying wire version 4 is rejected at the clear header before a
-    /// newly-added V5 transaction discriminant can ever be decoded.
+    /// A frame carrying wire version 5 is rejected at the clear header before a
+    /// newly-added V4 consensus discriminant can ever be decoded.
     #[test]
     fn rejects_the_previous_wire_version() {
-        assert_eq!(NET_PROTOCOL_VERSION, 5, "this test pins the v4 to v5 bump");
+        assert_eq!(NET_PROTOCOL_VERSION, 6, "this test pins the v5 to v6 bump");
         let message = NetMessage::Transaction(Box::new(sample_transaction()));
         let mut encoded = encode_message(&message).unwrap();
-        // Stamp the little-endian version field (bytes 4..6) back to 4.
-        encoded[4..6].copy_from_slice(&4u16.to_le_bytes());
+        // Stamp the little-endian version field (bytes 4..6) back to 5.
+        encoded[4..6].copy_from_slice(&5u16.to_le_bytes());
         assert!(matches!(
             decode_message(&encoded).unwrap_err(),
-            NetError::UnsupportedVersion { actual: 4 }
+            NetError::UnsupportedVersion { actual: 5 }
         ));
     }
 

@@ -28,6 +28,6 @@ pub use handshake::{
 };
 pub use transport::{spawn_network, InboundMessage, NetworkConfig, NetworkHandle};
 pub use wire::{
-    decode_message, encode_message, message_id, CertifiedBlock, NetMessage, MAX_FRAME_BYTES,
-    NET_PROTOCOL_MAGIC, NET_PROTOCOL_VERSION,
+    decode_message, encode_message, message_id, CertifiedBlock, CertifiedBlockV4, NetMessage,
+    MAX_FRAME_BYTES, NET_PROTOCOL_MAGIC, NET_PROTOCOL_VERSION,
 };

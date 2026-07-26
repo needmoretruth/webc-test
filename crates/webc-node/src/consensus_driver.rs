@@ -556,6 +556,11 @@ impl<K: KvStore + Send + Sync + 'static> ConsensusDriver<K> {
             // Protocol-2 transactions are consumed by the V5 runtime pump. The
             // frozen protocol-1 driver must never reinterpret them.
             NetMessage::TransactionV5(_) => return Ok(()),
+            // Protocol-2 consensus and sync artifacts have a separate V4
+            // driver. The legacy machine must never reinterpret their bytes.
+            NetMessage::ProposalV4(_)
+            | NetMessage::BlockRequestV4 { .. }
+            | NetMessage::BlockResponseV4(_) => return Ok(()),
             NetMessage::Proposal(proposal) => {
                 // C1 (`valid(v)`): only a proposal whose block re-executes
                 // cleanly at this exact chain position may reach the machine.

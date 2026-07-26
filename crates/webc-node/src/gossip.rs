@@ -43,7 +43,10 @@ where
             | NetMessage::Certificate(_)
             | NetMessage::BlockRequest { .. }
             | NetMessage::BlockResponse(_)
-            | NetMessage::TransactionV5(_) => {}
+            | NetMessage::TransactionV5(_)
+            | NetMessage::ProposalV4(_)
+            | NetMessage::BlockRequestV4 { .. }
+            | NetMessage::BlockResponseV4(_) => {}
         }
     }
 }

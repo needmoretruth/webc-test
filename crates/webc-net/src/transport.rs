@@ -699,7 +699,10 @@ async fn worker(
                             // gossip: deliver it locally but never reflood it, or
                             // one node's directed answer would still fan full
                             // blocks across the whole mesh (C7).
-                            let is_directed = matches!(message, NetMessage::BlockResponse(_));
+                            let is_directed = matches!(
+                                message,
+                                NetMessage::BlockResponse(_) | NetMessage::BlockResponseV4(_)
+                            );
                             let _ = inbound_tx.try_send(InboundMessage { from, message });
                             if !is_directed {
                                 // Continue the flood to everyone except the sender.
