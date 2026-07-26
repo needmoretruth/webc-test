@@ -138,10 +138,10 @@ pub use protocol::{
 };
 pub use receipt_v1::{
     receipt_root_v1, transaction_leaf_v1, transaction_root_v1, verify_transaction_receipt_binding,
-    ActionIndex, BlockPositionV1, EventIndex, EventV1, ExecutionFailureCodeV1, ReceiptError,
-    ReceiptStatusV1, ReceiptV1, TransactionIndex, EVENT_V1, EVENT_V1_DOMAIN, MAX_RECEIPT_EVENTS_V1,
-    MAX_RECEIPT_V1_JSON_BYTES, RECEIPT_LEAF_V1_DOMAIN, RECEIPT_V1, RECEIPT_V1_DOMAIN,
-    TRANSACTION_LEAF_V1_DOMAIN,
+    verify_transaction_receipt_pair_v1, ActionIndex, BlockPositionV1, EventIndex, EventV1,
+    ExecutionFailureCodeV1, ReceiptError, ReceiptStatusV1, ReceiptV1, TransactionIndex, EVENT_V1,
+    EVENT_V1_DOMAIN, MAX_RECEIPT_EVENTS_V1, MAX_RECEIPT_V1_JSON_BYTES, RECEIPT_LEAF_V1_DOMAIN,
+    RECEIPT_V1, RECEIPT_V1_DOMAIN, TRANSACTION_LEAF_V1_DOMAIN,
 };
 pub use round::{
     ConsensusAction, ConsensusActionV1, ConsensusEvent, ConsensusEventV1, ConsensusMachine,

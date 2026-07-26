@@ -75,6 +75,7 @@ pub struct IndexedMerkleProofV1 {
     /// Total number of leaves committed by the expected root.
     pub leaf_count: MerkleLeafCount,
     /// Bottom-up sibling digests, one per tree level.
+    #[serde(deserialize_with = "bounded_siblings::deserialize")]
     pub siblings: Vec<Hash256>,
 }
 
@@ -258,6 +259,61 @@ fn required_depth(mut count: u64) -> usize {
 
 const fn half_rounded_up(value: u64) -> u64 {
     value / 2 + value % 2
+}
+
+mod bounded_siblings {
+    use std::{fmt, marker::PhantomData};
+
+    use serde::{de::SeqAccess, de::Visitor, Deserializer};
+    use webc_crypto::Hash256;
+
+    use super::MAX_INDEXED_MERKLE_SIBLINGS;
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Hash256>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SiblingVisitor(PhantomData<Hash256>);
+
+        impl<'de> Visitor<'de> for SiblingVisitor {
+            type Value = Vec<Hash256>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an indexed Merkle path with at most 64 siblings")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|hint| hint > MAX_INDEXED_MERKLE_SIBLINGS)
+                {
+                    return Err(serde::de::Error::custom(
+                        "indexed Merkle path exceeds its sibling limit",
+                    ));
+                }
+                let mut siblings = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or(0)
+                        .min(MAX_INDEXED_MERKLE_SIBLINGS),
+                );
+                while let Some(sibling) = sequence.next_element()? {
+                    if siblings.len() == MAX_INDEXED_MERKLE_SIBLINGS {
+                        return Err(serde::de::Error::custom(
+                            "indexed Merkle path exceeds its sibling limit",
+                        ));
+                    }
+                    siblings.push(sibling);
+                }
+                Ok(siblings)
+            }
+        }
+
+        deserializer.deserialize_seq(SiblingVisitor(PhantomData))
+    }
 }
 
 mod canonical_u64 {

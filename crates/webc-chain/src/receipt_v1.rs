@@ -543,21 +543,32 @@ pub fn verify_transaction_receipt_binding(
         if !seen.insert(transaction_id) {
             return Err(ReceiptError::DuplicateTransactionId { transaction_id });
         }
-        if receipt.transaction_id != transaction_id {
-            return Err(ReceiptError::ReceiptTransactionIdMismatch {
-                index: transaction_index,
-            });
-        }
-        if receipt.sender != transaction.sender {
-            return Err(ReceiptError::ReceiptSenderMismatch {
-                index: transaction_index,
-            });
-        }
-        receipt.validate()?;
-        verify_receipt_fee_binding(transaction_index, transaction, &receipt.fee_summary)?;
-        verify_receipt_action_binding(transaction, receipt)?;
+        verify_transaction_receipt_pair_v1(transaction, receipt)?;
     }
     Ok(())
+}
+
+/// Verifies one signed transaction and receipt pair at the receipt's position.
+///
+/// This is the shared single-pair verifier for finalized inclusion proofs. It
+/// checks the complete transaction ID, sender, fee bid/payer reconciliation,
+/// receipt-local invariants, and action/event positions. The containing block or
+/// proof remains responsible for checking that `receipt.position` is the exact
+/// requested Merkle index and block height.
+pub fn verify_transaction_receipt_pair_v1(
+    transaction: &TransactionV5,
+    receipt: &ReceiptV1,
+) -> Result<(), ReceiptError> {
+    let index = receipt.position.transaction_index;
+    if receipt.transaction_id != transaction.transaction_id()? {
+        return Err(ReceiptError::ReceiptTransactionIdMismatch { index });
+    }
+    if receipt.sender != transaction.sender {
+        return Err(ReceiptError::ReceiptSenderMismatch { index });
+    }
+    receipt.validate()?;
+    verify_receipt_fee_binding(index, transaction, &receipt.fee_summary)?;
+    verify_receipt_action_binding(transaction, receipt)
 }
 
 fn verify_receipt_action_binding(

@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod checkpoint;
+mod finalized_transaction;
 mod indexed_merkle;
 
 pub use checkpoint::{
@@ -22,6 +23,13 @@ pub use checkpoint::{
     ValidatedCheckpointV1, AUTHORITY_SET_TRANSITION_V1, AUTHORITY_SET_TRANSITION_V1_DOMAIN,
     CHECKPOINT_V1, CHECKPOINT_V1_DOMAIN, MAX_AUTHORITY_SET_TRANSITION_V1_JSON_BYTES,
     MAX_CHECKPOINT_V1_JSON_BYTES,
+};
+pub use finalized_transaction::{
+    verify_finalized_transaction_proof_v1, FinalizedTransactionProofErrorV1,
+    FinalizedTransactionProofRequirementsV1, FinalizedTransactionProofV1,
+    VerifiedFinalizedTransactionV1, FINALIZED_TRANSACTION_PROOF_V1,
+    FINALIZED_TRANSACTION_PROOF_V1_DOMAIN, MAX_AUTHORITY_TRANSITIONS_V1,
+    MAX_FINALIZED_TRANSACTION_PROOF_V1_JSON_BYTES,
 };
 pub use indexed_merkle::{
     build_indexed_merkle_proof, verify_indexed_merkle_proof, IndexedMerkleProofError,

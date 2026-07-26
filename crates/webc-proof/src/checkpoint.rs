@@ -426,7 +426,7 @@ pub(crate) fn verify_certified_header_v1(
         .map_err(|_| CheckpointErrorV1::CertificateInvalid)
 }
 
-fn verify_authority_domain(
+pub(crate) fn verify_authority_domain(
     authority_set: &FinalityAuthoritySetV1,
     chain_id: &ChainId,
     protocol_version: ProtocolVersion,
