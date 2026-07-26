@@ -166,6 +166,25 @@ impl Default for StakingConfig {
 }
 
 impl StakingConfig {
+    /// Validates immutable staking thresholds before any transaction uses them.
+    ///
+    /// A zero `blocks_per_epoch` remains the documented test-only rollover
+    /// sentinel. Every economic threshold and cooldown must otherwise be
+    /// positive, internally ordered, and representable by its exact unit.
+    pub fn validate(&self) -> Result<(), crate::ChainError> {
+        if self.min_validator_self_stake.is_zero()
+            || self.min_validator_total_stake < self.min_validator_self_stake
+            || self.min_delegation.is_zero()
+            || self.max_commission_bps > 10_000
+            || self.unbonding_cooldown_epochs == 0
+            || self.slashable_unbonding_epochs == 0
+            || self.max_unbonding_units_per_epoch.is_zero()
+        {
+            return Err(crate::ChainError::InvalidStakingConfiguration);
+        }
+        Ok(())
+    }
+
     /// Sets normal cooldown and evidence windows in consensus epoch units.
     ///
     /// This is configuration construction only. Mainnet launch review must map
@@ -190,5 +209,32 @@ mod tests {
             .with_unbonding_delay_epochs(SEVEN_DAY_TARGET_AT_ONE_MINUTE_EPOCHS);
         assert_eq!(mainnet_target.unbonding_cooldown_epochs, 10_080);
         assert_eq!(mainnet_target.slashable_unbonding_epochs, 10_080);
+    }
+
+    #[test]
+    fn invalid_staking_thresholds_fail_closed() {
+        let config = StakingConfig {
+            min_validator_total_stake: Amount::from_webc(19),
+            ..StakingConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(crate::ChainError::InvalidStakingConfiguration)
+        ));
+
+        let zero_delay = StakingConfig {
+            unbonding_cooldown_epochs: 0,
+            ..StakingConfig::default()
+        };
+        assert!(matches!(
+            zero_delay.validate(),
+            Err(crate::ChainError::InvalidStakingConfiguration)
+        ));
+
+        let test_rollover = StakingConfig {
+            blocks_per_epoch: 0,
+            ..StakingConfig::default()
+        };
+        assert!(test_rollover.validate().is_ok());
     }
 }

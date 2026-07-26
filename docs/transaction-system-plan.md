@@ -901,6 +901,46 @@ staking configuration, and connect the four shared transitions with atomic
 rollback, restart, and supply-invariant tests. The legacy native staking forms
 must remain unsupported.
 
+### Root-authorized V5 staking execution checkpoint (2026-07-27)
+
+The dedicated `StakingControl` envelope is now active end to end without
+activating any legacy Ed25519-only staking operation. Rust and TypeScript share
+the strict action/reveal shape, 100,000-unit ML-DSA verification price plus the
+underlying transition price, default-lane restriction, exact-transfer-only
+sponsorship exclusion, bounded reveal fields, and frozen canonical action JSON
+and SHA-256 vector. The active account key must still sign the outer transaction;
+session keys and accounts without an installed policy fail during free
+preparation.
+
+Preparation validates the immutable staking configuration, checks current
+policy revision and nonce, then verifies every root signature over the exact
+chain, owner, revision, default lane, nonce, action index, and payload. It
+snapshots the complete staking configuration and current root. Execution checks
+both snapshots before any reservation or nonce mutation and re-prepares against
+the current logical state. Invalid/misbound root signatures and below-threshold
+static payloads are free preparation failures; a policy-root rotation or valid
+configuration change after preparation is a stale-preparation block error.
+
+Registration, delegation, undelegation, and operator unstaking call the same
+focused transitions as V4. Request creation remains in the bounded additive
+journal rather than cloning the global queue. Stable user-state races are
+chargeable receipt preconditions, while configuration, arithmetic, access, and
+journal invariant failures remain block errors. Coverage proves all four success
+paths, current-root/message binding, missing-policy and session-key rejection,
+configuration/root races, multi-action child rollback with parent fee/nonce
+commit, restart/state-root equality, and native supply reconciliation. The
+focused gate passes strict all-target Clippy, 522 chain unit tests, the randomized
+native supply invariant, eight parallel-execution tests, and the SDK/widget gate.
+
+Exact next item: replace the schema-1 at-rest transaction state with an explicit
+schema-2 record and bounded migration before V5 reaches the node/mempool API.
+`sponsor_grants` was added to the middle of the bincode `ChainState` layout, so a
+defaulted field alone is not a safe compatibility argument. The migration must
+preserve protocol-1 records byte-for-byte, persist protocol-2 grant state, reject
+hostile/trailing data before unbounded work, and prove crash/restart behavior.
+Then integrate V5 lifecycle records into the mempool/runtime/API and resume the
+finalized proof/browser-verifier track.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at

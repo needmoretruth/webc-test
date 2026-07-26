@@ -27,6 +27,7 @@ import {
   sponsorGrantV1DigestHex,
   sponsorUseV1DigestHex,
   stakingControlAuthorizationMessageV1,
+  stakingControlActionV1,
   transactionKindV1DigestHex,
   transactionV5RequiredUnits,
   transactionV5IdHex,
@@ -224,6 +225,41 @@ describe("V5 cross-language transaction fixtures", () => {
       },
     }]);
     expect(transactionV5RequiredUnits(kind, "SenderLane")).toBe(20_000n);
+  });
+
+  it("matches the bounded Rust staking-control action envelope", async () => {
+    const action = stakingControlActionV1(
+      { UnstakeValidator: { amount: "1" } },
+      { scheme: "MlDsa65", public_key: "aa", signature: "bb" },
+    );
+    const kind: TransactionKindV1Json = { Actions: { actions: [action] } };
+    expect(canonicalJson(action)).toBe(
+      '{"StakingControl":{"action":{"UnstakeValidator":{"amount":"1"}},"post_quantum_root_reveal":{"public_key":"aa","scheme":"MlDsa65","signature":"bb"}}}',
+    );
+    await expect(canonicalJsonHashHex(action)).resolves.toBe(
+      "1376bedc76a6188ea2f0ab089f439fd448b97dd61bcb66333a45b729582f2887",
+    );
+    expect(transactionV5RequiredUnits(kind, "SenderLane")).toBe(110_000n);
+    expect(() => transactionV5RequiredUnits(kind, sponsoredFixture().fee_payment)).toThrow(
+      "exactly one native transfer",
+    );
+
+    const nonDefaultLane = {
+      ...senderPaidFixture(),
+      authorization: {
+        ...senderPaidFixture().authorization,
+        lane: "11".repeat(32),
+        policy_revision: "1",
+      },
+      kind,
+    };
+    expect(() => validateTransactionV5Structure(nonDefaultLane)).toThrow(
+      "default authorization lane",
+    );
+    expect(() => stakingControlActionV1(
+      { UnstakeValidator: { amount: "1" } },
+      { scheme: "MlDsa65", public_key: "aa".repeat(4_097), signature: "bb" },
+    )).toThrow("oversized");
   });
 
   it("accepts a sponsor paying from its default account lane like Rust", async () => {

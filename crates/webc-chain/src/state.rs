@@ -1713,6 +1713,7 @@ impl ChainState {
         // refund share now rather than allowing object creation and discovering
         // the malformed policy only when a later owner attempts deletion.
         genesis.chain.storage_pricing.validate()?;
+        genesis.chain.staking.validate()?;
         // Reject a malformed sponsorship window (zero epochs) before any state
         // exists, so a chain never runs with an undefined "per day" boundary.
         genesis.chain.sponsorship.validate()?;

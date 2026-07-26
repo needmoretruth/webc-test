@@ -18,6 +18,7 @@ import { bytesToHex, hexToBytes } from "./hex.js";
 import type {
   FeeBid,
   OperationJson,
+  PostQuantumRootRevealJson,
   StateAccessListJson,
   StateKeyJson,
   WebcAddress,
@@ -62,6 +63,8 @@ export const REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS = 100_000n;
 export const SPONSOR_GRANT_USE_V1_REQUIRED_UNITS = 100_000n;
 /** Conservative units for one post-quantum staking authorization verification. */
 export const STAKING_CONTROL_AUTHORIZATION_V1_REQUIRED_UNITS = 100_000n;
+/** Hostile-input ceiling for each post-quantum reveal component. */
+export const MAX_POST_QUANTUM_REVEAL_COMPONENT_BYTES_V1 = 4_096;
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
@@ -147,6 +150,14 @@ export interface StakingControlAuthorizationRequestV1 {
 /** One ordered V1 action wrapping an existing native operation. */
 export type ActionV1Json =
   | { Native: { operation: OperationJson } }
+  | {
+      StakingControl: {
+        /** Exact staking payload bound into the root signature. */
+        action: StakingActionV1Json;
+        /** Current installed root's bounded public-key reveal and signature. */
+        post_quantum_root_reveal: PostQuantumRootRevealJson;
+      };
+    }
   | { RevokeSponsorGrant: { grant_id: string } }
   | { RevokeSignedSponsorGrant: { grant: SponsorGrantV1Json } };
 
@@ -179,6 +190,10 @@ export function transactionV5RequiredUnits(
         }
         if ("RevokeSignedSponsorGrant" in action) {
           return total + REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS;
+        }
+        if ("StakingControl" in action) {
+          return total + STAKING_CONTROL_AUTHORIZATION_V1_REQUIRED_UNITS
+            + stakingTransitionRequiredUnits(action.StakingControl.action);
         }
         return total + nativeActionRequiredUnits(action.Native.operation);
       }, 0n);
@@ -359,6 +374,21 @@ export function stakingControlAuthorizationMessageV1(
     action_index: request.actionIndex,
     action: request.action,
   });
+}
+
+/** Constructs one V5 critical staking action with its exact root reveal. */
+export function stakingControlActionV1(
+  action: StakingActionV1Json,
+  postQuantumRootReveal: PostQuantumRootRevealJson,
+): ActionV1Json {
+  validateStakingActionV1(action);
+  validatePostQuantumRootRevealV1(postQuantumRootReveal);
+  return {
+    StakingControl: {
+      action,
+      post_quantum_root_reveal: postQuantumRootReveal,
+    },
+  };
 }
 
 /** Constructs a protocol-2 action that permanently revokes one sponsor grant. */
@@ -688,6 +718,10 @@ export function validateTransactionV5Structure(
   validateAuthorization(value.authorization);
   validateValidity(value.validity);
   validateKind(value.kind);
+  if (kindContainsStakingControl(value.kind)
+    && value.authorization.lane !== "00".repeat(32)) {
+    throw new Error("V5 staking control requires the default authorization lane");
+  }
   validateAccessList(value.access_list);
   validateFeeBid(value.fee_bid);
   validateFeePaymentShape(value.fee_payment);
@@ -828,6 +862,16 @@ function validateKind(value: unknown): asserts value is TransactionKindV1Json {
           "V5 signed sponsor revocation action",
         );
         validateSponsorGrant(action.RevokeSignedSponsorGrant.grant, true);
+      } else if ("StakingControl" in action) {
+        requireExactKeys(action, ["StakingControl"], "V5 action");
+        requireRecord(action.StakingControl, "V5 staking-control action");
+        requireExactKeys(
+          action.StakingControl,
+          ["action", "post_quantum_root_reveal"],
+          "V5 staking-control action",
+        );
+        validateStakingActionV1(action.StakingControl.action);
+        validatePostQuantumRootRevealV1(action.StakingControl.post_quantum_root_reveal);
       } else {
         throw new Error("unsupported V5 action");
       }
@@ -939,6 +983,43 @@ function validateStakingActionV1(value: unknown): asserts value is StakingAction
     return;
   }
   throw new Error("unsupported V5 staking action");
+}
+
+/** Validates only bounded wire shape; Rust performs exact ML-DSA verification. */
+function validatePostQuantumRootRevealV1(
+  value: unknown,
+): asserts value is PostQuantumRootRevealJson {
+  requireRecord(value, "V5 post-quantum root reveal");
+  requireExactKeys(
+    value,
+    ["scheme", "public_key", "signature"],
+    "V5 post-quantum root reveal",
+  );
+  if (value.scheme !== "MlDsa65") {
+    throw new Error("unsupported V5 post-quantum root scheme");
+  }
+  requireBoundedHex(
+    value.public_key,
+    MAX_POST_QUANTUM_REVEAL_COMPONENT_BYTES_V1,
+    "V5 post-quantum public key",
+  );
+  requireBoundedHex(
+    value.signature,
+    MAX_POST_QUANTUM_REVEAL_COMPONENT_BYTES_V1,
+    "V5 post-quantum signature",
+  );
+  if (value.public_key.length === 0 || value.signature.length === 0) {
+    throw new Error("V5 post-quantum root reveal components must be non-empty");
+  }
+}
+
+function kindContainsStakingControl(kind: TransactionKindV1Json): boolean {
+  return "Actions" in kind
+    && kind.Actions.actions.some((action) => "StakingControl" in action);
+}
+
+function stakingTransitionRequiredUnits(action: StakingActionV1Json): bigint {
+  return "RegisterValidator" in action ? 25_000n : 10_000n;
 }
 
 /**

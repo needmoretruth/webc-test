@@ -15,20 +15,21 @@
 //! everything as block errors.
 
 use crate::sponsor_grant_book::SponsorGrantBookError;
-use crate::state::{NativeActionEffects, NativeObjectMutation};
+use crate::state::{NativeActionEffects, NativeObjectMutation, NativeValidatorRegistration};
 use crate::state_key::StateAccessRecorder;
 use crate::unbonding::{
     UnbondingClaimJournalV1, UnbondingKind, UnbondingRequestId, UnbondingRequestJournalV1,
 };
 use crate::{
-    calculate_fee_summary_v1, ActionIndex, ActionV1, Amount, AssetId, AuthorizationLaneId,
-    BlockHeight, BlockPositionV1, ChainConfig, ChainError, ChainId, ChainState, Event, EventIndex,
-    EventV1, ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1,
-    FeeRate, GasUnits, Nonce, ObjectId, Operation, ProtocolStateKey, ReceiptError, ReceiptStatusV1,
-    ReceiptV1, SessionKey, SessionKeyId, SponsorGrantId, SponsorGrantStateV1, StateKey,
-    StateKeyKind, StoragePricing, TransactionKindV1, TransactionV5, TransactionValidationErrorV1,
-    EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1,
-    SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+    calculate_fee_summary_v1, staking_control_authorization_message, ActionIndex,
+    ActionProgramIndexV1, ActionV1, Amount, AssetId, AuthorizationLaneId, BlockHeight,
+    BlockPositionV1, ChainConfig, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
+    ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate,
+    GasUnits, Nonce, ObjectId, Operation, PostQuantumRoot, ProtocolStateKey, ReceiptError,
+    ReceiptStatusV1, ReceiptV1, SessionKey, SessionKeyId, SponsorGrantId, SponsorGrantStateV1,
+    StakingActionV1, StakingConfig, StateKey, StateKeyKind, StoragePricing, TransactionKindV1,
+    TransactionV5, TransactionValidationErrorV1, EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1, SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
@@ -71,6 +72,12 @@ pub enum TransactionPreparationErrorV1 {
     /// The sender key, policy revision, session constraints, or expiry is invalid.
     #[error("V5 sender authority is not valid in current state")]
     SenderAuthorizationInvalid,
+    /// A staking action lacks a valid signature by the current installed root.
+    #[error("V5 staking control is not authorized by the current post-quantum root")]
+    StakingAuthorizationInvalid,
+    /// A staking payload violates immutable protocol thresholds.
+    #[error("V5 staking control violates the active staking thresholds")]
+    StakingParametersInvalid,
     /// The signed sender nonce is not the next nonce in its lane.
     #[error("V5 sender nonce does not match current state")]
     SenderNonceMismatch,
@@ -141,7 +148,7 @@ pub struct PreparedTransactionV1 {
 /// The signed transaction and its identifier are immutable once admitted, so
 /// re-execution only needs to recompute these state-derived scalar fields. This
 /// avoids cloning and canonically hashing the complete signed envelope again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PreparationSnapshotV1 {
     fee_payer: FeePayerV1,
     fee_reserve: Amount,
@@ -150,6 +157,10 @@ struct PreparationSnapshotV1 {
     effective_priority_fee_per_unit: FeeRate,
     authorization: PreparedAuthorizationV1,
     storage_pricing: StoragePricing,
+    /// Exact thresholds used by root-authorized staking, absent otherwise.
+    staking: Option<StakingConfig>,
+    /// Current installed root verified during preparation, absent otherwise.
+    staking_root: Option<PostQuantumRoot>,
 }
 
 /// Direction-preserving delta between a sparse overlay scalar and its snapshot.
@@ -792,6 +803,10 @@ impl ChainState {
             .storage_pricing
             .validate()
             .map_err(|_| TransactionPreparationErrorV1::InvalidChainConfiguration)?;
+        config
+            .staking
+            .validate()
+            .map_err(|_| TransactionPreparationErrorV1::InvalidChainConfiguration)?;
         if !transaction.validity.contains(height) {
             return Err(TransactionPreparationErrorV1::HeightOutsideValidity);
         }
@@ -827,6 +842,8 @@ impl ChainState {
         if expected_nonce != transaction.authorization.nonce {
             return Err(TransactionPreparationErrorV1::SenderNonceMismatch);
         }
+        let (staking, staking_root) =
+            prepare_staking_controls(self, transaction, authorization, &config.staking)?;
         let fee_payer = match &transaction.fee_payment {
             FeePaymentV1::SenderLane => FeePayerV1 {
                 address: transaction.sender,
@@ -855,6 +872,8 @@ impl ChainState {
             ),
             authorization,
             storage_pricing: config.storage_pricing,
+            staking,
+            staking_root,
         })
     }
 
@@ -875,6 +894,19 @@ impl ChainState {
         position: BlockPositionV1,
         config: &ChainConfig,
     ) -> Result<ExecutedTransactionV1, BlockExecutionErrorV1> {
+        if let Some(expected_staking) = prepared.snapshot.staking.as_ref() {
+            let expected_root = prepared
+                .snapshot
+                .staking_root
+                .ok_or(BlockExecutionErrorV1::InvalidState)?;
+            let current_root = self
+                .authorization_policies
+                .get(&prepared.validated.transaction().sender)
+                .map(|policy| *policy.post_quantum_root());
+            if expected_staking != &config.staking || current_root != Some(expected_root) {
+                return Err(BlockExecutionErrorV1::StalePreparation);
+            }
+        }
         let refreshed = self.prepare_snapshot_v1(&prepared.validated, position.height, config)?;
         if refreshed != prepared.snapshot {
             return Err(BlockExecutionErrorV1::StalePreparation);
@@ -945,6 +977,7 @@ impl ChainState {
                     program,
                     height: position.height,
                     storage_pricing: snapshot.storage_pricing,
+                    staking: snapshot.staking.as_ref(),
                 },
                 &mut access,
             )?,
@@ -1048,6 +1081,18 @@ fn unbonding_request_positions(
                     Some((sender, sender, UnbondingKind::OperatorStake))
                 }
                 _ => None,
+            },
+            ActionV1::StakingControl { action, .. } => match action.as_ref() {
+                StakingActionV1::Delegate { validator, .. } => {
+                    Some((*validator, *validator, UnbondingKind::OperatorStake))
+                }
+                StakingActionV1::Undelegate { validator, .. } => {
+                    Some((sender, *validator, UnbondingKind::Delegation))
+                }
+                StakingActionV1::UnstakeValidator { .. } => {
+                    Some((sender, sender, UnbondingKind::OperatorStake))
+                }
+                StakingActionV1::RegisterValidator { .. } => None,
             },
             _ => None,
         })
@@ -1196,6 +1241,58 @@ fn execute_native_action_v1(
     result.map_err(NativeActionExecutionErrorV1::Transition)
 }
 
+/// Executes one already root-authorized staking transition in the child overlay.
+///
+/// The post-quantum signature is deliberately absent here: preparation verified
+/// it against the current policy root, and execution re-prepared the transaction
+/// before constructing this child. This function owns only state transition
+/// dispatch and reuses the V4 helpers byte-for-byte.
+fn execute_staking_action_v1(
+    state: &mut ChainState,
+    unbonding_requests: &mut UnbondingRequestJournalV1,
+    sender: Address,
+    staking: &StakingConfig,
+    action: &StakingActionV1,
+    access: &mut StateAccessRecorder,
+    events: &mut Vec<Event>,
+) -> Result<(), ChainError> {
+    match action {
+        StakingActionV1::RegisterValidator {
+            consensus_key,
+            self_stake,
+            commission_bps,
+        } => state.apply_native_register_validator(
+            sender,
+            NativeValidatorRegistration::new(*consensus_key, *self_stake, *commission_bps, false),
+            staking,
+            NativeActionEffects::new(access, events),
+        ),
+        StakingActionV1::Delegate { validator, amount } => state.apply_native_delegate(
+            sender,
+            *validator,
+            *amount,
+            staking,
+            Some(unbonding_requests),
+            NativeActionEffects::new(access, events),
+        ),
+        StakingActionV1::Undelegate { validator, amount } => state.apply_native_undelegate(
+            sender,
+            *validator,
+            *amount,
+            staking,
+            Some(unbonding_requests),
+            NativeActionEffects::new(access, events),
+        ),
+        StakingActionV1::UnstakeValidator { amount } => state.apply_native_unstake_validator(
+            sender,
+            *amount,
+            staking,
+            Some(unbonding_requests),
+            NativeActionEffects::new(access, events),
+        ),
+    }
+}
+
 fn record_parent_access(
     transaction: &TransactionV5,
     payer: FeePayerV1,
@@ -1335,6 +1432,7 @@ struct ActionProgramContextV1<'a> {
     program: &'a crate::ActionProgramV1,
     height: BlockHeight,
     storage_pricing: StoragePricing,
+    staking: Option<&'a StakingConfig>,
 }
 
 /// Complete child-overlay result selected for fee and sparse-state commit.
@@ -1366,6 +1464,7 @@ fn execute_action_program_v1(
         program,
         height,
         storage_pricing,
+        staking,
     } = context;
     let mut child = parent.clone();
     let mut child_unbonding_claims = parent_unbonding_claims.clone();
@@ -1406,6 +1505,18 @@ fn execute_action_program_v1(
                 }
                 Err(NativeActionExecutionErrorV1::Transition(error)) => Err(error),
             },
+            ActionV1::StakingControl { action, .. } => {
+                let staking = staking.ok_or(BlockExecutionErrorV1::InvalidState)?;
+                execute_staking_action_v1(
+                    &mut child,
+                    &mut child_unbonding_requests,
+                    transaction.sender,
+                    staking,
+                    action,
+                    access,
+                    &mut action_events,
+                )
+            }
             ActionV1::RevokeSponsorGrant { grant_id } => {
                 access
                     .write(StateKey::sponsor_grant(
@@ -1545,8 +1656,14 @@ fn classify_action_failure(
         | ChainError::AuthorizationPolicyAlreadyExists
         | ChainError::AuthorizationLaneExists
         | ChainError::AuthorizationLaneNotFound
+        | ChainError::ValidatorAlreadyExists(_)
         | ChainError::ValidatorNotFound(_)
+        | ChainError::ValidatorNotActive(_)
         | ChainError::DelegationNotFound
+        | ChainError::DelegationTooSmall
+        | ChainError::DelegationRatioExceeded
+        | ChainError::OperatorExitHasDelegations
+        | ChainError::OperatorExitWouldDeactivatePool
         | ChainError::UnbondingRequestNotFound
         | ChainError::UnbondingOwnerMismatch
         | ChainError::UnbondingNotWithdrawable => Ok(ExecutionFailureCodeV1::Precondition),
@@ -1692,6 +1809,9 @@ fn prepare_sender_authorization(
         return Err(TransactionPreparationErrorV1::SenderStateNotFound);
     }
     let Some(policy) = state.authorization_policies.get(&transaction.sender) else {
+        if transaction_contains_staking_control(transaction) {
+            return Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid);
+        }
         if transaction.authorization.policy_revision != LEGACY_AUTHORIZATION_POLICY_REVISION
             || Address::from_public_key(&transaction.sender_public_key) != transaction.sender
         {
@@ -1708,6 +1828,9 @@ fn prepare_sender_authorization(
     if &transaction.sender_public_key == policy.active_transaction_key() {
         return Ok(PreparedAuthorizationV1::AccountKey);
     }
+    if transaction_contains_staking_control(transaction) {
+        return Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid);
+    }
 
     let session_id = SessionKeyId::derive(&transaction.sender_public_key);
     let session = state
@@ -1716,6 +1839,99 @@ fn prepare_sender_authorization(
         .ok_or(TransactionPreparationErrorV1::SenderAuthorizationInvalid)?;
     validate_session_authority(state, transaction, session, fee_reserve)?;
     Ok(PreparedAuthorizationV1::SessionKey(session_id))
+}
+
+fn transaction_contains_staking_control(transaction: &TransactionV5) -> bool {
+    matches!(
+        &transaction.kind,
+        TransactionKindV1::Actions(program)
+            if program.actions.iter().any(|action| matches!(action, ActionV1::StakingControl { .. }))
+    )
+}
+
+/// Verifies every critical staking action against one current policy snapshot.
+///
+/// Cheap sender, access, and nonce checks run first. Only then is ML-DSA invoked,
+/// and every message binds its exact action ordinal and transaction envelope.
+/// The returned configuration and root are compared again before execution, so
+/// a policy rotation or threshold change cannot race into a different result.
+fn prepare_staking_controls(
+    state: &ChainState,
+    transaction: &TransactionV5,
+    authorization: PreparedAuthorizationV1,
+    staking: &StakingConfig,
+) -> Result<(Option<StakingConfig>, Option<PostQuantumRoot>), TransactionPreparationErrorV1> {
+    let TransactionKindV1::Actions(program) = &transaction.kind else {
+        return Ok((None, None));
+    };
+    if !program
+        .actions
+        .iter()
+        .any(|action| matches!(action, ActionV1::StakingControl { .. }))
+    {
+        return Ok((None, None));
+    }
+    if authorization != PreparedAuthorizationV1::AccountKey
+        || !transaction.authorization.lane.is_default()
+    {
+        return Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid);
+    }
+    let policy = state
+        .authorization_policies
+        .get(&transaction.sender)
+        .ok_or(TransactionPreparationErrorV1::StakingAuthorizationInvalid)?;
+    policy
+        .validate()
+        .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+    let root = *policy.post_quantum_root();
+
+    for (ordinal, envelope) in program.actions.iter().enumerate() {
+        let ActionV1::StakingControl {
+            action,
+            post_quantum_root_reveal,
+        } = envelope
+        else {
+            continue;
+        };
+        match action.as_ref() {
+            StakingActionV1::RegisterValidator {
+                self_stake,
+                commission_bps,
+                ..
+            } if *self_stake < staking.min_validator_self_stake
+                || *commission_bps > staking.max_commission_bps =>
+            {
+                return Err(TransactionPreparationErrorV1::StakingParametersInvalid);
+            }
+            StakingActionV1::Delegate { amount, .. } if *amount < staking.min_delegation => {
+                return Err(TransactionPreparationErrorV1::StakingParametersInvalid);
+            }
+            _ => {}
+        }
+        let action_index = u32::try_from(ordinal)
+            .map_err(|_| TransactionPreparationErrorV1::InvalidState)
+            .and_then(|value| {
+                ActionProgramIndexV1::new(value)
+                    .map_err(|_| TransactionPreparationErrorV1::InvalidState)
+            })?;
+        let message = staking_control_authorization_message(
+            &transaction.chain_id,
+            transaction.sender,
+            transaction.authorization.policy_revision,
+            transaction.authorization.lane,
+            transaction.authorization.nonce,
+            action_index,
+            action,
+        )
+        .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+        if !post_quantum_root_reveal
+            .verify(&root, &message)
+            .map_err(|_| TransactionPreparationErrorV1::StakingAuthorizationInvalid)?
+        {
+            return Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid);
+        }
+    }
+    Ok((Some(staking.clone()), Some(root)))
 }
 
 fn validate_session_authority(
@@ -1927,7 +2143,7 @@ fn prepare_sponsor_storage(
                 }
                 candidates.push((key, unused));
             }
-            ActionV1::Native { .. } => {}
+            ActionV1::Native { .. } | ActionV1::StakingControl { .. } => {}
         }
     }
     state
@@ -1973,14 +2189,14 @@ mod tests {
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
         AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Delegation,
         Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectVersion, Operation, PostQuantumRoot,
-        PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints, SponsorGrantId,
-        SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1, TransactionAuthorizationV1,
-        TransactionIndex, UnbondingKind, UnbondingRequestId, Validator, ValidatorStatus,
-        ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
-        MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1, REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
-        TRANSACTION_V5_PROTOCOL_VERSION,
+        PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
+        SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
+        StakingActionV1, TransactionAuthorizationV1, TransactionIndex, UnbondingKind,
+        UnbondingRequestId, Validator, ValidatorStatus, ValidityWindowV1,
+        INITIAL_AUTHORIZATION_POLICY_REVISION, MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1,
+        REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, TRANSACTION_V5_PROTOCOL_VERSION,
     };
-    use webc_crypto::{Hash256, Keypair};
+    use webc_crypto::{Hash256, Keypair, MlDsa65PublicKey, MlDsa65SecretKey};
 
     fn sender_paid_fixture(sender: &Keypair, recipient: &Keypair) -> TransactionV5 {
         sender_actions_fixture(
@@ -2154,6 +2370,85 @@ mod tests {
                 config,
             )
             .expect("fixture prepares")
+    }
+
+    fn install_staking_policy(
+        state: &mut ChainState,
+        owner: &Keypair,
+        public_key: &MlDsa65PublicKey,
+    ) {
+        let root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, public_key.as_bytes())
+                .expect("test staking root");
+        state.authorization_policies.insert(
+            owner.address(),
+            AccountAuthorizationPolicy::new_v1(owner.public_key(), root)
+                .expect("test staking policy"),
+        );
+    }
+
+    fn staking_actions_transaction(
+        owner: &Keypair,
+        actions: Vec<StakingActionV1>,
+        public_key: &MlDsa65PublicKey,
+        secret_key: &MlDsa65SecretKey,
+        nonce: Nonce,
+        signed_nonce: Nonce,
+    ) -> TransactionV5 {
+        let envelopes = actions
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, action)| {
+                let action_index = ActionProgramIndexV1::new(
+                    u32::try_from(ordinal).expect("test action index fits u32"),
+                )
+                .expect("test action index is bounded");
+                let message = staking_control_authorization_message(
+                    &ChainId::devnet(),
+                    owner.address(),
+                    INITIAL_AUTHORIZATION_POLICY_REVISION,
+                    AuthorizationLaneId::DEFAULT,
+                    signed_nonce,
+                    action_index,
+                    &action,
+                )
+                .expect("test staking message");
+                ActionV1::staking_control(
+                    action,
+                    PostQuantumRootReveal {
+                        scheme: PostQuantumScheme::MlDsa65,
+                        public_key: public_key.to_bytes(),
+                        signature: secret_key
+                            .sign(&message, b"")
+                            .expect("test staking signature"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let gas_limit = envelopes.iter().map(ActionV1::required_units).sum::<u64>();
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            owner.address(),
+            owner.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: INITIAL_AUTHORIZATION_POLICY_REVISION,
+                nonce,
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            envelopes,
+            FeeBid {
+                gas_limit,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("test staking transaction builds");
+        transaction
+            .sign_with_policy_key(owner)
+            .expect("test staking transaction signs");
+        transaction
     }
 
     fn session_state(owner: &Keypair, session: &Keypair) -> ChainState {
@@ -4711,5 +5006,335 @@ mod tests {
         assert_eq!(failure_record.spent_fees, Amount::from_units(3_000));
         assert!(!failure_state.accounts.contains_key(&first.address()));
         assert!(!failure_state.accounts.contains_key(&second.address()));
+    }
+
+    #[test]
+    fn root_authorized_staking_executes_all_transitions_and_rolls_back_children() {
+        let operator = Keypair::from_seed([31; 32]);
+        let delegator = Keypair::from_seed([32; 32]);
+        let consensus = Keypair::from_seed([33; 32]);
+        let missing_validator = Keypair::from_seed([34; 32]);
+        let (operator_public, operator_secret) =
+            webc_crypto::ml_dsa65_keygen().expect("operator root keygen");
+        let (delegator_public, delegator_secret) =
+            webc_crypto::ml_dsa65_keygen().expect("delegator root keygen");
+        let initial_balance = Amount::from_webc(1_000);
+        let mut state = ChainState {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            current_base_fee_per_unit: 2,
+            minted_supply: initial_balance
+                .checked_add(initial_balance)
+                .expect("fixture supply"),
+            ..ChainState::default()
+        };
+        state
+            .accounts
+            .insert(operator.address(), Account::with_balance(initial_balance));
+        state
+            .accounts
+            .insert(delegator.address(), Account::with_balance(initial_balance));
+        install_staking_policy(&mut state, &operator, &operator_public);
+        install_staking_policy(&mut state, &delegator, &delegator_public);
+        let config = v5_config();
+
+        let register = staking_actions_transaction(
+            &operator,
+            vec![StakingActionV1::RegisterValidator {
+                consensus_key: consensus.public_key(),
+                self_stake: Amount::from_webc(100),
+                commission_bps: 1_000,
+            }],
+            &operator_public,
+            &operator_secret,
+            Nonce::new(0),
+            Nonce::new(0),
+        );
+        let prepared_register = prepared_with_config(&state, register, &config);
+        let register_receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_register,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("root-authorized registration executes")
+            .into_receipt();
+        assert_eq!(register_receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(
+            state.validators[&operator.address()].self_stake,
+            Amount::from_webc(100)
+        );
+
+        let delegate = staking_actions_transaction(
+            &delegator,
+            vec![StakingActionV1::Delegate {
+                validator: operator.address(),
+                amount: Amount::from_webc(20),
+            }],
+            &delegator_public,
+            &delegator_secret,
+            Nonce::new(0),
+            Nonce::new(0),
+        );
+        let prepared_delegate = prepared_with_config(&state, delegate, &config);
+        state
+            .execute_prepared_transaction_v1(
+                prepared_delegate,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(1)),
+                &config,
+            )
+            .expect("root-authorized delegation executes");
+        assert_eq!(
+            state.delegations[&(delegator.address(), operator.address())].amount,
+            Amount::from_webc(20)
+        );
+
+        let undelegate = staking_actions_transaction(
+            &delegator,
+            vec![StakingActionV1::Undelegate {
+                validator: operator.address(),
+                amount: Amount::from_webc(5),
+            }],
+            &delegator_public,
+            &delegator_secret,
+            Nonce::new(1),
+            Nonce::new(1),
+        );
+        let prepared_undelegate = prepared_with_config(&state, undelegate, &config);
+        state
+            .execute_prepared_transaction_v1(
+                prepared_undelegate,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(2)),
+                &config,
+            )
+            .expect("root-authorized undelegation queues");
+
+        let unstake = staking_actions_transaction(
+            &operator,
+            vec![StakingActionV1::UnstakeValidator {
+                amount: Amount::from_webc(10),
+            }],
+            &operator_public,
+            &operator_secret,
+            Nonce::new(1),
+            Nonce::new(1),
+        );
+        let prepared_unstake = prepared_with_config(&state, unstake, &config);
+        state
+            .execute_prepared_transaction_v1(
+                prepared_unstake,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(3)),
+                &config,
+            )
+            .expect("root-authorized operator exit queues");
+        assert_eq!(state.unbonding.requests().count(), 2);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("staking supply report")
+                .balanced
+        );
+
+        let child_before = state.clone();
+        let failing_program = staking_actions_transaction(
+            &delegator,
+            vec![
+                StakingActionV1::Delegate {
+                    validator: operator.address(),
+                    amount: Amount::from_webc(1),
+                },
+                StakingActionV1::Delegate {
+                    validator: missing_validator.address(),
+                    amount: Amount::from_webc(1),
+                },
+            ],
+            &delegator_public,
+            &delegator_secret,
+            Nonce::new(2),
+            Nonce::new(2),
+        );
+        let prepared_failure = prepared_with_config(&state, failing_program, &config);
+        let failure_receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_failure,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(4)),
+                &config,
+            )
+            .expect("missing validator is a chargeable state race")
+            .into_receipt();
+        assert_eq!(
+            failure_receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert!(failure_receipt.events.is_empty());
+        assert_eq!(state.validators, child_before.validators);
+        assert_eq!(state.delegations, child_before.delegations);
+        assert_eq!(state.unbonding, child_before.unbonding);
+        assert_eq!(state.accounts[&delegator.address()].nonce, 3);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("rollback supply report")
+                .balanced
+        );
+
+        let restored: ChainState =
+            bincode::deserialize(&bincode::serialize(&state).expect("staking state serializes"))
+                .expect("staking state restores");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored staking root"),
+            state.state_root().expect("live staking root")
+        );
+    }
+
+    #[test]
+    fn staking_root_binding_and_config_snapshot_fail_before_mutation() {
+        let owner = Keypair::from_seed([41; 32]);
+        let session = Keypair::from_seed([42; 32]);
+        let consensus = Keypair::from_seed([43; 32]);
+        let (public_key, secret_key) = webc_crypto::ml_dsa65_keygen().expect("staking root keygen");
+        let balance = Amount::from_webc(1_000);
+        let mut state = ChainState {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            current_base_fee_per_unit: 2,
+            minted_supply: balance,
+            ..ChainState::default()
+        };
+        state
+            .accounts
+            .insert(owner.address(), Account::with_balance(balance));
+        install_staking_policy(&mut state, &owner, &public_key);
+        let action = StakingActionV1::RegisterValidator {
+            consensus_key: consensus.public_key(),
+            self_stake: Amount::from_webc(100),
+            commission_bps: 1_000,
+        };
+        let misbound = staking_actions_transaction(
+            &owner,
+            vec![action.clone()],
+            &public_key,
+            &secret_key,
+            Nonce::new(0),
+            Nonce::new(9),
+        );
+        let before = state.clone();
+        let validated = ValidatedTransactionV1::validate(misbound, &ChainId::devnet())
+            .expect("outer active-key signature remains valid");
+        assert_eq!(
+            state.prepare_transaction_v1(validated, BlockHeight::new(10), &v5_config()),
+            Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid)
+        );
+        assert_eq!(state, before);
+
+        let valid = staking_actions_transaction(
+            &owner,
+            vec![action.clone()],
+            &public_key,
+            &secret_key,
+            Nonce::new(0),
+            Nonce::new(0),
+        );
+        let mut no_policy = state.clone();
+        no_policy.authorization_policies.remove(&owner.address());
+        let validated = ValidatedTransactionV1::validate(valid.clone(), &ChainId::devnet())
+            .expect("wire remains valid without state lookup");
+        assert_eq!(
+            no_policy.prepare_transaction_v1(validated, BlockHeight::new(10), &v5_config()),
+            Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid)
+        );
+
+        let constraints = SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_webc(1),
+            total_amount_budget: Amount::from_webc(1),
+            max_fee_per_use: Amount::from_webc(1),
+            total_fee_budget: Amount::from_webc(1),
+            lifetime_epochs: 10,
+        };
+        let record = SessionKey::new(
+            owner.address(),
+            session.public_key(),
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            constraints,
+            Epoch::new(10),
+        )
+        .expect("session record");
+        state
+            .session_keys
+            .insert((owner.address(), record.id), record);
+        let mut session_shaped = valid.clone();
+        session_shaped.sender_signature = None;
+        session_shaped.sender_public_key = session.public_key();
+        session_shaped.access_list = session_shaped
+            .expected_session_access_list()
+            .expect("session-shaped access");
+        session_shaped
+            .sign_with_policy_key(&session)
+            .expect("session signs outer transaction");
+        let validated = ValidatedTransactionV1::validate(session_shaped, &ChainId::devnet())
+            .expect("session-shaped wire validates");
+        assert_eq!(
+            state.prepare_transaction_v1(validated, BlockHeight::new(10), &v5_config()),
+            Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid)
+        );
+
+        let prepared = prepared_with_config(&state, valid.clone(), &v5_config());
+        let mut changed_config = v5_config();
+        changed_config.staking.max_unbonding_units_per_epoch = Amount::from_webc(2_000);
+        let before_execute = state.clone();
+        assert_eq!(
+            state.execute_prepared_transaction_v1(
+                prepared,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &changed_config,
+            ),
+            Err(BlockExecutionErrorV1::StalePreparation)
+        );
+        assert_eq!(state, before_execute);
+
+        let prepared_root = prepared_with_config(&state, valid, &v5_config());
+        let replacement_root =
+            PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([0x77; 32]))
+                .expect("replacement root");
+        state.authorization_policies.insert(
+            owner.address(),
+            AccountAuthorizationPolicy::new_v1(owner.public_key(), replacement_root)
+                .expect("replacement policy"),
+        );
+        let after_rotation = state.clone();
+        assert_eq!(
+            state.execute_prepared_transaction_v1(
+                prepared_root,
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
+            ),
+            Err(BlockExecutionErrorV1::StalePreparation)
+        );
+        assert_eq!(state, after_rotation);
+
+        install_staking_policy(&mut state, &owner, &public_key);
+
+        let too_small = staking_actions_transaction(
+            &owner,
+            vec![StakingActionV1::RegisterValidator {
+                consensus_key: consensus.public_key(),
+                self_stake: Amount::from_webc(19),
+                commission_bps: 1_000,
+            }],
+            &public_key,
+            &secret_key,
+            Nonce::new(0),
+            Nonce::new(0),
+        );
+        let validated = ValidatedTransactionV1::validate(too_small, &ChainId::devnet())
+            .expect("threshold-dependent wire validates structurally");
+        assert_eq!(
+            state.prepare_transaction_v1(validated, BlockHeight::new(10), &v5_config()),
+            Err(TransactionPreparationErrorV1::StakingParametersInvalid)
+        );
     }
 }

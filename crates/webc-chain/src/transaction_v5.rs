@@ -16,8 +16,8 @@
 
 use crate::{
     AccessList, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainId,
-    FeeBid, Nonce, Operation, ProtocolVersion, SessionKeyId, StateKey, MAX_OBJECT_DATA_BYTES,
-    MAX_TRANSACTION_STATE_KEYS,
+    FeeBid, Nonce, Operation, PostQuantumRootReveal, ProtocolVersion, SessionKeyId, StateKey,
+    MAX_OBJECT_DATA_BYTES, MAX_TRANSACTION_STATE_KEYS,
 };
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -417,6 +417,34 @@ impl StakingActionV1 {
             _ => Ok(()),
         }
     }
+
+    /// Reuses the reviewed V4 transition's exact state-access declaration.
+    ///
+    /// This conversion is internal only: the legacy operation is never placed
+    /// on the V5 wire and never bypasses the containing root-signature gate.
+    pub(crate) fn as_native_operation(&self) -> Operation {
+        match self {
+            Self::RegisterValidator {
+                consensus_key,
+                self_stake,
+                commission_bps,
+            } => Operation::RegisterValidator {
+                consensus_key: *consensus_key,
+                self_stake: *self_stake,
+                commission_bps: *commission_bps,
+                bootstrap: false,
+            },
+            Self::Delegate { validator, amount } => Operation::Delegate {
+                validator: *validator,
+                amount: *amount,
+            },
+            Self::Undelegate { validator, amount } => Operation::Undelegate {
+                validator: *validator,
+                amount: *amount,
+            },
+            Self::UnstakeValidator { amount } => Operation::UnstakeValidator { amount: *amount },
+        }
+    }
 }
 
 /// Zero-based position of one action inside the bounded V5 action program.
@@ -506,6 +534,13 @@ pub enum ActionV1 {
         /// Native operation executed at this ordered action position.
         operation: Box<Operation>,
     },
+    /// Critical staking transition additionally authorized by the current root.
+    StakingControl {
+        /// Exact staking payload bound into the recovery signature.
+        action: Box<StakingActionV1>,
+        /// Bounded public-key reveal and signature by the installed root.
+        post_quantum_root_reveal: Box<PostQuantumRootReveal>,
+    },
     /// Permanently prevents later uses of one grant issued by the sender.
     RevokeSponsorGrant {
         /// Wallet-generated identity of the grant being revoked.
@@ -529,6 +564,17 @@ impl ActionV1 {
         }
     }
 
+    /// Constructs one root-authorized V5 staking-control action.
+    pub fn staking_control(
+        action: StakingActionV1,
+        post_quantum_root_reveal: PostQuantumRootReveal,
+    ) -> Self {
+        Self::StakingControl {
+            action: Box::new(action),
+            post_quantum_root_reveal: Box::new(post_quantum_root_reveal),
+        }
+    }
+
     /// Constructs a protocol-2 sponsor-grant revocation action.
     pub const fn revoke_sponsor_grant(grant_id: SponsorGrantId) -> Self {
         Self::RevokeSponsorGrant { grant_id }
@@ -545,6 +591,9 @@ impl ActionV1 {
     pub fn required_units(&self) -> u64 {
         match self {
             Self::Native { operation } => operation.required_units(),
+            Self::StakingControl { action, .. } => {
+                STAKING_CONTROL_AUTHORIZATION_V1_REQUIRED_UNITS + action.transition_required_units()
+            }
             Self::RevokeSponsorGrant { .. } => REVOKE_SPONSOR_GRANT_V1_REQUIRED_UNITS,
             Self::RevokeSignedSponsorGrant { .. } => REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
         }
@@ -557,7 +606,9 @@ impl ActionV1 {
     /// was described as prepared/includable.
     pub(crate) fn execution_supported(&self) -> bool {
         match self {
-            Self::RevokeSponsorGrant { .. } | Self::RevokeSignedSponsorGrant { .. } => true,
+            Self::StakingControl { .. }
+            | Self::RevokeSponsorGrant { .. }
+            | Self::RevokeSignedSponsorGrant { .. } => true,
             Self::Native { operation } => {
                 matches!(
                     operation.as_ref(),
@@ -582,21 +633,36 @@ impl ActionV1 {
         if !self.execution_supported() {
             return Err(TransactionValidationErrorV1::UnsupportedNativeAction);
         }
-        let Self::Native { operation } = self else {
-            return match self {
-                Self::RevokeSponsorGrant { grant_id } if grant_id.digest() == Hash256::ZERO => {
-                    Err(TransactionValidationErrorV1::InvalidNativeAction)
-                }
-                Self::RevokeSponsorGrant { .. } => Ok(()),
-                Self::RevokeSignedSponsorGrant { grant } => {
-                    grant.validate_structure()?;
-                    if grant.sponsor_signature.is_none() {
-                        return Err(TransactionValidationErrorV1::MissingSponsorSignature);
+        let operation = match self {
+            Self::Native { operation } => operation,
+            Self::StakingControl {
+                action,
+                post_quantum_root_reveal,
+            } => {
+                action.validate_structure()?;
+                post_quantum_root_reveal
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)?;
+                return Ok(());
+            }
+            _ => {
+                return match self {
+                    Self::RevokeSponsorGrant { grant_id } if grant_id.digest() == Hash256::ZERO => {
+                        Err(TransactionValidationErrorV1::InvalidNativeAction)
                     }
-                    Ok(())
-                }
-                Self::Native { .. } => Err(TransactionValidationErrorV1::InvalidNativeAction),
-            };
+                    Self::RevokeSponsorGrant { .. } => Ok(()),
+                    Self::RevokeSignedSponsorGrant { grant } => {
+                        grant.validate_structure()?;
+                        if grant.sponsor_signature.is_none() {
+                            return Err(TransactionValidationErrorV1::MissingSponsorSignature);
+                        }
+                        Ok(())
+                    }
+                    Self::Native { .. } | Self::StakingControl { .. } => {
+                        Err(TransactionValidationErrorV1::InvalidNativeAction)
+                    }
+                };
+            }
         };
         match operation.as_ref() {
             Operation::InstallAuthorizationPolicy { post_quantum_root }
@@ -631,6 +697,10 @@ impl ActionV1 {
     ) -> Result<AccessList, TransactionValidationErrorV1> {
         match self {
             Self::Native { operation } => operation
+                .default_access_list_for_lane(sender, lane)
+                .map_err(|_| TransactionValidationErrorV1::InvalidAccessList),
+            Self::StakingControl { action, .. } => action
+                .as_native_operation()
                 .default_access_list_for_lane(sender, lane)
                 .map_err(|_| TransactionValidationErrorV1::InvalidAccessList),
             Self::RevokeSponsorGrant { grant_id } => {
@@ -1528,6 +1598,9 @@ fn validate_native_action_lane(
 ) -> Result<(), TransactionValidationErrorV1> {
     if !authorization_lane.is_default()
         && program.actions.iter().any(|action| {
+            if matches!(action, ActionV1::StakingControl { .. }) {
+                return true;
+            }
             matches!(
                 action,
                 ActionV1::Native { operation }
@@ -1810,6 +1883,73 @@ mod tests {
                 ActionProgramIndexV1::new(0).expect("bounded action index"),
                 &zero,
             ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+    }
+
+    #[test]
+    fn staking_control_action_wire_is_bounded_and_cross_language_stable() {
+        let action = ActionV1::staking_control(
+            StakingActionV1::UnstakeValidator {
+                amount: Amount::from_units(1),
+            },
+            PostQuantumRootReveal {
+                scheme: crate::PostQuantumScheme::MlDsa65,
+                public_key: vec![0xaa],
+                signature: vec![0xbb],
+            },
+        );
+        let bytes = canonical_bytes(&action).expect("staking action canonicalizes");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).expect("canonical JSON is UTF-8"),
+            r#"{"StakingControl":{"action":{"UnstakeValidator":{"amount":"1"}},"post_quantum_root_reveal":{"public_key":"aa","scheme":"MlDsa65","signature":"bb"}}}"#
+        );
+        assert_eq!(
+            Hash256::digest(&bytes).to_string(),
+            "1376bedc76a6188ea2f0ab089f439fd448b97dd61bcb66333a45b729582f2887"
+        );
+        assert_eq!(action.required_units(), 110_000);
+        assert!(action.validate_structure().is_ok());
+        assert!(
+            !TransactionKindV1::Actions(ActionProgramV1::new(vec![action.clone()]))
+                .is_sponsorable()
+        );
+
+        let sender = Keypair::from_seed([3; 32]);
+        assert_eq!(
+            TransactionV5::for_actions_unsigned(
+                ChainId::devnet(),
+                sender.address(),
+                sender.public_key(),
+                TransactionAuthorizationV1 {
+                    lane: AuthorizationLaneId::new(Hash256([9; 32])),
+                    policy_revision: AuthorizationPolicyRevision::new(1),
+                    nonce: Nonce::new(0),
+                },
+                ValidityWindowV1::new(BlockHeight::new(1), BlockHeight::new(1)),
+                vec![action],
+                FeeBid {
+                    gas_limit: 110_000,
+                    max_fee_per_unit: 1,
+                    priority_fee_per_unit: 0,
+                },
+                FeePaymentV1::SenderLane,
+            ),
+            Err(TransactionValidationErrorV1::InvalidNativeAction)
+        );
+
+        let oversized = ActionV1::staking_control(
+            StakingActionV1::UnstakeValidator {
+                amount: Amount::from_units(1),
+            },
+            PostQuantumRootReveal {
+                scheme: crate::PostQuantumScheme::MlDsa65,
+                public_key: vec![0; crate::MAX_POST_QUANTUM_PUBLIC_KEY_BYTES + 1],
+                signature: vec![1],
+            },
+        );
+        assert_eq!(
+            oversized.validate_structure(),
             Err(TransactionValidationErrorV1::InvalidNativeAction)
         );
     }

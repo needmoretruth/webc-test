@@ -367,6 +367,8 @@ pub enum ChainError {
     AuthorizationLaneDepositZero,
     #[error("storage pricing refund basis points exceed 10000")]
     InvalidStoragePricing,
+    #[error("staking configuration thresholds or cooldowns are invalid")]
+    InvalidStakingConfiguration,
     #[error("sponsorship configuration is invalid (day-window must be non-zero)")]
     InvalidSponsorshipConfig,
     #[error("application sponsor already exists for this namespace")]
