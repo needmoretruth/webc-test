@@ -22,9 +22,9 @@
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 use webc_chain::{
-    BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4, FinalityAuthoritySetV1,
-    FinalityCertificate, ReceiptV1, SlashingEvidence, TransactionId, TransactionV5,
-    TRANSACTION_V5_PROTOCOL_VERSION,
+    BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4, ConsensusWalRecordV1,
+    FinalityAuthoritySetV1, FinalityCertificate, ReceiptV1, SlashingEvidence, TransactionId,
+    TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_storage::{
     KvStore, LocalDropReasonV1, LocalTimestampMs, LocalTransactionObservationV1,
@@ -66,6 +66,26 @@ pub struct V5RuntimeStats {
     pub mempool_size: usize,
     /// Sum of canonical JSON bytes charged to the configured memory budget.
     pub mempool_bytes: usize,
+}
+
+/// Actor-consistent protocol-2 consensus inputs for the next height.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsensusContextV1 {
+    /// Exact next height after the durable tip.
+    pub height: BlockHeight,
+    /// Immutable outgoing set that proposes and certifies this height.
+    pub current_authority_set: FinalityAuthoritySetV1,
+}
+
+/// Stored protocol-2 state-sync unit returned by the single runtime owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertifiedBlockSnapshotV1 {
+    /// Exact finalized V4 block.
+    pub block: BlockV4,
+    /// Concrete set committed to authorize the following height.
+    pub next_authority_set: FinalityAuthoritySetV1,
+    /// Finality certificate over the exact V4 header hash.
+    pub certificate: FinalityCertificate,
 }
 
 /// Errors returned by the protocol-2 runtime and its bounded handle.
@@ -237,14 +257,90 @@ impl NodeHandle {
     ) -> Result<BuiltBlockV4, NodeRuntimeError> {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .try_send(Command::BuildCandidateV4 {
+            .send(Command::BuildCandidateV4 {
                 proposer,
                 timestamp_ms,
                 now_ms,
                 evidence,
                 response,
             })
-            .map_err(map_send_error)?;
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Returns one consistent height/authority snapshot for a V4 machine.
+    ///
+    /// Consensus commands wait on the bounded mailbox instead of failing on a
+    /// transiently full API queue; only the single driver can issue them, so
+    /// this preserves bounded memory while preventing request traffic from
+    /// turning queue pressure into consensus failure.
+    pub async fn consensus_context_v1(&self) -> Result<ConsensusContextV1, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ConsensusContextV1 { response })
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Replays a received authenticated V4 proposal without committing it.
+    pub async fn validate_candidate_v4(
+        &self,
+        block: BlockV4,
+        next_authority_set: FinalityAuthoritySetV1,
+    ) -> Result<(), NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ValidateCandidateV4 {
+                block: Box::new(block),
+                next_authority_set: Box::new(next_authority_set),
+                response,
+            })
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Loads the protocol-2 crash journal for one unfinished height.
+    pub async fn consensus_wal_v1(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ConsensusWalRecordV1>, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ConsensusWalV1 { height, response })
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Persists the full protocol-2 WAL before any own message reaches peers.
+    pub async fn persist_consensus_wal_v1(
+        &self,
+        record: ConsensusWalRecordV1,
+    ) -> Result<(), NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::PersistConsensusWalV1 {
+                record: Box::new(record),
+                response,
+            })
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Loads one stored certified V4 state-sync unit through the actor.
+    pub async fn certified_block_v4(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<CertifiedBlockSnapshotV1>, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::CertifiedBlockV4 { height, response })
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
         receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
     }
 
@@ -261,13 +357,14 @@ impl NodeHandle {
     ) -> Result<V4FinalizationResult, NodeRuntimeError> {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .try_send(Command::FinalizeV4 {
+            .send(Command::FinalizeV4 {
                 block: Box::new(block),
                 next_authority_set: Box::new(next_authority_set),
                 certificate: Box::new(certificate),
                 response,
             })
-            .map_err(map_send_error)?;
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
         receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
     }
 
@@ -319,6 +416,26 @@ enum Command {
         now_ms: LocalTimestampMs,
         evidence: Vec<SlashingEvidence>,
         response: oneshot::Sender<Result<BuiltBlockV4, NodeRuntimeError>>,
+    },
+    ConsensusContextV1 {
+        response: oneshot::Sender<Result<ConsensusContextV1, NodeRuntimeError>>,
+    },
+    ValidateCandidateV4 {
+        block: Box<BlockV4>,
+        next_authority_set: Box<FinalityAuthoritySetV1>,
+        response: oneshot::Sender<Result<(), NodeRuntimeError>>,
+    },
+    ConsensusWalV1 {
+        height: BlockHeight,
+        response: oneshot::Sender<Result<Option<ConsensusWalRecordV1>, NodeRuntimeError>>,
+    },
+    PersistConsensusWalV1 {
+        record: Box<ConsensusWalRecordV1>,
+        response: oneshot::Sender<Result<(), NodeRuntimeError>>,
+    },
+    CertifiedBlockV4 {
+        height: BlockHeight,
+        response: oneshot::Sender<Result<Option<CertifiedBlockSnapshotV1>, NodeRuntimeError>>,
     },
     FinalizeV4 {
         block: Box<BlockV4>,
@@ -469,6 +586,51 @@ where
                         return Err(NodeRuntimeError::Inconsistent(message));
                     }
                 }
+                Command::ConsensusContextV1 { response } => {
+                    let result = self.consensus_context_v1();
+                    let _response_canceled = response.send(result);
+                }
+                Command::ValidateCandidateV4 {
+                    block,
+                    next_authority_set,
+                    response,
+                } => {
+                    let result = self
+                        .node
+                        .validate_candidate_v4(&block, &next_authority_set)
+                        .map_err(NodeRuntimeError::from);
+                    let _response_canceled = response.send(result);
+                }
+                Command::ConsensusWalV1 { height, response } => {
+                    let result = self
+                        .node
+                        .consensus_wal_v1(height.get())
+                        .map_err(NodeRuntimeError::from);
+                    let _response_canceled = response.send(result);
+                }
+                Command::PersistConsensusWalV1 { record, response } => {
+                    let result = self
+                        .node
+                        .persist_consensus_wal_v1(&record)
+                        .map_err(NodeRuntimeError::from);
+                    let _response_canceled = response.send(result);
+                }
+                Command::CertifiedBlockV4 { height, response } => {
+                    let result = self
+                        .node
+                        .certified_block_v4(height)
+                        .map(|snapshot| {
+                            snapshot.map(|(block, next_authority_set, certificate)| {
+                                CertifiedBlockSnapshotV1 {
+                                    block,
+                                    next_authority_set,
+                                    certificate,
+                                }
+                            })
+                        })
+                        .map_err(NodeRuntimeError::from);
+                    let _response_canceled = response.send(result);
+                }
                 Command::FinalizeV4 {
                     block,
                     next_authority_set,
@@ -604,6 +766,13 @@ where
             committed_height,
             mempool_size: self.mempool.len(),
             mempool_bytes: self.mempool.total_bytes(),
+        })
+    }
+
+    fn consensus_context_v1(&self) -> Result<ConsensusContextV1, NodeRuntimeError> {
+        Ok(ConsensusContextV1 {
+            height: next_height(&self.node)?,
+            current_authority_set: self.node.current_finality_authority_set_v1()?,
         })
     }
 
@@ -966,6 +1135,93 @@ mod tests {
             .sign(sender)
             .expect("test transaction signature is valid");
         transaction
+    }
+
+    #[tokio::test]
+    async fn consensus_commands_share_the_actor_and_prune_wal_on_finality() {
+        let validator = Keypair::from_seed([1; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let node = Node::open(MemoryKvStore::new(), &genesis).expect("test node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+
+        let context = handle
+            .consensus_context_v1()
+            .await
+            .expect("context is actor-consistent");
+        assert_eq!(context.height, BlockHeight::new(1));
+        assert_eq!(context.current_authority_set.authorities.len(), 1);
+        let journal = ConsensusWalRecordV1 {
+            height: 1,
+            proposals: Vec::new(),
+            votes: Vec::new(),
+            locked_round: None,
+            locked_value: None,
+            valid_round: None,
+            valid_value: None,
+        };
+        handle
+            .persist_consensus_wal_v1(journal.clone())
+            .await
+            .expect("journal commits");
+        assert_eq!(
+            handle
+                .consensus_wal_v1(BlockHeight::new(1))
+                .await
+                .expect("journal loads"),
+            Some(journal)
+        );
+
+        let candidate = handle
+            .build_candidate_v4(
+                validator.address(),
+                NOW,
+                LocalTimestampMs::new(NOW),
+                Vec::new(),
+            )
+            .await
+            .expect("candidate builds through actor");
+        handle
+            .validate_candidate_v4(
+                candidate.block.clone(),
+                candidate.next_authority_set.clone(),
+            )
+            .await
+            .expect("candidate replays through actor");
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+        handle
+            .finalize_v4(
+                candidate.block.clone(),
+                candidate.next_authority_set.clone(),
+                certificate,
+            )
+            .await
+            .expect("candidate finalizes through actor");
+        assert!(handle
+            .consensus_wal_v1(BlockHeight::new(1))
+            .await
+            .expect("pruned journal query succeeds")
+            .is_none());
+        let stored = handle
+            .certified_block_v4(BlockHeight::new(1))
+            .await
+            .expect("certified snapshot loads")
+            .expect("height one exists");
+        assert_eq!(
+            stored.block.header.hash().unwrap(),
+            candidate.block.header.hash().unwrap()
+        );
+        assert_eq!(stored.next_authority_set, candidate.next_authority_set);
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
     }
 
     #[tokio::test]

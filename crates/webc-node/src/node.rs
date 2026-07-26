@@ -465,6 +465,79 @@ impl<K: KvStore> Node<K> {
         )?)
     }
 
+    /// Replays one received V4 proposal against committed state without mutation.
+    ///
+    /// Consensus authentication runs before this call. This is the expensive
+    /// `valid(v)` gate: success proves the exact block and transported successor
+    /// set reproduce locally, while every failure leaves memory and disk intact.
+    pub fn validate_candidate_v4(
+        &self,
+        block: &BlockV4,
+        next_authority_set: &FinalityAuthoritySetV1,
+    ) -> Result<(), NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        if block.header.chain_id != self.config.chain_id {
+            return Err(NodeError::ChainIdMismatch);
+        }
+        let current_authority_set = self.current_finality_authority_set_v1()?;
+        let mut scratch = self.state.clone();
+        apply_block_v4(
+            &mut scratch,
+            &self.config,
+            block,
+            &current_authority_set,
+            next_authority_set,
+        )?;
+        Ok(())
+    }
+
+    /// Returns one stored certified V4 block with its committed successor set.
+    ///
+    /// The set is resolved by commitment rather than guessed from epoch alone;
+    /// an ordinary block reuses the current epoch, while a boundary block names
+    /// the single next epoch. Missing or inconsistent records fail closed.
+    pub fn certified_block_v4(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<(BlockV4, FinalityAuthoritySetV1, FinalityCertificate)>, NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        let Some(block) = self.store.block_v4_by_height(height)? else {
+            return Ok(None);
+        };
+        let Some(certificate) = self.store.certificate(height.get())? else {
+            return Ok(None);
+        };
+        let current = self
+            .store
+            .finality_authority_set_v1(block.header.epoch)?
+            .ok_or_else(|| {
+                StorageError::Inconsistent(
+                    "stored V4 block has no current authority snapshot".into(),
+                )
+            })?;
+        let next = if current.commitment()? == block.header.next_finality_authority_set_root {
+            current
+        } else {
+            let next_epoch = block.header.epoch.checked_next().ok_or_else(|| {
+                StorageError::Inconsistent("stored V4 authority epoch is exhausted".into())
+            })?;
+            self.store
+                .finality_authority_set_v1(next_epoch)?
+                .ok_or_else(|| {
+                    StorageError::Inconsistent(
+                        "stored V4 block has no successor authority snapshot".into(),
+                    )
+                })?
+        };
+        if next.commitment()? != block.header.next_finality_authority_set_root {
+            return Err(StorageError::Inconsistent(
+                "stored V4 successor authority commitment does not match its header".into(),
+            )
+            .into());
+        }
+        Ok(Some((block, next, certificate)))
+    }
+
     /// Replays and atomically commits one certified protocol-2 V4 block.
     ///
     /// The store transaction includes block/state/authority/certificate/tip,
