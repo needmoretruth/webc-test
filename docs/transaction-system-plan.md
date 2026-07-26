@@ -1020,6 +1020,17 @@ Exact next item remains the atomic finalized storage batch, now using this
 explicit `BlockV4` boundary rather than extending or reinterpreting the legacy
 container.
 
+The V4 authority commitment is also concrete rather than caller-supplied opaque
+data. `FinalityAuthoritySetV1` binds protocol, chain, decimal-string epoch,
+strictly sorted validator IDs, distinct Ed25519 consensus keys, non-zero voting
+power, and its checked exact total under `WEBC_FINALITY_AUTHORITY_SET_V1`.
+Hostile JSON is bounded to 8 MiB and 16,384 entries before retention. It converts
+only after validation to the existing `ValidatorSet` certificate verifier. Rust
+and TypeScript freeze commitment
+`4361528bc72a2ea4e098119168f5eec6c5087d2958d48c2bccd26d0de2651899`.
+This closes the prerequisite for checking a V4 header's current authority root
+before accepting its finality certificate in the atomic storage batch.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at

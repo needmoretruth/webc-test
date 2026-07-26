@@ -18,6 +18,7 @@ pub mod contract;
 pub mod dex;
 pub mod execution_v1;
 pub mod fees;
+pub mod finality_authority;
 pub mod genesis;
 pub mod governance;
 pub mod grants;
@@ -94,6 +95,11 @@ pub use fees::{
     calculate_fee_summary_v1, next_base_fee, next_localized_base_fee, split_fee, FeeBreakdown,
     FeeComputationError, FeePayerV1, FeePolicy, FeeRate, FeeSummaryV1, GasUnits, NamespaceFeeState,
     StoragePricing, StorageRefund, FEE_SUMMARY_V1, NAMESPACE_FEE_LEAF_DOMAIN,
+};
+pub use finality_authority::{
+    FinalityAuthoritySetErrorV1, FinalityAuthoritySetV1, FinalityAuthorityV1,
+    FINALITY_AUTHORITY_SET_V1, FINALITY_AUTHORITY_SET_V1_DOMAIN, MAX_FINALITY_AUTHORITIES_V1,
+    MAX_FINALITY_AUTHORITY_SET_V1_JSON_BYTES,
 };
 pub use genesis::{GenesisAccount, GenesisConfig, GenesisValidator};
 pub use governance::{

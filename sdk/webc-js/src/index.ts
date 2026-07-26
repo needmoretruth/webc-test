@@ -16,6 +16,7 @@ export * from "./clients/token.js";
 export * from "./clients/nft.js";
 export * from "./canonical.js";
 export * from "./hex.js";
+export * from "./finality-authority.js";
 export * from "./http402.js";
 export * from "./keystore.js";
 export * from "./node-client.js";
