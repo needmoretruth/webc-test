@@ -19,6 +19,7 @@ pub mod consensus_driver;
 pub mod gossip;
 pub mod http;
 pub mod mempool;
+pub mod mempool_v1;
 pub mod node;
 pub mod service;
 
@@ -26,6 +27,9 @@ pub use consensus_driver::{CommitInfo, ConsensusDriver, DriverExit, DriverTimeou
 pub use gossip::run_gossip_pump;
 pub use http::{router, serve, AppState, BlockEvent};
 pub use mempool::{InsertOutcome, Mempool, MempoolConfig, MempoolError};
+pub use mempool_v1::{
+    V5AdmissionPlan, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError,
+};
 pub use node::{Node, NodeError};
 pub use service::{
     ApiError, FaucetConfig, NetworkAdmission, NodeService, NodeServiceOptions, API_VERSION,
