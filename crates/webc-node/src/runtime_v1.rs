@@ -574,15 +574,22 @@ mod tests {
     const NOW: u64 = 1_700_000_000_000;
 
     fn genesis(sender: &Keypair) -> GenesisConfig {
+        genesis_for(&[sender])
+    }
+
+    fn genesis_for(senders: &[&Keypair]) -> GenesisConfig {
         GenesisConfig {
             chain: ChainConfig {
                 protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
                 ..ChainConfig::default()
             },
-            accounts: vec![GenesisAccount {
-                address: sender.address(),
-                balance: Amount::from_units(10_000_000),
-            }],
+            accounts: senders
+                .iter()
+                .map(|sender| GenesisAccount {
+                    address: sender.address(),
+                    balance: Amount::from_units(10_000_000),
+                })
+                .collect(),
             validators: Vec::new(),
         }
     }
@@ -668,6 +675,106 @@ mod tests {
         assert_eq!(stats.committed_height, BlockHeight::new(0));
         assert_eq!(stats.mempool_size, 1);
         assert!(stats.mempool_bytes > 0);
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn replacement_commits_old_and_new_lifecycles_before_memory_changes() {
+        let alice = Keypair::from_seed([39; 32]);
+        let bob = Keypair::from_seed([40; 32]);
+        let node = Node::open(MemoryKvStore::new(), &genesis(&alice)).expect("test node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+        let old = transfer(&alice, &bob, 0, 5);
+        let old_id = old.transaction_id().expect("old transaction has an ID");
+        handle
+            .submit(old, LocalTimestampMs::new(NOW))
+            .await
+            .expect("old transaction commits");
+
+        let replacement = transfer(&alice, &bob, 0, 6);
+        let replacement_id = replacement.transaction_id().expect("replacement has an ID");
+        let receipt = handle
+            .submit(replacement, LocalTimestampMs::new(NOW + 1))
+            .await
+            .expect("replacement commits atomically");
+        assert_eq!(receipt.outcome, V5InsertOutcome::Replaced { old_id });
+        assert_eq!(receipt.transaction_id, replacement_id);
+        assert_eq!(receipt.mempool_size, 1);
+        assert!(matches!(
+            handle
+                .lifecycle(old_id)
+                .await
+                .expect("old lifecycle query succeeds")
+                .and_then(|entry| entry.local_observation),
+            Some(LocalTransactionObservationV1::Replaced {
+                replacement_id: actual,
+                ..
+            }) if actual == replacement_id
+        ));
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn runnable_admission_durably_evicts_parked_gap_at_capacity() {
+        let alice = Keypair::from_seed([41; 32]);
+        let carol = Keypair::from_seed([42; 32]);
+        let recipient = Keypair::from_seed([43; 32]);
+        let node = Node::open(MemoryKvStore::new(), &genesis_for(&[&alice, &carol]))
+            .expect("test node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig {
+                max_transactions: 1,
+                ..V5MempoolConfig::default()
+            },
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+        let parked = transfer(&alice, &recipient, 1, 100);
+        let parked_id = parked
+            .transaction_id()
+            .expect("parked transaction has an ID");
+        handle
+            .submit(parked, LocalTimestampMs::new(NOW))
+            .await
+            .expect("bounded future nonce is parked");
+
+        let runnable = transfer(&carol, &recipient, 0, 5);
+        let receipt = handle
+            .submit(runnable, LocalTimestampMs::new(NOW + 1))
+            .await
+            .expect("runnable newcomer evicts parked gap");
+        assert_eq!(
+            receipt.outcome,
+            V5InsertOutcome::Evicted { old_id: parked_id }
+        );
+        assert_eq!(receipt.mempool_size, 1);
+        assert!(matches!(
+            handle
+                .lifecycle(parked_id)
+                .await
+                .expect("evicted lifecycle query succeeds")
+                .and_then(|entry| entry.local_observation),
+            Some(LocalTransactionObservationV1::Dropped {
+                reason: LocalDropReasonV1::CapacityEviction,
+                ..
+            })
+        ));
 
         handle.shutdown().await.expect("shutdown is acknowledged");
         task.await
