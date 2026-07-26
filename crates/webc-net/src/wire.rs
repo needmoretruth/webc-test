@@ -61,6 +61,13 @@ pub const NET_PROTOCOL_VERSION: u16 = 6;
 /// before decompressing or deserializing any attacker-controlled payload.
 const FRAME_HEADER_LEN: usize = NET_PROTOCOL_MAGIC.len() + 2;
 
+/// Decoded bytes represented by one inbound rate-limit work unit.
+///
+/// Votes and ordinary transactions normally cost one unit. A maximum-size V4
+/// proposal or sync response costs 512 units, so compression cannot turn an
+/// 8 MiB decompression/deserialize job into the same allowance as one tiny vote.
+pub(crate) const RATE_LIMIT_BYTES_PER_UNIT: usize = 16 * 1024;
+
 /// Maximum size of a single decoded frame payload, in bytes.
 ///
 /// Protocol-2 proposals and sync replies carry a bounded V4 block plus an
@@ -193,6 +200,57 @@ pub fn decode_message(bytes: &[u8]) -> Result<NetMessage, NetError> {
     Ok(message)
 }
 
+/// Computes the pre-decode rate-limit cost of one hostile frame.
+///
+/// Clear header/tag checks and zstd's frame-content-size parser are bounded and
+/// happen before hashing, decompression, deserialization, or reflood. Locally
+/// produced zstd frames declare their decoded size. A syntactically valid frame
+/// that omits it is charged the full frame budget, preventing a peer from hiding
+/// decompression work behind a tiny compressed byte count.
+pub(crate) fn inbound_work_units(bytes: &[u8]) -> Result<u32, NetError> {
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(NetError::FrameTooLarge {
+            maximum: MAX_FRAME_BYTES,
+        });
+    }
+    if bytes.len() <= FRAME_HEADER_LEN {
+        return Err(NetError::MalformedFrame);
+    }
+    if bytes[0..4] != NET_PROTOCOL_MAGIC {
+        return Err(NetError::BadMagic);
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != NET_PROTOCOL_VERSION {
+        return Err(NetError::UnsupportedVersion { actual: version });
+    }
+
+    let (tag, payload) = bytes[FRAME_HEADER_LEN..]
+        .split_first()
+        .ok_or(NetError::MalformedFrame)?;
+    let decoded_bytes = match *tag {
+        crate::codec::RAW_TAG => payload.len(),
+        crate::codec::ZSTD_TAG => match zstd::zstd_safe::get_frame_content_size(payload) {
+            Ok(Some(size)) => usize::try_from(size).map_err(|_| NetError::FrameTooLarge {
+                maximum: MAX_FRAME_BYTES,
+            })?,
+            Ok(None) => MAX_FRAME_BYTES,
+            Err(_) => return Err(NetError::MalformedFrame),
+        },
+        _ => return Err(NetError::MalformedFrame),
+    };
+    if decoded_bytes > MAX_FRAME_BYTES {
+        return Err(NetError::FrameTooLarge {
+            maximum: MAX_FRAME_BYTES,
+        });
+    }
+    let charged_bytes = decoded_bytes.max(bytes.len()).max(1);
+    u32::try_from(charged_bytes.div_ceil(RATE_LIMIT_BYTES_PER_UNIT)).map_err(|_| {
+        NetError::FrameTooLarge {
+            maximum: MAX_FRAME_BYTES,
+        }
+    })
+}
+
 /// Stable content identity of an encoded frame, used to suppress gossip loops.
 ///
 /// Two byte-identical frames share an ID, so a node that has already seen and
@@ -205,6 +263,7 @@ pub fn message_id(encoded_frame: &[u8]) -> Hash256 {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::io::Write;
 
     use webc_chain::{
         Amount, BlockHeaderV4, ChainId, Epoch, FeeBid, Operation, ProtocolVersion, ValidatorPower,
@@ -712,6 +771,59 @@ mod tests {
         let a = encode_message(&message).unwrap();
         let b = encode_message(&message).unwrap();
         assert_eq!(message_id(&a), message_id(&b));
+    }
+
+    #[test]
+    fn inbound_cost_uses_declared_expanded_size_before_decode() {
+        let payload = vec![0u8; RATE_LIMIT_BYTES_PER_UNIT * 5];
+        let body = compress_payload(&payload);
+        assert_eq!(body[0], crate::codec::ZSTD_TAG);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&NET_PROTOCOL_MAGIC);
+        frame.extend_from_slice(&NET_PROTOCOL_VERSION.to_le_bytes());
+        frame.extend_from_slice(&body);
+        assert_eq!(inbound_work_units(&frame).unwrap(), 5);
+    }
+
+    #[test]
+    fn zstd_without_content_size_is_charged_the_full_budget() {
+        let payload = vec![0u8; RATE_LIMIT_BYTES_PER_UNIT * 2];
+        let mut encoder =
+            zstd::stream::write::Encoder::new(Vec::new(), 3).expect("streaming encoder starts");
+        encoder
+            .include_contentsize(false)
+            .expect("content-size flag configures");
+        encoder.write_all(&payload).expect("payload compresses");
+        let compressed = encoder.finish().expect("zstd frame finishes");
+        assert!(matches!(
+            zstd::zstd_safe::get_frame_content_size(&compressed),
+            Ok(None)
+        ));
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&NET_PROTOCOL_MAGIC);
+        frame.extend_from_slice(&NET_PROTOCOL_VERSION.to_le_bytes());
+        frame.push(crate::codec::ZSTD_TAG);
+        frame.extend_from_slice(&compressed);
+        assert_eq!(
+            inbound_work_units(&frame).unwrap(),
+            u32::try_from(MAX_FRAME_BYTES / RATE_LIMIT_BYTES_PER_UNIT)
+                .expect("fixed rate-limit ratio fits")
+        );
+    }
+
+    #[test]
+    fn declared_expansion_over_the_frame_cap_is_rejected_before_decode() {
+        let payload = vec![0u8; MAX_FRAME_BYTES + 1];
+        let compressed = zstd::bulk::compress(&payload, 3).expect("payload compresses");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&NET_PROTOCOL_MAGIC);
+        frame.extend_from_slice(&NET_PROTOCOL_VERSION.to_le_bytes());
+        frame.push(crate::codec::ZSTD_TAG);
+        frame.extend_from_slice(&compressed);
+        assert!(matches!(
+            inbound_work_units(&frame),
+            Err(NetError::FrameTooLarge { maximum }) if maximum == MAX_FRAME_BYTES
+        ));
     }
 
     #[test]

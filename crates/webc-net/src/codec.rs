@@ -137,10 +137,11 @@ pub(crate) fn compress_payload(payload: &[u8]) -> Vec<u8> {
     if payload.len() < MIN_COMPRESS_LEN {
         return with_tag(RAW_TAG, payload);
     }
-    // Compress; keep it only if strictly smaller than the raw form. `encode_all`
-    // on an in-memory slice only fails on allocation-class errors; treat any
-    // failure as "not compressible" and fall back to raw.
-    match zstd::encode_all(payload, ZSTD_LEVEL) {
+    // `bulk::compress` knows the complete source length and records it in the
+    // zstd frame header. The transport can therefore rate-limit the declared
+    // expanded work before decompressing. Keep compressed bytes only when they
+    // are strictly smaller; any codec failure falls back to raw.
+    match zstd::bulk::compress(payload, ZSTD_LEVEL) {
         Ok(compressed) if compressed.len() < payload.len() => with_tag(ZSTD_TAG, &compressed),
         _ => with_tag(RAW_TAG, payload),
     }
@@ -288,6 +289,10 @@ mod tests {
         let payload = vec![0u8; 200_000];
         let body = compress_payload(&payload);
         assert_eq!(body[0], ZSTD_TAG);
+        assert!(matches!(
+            zstd::zstd_safe::get_frame_content_size(&body[1..]),
+            Ok(Some(size)) if size == payload.len() as u64
+        ));
         assert!(
             body.len() < payload.len() / 10,
             "expected strong compression, got {} bytes from {}",

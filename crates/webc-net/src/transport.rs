@@ -38,7 +38,9 @@ use crate::handshake::{
     accept_hello, build_hello, build_proof, verify_peer_proof, HandshakeHello, HandshakeProof,
     PeerId, CHALLENGE_LEN,
 };
-use crate::wire::{decode_message, encode_message, message_id, NetMessage, MAX_FRAME_BYTES};
+use crate::wire::{
+    decode_message, encode_message, inbound_work_units, message_id, NetMessage, MAX_FRAME_BYTES,
+};
 
 /// Number of recently seen frame IDs retained to suppress gossip loops.
 const SEEN_CACHE_CAPACITY: usize = 8192;
@@ -92,22 +94,23 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 8;
 /// eviction of the least useful peer are later work).
 const DEFAULT_MAX_PEERS: usize = 1024;
 
-/// Default per-peer inbound token-bucket burst capacity, in frames.
+/// Default per-peer inbound token-bucket burst capacity, in 16 KiB work units.
 ///
 /// Why 512 (finding N4): a peer may legitimately deliver a short burst — a batch
 /// of relayed transactions plus a round's worth of consensus proposals/votes —
-/// so the bucket must absorb a spike without dropping honest gossip. 512 frames
-/// is comfortably above any normal burst.
+/// so the bucket must absorb a spike without dropping honest gossip. Small
+/// frames cost one unit, while 512 units also admit one maximum-size 8 MiB V4
+/// frame. This bounds expanded-byte work without starving normal consensus.
 const DEFAULT_PEER_RATE_CAPACITY: u32 = 512;
 
-/// Default per-peer inbound sustained rate, in frames per second.
+/// Default per-peer inbound sustained rate, in 16 KiB work units per second.
 ///
 /// Why 256/s (finding N4): one fast peer must not monopolize the single gossip
 /// worker (each inbound frame costs a hash, a decode, and a re-flood) and starve
-/// honest peers. 256 frames/s sustained is far above a healthy peer's steady
-/// gossip volume at devnet block cadence, yet bounds any single peer's share of
-/// the worker; frames beyond the rate are dropped before they cost work and are
-/// re-learned from other peers (a fairness bound, not a correctness one).
+/// honest peers. 256 units/s permits 256 small frames or 4 MiB of decoded large
+/// frames per second, yet bounds any single peer's share of the worker. Excess
+/// gossip is dropped before decompression and can be re-learned from other peers
+/// (a fairness bound, not a correctness one).
 const DEFAULT_PEER_RATE_PER_SEC: u32 = 256;
 
 /// A gossip message received from an authenticated peer.
@@ -150,9 +153,9 @@ pub struct NetworkConfig {
     /// A deterministic hard cap; connections authenticated beyond it are
     /// rejected so a Sybil cannot inflate the table or gossip fan-out.
     pub max_peers: usize,
-    /// Per-peer inbound burst capacity, in frames (finding N4).
+    /// Per-peer inbound burst capacity, in 16 KiB decoded work units (N4).
     pub peer_rate_capacity: u32,
-    /// Per-peer inbound sustained rate, in frames per second (finding N4).
+    /// Per-peer sustained rate, in 16 KiB decoded work units per second (N4).
     pub peer_rate_per_sec: u32,
 }
 
@@ -679,13 +682,16 @@ async fn worker(
                         connected.store(peers.len(), Ordering::Relaxed);
                     }
                     Some(Event::Frame { from, bytes }) => {
-                        // Per-peer rate limit FIRST (finding N4), before the hash,
-                        // decode, and re-flood a frame would otherwise cost: a peer
-                        // that exceeds its token bucket has this frame dropped so it
-                        // cannot monopolize the shared worker. Dropped gossip is
-                        // re-learned from other peers.
+                        // Parse only the clear header/compression metadata, then
+                        // charge expanded-byte work before hashing, decompression,
+                        // deserialization, or reflood. This prevents a small zstd
+                        // frame carrying a large V4 block from costing one vote-sized
+                        // token. Malformed metadata is dropped on this cheap path.
+                        let Ok(work_units) = inbound_work_units(&bytes) else {
+                            continue;
+                        };
                         if let Some(bucket) = rate_limits.get_mut(&from) {
-                            if !bucket.try_admit(tokio::time::Instant::now()) {
+                            if !bucket.try_admit(tokio::time::Instant::now(), work_units) {
                                 continue;
                             }
                         }
@@ -743,12 +749,13 @@ fn send_to_peer(
     }
 }
 
-/// A per-peer token bucket bounding how many inbound frames one peer may force
-/// the shared worker to process (finding N4).
+/// A per-peer token bucket bounding how much decoded inbound work one peer may
+/// force the shared worker to process (finding N4).
 ///
-/// Standard token bucket: up to `capacity` tokens accrue at `refill_per_sec`,
-/// one token is spent per admitted frame, and a frame arriving with the bucket
-/// empty is dropped *before* it costs the worker a hash, a decode, or a re-flood.
+/// Standard token bucket: up to `capacity` units accrue at `refill_per_sec`; a
+/// frame spends one unit per 16 KiB of its greater encoded/declared-decoded size.
+/// A frame whose full cost is unavailable is dropped before hashing,
+/// decompression, deserialization, or re-flood.
 /// This keeps one fast peer from monopolizing the single gossip worker and
 /// starving honest peers — a fairness/throughput bound, not a correctness one:
 /// dropped gossip is re-learned from other peers. It lives in the network worker,
@@ -779,11 +786,11 @@ impl TokenBucket {
         }
     }
 
-    /// Refills for the elapsed time, then spends one token.
+    /// Refills for the elapsed time, then atomically spends `cost` units.
     ///
     /// Returns `true` if the frame is admitted, `false` if it must be dropped
     /// because the peer has exceeded its allowance.
-    fn try_admit(&mut self, now: tokio::time::Instant) -> bool {
+    fn try_admit(&mut self, now: tokio::time::Instant, cost: u32) -> bool {
         let elapsed_ms = now.saturating_duration_since(self.last_refill).as_millis();
         // tokens accrued = elapsed_ms * refill_per_sec / 1000 (integer).
         let accrued = elapsed_ms.saturating_mul(u128::from(self.refill_per_sec)) / 1000;
@@ -802,8 +809,9 @@ impl TokenBucket {
                 (u128::from(accrued).saturating_mul(1000) / u128::from(self.refill_per_sec)) as u64;
             self.last_refill += std::time::Duration::from_millis(credited_ms);
         }
-        if self.tokens > 0 {
-            self.tokens -= 1;
+        let cost = u64::from(cost.max(1));
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -1411,25 +1419,42 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let mut bucket = TokenBucket::new(2, 10, t0); // capacity 2, 10 tokens/sec
 
-        assert!(bucket.try_admit(t0), "first burst frame admitted");
-        assert!(bucket.try_admit(t0), "second burst frame admitted");
-        assert!(!bucket.try_admit(t0), "third frame beyond capacity denied");
+        assert!(bucket.try_admit(t0, 1), "first burst frame admitted");
+        assert!(bucket.try_admit(t0, 1), "second burst frame admitted");
+        assert!(
+            !bucket.try_admit(t0, 1),
+            "third frame beyond capacity denied"
+        );
 
         // 50ms at 10/sec is under one whole token → still denied.
-        assert!(!bucket.try_admit(t0 + Duration::from_millis(50)));
+        assert!(!bucket.try_admit(t0 + Duration::from_millis(50), 1));
 
         // 100ms → exactly one token refilled → one admit, then denied again.
         let t1 = t0 + Duration::from_millis(100);
-        assert!(bucket.try_admit(t1), "one refilled token admits one frame");
         assert!(
-            !bucket.try_admit(t1),
+            bucket.try_admit(t1, 1),
+            "one refilled token admits one frame"
+        );
+        assert!(
+            !bucket.try_admit(t1, 1),
             "no tokens left after spending the refill"
         );
 
         // A long idle refills to capacity but never beyond it.
         let t2 = t1 + Duration::from_secs(60);
-        assert!(bucket.try_admit(t2));
-        assert!(bucket.try_admit(t2));
-        assert!(!bucket.try_admit(t2), "refill is clamped to capacity");
+        assert!(bucket.try_admit(t2, 2));
+        assert!(!bucket.try_admit(t2, 1), "refill is clamped to capacity");
+    }
+
+    #[tokio::test]
+    async fn token_bucket_rejects_a_frame_whose_whole_cost_is_unavailable() {
+        let now = tokio::time::Instant::now();
+        let mut bucket = TokenBucket::new(512, 256, now);
+        assert!(bucket.try_admit(now, 500));
+        assert!(
+            !bucket.try_admit(now, 13),
+            "a large frame cannot be partially charged"
+        );
+        assert!(bucket.try_admit(now, 12));
     }
 }
