@@ -1,6 +1,6 @@
 //! Bounded encoding for typed records stored behind [`crate::KvStore`].
 //!
-//! Purpose: keep the schema-v1 bincode representation and every hostile-record
+//! Purpose: keep the stable bincode representation and every hostile-record
 //! limit in one auditable seam. Responsibilities: choose an absolute byte cap
 //! for each record class, use the protocol's variable-length integer encoding,
 //! reject trailing bytes, and classify malformed persisted input as corruption.
@@ -27,12 +27,12 @@ use crate::StorageError;
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 
-/// Absolute byte limits for one encoded schema-v1 record of each semantic kind.
+/// Absolute byte limits for one encoded record of each semantic kind.
 ///
 /// Small metadata limits exceed their exact current encodings while remaining
 /// tight. Blocks and certificates align with the current 4 MiB network/block
 /// envelope. Validator sets allow the ADR-0016 authority-set ceiling with ample
-/// per-entry overhead. State and WAL records need larger caps because schema 1
+/// per-entry overhead. State and WAL records need larger caps because the store
 /// stores a complete latest-state snapshot and full signed proposal history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoredRecordKind {
@@ -80,7 +80,7 @@ impl StoredRecordKind {
     }
 }
 
-/// Returns the schema-v1 bincode configuration for `kind`.
+/// Returns the stable bounded bincode configuration for `kind`.
 ///
 /// Variable-length integers implement the current schema-1 at-rest format from
 /// §15.14. Little endian is explicit for the multi-byte varint payloads, while
@@ -95,7 +95,7 @@ fn options(kind: StoredRecordKind) -> impl Options {
         .with_limit(kind.max_bytes())
 }
 
-/// Encodes one typed record in the bounded schema-v1 at-rest representation.
+/// Encodes one typed record in the bounded at-rest representation.
 ///
 /// The record is rejected with [`StorageError::Serialization`] if its encoded
 /// form exceeds the kind-specific absolute byte cap or serialization otherwise

@@ -941,6 +941,39 @@ hostile/trailing data before unbounded work, and prove crash/restart behavior.
 Then integrate V5 lifecycle records into the mempool/runtime/API and resume the
 finalized proof/browser-verifier track.
 
+### Atomic storage schema-2 checkpoint (2026-07-27)
+
+The at-rest ambiguity is closed before V5 reaches the node. `ChainStore` now
+stamps schema 2 and stores each current `ChainState` inside an explicit
+`WEBCSTV2`/record-version-2 envelope. Encoding borrows the state instead of
+cloning a potentially large snapshot. Every read still passes through the
+kind-specific 256 MiB outer bound, active bincode limit, strict trailing-byte
+rejection, and the physical zstd codec.
+
+Opening schema 1 performs one bounded, one-way migration. The compatibility
+type exactly matches the 54 field names, types, and order in the final
+`origin/main` schema-1 `ChainState`; a frozen old-record hash catches drift. Only
+protocol 1 is accepted through that adapter, and its V5 grant book is created
+empty. The old state is decoded, its chain and tip root are verified, the old
+buffer is released, and the schema-2 state plus schema marker are committed in
+one redb/KV transaction. Because schema 1 retained only the latest snapshot,
+migration work is constant with chain age and needs no partial-progress cursor.
+Any malformed/trailing/oversized record, wrong chain/root, encode failure, or
+database failure leaves the schema-1 marker and bytes untouched for a safe
+retry.
+
+Tests prove memory and redb migration, unchanged protocol-1 state root, frozen
+legacy bytes, failure atomicity across reopen, rejection of unwrapped/wrong-magic
+schema-2 records, and persistence of a real non-empty protocol-2 sponsor-grant
+book across restart with a stable V21 root. Strict storage Clippy and all 53
+storage tests pass.
+
+Exact next item: add the protocol-2 pending/finalized transaction lifecycle
+records and atomic indexes, then integrate V5 admission/replacement/expiry into
+the mempool and node runtime with versioned HTTP/WebSocket APIs. The V4 paths
+must remain byte-compatible and active under protocol 1 while protocol 2 is
+explicitly configured in tests/devnet fixtures.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at

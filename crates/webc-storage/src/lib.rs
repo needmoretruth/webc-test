@@ -36,6 +36,7 @@ mod kv;
 mod memory;
 mod record_codec;
 mod redb_store;
+mod state_record;
 
 pub use chainstore::{BlockCommit, ChainStore, ChainTip, CHAIN_STORE_SCHEMA_VERSION};
 pub use error::StorageError;

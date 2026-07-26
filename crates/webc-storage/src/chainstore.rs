@@ -36,12 +36,16 @@ use webc_crypto::Hash256;
 use crate::error::StorageError;
 use crate::kv::{KvStore, Table, WriteBatch};
 use crate::record_codec::{decode, encode, StoredRecordKind};
+use crate::state_record::{decode_schema_v1, decode_schema_v2, encode_schema_v2};
 
 /// On-disk schema version for the typed chain layout.
 ///
-/// Bump this only with a migration: [`ChainStore::open`] refuses any other
-/// version so a future layout is never interpreted with today's rules.
-pub const CHAIN_STORE_SCHEMA_VERSION: u32 = 1;
+/// Bump this only with a migration. [`ChainStore::open`] accepts this version
+/// and the one explicitly supported predecessor; every other value is refused.
+pub const CHAIN_STORE_SCHEMA_VERSION: u32 = 2;
+
+/// Only predecessor accepted for automatic one-way migration.
+const LEGACY_CHAIN_STORE_SCHEMA_VERSION: u32 = 1;
 
 /// Meta-table key holding the 4-byte big-endian schema version.
 const META_SCHEMA_VERSION: &[u8] = b"schema_version";
@@ -100,11 +104,11 @@ impl<K: KvStore> ChainStore<K> {
     /// Opens typed storage over `store`, initializing or verifying the schema and
     /// checking tip consistency.
     ///
-    /// A fresh (empty) store is stamped with the current schema version. An
-    /// existing store must carry exactly [`CHAIN_STORE_SCHEMA_VERSION`]; any other
-    /// value is [`StorageError::UnsupportedSchemaVersion`]. If a tip is present,
-    /// its block (for height > 0) and state snapshot must exist and hash
-    /// consistently, else the store is reported as inconsistent/corrupt.
+    /// A fresh store is stamped with the current schema version. Schema 1 is
+    /// migrated atomically to schema 2; any other version is
+    /// [`StorageError::UnsupportedSchemaVersion`]. If a tip is present, its block
+    /// (for height > 0) and state snapshot must exist and hash consistently,
+    /// else the store is reported as inconsistent/corrupt.
     pub fn open(mut store: K, expected_chain_id: &ChainId) -> Result<Self, StorageError> {
         match store.get(Table::Meta, META_SCHEMA_VERSION)? {
             None => {
@@ -128,7 +132,8 @@ impl<K: KvStore> ChainStore<K> {
                 let found = decode_u32(&bytes).ok_or_else(|| {
                     StorageError::Corruption("schema version is malformed".into())
                 })?;
-                if found != CHAIN_STORE_SCHEMA_VERSION {
+                if found != CHAIN_STORE_SCHEMA_VERSION && found != LEGACY_CHAIN_STORE_SCHEMA_VERSION
+                {
                     return Err(StorageError::UnsupportedSchemaVersion {
                         found,
                         expected: CHAIN_STORE_SCHEMA_VERSION,
@@ -147,12 +152,73 @@ impl<K: KvStore> ChainStore<K> {
                         found: stored_chain_id.to_string(),
                     });
                 }
+                if found == LEGACY_CHAIN_STORE_SCHEMA_VERSION {
+                    Self::migrate_schema_v1(&mut store, expected_chain_id)?;
+                }
             }
         }
 
         let chain_store = Self { store };
         chain_store.verify_tip_consistency()?;
         Ok(chain_store)
+    }
+
+    /// Atomically rewrites the latest legacy state and advances the schema marker.
+    ///
+    /// Schema 1 retained only the latest state snapshot, so migration is bounded
+    /// to one record regardless of chain age. The old bytes and schema marker
+    /// remain untouched if decode, chain/root validation, encoding, or the final
+    /// database transaction fails. Reopening after a crash therefore observes
+    /// either a complete schema-1 store or a complete schema-2 store.
+    fn migrate_schema_v1(store: &mut K, expected_chain_id: &ChainId) -> Result<(), StorageError> {
+        let tip = match store.get(Table::Meta, META_TIP)? {
+            None => None,
+            Some(bytes) => Some(decode::<ChainTip>(StoredRecordKind::ChainTip, &bytes)?),
+        };
+        let mut batch = WriteBatch::new();
+        if let Some(tip) = tip {
+            let key = be(tip.height);
+            let old_bytes = store.get(Table::StateSnapshots, &key)?.ok_or_else(|| {
+                StorageError::Inconsistent(format!(
+                    "schema-1 tip names height {} but its state is missing",
+                    tip.height
+                ))
+            })?;
+            let state = decode_schema_v1(&old_bytes)?;
+            // The decoded state now owns every value. Release the up-to-256 MiB
+            // legacy buffer before allocating the schema-2 encoding.
+            drop(old_bytes);
+            if &state.chain_id != expected_chain_id {
+                return Err(StorageError::ChainIdMismatch {
+                    expected: expected_chain_id.to_string(),
+                    found: state.chain_id.to_string(),
+                });
+            }
+            let root = state
+                .state_root()
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            if root != tip.state_root {
+                return Err(StorageError::Corruption(format!(
+                    "schema-1 state root does not match the tip at height {}",
+                    tip.height
+                )));
+            }
+            batch.put(
+                Table::StateSnapshots,
+                key.to_vec(),
+                encode_schema_v2(&state)?,
+            );
+        } else if !store.scan(Table::StateSnapshots, None, 1)?.is_empty() {
+            return Err(StorageError::Inconsistent(
+                "schema-1 store has a state snapshot but no chain tip".into(),
+            ));
+        }
+        batch.put(
+            Table::Meta,
+            META_SCHEMA_VERSION,
+            CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec(),
+        );
+        store.commit(batch)
     }
 
     /// Confirms that a stored tip is backed by the block and state it names.
@@ -215,7 +281,7 @@ impl<K: KvStore> ChainStore<K> {
             }
             return Ok(());
         }
-        let state_bytes = encode(StoredRecordKind::StateSnapshot, genesis)?;
+        let state_bytes = encode_schema_v2(genesis)?;
         let tip = ChainTip {
             height: 0,
             block_hash: None,
@@ -279,7 +345,7 @@ impl<K: KvStore> ChainStore<K> {
             .hash()
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
         let block_bytes = encode(StoredRecordKind::Block, commit.block)?;
-        let state_bytes = encode(StoredRecordKind::StateSnapshot, commit.state)?;
+        let state_bytes = encode_schema_v2(commit.state)?;
         let new_tip = ChainTip {
             height: header.height,
             block_hash: Some(block_hash),
@@ -369,7 +435,7 @@ impl<K: KvStore> ChainStore<K> {
     pub fn state_at_height(&self, height: u64) -> Result<Option<ChainState>, StorageError> {
         match self.store.get(Table::StateSnapshots, &be(height))? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(decode(StoredRecordKind::StateSnapshot, &bytes)?)),
+            Some(bytes) => Ok(Some(decode_schema_v2(&bytes)?)),
         }
     }
 
@@ -445,9 +511,15 @@ fn decode_u64(bytes: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webc_chain::{ChainConfig, ChainId, CURRENT_PROTOCOL_VERSION};
-    use webc_crypto::Keypair;
+    use std::collections::BTreeMap;
 
+    use webc_chain::{
+        BlockHeight, ChainConfig, ChainId, SponsorGrantId, SponsorGrantStateV1,
+        CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
+    };
+    use webc_crypto::{Hash256, Keypair};
+
+    use crate::state_record::{decode_schema_v2, encode_schema_v1_fixture, encode_schema_v2};
     use crate::{MemoryKvStore, RedbKvStore};
 
     /// Stamps the fixed schema and a valid devnet chain-id record so tests can
@@ -465,6 +537,41 @@ mod tests {
             encode(StoredRecordKind::ChainId, &ChainId::devnet()).unwrap(),
         );
         store.commit(batch).unwrap();
+    }
+
+    /// Stamps the predecessor layout so migration tests exercise the real open path.
+    fn stamp_schema_v1(store: &mut impl KvStore) {
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Table::Meta,
+            META_SCHEMA_VERSION.to_vec(),
+            LEGACY_CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            Table::Meta,
+            META_CHAIN_ID.to_vec(),
+            encode(StoredRecordKind::ChainId, &ChainId::devnet()).unwrap(),
+        );
+        store.commit(batch).unwrap();
+    }
+
+    fn write_schema_v1_genesis(store: &mut impl KvStore, state: &ChainState) -> Vec<u8> {
+        stamp_schema_v1(store);
+        let state_bytes = encode_schema_v1_fixture(state).unwrap();
+        let tip = ChainTip {
+            height: 0,
+            block_hash: None,
+            state_root: state.state_root().unwrap(),
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(Table::StateSnapshots, be(0).to_vec(), state_bytes.clone());
+        batch.put(
+            Table::Meta,
+            META_TIP.to_vec(),
+            encode(StoredRecordKind::ChainTip, &tip).unwrap(),
+        );
+        store.commit(batch).unwrap();
+        state_bytes
     }
 
     /// A distinct genesis-shaped state per epoch, so successive blocks commit to
@@ -570,6 +677,140 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = RedbKvStore::open(dir.path().join("chain.redb")).unwrap();
         exercise_lifecycle(backend);
+    }
+
+    #[test]
+    fn schema_one_state_migrates_atomically_without_changing_its_root() {
+        let state = state_at_epoch(7);
+        let expected_root = state.state_root().unwrap();
+        let mut backend = MemoryKvStore::new();
+        let legacy_bytes = write_schema_v1_genesis(&mut backend, &state);
+        // Frozen bytes from the exact 54-field `origin/main` schema-1 layout.
+        // A field reorder/type change in the compatibility adapter must never
+        // silently turn an old database into a different state.
+        assert_eq!(
+            Hash256::digest(&legacy_bytes).to_string(),
+            "6c9189155138615cc1a618072fd505ff6cdc3c7e90ab6f97503a383f69d075c0"
+        );
+
+        let store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        assert_eq!(store.latest_state().unwrap(), Some(state.clone()));
+        assert_eq!(
+            store.latest_state().unwrap().unwrap().state_root().unwrap(),
+            expected_root
+        );
+        assert_eq!(
+            store
+                .backend()
+                .get(Table::Meta, META_SCHEMA_VERSION)
+                .unwrap(),
+            Some(CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec())
+        );
+        let migrated_bytes = store
+            .backend()
+            .get(Table::StateSnapshots, &be(0))
+            .unwrap()
+            .unwrap();
+        assert_ne!(migrated_bytes, legacy_bytes);
+        assert_eq!(decode_schema_v2(&migrated_bytes).unwrap(), state);
+    }
+
+    #[test]
+    fn schema_one_corruption_does_not_advance_the_schema_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema-one-corrupt.redb");
+        let mut corrupted;
+        {
+            let mut backend = RedbKvStore::open(&path).unwrap();
+            corrupted = write_schema_v1_genesis(&mut backend, &state_at_epoch(0));
+            corrupted.push(0xaa);
+            let mut batch = WriteBatch::new();
+            batch.put(Table::StateSnapshots, be(0).to_vec(), corrupted.clone());
+            backend.commit(batch).unwrap();
+        }
+        let error =
+            ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Serialization(_) | StorageError::Corruption(_)
+        ));
+
+        let reopened = RedbKvStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.get(Table::Meta, META_SCHEMA_VERSION).unwrap(),
+            Some(LEGACY_CHAIN_STORE_SCHEMA_VERSION.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            reopened.get(Table::StateSnapshots, &be(0)).unwrap(),
+            Some(corrupted)
+        );
+    }
+
+    #[test]
+    fn schema_two_persists_protocol_two_grant_state_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema-two-v5.redb");
+        let sponsor = Keypair::from_seed([0x51; 32]);
+        let grant_id = SponsorGrantId::new(Hash256([0x52; 32]));
+        let record = SponsorGrantStateV1::unused(Hash256([0x53; 32]), BlockHeight::new(500));
+        let map = BTreeMap::from([((sponsor.address(), grant_id), record)]);
+        let mut state = state_at_epoch(9);
+        state.protocol_version = TRANSACTION_V5_PROTOCOL_VERSION;
+        state.sponsor_grants = bincode::deserialize(&bincode::serialize(&map).unwrap()).unwrap();
+        let expected_root = state.state_root().unwrap();
+        {
+            let mut store =
+                ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
+            store.initialize_genesis(&state).unwrap();
+        }
+
+        let reopened =
+            ChainStore::open(RedbKvStore::open(&path).unwrap(), &ChainId::devnet()).unwrap();
+        let restored = reopened.latest_state().unwrap().unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), expected_root);
+        assert_eq!(
+            restored.sponsor_grants.get(&(sponsor.address(), grant_id)),
+            Some(&record)
+        );
+    }
+
+    #[test]
+    fn schema_two_rejects_an_unwrapped_state_record() {
+        let state = state_at_epoch(0);
+        let tip = ChainTip {
+            height: 0,
+            block_hash: None,
+            state_root: state.state_root().unwrap(),
+        };
+        let mut backend = MemoryKvStore::new();
+        stamp_schema(&mut backend);
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Table::StateSnapshots,
+            be(0).to_vec(),
+            encode(StoredRecordKind::StateSnapshot, &state).unwrap(),
+        );
+        batch.put(
+            Table::Meta,
+            META_TIP.to_vec(),
+            encode(StoredRecordKind::ChainTip, &tip).unwrap(),
+        );
+        backend.commit(batch).unwrap();
+        assert!(ChainStore::open(backend, &ChainId::devnet()).is_err());
+    }
+
+    #[test]
+    fn schema_two_state_record_rejects_wrong_magic_and_trailing_bytes() {
+        let state = state_at_epoch(0);
+        let valid = encode_schema_v2(&state).unwrap();
+        let mut wrong_magic = valid.clone();
+        wrong_magic[0] ^= 0xff;
+        assert!(decode_schema_v2(&wrong_magic).is_err());
+
+        let mut trailing = valid;
+        trailing.push(0xaa);
+        assert!(decode_schema_v2(&trailing).is_err());
     }
 
     #[test]
