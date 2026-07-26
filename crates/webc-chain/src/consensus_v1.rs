@@ -69,6 +69,7 @@ impl SignedProposalV1 {
             None,
             block,
             next_authority_set,
+            None,
             consensus_key,
             Vec::new(),
         )
@@ -84,6 +85,7 @@ impl SignedProposalV1 {
         valid_round: Option<u32>,
         block: BlockV4,
         next_authority_set: FinalityAuthoritySetV1,
+        reproposer: Option<webc_crypto::Address>,
         consensus_key: &Keypair,
         proof_of_lock: Vec<SignedVote>,
     ) -> Result<Self, ProposalV1Error> {
@@ -92,6 +94,10 @@ impl SignedProposalV1 {
         }
         block.validate()?;
         validate_next_authority_binding(&block, &next_authority_set)?;
+        let proposer = reproposer.unwrap_or(block.header.proposer);
+        if valid_round.is_none() && proposer != block.header.proposer {
+            return Err(ProposalV1Error::HeaderBindingMismatch);
+        }
         let payload = Proposal {
             protocol_version: block.header.protocol_version,
             chain_id: block.header.chain_id.clone(),
@@ -99,7 +105,7 @@ impl SignedProposalV1 {
             round,
             block_hash: block.header.hash()?,
             valid_round,
-            proposer: block.header.proposer,
+            proposer,
         };
         let signature = consensus_key.sign(&proposal_signing_bytes(&payload)?);
         Ok(Self {
@@ -133,7 +139,8 @@ impl SignedProposalV1 {
         }
         self.block.validate()?;
         if self.payload.height != self.block.header.height.get()
-            || self.payload.proposer != self.block.header.proposer
+            || (self.payload.valid_round.is_none()
+                && self.payload.proposer != self.block.header.proposer)
         {
             return Err(ProposalV1Error::HeaderBindingMismatch);
         }
@@ -408,20 +415,22 @@ mod tests {
                 .expect("vote signs")
             })
             .collect();
-        let round = 1;
         let set = authority.to_validator_set().expect("set converts");
+        let original_proposer = block.header.proposer;
+        let round = (1..=32)
+            .find(|round| set.proposer_for(1, *round) != Some(original_proposer))
+            .expect("later round rotates to a different proposer");
         let leader = set.proposer_for(1, round).expect("leader exists");
         let leader_key = keys
             .iter()
             .find(|key| key.address() == leader)
             .expect("leader key exists");
-        let mut reproposed_block = block;
-        reproposed_block.header.proposer = leader;
         let proposal = SignedProposalV1::sign_with_proof_of_lock(
             round,
             Some(0),
-            reproposed_block,
+            block,
             authority.clone(),
+            Some(leader),
             leader_key,
             proof,
         )
@@ -429,6 +438,7 @@ mod tests {
         proposal
             .verify_in_authority_set(&authority)
             .expect("quorum lock proof verifies");
+        assert_ne!(proposal.payload.proposer, proposal.block.header.proposer);
     }
 
     #[test]

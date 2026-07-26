@@ -392,7 +392,7 @@ impl ConsensusProposalScheme for Protocol2ConsensusScheme {
         round: u32,
         valid_round: Option<u32>,
         value: Self::Value,
-        _proposer: Address,
+        proposer: Address,
         consensus_key: &Keypair,
         proof_of_lock: Vec<SignedVote>,
         _context: &Self::Context,
@@ -402,6 +402,7 @@ impl ConsensusProposalScheme for Protocol2ConsensusScheme {
             valid_round,
             value.block,
             value.next_authority_set,
+            Some(proposer),
             consensus_key,
             proof_of_lock,
         )
