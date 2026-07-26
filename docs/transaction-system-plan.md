@@ -1116,6 +1116,63 @@ request slots before large bodies, and never hold a second `Node`/mempool copy.
 Then wire gossip/proposal/finalization callbacks through the same handle before
 starting finalized checkpoint/proof/browser verification.
 
+### V2 transport, gossip, and certified V4 runtime checkpoint (2026-07-27)
+
+Commits `5cf0e35`, `a2ea41e`, and `3c058f4` expose the single actor-owned V5
+lifecycle without creating a second node or mempool. The bounded V2 surface now
+supports durable submission, lifecycle and finalized-receipt queries, and an
+explicit-ID WebSocket stream with actor-consistent snapshots, monotonic durable
+sequences, lag/resnapshot signaling, message/connection/subscription limits,
+pre-body submission slots, redacted correlated errors, and a bounded socket-IP
+token bucket that ignores spoofable forwarding headers. Successful durable
+admission is gossiped as a versioned authenticated network message; a real
+two-node HTTP-to-TCP-to-remote-runtime test passes. Legacy consumers ignore V5
+without reinterpreting it.
+
+Commits `09aaee5`, `97afba3`, and `8714660` close the next execution/finality
+unit. One protocol-2 block transition now validates metadata and authority
+domains, applies objective evidence before user work, prunes expired grant state,
+executes ordered V5 transactions into position-bound V1 receipts, treats a
+chargeable action failure as an includable receipt, finishes fee/epoch state,
+checks supply conservation, derives the successor authority snapshot from
+post-state, and constructs every V4 root on a whole-block overlay. Import uses
+the same transition and adopts nothing unless the reconstructed block matches
+exactly. Tests cover later-invalid rollback, tampered roots, duplicate IDs,
+non-contiguous height, stale time, outsider proposer, byte limits, epoch
+transition, failed-then-successful execution, and producer/importer equality.
+
+`V5Mempool` now selects deterministic, gap-free sender/lane runs by effective
+fee while simulating preparation and ordered execution on a private state clone.
+This lets a chargeable failure consume its nonce so the next transaction remains
+eligible, but a stale head cannot poison unrelated lanes. `NodeRuntime` builds
+these candidates and atomically commits a mandatory certificate, block,
+post-state, current/next authority sets, receipt/index/lifecycle records, pending
+deletions, WAL cleanup, and tip before changing live state or pending memory. An
+injected storage failure leaves height and memory untouched and the identical
+certificate retries successfully; an externally finalized transaction removes a
+different local occupant of the same slot only after disk commit. Strict
+chain/node Clippy passes, all 535 chain tests plus supply/parallel integration
+tests pass, and all 79 node-library, 9 binary, and 18 node integration tests pass.
+
+This is not yet an end-to-end consensus claim. The active consensus proposal,
+vote driver, and state-sync messages still carry the frozen legacy `Block`, so
+they cannot transport or certify `BlockV4`; production `webc-node run` also does
+not yet start the protocol-2 actor/API/gossip/finality stack. Protocol-2 action
+programs currently use the one global V1 receipt base rate; localized
+multi-namespace pricing needs an explicit versioned rule and must not be inferred
+inside the current receipt. Finalized proof assembly and the browser verifier are
+also still absent.
+
+Exact next item: add distinct versioned protocol-2 proposal/state-sync network
+messages carrying `BlockV4` plus the derived next authority set, and a V4
+consensus driver that uses the existing pure BFT machine/WAL but routes candidate
+build, proposal validity replay, and certified finalization exclusively through
+`NodeHandle`. Reproduce malformed/oversized proposal bounds before allocation,
+wrong authority commitments, invalid proposer/certificate, restart WAL replay,
+storage retry, and a three-validator HTTP-to-gossip-to-consensus-to-finalized-
+receipt flow before wiring the public run command. Never reinterpret the legacy
+proposal bytes.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
