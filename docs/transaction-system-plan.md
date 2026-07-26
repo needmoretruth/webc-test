@@ -1080,6 +1080,42 @@ records, revalidate or durably drop them before re-gossip, commit admission/
 replacement/eviction before applying the corresponding `V5Mempool` plan, and
 prove queue backpressure plus database-failure rollback.
 
+### Protocol-2 single-owner runtime checkpoint (2026-07-27)
+
+Commits `8053d80` and `4acaaf8` complete that runtime half. A protocol-2
+`NodeRuntime` now exclusively owns `Node` plus `V5Mempool` behind a bounded
+Tokio mailbox and cloneable `NodeHandle`. Submission plans against one committed
+state view, writes queued/replaced/capacity-evicted lifecycle and pending records
+first, and only then applies the infallible memory plan. Exact duplicates are
+durably idempotent, a full mailbox returns typed backpressure immediately, and a
+failed backend commit leaves the in-memory pool unchanged and accepts a later
+retry. Expiry follows the same disk-before-memory order.
+
+Restart scans at most the storage cap, deterministically revalidates records in
+transaction-ID order, retains the original admission timestamp, durably expires
+TTL-old records, records state/policy rejection as `RevalidationFailed`, and
+applies the current count/byte policy without re-gossiping a rejected record.
+Tightening capacity keeps the runnability-aware eviction rule. Protocol-2 genesis
+uses a separate constructor but shares the existing allocation, staking,
+configuration, supply-pin, and supply-invariant implementation; legacy V3 block
+methods now fail closed rather than writing their format into a protocol-2 store.
+
+The runtime tests cover durable/idempotent submission and lifecycle query,
+atomic replacement, durable runnable-over-parked eviction, injected storage
+failure with unchanged memory and successful retry, real redb close/reopen and
+durable TTL cleanup, and mailbox saturation. Strict Clippy passed for the touched
+chain/storage/node crates. All 530 chain unit tests plus invariant/sharded tests,
+all 73 node-library tests plus 21 binary/integration tests, and Rustdoc generation
+for chain/storage/node passed.
+
+Exact next item: expose this one runtime owner through bounded `/v2/transactions`
+submission and lifecycle/receipt query routes plus a replayable protocol-2
+WebSocket lifecycle stream. The API must decode with existing V5 hostile-input
+bounds, preserve typed public errors without leaking storage details, reserve
+request slots before large bodies, and never hold a second `Node`/mempool copy.
+Then wire gossip/proposal/finalization callbacks through the same handle before
+starting finalized checkpoint/proof/browser verification.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
