@@ -308,7 +308,15 @@ pub(crate) enum SponsorGrantBookError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
     use webc_crypto::Keypair;
+
+    use crate::{
+        build_block_v4, BlockBuildInputV1, ChainConfig, ChainState, Epoch, FinalityAuthoritySetV1,
+        GenesisAccount, GenesisConfig, GenesisValidator, ValidatorSet,
+        TRANSACTION_V5_PROTOCOL_VERSION,
+    };
 
     fn key(seed: u8, id: u8) -> SponsorGrantKey {
         (
@@ -319,6 +327,130 @@ mod tests {
 
     fn record(digest: u8, expiry: u64) -> SponsorGrantStateV1 {
         SponsorGrantStateV1::unused(Hash256([digest; 32]), BlockHeight::new(expiry))
+    }
+
+    /// Runs the protocol-2 activation capacity gate on an optimized build.
+    ///
+    /// This is deliberately ignored by ordinary tests because it constructs the
+    /// complete default live-set ceiling. Run with:
+    /// `cargo test --release -p webc-chain sponsor_grant_capacity_benchmark -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "release-only 163,840-record capacity benchmark"]
+    fn sponsor_grant_capacity_benchmark() {
+        const LIVE_GRANTS: usize = 163_840;
+        const EXPIRY_HEIGHT: u64 = 4_096;
+
+        let validator = Keypair::from_seed([0x71; 32]);
+        let sponsor = Keypair::from_seed([0x72; 32]).address();
+        let config = ChainConfig {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            ..ChainConfig::default()
+        };
+        let genesis = GenesisConfig {
+            chain: config.clone(),
+            accounts: vec![GenesisAccount {
+                address: validator.address(),
+                balance: Amount::from_webc(1_000),
+            }],
+            validators: vec![GenesisValidator {
+                operator: validator.address(),
+                consensus_key: validator.public_key(),
+                self_stake: Amount::from_webc(100),
+                commission_bps: 500,
+                bootstrap: false,
+            }],
+        };
+        let mut state = ChainState::from_genesis_v1(&genesis)
+            .expect("capacity benchmark protocol-2 genesis builds");
+
+        let populate_started = Instant::now();
+        for index in 0..LIVE_GRANTS {
+            let mut identity = [0u8; 32];
+            identity[..8].copy_from_slice(
+                &u64::try_from(index)
+                    .expect("benchmark grant index fits u64")
+                    .to_be_bytes(),
+            );
+            identity[31] = 1;
+            let grant_id = SponsorGrantId::new(Hash256(identity));
+            let grant_digest = Hash256::digest_many([
+                b"WEBC_SPONSOR_GRANT_CAPACITY_BENCH_V1".as_slice(),
+                identity.as_slice(),
+            ]);
+            state
+                .sponsor_grants
+                .set(
+                    (sponsor, grant_id),
+                    SponsorGrantStateV1::unused(grant_digest, BlockHeight::new(EXPIRY_HEIGHT)),
+                )
+                .expect("generated benchmark grant is valid");
+        }
+        let populate_elapsed = populate_started.elapsed();
+        assert_eq!(state.sponsor_grants.len(), LIVE_GRANTS);
+
+        let clone_started = Instant::now();
+        let cloned = black_box(state.clone());
+        let clone_elapsed = clone_started.elapsed();
+        assert_eq!(cloned.sponsor_grants.len(), LIVE_GRANTS);
+        drop(cloned);
+
+        let root_started = Instant::now();
+        let root = black_box(
+            state
+                .state_root()
+                .expect("capacity benchmark state root computes"),
+        );
+        let root_elapsed = root_started.elapsed();
+
+        let validator_set =
+            ValidatorSet::from_state(&state).expect("capacity benchmark validator set derives");
+        let authority_set = FinalityAuthoritySetV1::from_validator_set(
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            state.chain_id.clone(),
+            Epoch::new(0),
+            &validator_set,
+        )
+        .expect("capacity benchmark authority set derives");
+        let input = BlockBuildInputV1 {
+            chain_id: state.chain_id.clone(),
+            height: BlockHeight::new(1),
+            epoch: Epoch::new(0),
+            previous_hash: Hash256::ZERO,
+            proposer: validator.address(),
+            timestamp_ms: 1,
+        };
+        let block_started = Instant::now();
+        let block = black_box(
+            build_block_v4(
+                &mut state,
+                &config,
+                input,
+                Vec::new(),
+                Vec::new(),
+                &authority_set,
+                &authority_set,
+            )
+            .expect("capacity benchmark V4 block executes"),
+        );
+        let block_elapsed = block_started.elapsed();
+        assert_eq!(state.sponsor_grants.len(), LIVE_GRANTS);
+        assert_eq!(
+            block.header.state_root,
+            state.state_root().expect("post-root")
+        );
+
+        println!("sponsor_grants={LIVE_GRANTS}");
+        println!(
+            "populate_ms={:.3}",
+            populate_elapsed.as_secs_f64() * 1_000.0
+        );
+        println!("clone_ms={:.3}", clone_elapsed.as_secs_f64() * 1_000.0);
+        println!("state_root_ms={:.3}", root_elapsed.as_secs_f64() * 1_000.0);
+        println!(
+            "block_execute_ms={:.3}",
+            block_elapsed.as_secs_f64() * 1_000.0
+        );
+        println!("state_root={root}");
     }
 
     #[test]
