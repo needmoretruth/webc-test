@@ -23,7 +23,6 @@ use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use webc_chain::{
@@ -44,8 +43,35 @@ use crate::{
 pub const MAX_PROTOCOL2_GENESIS_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum genesis accounts accepted by the public node assembly boundary.
 pub const MAX_PROTOCOL2_GENESIS_ACCOUNTS: usize = 65_536;
-/// Maximum bytes read from the small validator credential JSON file.
-pub const MAX_VALIDATOR_KEY_FILE_BYTES: usize = 512;
+/// Maximum bytes read from a small protected credential JSON file.
+pub const MAX_PROTECTED_KEY_FILE_BYTES: usize = 512;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatorKeyFileV1 {
+    version: u8,
+    operator: Address,
+    seed_hex: String,
+}
+
+impl Drop for ValidatorKeyFileV1 {
+    fn drop(&mut self) {
+        self.seed_hex.zeroize();
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevnetKeyFileV1 {
+    version: u8,
+    seed_hex: String,
+}
+
+impl Drop for DevnetKeyFileV1 {
+    fn drop(&mut self) {
+        self.seed_hex.zeroize();
+    }
+}
 
 /// Filesystem and socket inputs required to start one protocol-2 node.
 pub struct Protocol2RunConfig {
@@ -234,56 +260,69 @@ pub fn load_consensus_credentials(
     path: &Path,
     genesis: &GenesisConfig,
 ) -> Result<ConsensusCredentialsV1> {
-    let file = File::open(path).context("open validator key file")?;
-    validate_key_file_permissions(&file)?;
-    let bytes = Zeroizing::new(read_open_file_bounded(
-        file,
-        MAX_VALIDATOR_KEY_FILE_BYTES,
-        "validator key",
-    )?);
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&bytes).context("validator key JSON is malformed")?;
-    let object = value
-        .as_object_mut()
-        .context("validator key JSON must be an object")?;
-    if object.len() != 3
-        || object.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-        || !object.contains_key("operator")
-        || !object.contains_key("seed_hex")
-    {
+    let key_file: ValidatorKeyFileV1 = read_protected_key_json(path, "validator key")?;
+    if key_file.version != 1 {
         bail!("validator key schema is invalid");
     }
-    let operator = object
-        .remove("operator")
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .and_then(|text| Address::from_str(&text).ok())
-        .context("validator key operator is invalid")?;
-    let seed_hex = object
-        .remove("seed_hex")
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .map(Zeroizing::new)
-        .context("validator key seed is invalid")?;
-    if seed_hex.len() != 64
-        || !seed_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("validator key seed is invalid");
-    }
-    let mut seed = [0u8; 32];
-    if hex::decode_to_slice(seed_hex.as_bytes(), &mut seed).is_err() {
-        seed.zeroize();
-        bail!("validator key seed is invalid");
-    }
+    let mut seed = decode_seed(&key_file.seed_hex, "validator key")?;
     let consensus_public_key = Keypair::from_seed(seed).public_key();
     let matches_genesis = genesis.validators.iter().any(|validator| {
-        validator.operator == operator && validator.consensus_key == consensus_public_key
+        validator.operator == key_file.operator && validator.consensus_key == consensus_public_key
     });
     if !matches_genesis {
         seed.zeroize();
         bail!("validator key does not match a genesis authority");
     }
-    Ok(ConsensusCredentialsV1::new(operator, seed))
+    let credentials = ConsensusCredentialsV1::new(key_file.operator, seed);
+    seed.zeroize();
+    Ok(credentials)
+}
+
+/// Loads a devnet signing key from a bounded, protected JSON file.
+///
+/// The accepted schema is exactly `{"version":1,"seed_hex":"<64 lowercase
+/// hex characters>"}`. The raw secret is never accepted through argv, included
+/// in errors, logged, serialized, or returned. This helper is for local devnet
+/// commands only; production browser wallets require an encrypted keystore.
+pub fn load_devnet_keypair(path: &Path) -> Result<Keypair> {
+    let key_file: DevnetKeyFileV1 = read_protected_key_json(path, "devnet key")?;
+    if key_file.version != 1 {
+        bail!("devnet key schema is invalid");
+    }
+    let mut seed = decode_seed(&key_file.seed_hex, "devnet key")?;
+    let keypair = Keypair::from_seed(seed);
+    seed.zeroize();
+    Ok(keypair)
+}
+
+fn read_protected_key_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    label: &'static str,
+) -> Result<T> {
+    let file = File::open(path).with_context(|| format!("open {label} file"))?;
+    validate_key_file_permissions(&file)?;
+    let bytes = Zeroizing::new(read_open_file_bounded(
+        file,
+        MAX_PROTECTED_KEY_FILE_BYTES,
+        label,
+    )?);
+    serde_json::from_slice(&bytes).with_context(|| format!("{label} JSON is malformed"))
+}
+
+fn decode_seed(seed_hex: &str, label: &'static str) -> Result<[u8; 32]> {
+    if seed_hex.len() != 64
+        || !seed_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{label} seed is invalid");
+    }
+    let mut seed = [0u8; 32];
+    if hex::decode_to_slice(seed_hex.as_bytes(), &mut seed).is_err() {
+        seed.zeroize();
+        bail!("{label} seed is invalid");
+    }
+    Ok(seed)
 }
 
 fn read_bounded(path: &Path, maximum: usize, label: &'static str) -> Result<Vec<u8>> {
@@ -393,6 +432,51 @@ mod tests {
             .err()
             .expect("wrong registered key is rejected");
         assert!(!error.to_string().contains(&hex::encode([0x22; 32])));
+    }
+
+    #[test]
+    fn devnet_key_file_is_strict_bounded_and_secret_safe() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let path = directory.path().join("devnet-key.json");
+        let secret = "42".repeat(32);
+        let json = serde_json::json!({
+            "version": 1,
+            "seed_hex": secret.clone(),
+        });
+        std::fs::write(&path, serde_json::to_vec(&json).expect("JSON encodes"))
+            .expect("test key writes");
+        protect_key_file(&path);
+        let keypair = load_devnet_keypair(&path).expect("strict devnet key loads");
+        assert_eq!(keypair.address(), Keypair::from_seed([0x42; 32]).address());
+
+        let duplicate = format!(r#"{{"version":1,"seed_hex":"{secret}","seed_hex":"{secret}"}}"#);
+        std::fs::write(&path, duplicate).expect("duplicate-field key writes");
+        let duplicate_error = load_devnet_keypair(&path)
+            .err()
+            .expect("duplicate field is rejected");
+        assert!(!duplicate_error.to_string().contains(&secret));
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "seed_hex": secret.clone(),
+                "unexpected": true,
+            }))
+            .expect("JSON encodes"),
+        )
+        .expect("unknown-field key writes");
+        let unknown_error = load_devnet_keypair(&path)
+            .err()
+            .expect("unknown field is rejected");
+        assert!(!unknown_error.to_string().contains(&secret));
+
+        std::fs::write(&path, vec![b'x'; MAX_PROTECTED_KEY_FILE_BYTES + 1])
+            .expect("oversized key writes");
+        let oversized_error = load_devnet_keypair(&path)
+            .err()
+            .expect("oversized file is rejected");
+        assert!(oversized_error.to_string().contains("byte limit"));
     }
 
     #[tokio::test]

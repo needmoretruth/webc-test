@@ -46,8 +46,8 @@ pub use mempool_v1::{
 };
 pub use node::{FinalizedTransactionProofBundleV1, Node, NodeError, V4FinalizationResult};
 pub use run_v1::{
-    load_consensus_credentials, load_protocol2_genesis, start_protocol2, Protocol2Node,
-    Protocol2RunConfig,
+    load_consensus_credentials, load_devnet_keypair, load_protocol2_genesis, start_protocol2,
+    Protocol2Node, Protocol2RunConfig,
 };
 pub use runtime_v1::{
     CertifiedBlockSnapshotV1, ConsensusContextV1, NodeHandle, NodeRuntime, NodeRuntimeError,

@@ -13,8 +13,8 @@ use webc_chain::{
 use webc_crypto::{Address, Hash256, Keypair, PublicKeyBytes};
 use webc_net::{spawn_network, NetworkConfig};
 use webc_node::{
-    run_gossip_pump, start_protocol2, AppState, FaucetConfig, MempoolConfig, Node, NodeService,
-    NodeServiceOptions, Protocol2RunConfig,
+    load_devnet_keypair, run_gossip_pump, start_protocol2, AppState, FaucetConfig, MempoolConfig,
+    Node, NodeService, NodeServiceOptions, Protocol2RunConfig,
 };
 use webc_storage::{MemoryKvStore, RedbKvStore};
 
@@ -82,9 +82,9 @@ enum Command {
         /// Validator commission in basis points (0..=max_commission_bps).
         #[arg(long, default_value_t = 500)]
         commission_bps: u16,
-        /// Optional 32-byte hex seed for the local key (defaults to a fixed devnet seed).
+        /// Protected devnet key JSON (defaults to a fixed valueless devnet key).
         #[arg(long)]
-        seed: Option<String>,
+        key_file: Option<PathBuf>,
     },
     /// Delegate whole WEBC from the local key to a validator (drives Operation::Delegate).
     StakeDelegate {
@@ -94,9 +94,9 @@ enum Command {
         /// Target validator operator address (defaults to the demo's local validator).
         #[arg(long)]
         validator: Option<String>,
-        /// Optional 32-byte hex seed for the local key.
+        /// Protected devnet key JSON (defaults to a fixed valueless devnet key).
         #[arg(long)]
-        seed: Option<String>,
+        key_file: Option<PathBuf>,
     },
     /// Begin undelegation of whole WEBC from a validator (drives Operation::Undelegate).
     StakeUndelegate {
@@ -106,9 +106,9 @@ enum Command {
         /// Target validator operator address (defaults to the demo's local validator).
         #[arg(long)]
         validator: Option<String>,
-        /// Optional 32-byte hex seed for the local key.
+        /// Protected devnet key JSON (defaults to a fixed valueless devnet key).
         #[arg(long)]
-        seed: Option<String>,
+        key_file: Option<PathBuf>,
     },
     /// Claim validator and/or delegator rewards (drives the Claim* operations).
     StakeClaim {
@@ -121,18 +121,18 @@ enum Command {
         /// Validator the delegator-reward claim targets (defaults to the demo validator).
         #[arg(long)]
         validator: Option<String>,
-        /// Optional 32-byte hex seed for the local key.
+        /// Protected devnet key JSON (defaults to a fixed valueless devnet key).
         #[arg(long)]
-        seed: Option<String>,
+        key_file: Option<PathBuf>,
     },
     /// Faucet-drip the local key then delegate in one flow (drives faucet + Operation::Delegate).
     FaucetStake {
         /// Amount to delegate from the freshly dripped funds, in whole WEBC.
         #[arg(long, default_value_t = 10)]
         amount: u64,
-        /// Optional 32-byte hex seed for the local key.
+        /// Protected devnet key JSON (defaults to a fixed valueless devnet key).
         #[arg(long)]
-        seed: Option<String>,
+        key_file: Option<PathBuf>,
     },
 }
 
@@ -165,30 +165,30 @@ fn main() -> Result<()> {
         Command::StakeRegister {
             self_stake,
             commission_bps,
-            seed,
-        } => emit(run_stake_register(self_stake, commission_bps, seed)?),
+            key_file,
+        } => emit(run_stake_register(self_stake, commission_bps, key_file)?),
         Command::StakeDelegate {
             amount,
             validator,
-            seed,
-        } => emit(run_stake_delegate(amount, validator, seed)?),
+            key_file,
+        } => emit(run_stake_delegate(amount, validator, key_file)?),
         Command::StakeUndelegate {
             amount,
             validator,
-            seed,
-        } => emit(run_stake_undelegate(amount, validator, seed)?),
+            key_file,
+        } => emit(run_stake_undelegate(amount, validator, key_file)?),
         Command::StakeClaim {
             validator_rewards,
             delegator_rewards,
             validator,
-            seed,
+            key_file,
         } => emit(run_stake_claim(
             validator_rewards,
             delegator_rewards,
             validator,
-            seed,
+            key_file,
         )?),
-        Command::FaucetStake { amount, seed } => emit(run_faucet_stake(amount, seed)?),
+        Command::FaucetStake { amount, key_file } => emit(run_faucet_stake(amount, key_file)?),
     }
 }
 
@@ -702,23 +702,13 @@ fn emit(value: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Parses a 32-byte key seed from lowercase hex (64 characters).
-fn parse_seed(text: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(text.trim()).context("--seed must be hex-encoded")?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("--seed must be exactly 32 bytes (64 hex characters)"))
-}
-
-/// Resolves the local staking keypair from an optional hex seed, defaulting to
-/// the fixed devnet seed.
-fn local_keypair(seed: Option<String>) -> Result<Keypair> {
-    let seed = match seed {
-        Some(text) => parse_seed(&text)?,
-        None => DEFAULT_LOCAL_SEED,
-    };
-    Ok(Keypair::from_seed(seed))
+/// Resolves the local staking keypair from an optional protected file,
+/// defaulting to the fixed valueless devnet key.
+fn local_keypair(key_file: Option<PathBuf>) -> Result<Keypair> {
+    match key_file {
+        Some(path) => load_devnet_keypair(&path),
+        None => Ok(Keypair::from_seed(DEFAULT_LOCAL_SEED)),
+    }
 }
 
 /// Resolves a validator target address from an optional base58 argument,
@@ -784,9 +774,9 @@ fn open_staking_service(
 fn run_stake_register(
     self_stake_webc: u64,
     commission_bps: u16,
-    seed: Option<String>,
+    key_file: Option<PathBuf>,
 ) -> Result<serde_json::Value> {
-    let local = local_keypair(seed)?;
+    let local = local_keypair(key_file)?;
     let genesis = GenesisConfig {
         chain: ChainConfig::default(),
         accounts: vec![GenesisAccount {
@@ -825,9 +815,9 @@ fn run_stake_register(
 fn run_stake_delegate(
     amount_webc: u64,
     validator: Option<String>,
-    seed: Option<String>,
+    key_file: Option<PathBuf>,
 ) -> Result<serde_json::Value> {
-    let local = local_keypair(seed)?;
+    let local = local_keypair(key_file)?;
     let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
     let validator_addr = resolve_validator(validator, target.address())?;
     let genesis = staking_genesis_with_target(&local, &target);
@@ -860,9 +850,9 @@ fn run_stake_delegate(
 fn run_stake_undelegate(
     amount_webc: u64,
     validator: Option<String>,
-    seed: Option<String>,
+    key_file: Option<PathBuf>,
 ) -> Result<serde_json::Value> {
-    let local = local_keypair(seed)?;
+    let local = local_keypair(key_file)?;
     let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
     let validator_addr = resolve_validator(validator, target.address())?;
     let genesis = staking_genesis_with_target(&local, &target);
@@ -914,14 +904,14 @@ fn run_stake_claim(
     claim_validator: bool,
     claim_delegator: bool,
     validator: Option<String>,
-    seed: Option<String>,
+    key_file: Option<PathBuf>,
 ) -> Result<serde_json::Value> {
     let (do_validator, do_delegator) = if !claim_validator && !claim_delegator {
         (true, true)
     } else {
         (claim_validator, claim_delegator)
     };
-    let local = local_keypair(seed)?;
+    let local = local_keypair(key_file)?;
     let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
     let del_validator = resolve_validator(validator, target.address())?;
     let genesis = GenesisConfig {
@@ -993,8 +983,8 @@ fn run_stake_claim(
 }
 
 /// `faucet-stake`: drips valueless devnet funds to the local key, then delegates.
-fn run_faucet_stake(amount_webc: u64, seed: Option<String>) -> Result<serde_json::Value> {
-    let local = local_keypair(seed)?;
+fn run_faucet_stake(amount_webc: u64, key_file: Option<PathBuf>) -> Result<serde_json::Value> {
+    let local = local_keypair(key_file)?;
     let target = Keypair::from_seed(TARGET_VALIDATOR_SEED);
     let faucet = Keypair::from_seed(STAKE_FAUCET_SEED);
     // The local key is intentionally absent from genesis so the faucet can fund it.
@@ -1071,6 +1061,15 @@ mod tests {
         Amount::from_webc(whole).0.to_string()
     }
 
+    fn protect_key_file(_path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))
+                .expect("test key permissions set");
+        }
+    }
+
     #[test]
     fn run_accepts_protocol2_files_without_putting_a_seed_in_argv() {
         let cli = Cli::try_parse_from([
@@ -1108,12 +1107,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_seed_accepts_32_byte_hex_and_rejects_others() {
-        let hex_seed = "11".repeat(32);
-        assert_eq!(parse_seed(&hex_seed).unwrap(), [0x11u8; 32]);
-        // Wrong length and non-hex are rejected.
-        assert!(parse_seed("1122").is_err());
-        assert!(parse_seed(&"zz".repeat(32)).is_err());
+    fn staking_commands_reject_secret_seed_arguments() {
+        for command in [
+            "stake-register",
+            "stake-delegate",
+            "stake-undelegate",
+            "stake-claim",
+            "faucet-stake",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "webc-node",
+                    command,
+                    "--seed",
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                ])
+                .is_err(),
+                "{command} must never accept a secret through argv"
+            );
+        }
+    }
+
+    #[test]
+    fn staking_commands_accept_key_file_paths() {
+        for command in [
+            "stake-register",
+            "stake-delegate",
+            "stake-undelegate",
+            "stake-claim",
+            "faucet-stake",
+        ] {
+            assert!(
+                Cli::try_parse_from(["webc-node", command, "--key-file", "devnet-key.json"])
+                    .is_ok(),
+                "{command} accepts a protected key file path"
+            );
+        }
     }
 
     #[test]
@@ -1123,7 +1152,19 @@ mod tests {
             default.address(),
             Keypair::from_seed(DEFAULT_LOCAL_SEED).address()
         );
-        let explicit = local_keypair(Some("11".repeat(32))).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devnet-key.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "seed_hex": "11".repeat(32),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        protect_key_file(&path);
+        let explicit = local_keypair(Some(path)).unwrap();
         assert_eq!(
             explicit.address(),
             Keypair::from_seed([0x11u8; 32]).address()

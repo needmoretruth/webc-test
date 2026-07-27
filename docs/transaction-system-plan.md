@@ -1322,13 +1322,27 @@ removals) passes while 6,500,000 (65 records, 260 required) fails before state
 allocation. The focused full chain gate passed 550 unit tests, the randomized
 supply invariant, 8 parallel-execution tests, strict Clippy, and Rustdoc.
 
-Exact next item: run the complete workspace format/lint/test/doc/demo, exact
-pnpm, dependency/advisory, unsafe/panic/secret, and branch red-team inventory
-gates. Record every remaining limitation as passed, intentionally deferred with
-a concrete reason, or unverified. Then confirm `origin/main` is still fully
-contained, reconcile the two global status documents, push, open the CI-bearing
-integration PR, and require Linux fuzz plus every other CI job green before any
-merge.
+The command-line secret audit found five legacy/local staking commands that
+accepted a raw 32-byte seed through `--seed`, which exposes the secret through
+process inspection and shell history. A regression test reproduced the leak
+surface before the fix. All five commands now reject secret argv and accept only
+an optional `--key-file` path (or their fixed, valueless devnet default). The
+loader reuses the protocol-2 bounded single-handle file boundary, enforces Unix
+owner-only permissions, rejects oversized, malformed, duplicate-field, and
+unknown-field JSON, accepts only version 1 lowercase 32-byte seed encoding, and
+zeroizes the input buffer, decoded text, and temporary seed without including a
+secret in an error. Windows ACL ownership remains an explicit deployment
+responsibility because Rust's portable file-permission API cannot validate a
+Windows DACL. Strict all-target node Clippy, 103 node unit/binary tests, all node
+integration tests, and node Rustdoc pass after the replacement.
+
+Exact next item: finish the complete workspace format/lint/test/doc/demo, exact
+pnpm, dependency/advisory, strict production panic, unsafe, secret, and branch
+red-team inventory gates. Record every remaining limitation as passed,
+intentionally deferred with a concrete reason, or unverified. Then confirm
+`origin/main` is still fully contained, reconcile the two global status
+documents, push, open the CI-bearing integration PR, and require Linux fuzz plus
+every other CI job green before any merge.
 
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
