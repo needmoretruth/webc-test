@@ -54,7 +54,7 @@ use crate::session_key::{
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
 };
-use crate::sponsor_grant_book::SponsorGrantBookError;
+use crate::sponsor_grant_book::{pruning_capacity_covers_maximum_ingress, SponsorGrantBookError};
 use crate::sponsorship::{
     sponsor_state_key_hash, AppSponsor, SponsorshipConfig, SPONSOR_LEAF_DOMAIN,
 };
@@ -1722,6 +1722,9 @@ impl ChainState {
             return Err(ChainError::UnsupportedProtocolVersion {
                 actual: genesis.chain.protocol_version,
             });
+        }
+        if !pruning_capacity_covers_maximum_ingress(genesis.chain.fee_policy.max_block_units) {
+            return Err(ChainError::InvalidSponsorGrantPruningCapacity);
         }
         let state = Self {
             protocol_version: genesis.chain.protocol_version,
@@ -12675,6 +12678,35 @@ mod tests {
             Err(ChainError::GenesisSupplyMismatch { expected, actual })
                 if expected == Amount::from_units(50_001) && actual == declared
         ));
+    }
+
+    #[test]
+    fn protocol_two_genesis_rejects_sponsor_ingress_above_pruning_headroom() {
+        let genesis = GenesisConfig {
+            chain: ChainConfig {
+                protocol_version: crate::TRANSACTION_V5_PROTOCOL_VERSION,
+                fee_policy: FeePolicy {
+                    // At 100,000 units per possible materialization this permits
+                    // 65 new records. Four-block cleanup headroom would require
+                    // 260 removals, above the fixed 256-record pruning bound.
+                    max_block_units: 6_500_000,
+                    ..FeePolicy::default()
+                },
+                ..ChainConfig::default()
+            },
+            accounts: Vec::new(),
+            validators: Vec::new(),
+        };
+
+        assert!(matches!(
+            ChainState::from_genesis_v1(&genesis),
+            Err(ChainError::InvalidSponsorGrantPruningCapacity)
+        ));
+
+        let mut exact_boundary = genesis;
+        exact_boundary.chain.fee_policy.max_block_units = 6_499_999;
+        ChainState::from_genesis_v1(&exact_boundary)
+            .expect("exact 64-materialization boundary retains fourfold cleanup headroom");
     }
 
     #[test]

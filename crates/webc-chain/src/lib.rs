@@ -163,6 +163,7 @@ pub use session_key::{
 pub use slashing::{InactivityLeakConfig, SlashingEvidence, SlashingOutcome, SlashingPolicy};
 pub use sponsor_grant_book::{
     SponsorGrantBookV1, SponsorGrantStateV1, MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1,
+    SPONSOR_GRANT_PRUNE_HEADROOM_V1,
 };
 pub use sponsorship::{
     sponsor_state_key_hash, AppSponsor, SponsorUserWindow, SponsorshipConfig, SPONSOR_LEAF_DOMAIN,
@@ -354,6 +355,8 @@ pub enum ChainError {
     UnusedDeclaredStateAccess,
     #[error("durable sponsor grant state or its expiry index is invalid")]
     InvalidSponsorGrantState,
+    #[error("protocol-2 sponsor grant ingress exceeds bounded pruning headroom")]
+    InvalidSponsorGrantPruningCapacity,
     #[error("unbonding amount must be greater than zero")]
     UnbondingAmountZero,
     #[error("unbonding request was not found")]

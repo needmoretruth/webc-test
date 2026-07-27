@@ -13,7 +13,10 @@
 //! invalid counters/digests fail closed, and cleanup never performs more than
 //! the fixed consensus work limit in one block.
 
-use crate::{Amount, BlockHeight, SponsorGrantId, SponsorUseCount, SponsorUseNonce};
+use crate::{
+    Amount, BlockHeight, SponsorGrantId, SponsorUseCount, SponsorUseNonce,
+    REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256};
@@ -26,6 +29,28 @@ use webc_crypto::{Address, Hash256};
 /// bound ingress while this value bounds deterministic cleanup work. It is a
 /// protocol-2 activation parameter and must be benchmarked before activation.
 pub const MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1: usize = 256;
+
+/// Required cleanup headroom over maximum per-block grant materialization.
+///
+/// A value of four means one block's worst-case new records must be removable
+/// within at most one quarter of the fixed pruning capacity. Protocol-2 genesis
+/// rejects a block-unit policy that violates this relationship, preventing a
+/// configuration change from turning bounded cleanup into permanent growth.
+pub const SPONSOR_GRANT_PRUNE_HEADROOM_V1: u64 = 4;
+
+/// Returns whether one protocol-2 block-unit policy preserves cleanup headroom.
+pub(crate) fn pruning_capacity_covers_maximum_ingress(max_block_units: u64) -> bool {
+    let minimum_materialization_units =
+        REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS.min(SPONSOR_GRANT_USE_V1_REQUIRED_UNITS);
+    let maximum_materializations = max_block_units / minimum_materialization_units;
+    let Some(required_prunes) =
+        maximum_materializations.checked_mul(SPONSOR_GRANT_PRUNE_HEADROOM_V1)
+    else {
+        return false;
+    };
+    u64::try_from(MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1)
+        .is_ok_and(|available_prunes| required_prunes <= available_prunes)
+}
 
 /// Durable replay, fee-budget, use-count, revocation, and lifetime state.
 ///
