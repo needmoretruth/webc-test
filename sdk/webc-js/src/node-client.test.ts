@@ -434,6 +434,80 @@ describe("WebcNodeClient HTTP", () => {
     expect(reads).toBeLessThanOrEqual(6);
     expect(canceled).toBe(true);
   });
+
+  it("rejects malformed UTF-8 in a streamed body before JSON parsing (S6)", async () => {
+    // A hostile node must not smuggle an invalid wire byte through the
+    // TextDecoder replacement character. Rust's JSON boundary rejects invalid
+    // UTF-8, so the browser verifier must fail closed in the same way.
+    const chunks = [
+      new TextEncoder().encode('{"error":"'),
+      Uint8Array.of(0xff),
+      new TextEncoder().encode('","kind":"bad_utf8"}'),
+    ];
+    let index = 0;
+    let canceled = false;
+    const fetchImpl: FetchLike = async () => ({
+      ok: false,
+      status: 502,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              const value = chunks[index];
+              index += 1;
+              return value === undefined ? { done: true } : { done: false, value };
+            },
+            async cancel() {
+              canceled = true;
+            },
+          };
+        },
+      },
+      text: async () => {
+        throw new Error("text() must not be used when a stream body exists");
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+
+    await expect(client.health()).rejects.toThrow(/invalid UTF-8/u);
+    expect(canceled).toBe(true);
+  });
+
+  it("decodes a UTF-8 scalar split across streamed chunks (S6)", async () => {
+    // Streaming decoders must retain an incomplete scalar between chunks;
+    // otherwise a normal network split could be mistaken for hostile input.
+    const prefix = new TextEncoder().encode('{"error":"');
+    const euro = new TextEncoder().encode("€");
+    const suffix = new TextEncoder().encode('","kind":"split_scalar"}');
+    const chunks = [prefix, euro.subarray(0, 1), euro.subarray(1), suffix];
+    let index = 0;
+    const fetchImpl: FetchLike = async () => ({
+      ok: false,
+      status: 502,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              const value = chunks[index];
+              index += 1;
+              return value === undefined ? { done: true } : { done: false, value };
+            },
+            async cancel() {},
+          };
+        },
+      },
+      text: async () => {
+        throw new Error("text() must not be used when a stream body exists");
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+
+    await expect(client.health()).rejects.toMatchObject({
+      name: "NodeApiError",
+      message: "€",
+      kind: "split_scalar",
+    });
+  });
 });
 
 describe("parseBlockEvent", () => {

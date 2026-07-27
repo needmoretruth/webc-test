@@ -764,7 +764,12 @@ export class WebcNodeClient {
 
   async #readStreamCapped(body: ByteStream, maximumBytes: number): Promise<string> {
     const reader = body.getReader();
-    const chunks: Uint8Array[] = [];
+    // Decode each network chunk immediately instead of retaining every backing
+    // ArrayBuffer and then allocating a second concatenated byte buffer. Fatal
+    // mode keeps the browser boundary aligned with Rust JSON decoding: malformed
+    // UTF-8 is hostile input, not text that may be silently repaired.
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const decodedChunks: string[] = [];
     let total = 0;
     try {
       for (;;) {
@@ -775,9 +780,12 @@ export class WebcNodeClient {
           if (total > maximumBytes) {
             throw new Error("node response exceeds the maximum allowed size");
           }
-          chunks.push(value);
+          const decoded = decodeUtf8Chunk(decoder, value, true);
+          if (decoded.length > 0) decodedChunks.push(decoded);
         }
       }
+      const tail = decodeUtf8Chunk(decoder, undefined, false);
+      if (tail.length > 0) decodedChunks.push(tail);
     } finally {
       // Abort any remaining body (early exit on the cap) and release resources.
       try {
@@ -786,7 +794,7 @@ export class WebcNodeClient {
         // The stream may already be closed/errored; nothing to release.
       }
     }
-    return new TextDecoder("utf-8").decode(concatChunks(chunks, total));
+    return decodedChunks.join("");
   }
 }
 
@@ -795,15 +803,17 @@ function utf8ByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
 }
 
-/** Concatenates byte chunks into one buffer of the known total length. */
-function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.length;
+/** Strictly decodes one UTF-8 stream chunk without leaking engine-specific errors. */
+function decodeUtf8Chunk(
+  decoder: TextDecoder,
+  bytes: Uint8Array | undefined,
+  stream: boolean,
+): string {
+  try {
+    return decoder.decode(bytes, { stream });
+  } catch {
+    throw new Error("node returned invalid UTF-8");
   }
-  return out;
 }
 
 /** Bounds a node-controlled string to `max` characters before it reaches UI. */
