@@ -1336,6 +1336,14 @@ responsibility because Rust's portable file-permission API cannot validate a
 Windows DACL. Strict all-target node Clippy, 103 node unit/binary tests, all node
 integration tests, and node Rustdoc pass after the replacement.
 
+The workspace-wide production panic audit compiles every library and binary
+with Clippy's `unwrap_used`, `expect_used`, and `panic` rules denied. It found
+one fixed-length hash-prefix conversion in consensus and one local demo
+postcondition that still used `expect`. The consensus conversion now copies its
+compile-time 16-byte prefix into a fixed array, and the demo returns contextual
+failure instead of aborting. The strict production panic gate passes across the
+workspace; test-only assertions remain allowed.
+
 Exact next item: finish the complete workspace format/lint/test/doc/demo, exact
 pnpm, dependency/advisory, strict production panic, unsafe, secret, and branch
 red-team inventory gates. Record every remaining limitation as passed,

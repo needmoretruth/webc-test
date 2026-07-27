@@ -119,11 +119,9 @@ impl ValidatorSet {
             &height.to_le_bytes(),
             &round.to_le_bytes(),
         ]);
-        let draw_source = u128::from_le_bytes(
-            seed.0[..16]
-                .try_into()
-                .expect("16 bytes fit a u128 from a 32-byte hash"),
-        );
+        let mut draw_bytes = [0u8; 16];
+        draw_bytes.copy_from_slice(&seed.0[..16]);
+        let draw_source = u128::from_le_bytes(draw_bytes);
         let draw = draw_source % self.total_power.0;
         // Walk validators in their deterministic address order, accumulating
         // power until the running total passes the drawn point.

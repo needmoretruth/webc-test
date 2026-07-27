@@ -600,7 +600,7 @@ fn demo() -> Result<()> {
 
     let bob_proof = state
         .account_state_proof(bob.address())?
-        .expect("Bob should exist after the demo transfer");
+        .context("Bob is missing after the demo transfer")?;
     let bob_proof_valid = bob_proof.verify()?;
 
     let summary = serde_json::json!({
