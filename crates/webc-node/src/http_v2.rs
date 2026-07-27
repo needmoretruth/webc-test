@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, Path, RawQuery, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -40,12 +40,16 @@ use webc_chain::{
     BlockPositionV1, ReceiptV1, TransactionId, TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_net::{NetMessage, NetworkHandle};
+use webc_proof::{CheckpointV1, FinalizedTransactionProofV1};
 use webc_storage::{
     LifecycleSequence, LocalDropReasonV1, LocalTimestampMs, LocalTransactionObservationV1,
     TransactionConsensusFactV1, TransactionLifecycleV1,
 };
 
-use crate::{NodeHandle, NodeRuntimeError, V5InsertOutcome, V5MempoolError, V5SubmitReceipt};
+use crate::{
+    FinalizedTransactionProofBundleV1, NodeError, NodeHandle, NodeRuntimeError, V5InsertOutcome,
+    V5MempoolError, V5SubmitReceipt,
+};
 
 /// Stable route/API version returned by protocol-2 transaction endpoints.
 pub const TRANSACTION_API_VERSION_V2: &str = "v2";
@@ -53,6 +57,8 @@ pub const TRANSACTION_API_VERSION_V2: &str = "v2";
 pub const MAX_V2_HTTP_BODY_BYTES: usize = 1024 * 1024;
 /// Maximum concurrently decoding/validating V2 submissions.
 pub const MAX_V2_CONCURRENT_SUBMISSIONS: usize = 128;
+/// Maximum proof assemblies admitted concurrently before fail-fast backpressure.
+pub const MAX_V2_CONCURRENT_PROOFS: usize = 4;
 /// Maximum concurrent V2 lifecycle WebSocket connections.
 pub const MAX_V2_WS_SUBSCRIPTIONS: usize = 256;
 /// Maximum first subscription frame size before JSON decoding.
@@ -250,6 +256,32 @@ pub struct V2SubmitResponse {
     pub mempool_size: usize,
 }
 
+/// Successful checkpoint-relative finalized transaction proof response.
+///
+/// `checkpoint_candidate` is structurally valid but not trusted merely because
+/// this node served it. Clients must corroborate it under an explicit source
+/// policy before verifying and relying on `proof`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2FinalizedTransactionProofResponse {
+    /// Stable API route family.
+    pub api_version: &'static str,
+    /// Certified checkpoint candidate requiring independent corroboration.
+    pub checkpoint_candidate: CheckpointV1,
+    /// Transaction and receipt inclusion proof relative to the candidate.
+    pub proof: FinalizedTransactionProofV1,
+}
+
+impl From<FinalizedTransactionProofBundleV1> for V2FinalizedTransactionProofResponse {
+    fn from(bundle: FinalizedTransactionProofBundleV1) -> Self {
+        Self {
+            api_version: TRANSACTION_API_VERSION_V2,
+            checkpoint_candidate: bundle.checkpoint_candidate,
+            proof: bundle.proof,
+        }
+    }
+}
+
 impl From<V5SubmitReceipt> for V2SubmitResponse {
     fn from(receipt: V5SubmitReceipt) -> Self {
         Self {
@@ -283,7 +315,10 @@ pub struct V2ErrorBody {
 enum V2ApiError {
     InvalidTransaction,
     InvalidTransactionId,
+    InvalidCheckpointHeight,
     ReceiptNotFinalized,
+    ProofNotFinalized,
+    ProofLimit,
     BodyTooLarge,
     SubmissionLimit,
     WebSocketLimit,
@@ -312,10 +347,28 @@ impl IntoResponse for V2ApiRejection {
                 "transaction ID must be 32-byte lowercase or uppercase hex",
                 false,
             ),
+            V2ApiError::InvalidCheckpointHeight => (
+                StatusCode::BAD_REQUEST,
+                "invalid_checkpoint_height",
+                "checkpoint_height must be one non-zero canonical decimal u64",
+                false,
+            ),
             V2ApiError::ReceiptNotFinalized => (
                 StatusCode::NOT_FOUND,
                 "receipt_not_finalized",
                 "no finalized receipt is available",
+                false,
+            ),
+            V2ApiError::ProofNotFinalized => (
+                StatusCode::NOT_FOUND,
+                "proof_not_finalized",
+                "no finalized transaction proof is available",
+                false,
+            ),
+            V2ApiError::ProofLimit => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "proof_limit",
+                "too many finalized proof requests are in progress",
                 false,
             ),
             V2ApiError::BodyTooLarge => (
@@ -409,6 +462,18 @@ fn classify_runtime_error(
             "protocol-2 transaction service is not active",
             false,
         ),
+        NodeRuntimeError::Node(NodeError::InvalidProofRequest(_)) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_checkpoint_height",
+            "checkpoint height cannot anchor the requested finalized transaction",
+            false,
+        ),
+        NodeRuntimeError::Node(NodeError::ProofDataUnavailable(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "proof_data_unavailable",
+            "required finalized proof history is unavailable on this node",
+            false,
+        ),
         NodeRuntimeError::Mempool(V5MempoolError::PendingRecord(_))
         | NodeRuntimeError::Mempool(V5MempoolError::InconsistentRecovery)
         | NodeRuntimeError::InvalidQueueCapacity
@@ -442,6 +507,8 @@ pub struct V2AppState {
 pub struct V2TransportLimits {
     /// Maximum submissions concurrently reading/decoding/awaiting the actor.
     pub concurrent_submissions: usize,
+    /// Maximum proof assemblies concurrently admitted to the runtime queue.
+    pub concurrent_proofs: usize,
     /// Maximum live lifecycle WebSocket connections.
     pub websocket_subscriptions: usize,
     /// Request tokens available in a burst for one observed socket IP.
@@ -456,6 +523,7 @@ impl Default for V2TransportLimits {
     fn default() -> Self {
         Self {
             concurrent_submissions: MAX_V2_CONCURRENT_SUBMISSIONS,
+            concurrent_proofs: MAX_V2_CONCURRENT_PROOFS,
             websocket_subscriptions: MAX_V2_WS_SUBSCRIPTIONS,
             per_ip_burst: DEFAULT_V2_PER_IP_BURST,
             per_ip_refill_ms: DEFAULT_V2_PER_IP_REFILL_MS,
@@ -473,6 +541,7 @@ struct V2AppInner {
     runtime: NodeHandle,
     network: Option<NetworkHandle>,
     submission_slots: Arc<Semaphore>,
+    proof_slots: Arc<Semaphore>,
     websocket_slots: Arc<Semaphore>,
     peer_rate_limiter: Mutex<PeerRateLimiter>,
     correlation_sequence: AtomicU64,
@@ -495,6 +564,7 @@ impl V2AppState {
         limits: V2TransportLimits,
     ) -> Result<Self, V2TransportConfigError> {
         if limits.concurrent_submissions == 0
+            || limits.concurrent_proofs == 0
             || limits.websocket_subscriptions == 0
             || limits.per_ip_burst == 0
             || limits.per_ip_refill_ms == 0
@@ -512,6 +582,7 @@ impl V2AppState {
         limits: V2TransportLimits,
     ) -> Result<Self, V2TransportConfigError> {
         if limits.concurrent_submissions == 0
+            || limits.concurrent_proofs == 0
             || limits.websocket_subscriptions == 0
             || limits.per_ip_burst == 0
             || limits.per_ip_refill_ms == 0
@@ -532,6 +603,7 @@ impl V2AppState {
                 runtime,
                 network,
                 submission_slots: Arc::new(Semaphore::new(limits.concurrent_submissions)),
+                proof_slots: Arc::new(Semaphore::new(limits.concurrent_proofs)),
                 websocket_slots: Arc::new(Semaphore::new(limits.websocket_subscriptions)),
                 peer_rate_limiter: Mutex::new(PeerRateLimiter::new(limits)),
                 correlation_sequence: AtomicU64::new(1),
@@ -622,6 +694,7 @@ pub fn router_v2(state: V2AppState) -> Router {
         .route("/v2/transactions", post(submit_transaction))
         .route("/v2/transactions/{id}", get(transaction_lifecycle))
         .route("/v2/transactions/{id}/receipt", get(transaction_receipt))
+        .route("/v2/transactions/{id}/proof", get(transaction_proof))
         .route("/v2/transactions/ws", get(subscribe_transactions))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_V2_HTTP_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -774,6 +847,29 @@ async fn transaction_receipt(
     Ok(Json(receipt))
 }
 
+async fn transaction_proof(
+    State(state): State<V2AppState>,
+    Path(raw_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<V2FinalizedTransactionProofResponse>, V2ApiRejection> {
+    let transaction_id = parse_transaction_id(&raw_id)
+        .ok_or_else(|| state.reject(V2ApiError::InvalidTransactionId))?;
+    let checkpoint_height = parse_checkpoint_height_query(raw_query.as_deref())
+        .ok_or_else(|| state.reject(V2ApiError::InvalidCheckpointHeight))?;
+    let permit = Arc::clone(&state.inner.proof_slots)
+        .try_acquire_owned()
+        .map_err(|_| state.reject(V2ApiError::ProofLimit))?;
+    let bundle = state
+        .inner
+        .runtime
+        .finalized_proof(transaction_id, checkpoint_height)
+        .await
+        .map_err(|error| state.reject(V2ApiError::Runtime(error)))?
+        .ok_or_else(|| state.reject(V2ApiError::ProofNotFinalized))?;
+    drop(permit);
+    Ok(Json(bundle.into()))
+}
+
 fn parse_transaction_id(raw: &str) -> Option<TransactionId> {
     if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -781,6 +877,22 @@ fn parse_transaction_id(raw: &str) -> Option<TransactionId> {
     let bytes = hex::decode(raw).ok()?;
     let digest: [u8; 32] = bytes.try_into().ok()?;
     Some(TransactionId::new(webc_crypto::Hash256(digest)))
+}
+
+fn parse_checkpoint_height_query(raw: Option<&str>) -> Option<webc_chain::BlockHeight> {
+    let value = raw?.strip_prefix("checkpoint_height=")?;
+    if value.is_empty()
+        || value.len() > 20
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || value.starts_with('0')
+    {
+        return None;
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|height| *height > 0)
+        .map(webc_chain::BlockHeight::new)
 }
 
 /// First and only client-to-server lifecycle subscription message.
@@ -1037,5 +1149,129 @@ mod tests {
         assert!(!limiter.allow(second, start));
         assert!(limiter.allow(first, start + Duration::from_millis(10)));
         assert_eq!(limiter.buckets.len(), 1);
+    }
+
+    #[test]
+    fn checkpoint_query_accepts_only_one_non_zero_canonical_decimal_height() {
+        assert_eq!(
+            parse_checkpoint_height_query(Some("checkpoint_height=1")),
+            Some(webc_chain::BlockHeight::new(1))
+        );
+        assert_eq!(
+            parse_checkpoint_height_query(Some("checkpoint_height=18446744073709551615")),
+            Some(webc_chain::BlockHeight::new(u64::MAX))
+        );
+        for rejected in [
+            None,
+            Some(""),
+            Some("checkpoint_height="),
+            Some("checkpoint_height=0"),
+            Some("checkpoint_height=01"),
+            Some("checkpoint_height=+1"),
+            Some("checkpoint_height=1&extra=1"),
+            Some("height=1"),
+            Some("checkpoint_height=18446744073709551616"),
+        ] {
+            assert_eq!(parse_checkpoint_height_query(rejected), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_proof_concurrency_is_rejected() {
+        let sender = webc_crypto::Keypair::from_seed([0x71; 32]);
+        let genesis = webc_chain::GenesisConfig {
+            chain: webc_chain::ChainConfig {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                ..webc_chain::ChainConfig::default()
+            },
+            accounts: vec![webc_chain::GenesisAccount {
+                address: sender.address(),
+                balance: webc_chain::Amount::from_units(1_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = crate::Node::open(webc_storage::MemoryKvStore::new(), &genesis)
+            .expect("test node opens");
+        let (runtime, task) = crate::NodeRuntime::spawn(
+            node,
+            crate::V5MempoolConfig::default(),
+            1,
+            LocalTimestampMs::new(0),
+        )
+        .expect("runtime starts");
+        let result = V2AppState::with_limits(
+            runtime.clone(),
+            V2TransportLimits {
+                concurrent_proofs: 0,
+                ..V2TransportLimits::default()
+            },
+        );
+        assert!(result.is_err());
+        runtime.shutdown().await.expect("runtime shuts down");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn proof_slot_returns_fail_fast_backpressure() {
+        use tower::ServiceExt;
+
+        let sender = webc_crypto::Keypair::from_seed([0x72; 32]);
+        let genesis = webc_chain::GenesisConfig {
+            chain: webc_chain::ChainConfig {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                ..webc_chain::ChainConfig::default()
+            },
+            accounts: vec![webc_chain::GenesisAccount {
+                address: sender.address(),
+                balance: webc_chain::Amount::from_units(1_000_000),
+            }],
+            validators: Vec::new(),
+        };
+        let node = crate::Node::open(webc_storage::MemoryKvStore::new(), &genesis)
+            .expect("test node opens");
+        let (runtime, task) = crate::NodeRuntime::spawn(
+            node,
+            crate::V5MempoolConfig::default(),
+            1,
+            LocalTimestampMs::new(0),
+        )
+        .expect("runtime starts");
+        let state = V2AppState::with_limits(
+            runtime.clone(),
+            V2TransportLimits {
+                concurrent_proofs: 1,
+                ..V2TransportLimits::default()
+            },
+        )
+        .expect("non-zero limits are valid");
+        let held = Arc::clone(&state.inner.proof_slots)
+            .try_acquire_owned()
+            .expect("test reserves the only proof slot");
+        let unknown = webc_chain::TransactionId::new(webc_crypto::Hash256([0x73; 32]));
+        let response = router_v2(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/transactions/{unknown}/proof?checkpoint_height=1"
+                    ))
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body reads");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("error body is JSON");
+        assert_eq!(body["code"], "proof_limit");
+        drop(held);
+
+        runtime.shutdown().await.expect("runtime shuts down");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
     }
 }

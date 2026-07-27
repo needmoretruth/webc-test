@@ -23,8 +23,9 @@ use futures_util::{SinkExt, StreamExt};
 use tower::ServiceExt;
 use webc_chain::{
     ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainConfig,
-    ChainId, FeeBid, FeePaymentV1, GenesisAccount, GenesisConfig, Nonce, Operation,
-    TransactionAuthorizationV1, TransactionV5, ValidityWindowV1, TRANSACTION_V5_PROTOCOL_VERSION,
+    ChainId, FeeBid, FeePaymentV1, FinalityCertificate, GenesisAccount, GenesisConfig,
+    GenesisValidator, Nonce, Operation, SignedVote, TransactionAuthorizationV1, TransactionV5,
+    ValidatorSet, ValidityWindowV1, Vote, VoteType, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::Keypair;
 use webc_node::{
@@ -172,6 +173,166 @@ async fn submission_duplicate_status_and_pending_receipt_are_stable() {
     assert!(error["request_id"]
         .as_str()
         .is_some_and(|request_id| request_id.starts_with("v2-")));
+
+    handle.shutdown().await.expect("runtime shuts down");
+    task.await
+        .expect("runtime does not panic")
+        .expect("runtime exits cleanly");
+}
+
+#[tokio::test]
+async fn finalized_proof_route_requires_an_explicit_anchor_and_serves_a_verifiable_proof() {
+    let validator = Keypair::from_seed([0x61; 32]);
+    let recipient = Keypair::from_seed([0x62; 32]);
+    let genesis = GenesisConfig {
+        chain: ChainConfig {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            ..ChainConfig::default()
+        },
+        accounts: vec![GenesisAccount {
+            address: validator.address(),
+            balance: Amount::from_webc(1_000),
+        }],
+        validators: vec![GenesisValidator {
+            operator: validator.address(),
+            consensus_key: validator.public_key(),
+            self_stake: Amount::from_webc(100),
+            commission_bps: 500,
+            bootstrap: false,
+        }],
+    };
+    let node = Node::open(MemoryKvStore::new(), &genesis).expect("validator node opens");
+    let (handle, task) = NodeRuntime::spawn(
+        node,
+        V5MempoolConfig::default(),
+        32,
+        LocalTimestampMs::new(NOW),
+    )
+    .expect("test runtime starts");
+    let app = router_v2(V2AppState::new(handle.clone()));
+    let transaction = transaction(&validator, &recipient);
+    let transaction_id = transaction
+        .transaction_id()
+        .expect("test transaction has an ID");
+    handle
+        .submit(transaction, LocalTimestampMs::new(NOW))
+        .await
+        .expect("transaction is durably queued");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v2/transactions/{transaction_id}/proof"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await["code"],
+        "invalid_checkpoint_height"
+    );
+
+    let candidate = handle
+        .build_candidate_v4(
+            validator.address(),
+            NOW + 1,
+            LocalTimestampMs::new(NOW + 1),
+            Vec::new(),
+        )
+        .await
+        .expect("candidate builds");
+    let height = candidate.block.header.height;
+    let epoch = candidate.block.header.epoch;
+    let state = webc_chain::ChainState::from_genesis_v1(&genesis)
+        .expect("certificate fixture genesis builds");
+    let validator_set =
+        ValidatorSet::from_state(&state).expect("certificate authority snapshot builds");
+    let block_hash = candidate.block.hash().expect("candidate hashes");
+    let signed_vote = SignedVote::sign(
+        Vote {
+            protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+            chain_id: genesis.chain.chain_id.clone(),
+            height: height.get(),
+            round: 0,
+            vote_type: VoteType::Precommit,
+            block_hash,
+            validator: validator.address(),
+        },
+        &validator,
+    )
+    .expect("finality vote signs");
+    let certificate = FinalityCertificate::build(
+        &validator_set,
+        TRANSACTION_V5_PROTOCOL_VERSION,
+        genesis.chain.chain_id.clone(),
+        height.get(),
+        0,
+        block_hash,
+        &[signed_vote],
+    )
+    .expect("single validator reaches quorum");
+    handle
+        .finalize_v4(candidate.block, candidate.next_authority_set, certificate)
+        .await
+        .expect("candidate finalizes");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v2/transactions/{transaction_id}/proof?checkpoint_height={}",
+                    height.get()
+                ))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["api_version"], "v2");
+    let checkpoint_candidate: webc_proof::CheckpointV1 =
+        serde_json::from_value(body["checkpoint_candidate"].clone())
+            .expect("checkpoint response decodes");
+    let proof: webc_proof::FinalizedTransactionProofV1 =
+        serde_json::from_value(body["proof"].clone()).expect("proof response decodes");
+    let checkpoint = webc_proof::validate_checkpoint_v1(
+        checkpoint_candidate,
+        &webc_proof::CheckpointRequirementsV1::new(genesis.chain.chain_id.clone(), height, epoch),
+    )
+    .expect("served checkpoint is structurally valid");
+    let verified = webc_proof::verify_finalized_transaction_proof_v1(
+        &proof,
+        &checkpoint,
+        &webc_proof::FinalizedTransactionProofRequirementsV1::new(
+            genesis.chain.chain_id.clone(),
+            transaction_id,
+            genesis.chain.staking.blocks_per_epoch,
+        ),
+    )
+    .expect("served proof independently verifies");
+    assert_eq!(verified.transaction_id, transaction_id);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v2/transactions/{transaction_id}/proof?checkpoint_height=2"
+                ))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await["code"],
+        "invalid_checkpoint_height"
+    );
 
     handle.shutdown().await.expect("runtime shuts down");
     task.await
