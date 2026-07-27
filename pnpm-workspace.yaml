@@ -4,6 +4,9 @@ packages:
 allowBuilds:
   esbuild: true
 
+overrides:
+  postcss: 8.5.18
+
 catalog:
   typescript: 5.9.3
-  vitest: 3.2.4
+  vitest: 3.2.7

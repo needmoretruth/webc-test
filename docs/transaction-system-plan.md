@@ -1344,6 +1344,16 @@ compile-time 16-byte prefix into a fixed array, and the demo returns contextual
 failure instead of aborting. The strict production panic gate passes across the
 workspace; test-only assertions remain allowed.
 
+The JavaScript supply-chain audit found one critical Vitest 3.2.4 development
+server advisory and one high-severity PostCSS 8.5.16 source-map path traversal
+advisory. Production-only dependencies were clean, but CI and developer tooling
+remain an attack surface. The shared catalog and root pin now use Vitest 3.2.7,
+and the pnpm 11 workspace override pins PostCSS 8.5.18. Both packages are
+MIT-licensed. A frozen install, full dependency audit (including development
+dependencies), 275 SDK tests, 3 widget tests, both TypeScript builds, package
+entry validation, and documentation-link validation pass with no known
+vulnerability remaining.
+
 Exact next item: finish the complete workspace format/lint/test/doc/demo, exact
 pnpm, dependency/advisory, strict production panic, unsafe, secret, and branch
 red-team inventory gates. Record every remaining limitation as passed,
