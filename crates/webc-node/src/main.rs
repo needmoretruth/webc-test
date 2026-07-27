@@ -1,3 +1,5 @@
+mod proof_bench;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,6 +38,15 @@ enum Command {
     Bench {
         /// Iterations per measured operation.
         #[arg(long, default_value_t = 300)]
+        iterations: u32,
+    },
+    /// Benchmark finalized V5 transaction-proof assembly (indicative only).
+    ProofBench {
+        /// Sequential transfers in the single finalized V4 block (1..=8192).
+        #[arg(long, default_value_t = 1_750)]
+        transactions: u32,
+        /// Timed proof assemblies after one warm-up call.
+        #[arg(long, default_value_t = 20)]
         iterations: u32,
     },
     /// Run a restartable devnet node serving the HTTP/WebSocket developer API.
@@ -132,6 +143,10 @@ fn main() -> Result<()> {
         Command::GenesisTemplate => genesis_template(),
         Command::Demo => demo(),
         Command::Bench { iterations } => bench(iterations),
+        Command::ProofBench {
+            transactions,
+            iterations,
+        } => proof_bench::run(transactions, iterations),
         Command::Run {
             data_dir,
             listen,

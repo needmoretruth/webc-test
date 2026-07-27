@@ -51,8 +51,9 @@ pub use run_v1::{
 };
 pub use runtime_v1::{
     CertifiedBlockSnapshotV1, ConsensusContextV1, NodeHandle, NodeRuntime, NodeRuntimeError,
-    V5RuntimeStats, V5SubmitReceipt, DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY,
-    DEFAULT_V5_RUNTIME_QUEUE_CAPACITY, MAX_V5_LIFECYCLE_QUERY_IDS,
+    V5RuntimeStats, V5SubmitReceipt, DEFAULT_FINALIZED_PROOF_WORKERS,
+    DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY, DEFAULT_V5_RUNTIME_QUEUE_CAPACITY,
+    MAX_V5_LIFECYCLE_QUERY_IDS,
 };
 pub use service::{
     ApiError, FaucetConfig, NetworkAdmission, NodeService, NodeServiceOptions, API_VERSION,

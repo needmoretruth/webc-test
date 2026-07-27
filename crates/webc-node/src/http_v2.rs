@@ -432,6 +432,12 @@ fn classify_runtime_error(
             "transaction runtime is busy; retry with backoff",
             false,
         ),
+        NodeRuntimeError::ProofWorkersBusy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "proof_workers_busy",
+            "finalized proof workers are busy; retry with backoff",
+            false,
+        ),
         NodeRuntimeError::Stopped => (
             StatusCode::SERVICE_UNAVAILABLE,
             "runtime_stopped",
@@ -1130,6 +1136,16 @@ mod tests {
         assert_eq!(body["message"], "internal server error");
         assert_eq!(body["request_id"], "v2-test");
         assert!(!body.to_string().contains("secret database path"));
+    }
+
+    #[test]
+    fn proof_worker_saturation_is_public_retryable_backpressure() {
+        let (status, code, message, internal) =
+            classify_runtime_error(&NodeRuntimeError::ProofWorkersBusy);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "proof_workers_busy");
+        assert!(message.contains("retry"));
+        assert!(!internal);
     }
 
     #[test]

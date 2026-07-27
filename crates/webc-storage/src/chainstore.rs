@@ -686,6 +686,40 @@ impl<K: KvStore> ChainStore<K> {
         }
     }
 
+    /// Returns one bounded decoded V4 block for finalized-proof construction.
+    ///
+    /// This deliberately validates only the header and height-key binding, not
+    /// every transaction signature, receipt binding, root, and canonical JSON
+    /// byte. The proof builder must subsequently authenticate the requested
+    /// transaction, reconstruct both Merkle paths, bind them to this header,
+    /// and verify the header's finality certificate before exposing a result.
+    /// Keeping this separate from [`Self::block_v4_by_height`] prevents ordinary
+    /// state-sync and block-query callers from accidentally skipping full block
+    /// validation. Stored bytes still pass through the 4 MiB record-codec limit
+    /// and collection-bounded serde visitors before this method returns.
+    pub fn block_v4_for_finalized_proof(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockV4>, StorageError> {
+        match self.store.get(Table::BlocksV2, &be(height.get()))? {
+            None => Ok(None),
+            Some(bytes) => {
+                let block: BlockV4 = decode(StoredRecordKind::BlockV4, &bytes)?;
+                block.header.validate().map_err(|error| {
+                    StorageError::Corruption(format!(
+                        "stored protocol-2 proof header failed validation: {error}"
+                    ))
+                })?;
+                if block.header.height != height {
+                    return Err(StorageError::Corruption(
+                        "stored protocol-2 proof block does not match its height key".into(),
+                    ));
+                }
+                Ok(Some(block))
+            }
+        }
+    }
+
     /// Returns a finalized protocol-2 block through its V4 header hash index.
     pub fn block_v4_by_hash(&self, hash: &Hash256) -> Result<Option<BlockV4>, StorageError> {
         let Some(height_bytes) = self.store.get(Table::BlockV4HashIndex, &hash.0)? else {

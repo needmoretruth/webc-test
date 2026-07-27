@@ -20,7 +20,9 @@
 //! and a failed durable write leaves memory unchanged. Local time affects only
 //! retention and never enters consensus state.
 
-use tokio::sync::{broadcast, mpsc, oneshot};
+use std::sync::Arc;
+
+use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use webc_chain::{
     BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4, ConsensusWalRecordV1,
     FinalityAuthoritySetV1, FinalityCertificate, ReceiptV1, SlashingEvidence, TransactionId,
@@ -41,6 +43,8 @@ use crate::{
 pub const DEFAULT_V5_RUNTIME_QUEUE_CAPACITY: usize = 1_024;
 /// Retained live lifecycle snapshots before a slow subscriber is disconnected.
 pub const DEFAULT_V5_LIFECYCLE_EVENT_CAPACITY: usize = 1_024;
+/// Maximum CPU-heavy finalized proofs built concurrently outside the actor.
+pub const DEFAULT_FINALIZED_PROOF_WORKERS: usize = 2;
 /// Maximum transaction IDs read by one actor lifecycle snapshot command.
 pub const MAX_V5_LIFECYCLE_QUERY_IDS: usize = 64;
 
@@ -66,6 +70,8 @@ pub struct V5RuntimeStats {
     pub mempool_size: usize,
     /// Sum of canonical JSON bytes charged to the configured memory budget.
     pub mempool_bytes: usize,
+    /// CPU-heavy finalized proofs currently running outside the actor.
+    pub active_finalized_proofs: usize,
 }
 
 /// Actor-consistent protocol-2 consensus inputs for the next height.
@@ -100,6 +106,9 @@ pub enum NodeRuntimeError {
     /// The bounded command mailbox is full; callers must retry with backoff.
     #[error("protocol-2 runtime command queue is full")]
     QueueFull,
+    /// Every bounded finalized-proof worker is already occupied.
+    #[error("protocol-2 finalized proof workers are busy")]
+    ProofWorkersBusy,
     /// The actor stopped or the response receiver was canceled.
     #[error("protocol-2 runtime is stopped")]
     Stopped,
@@ -480,6 +489,7 @@ pub struct NodeRuntime<K: KvStore> {
     node: Node<K>,
     mempool: V5Mempool,
     lifecycle_events: broadcast::Sender<TransactionLifecycleV1>,
+    proof_workers: Arc<Semaphore>,
 }
 
 impl<K> NodeRuntime<K>
@@ -516,6 +526,7 @@ where
             node,
             mempool,
             lifecycle_events: lifecycle_events.clone(),
+            proof_workers: Arc::new(Semaphore::new(DEFAULT_FINALIZED_PROOF_WORKERS)),
         };
         let task = tokio::spawn(runtime.run(receiver));
         Ok((
@@ -590,11 +601,42 @@ where
                     checkpoint_height,
                     response,
                 } => {
-                    let result = self
-                        .node
-                        .finalized_transaction_proof_v1(transaction_id, checkpoint_height)
-                        .map_err(NodeRuntimeError::from);
-                    let _response_canceled = response.send(result);
+                    let permit = self.proof_workers.clone().try_acquire_owned();
+                    match permit {
+                        Err(_) => {
+                            let _response_canceled =
+                                response.send(Err(NodeRuntimeError::ProofWorkersBusy));
+                        }
+                        Ok(permit) => {
+                            match self.node.load_finalized_transaction_proof_v1(
+                                transaction_id,
+                                checkpoint_height,
+                            ) {
+                                Err(error) => {
+                                    drop(permit);
+                                    let _response_canceled =
+                                        response.send(Err(NodeRuntimeError::from(error)));
+                                }
+                                Ok(None) => {
+                                    drop(permit);
+                                    let _response_canceled = response.send(Ok(None));
+                                }
+                                Ok(Some(material)) => {
+                                    // The snapshot owns no store or mutable node
+                                    // state. Hashing and signatures may therefore
+                                    // run outside the ordered consensus owner.
+                                    let _worker = tokio::task::spawn_blocking(move || {
+                                        let _permit = permit;
+                                        let result = material
+                                            .assemble()
+                                            .map(Some)
+                                            .map_err(NodeRuntimeError::from);
+                                        let _response_canceled = response.send(result);
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
                 Command::Expire { now_ms, response } => {
                     let result = self.expire(now_ms);
@@ -686,6 +728,21 @@ where
                     }
                 }
                 Command::Shutdown { response } => {
+                    // No earlier proof task may outlive an acknowledged clean
+                    // shutdown. Acquiring every permit waits for the bounded
+                    // workers without retaining their large owned snapshots.
+                    let worker_count =
+                        u32::try_from(DEFAULT_FINALIZED_PROOF_WORKERS).map_err(|_| {
+                            NodeRuntimeError::Inconsistent("proof worker count exceeds u32")
+                        })?;
+                    if let Ok(permits) = self
+                        .proof_workers
+                        .clone()
+                        .acquire_many_owned(worker_count)
+                        .await
+                    {
+                        drop(permits);
+                    }
                     let _response_canceled = response.send(());
                     return Ok(());
                 }
@@ -804,6 +861,8 @@ where
             committed_height,
             mempool_size: self.mempool.len(),
             mempool_bytes: self.mempool.total_bytes(),
+            active_finalized_proofs: DEFAULT_FINALIZED_PROOF_WORKERS
+                .saturating_sub(self.proof_workers.available_permits()),
         })
     }
 
@@ -1053,6 +1112,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+    use std::time::Duration;
 
     use super::*;
     use webc_chain::{
@@ -1453,6 +1513,83 @@ mod tests {
         .expect("cross-epoch proof verifies independently");
         assert_eq!(verified.position.height, BlockHeight::new(3));
 
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn bounded_proof_workers_keep_the_actor_responsive() {
+        let validator = Keypair::from_seed([0x25; 32]);
+        let recipient = Keypair::from_seed([0x26; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let mut node = Node::open(MemoryKvStore::new(), &genesis).expect("test node opens");
+        let transactions = (0..128)
+            .map(|nonce| transfer(&validator, &recipient, nonce, 5))
+            .collect::<Vec<_>>();
+        let transaction_id = transactions[64]
+            .transaction_id()
+            .expect("target transaction has an ID");
+        let candidate = node
+            .build_candidate_v4(transactions, Vec::new(), validator.address(), NOW + 1)
+            .expect("large proof fixture builds");
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+        node.import_finalized_block_v4(
+            candidate.block,
+            &candidate.next_authority_set,
+            &certificate,
+        )
+        .expect("large proof fixture finalizes");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW + 1),
+        )
+        .expect("runtime starts");
+
+        let first_handle = handle.clone();
+        let first = tokio::spawn(async move {
+            first_handle
+                .finalized_proof(transaction_id, BlockHeight::new(1))
+                .await
+        });
+        let second_handle = handle.clone();
+        let second = tokio::spawn(async move {
+            second_handle
+                .finalized_proof(transaction_id, BlockHeight::new(1))
+                .await
+        });
+
+        // Stats are served by the same ordered actor. Observing both workers
+        // active proves that CPU-heavy hashing did not pin that actor.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stats = handle.stats().await.expect("actor serves stats");
+                if stats.active_finalized_proofs == DEFAULT_FINALIZED_PROOF_WORKERS {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actor remains responsive while proof workers run");
+        assert!(matches!(
+            handle
+                .finalized_proof(transaction_id, BlockHeight::new(1))
+                .await,
+            Err(NodeRuntimeError::ProofWorkersBusy)
+        ));
+
+        for worker in [first, second] {
+            let proof = worker
+                .await
+                .expect("proof task does not panic")
+                .expect("proof worker succeeds")
+                .expect("finalized transaction has a proof");
+            assert_eq!(proof.proof.transaction_proof.leaf_count.get(), 128);
+        }
         handle.shutdown().await.expect("shutdown is acknowledged");
         task.await
             .expect("runtime task does not panic")
