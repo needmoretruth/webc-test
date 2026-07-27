@@ -1532,6 +1532,7 @@ dependencies = [
  "webc-chain",
  "webc-crypto",
  "webc-net",
+ "webc-proof",
  "webc-storage",
  "zeroize",
 ]

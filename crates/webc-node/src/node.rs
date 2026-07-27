@@ -34,6 +34,14 @@ use webc_chain::{
     ValidatorSet, CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Hash256};
+use webc_proof::{
+    build_indexed_merkle_proof, validate_checkpoint_v1, verify_authority_set_transition_v1,
+    verify_finalized_transaction_proof_v1, AuthoritySetTransitionV1, CheckpointErrorV1,
+    CheckpointRequirementsV1, CheckpointV1, FinalizedTransactionProofErrorV1,
+    FinalizedTransactionProofRequirementsV1, FinalizedTransactionProofV1,
+    AUTHORITY_SET_TRANSITION_V1, CHECKPOINT_V1, FINALIZED_TRANSACTION_PROOF_V1,
+    MAX_AUTHORITY_TRANSITIONS_V1,
+};
 use webc_storage::{BlockCommit, BlockV4Commit, ChainStore, KvStore, PendingSlotV1, StorageError};
 
 /// Errors returned by the node runtime.
@@ -64,6 +72,18 @@ pub enum NodeError {
     /// A persisted or genesis-derived protocol-2 authority snapshot is invalid.
     #[error("protocol-2 authority set is invalid: {0}")]
     Authority(#[from] FinalityAuthoritySetErrorV1),
+    /// A stored or assembled transparent proof failed pure verification.
+    #[error("protocol-2 finalized proof is invalid: {0}")]
+    FinalizedProof(#[from] FinalizedTransactionProofErrorV1),
+    /// A checkpoint candidate or authority transition failed pure verification.
+    #[error("protocol-2 checkpoint proof is invalid: {0}")]
+    CheckpointProof(#[from] CheckpointErrorV1),
+    /// A requested checkpoint or its certified history is unavailable locally.
+    #[error("protocol-2 finalized proof data is unavailable: {0}")]
+    ProofDataUnavailable(&'static str),
+    /// A requested checkpoint/target relationship cannot form a proof.
+    #[error("protocol-2 finalized proof request is invalid: {0}")]
+    InvalidProofRequest(&'static str),
 }
 
 impl From<BlockV4ExecutionError> for NodeError {
@@ -82,6 +102,21 @@ pub struct V4FinalizationResult {
     /// Pending identities deleted atomically, including finalized IDs and local
     /// competitors that occupied a finalized `(sender, lane, nonce)` slot.
     pub removed_pending_ids: Vec<TransactionId>,
+}
+
+/// Node-served proof plus an explicitly untrusted checkpoint candidate.
+///
+/// The proof is valid relative to `checkpoint_candidate`, but serving both does
+/// not make the checkpoint trusted. A browser must validate the candidate under
+/// its configured multi-source or explicit-operator policy before relying on
+/// the proof.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizedTransactionProofBundleV1 {
+    /// Candidate anchor to corroborate independently before proof verification.
+    pub checkpoint_candidate: CheckpointV1,
+    /// Finalized transaction proof relative to that candidate.
+    pub proof: FinalizedTransactionProofV1,
 }
 
 /// A single-proposer, restartable WEBC node over any storage backend.
@@ -536,6 +571,218 @@ impl<K: KvStore> Node<K> {
             .into());
         }
         Ok(Some((block, next, certificate)))
+    }
+
+    /// Builds and self-verifies a checkpoint-relative finalized transaction proof.
+    ///
+    /// The requested transaction must already have an authoritative finalized
+    /// position. `checkpoint_height` names a stored certified V4 block at or
+    /// before that position. Only epoch-boundary blocks between the checkpoint
+    /// and target are loaded as transitions; no per-height history scan or
+    /// precomputed path table is needed. Returning `None` means the transaction
+    /// is not finalized. Missing/corrupt checkpoint history fails closed.
+    pub fn finalized_transaction_proof_v1(
+        &self,
+        transaction_id: TransactionId,
+        checkpoint_height: BlockHeight,
+    ) -> Result<Option<FinalizedTransactionProofBundleV1>, NodeError> {
+        self.ensure_protocol_two_block_api()?;
+        let Some(index) = self.store.finalized_transaction_index_v1(transaction_id)? else {
+            return Ok(None);
+        };
+        if checkpoint_height.get() == 0 || checkpoint_height > index.position.height {
+            return Err(NodeError::InvalidProofRequest(
+                "checkpoint height must be finalized, non-zero, and no later than the target",
+            ));
+        }
+
+        let checkpoint_block = self.store.block_v4_by_height(checkpoint_height)?.ok_or(
+            NodeError::ProofDataUnavailable("checkpoint block is not retained"),
+        )?;
+        let checkpoint_certificate = self.store.certificate(checkpoint_height.get())?.ok_or(
+            NodeError::ProofDataUnavailable("checkpoint certificate is not retained"),
+        )?;
+        let checkpoint_authority_set = self
+            .store
+            .finality_authority_set_v1(checkpoint_block.header.epoch)?
+            .ok_or(NodeError::ProofDataUnavailable(
+                "checkpoint authority set is not retained",
+            ))?;
+        let checkpoint_candidate = CheckpointV1 {
+            version: CHECKPOINT_V1,
+            header: checkpoint_block.header.clone(),
+            certificate: checkpoint_certificate,
+            authority_set: checkpoint_authority_set,
+        };
+        let checkpoint = validate_checkpoint_v1(
+            checkpoint_candidate.clone(),
+            &CheckpointRequirementsV1::new(
+                self.config.chain_id.clone(),
+                checkpoint_height,
+                checkpoint_block.header.epoch,
+            ),
+        )?;
+
+        let target_block = self
+            .store
+            .block_v4_by_height(index.position.height)?
+            .ok_or(NodeError::ProofDataUnavailable(
+                "target block is not retained",
+            ))?;
+        let target_certificate = self.store.certificate(index.position.height.get())?.ok_or(
+            NodeError::ProofDataUnavailable("target certificate is not retained"),
+        )?;
+        let target_authority_set = self
+            .store
+            .finality_authority_set_v1(target_block.header.epoch)?
+            .ok_or(NodeError::ProofDataUnavailable(
+                "target authority set is not retained",
+            ))?;
+
+        let transaction_index =
+            usize::try_from(index.position.transaction_index.get()).map_err(|_| {
+                NodeError::InvalidProofRequest("transaction index is not representable")
+            })?;
+        let transaction = target_block
+            .transactions
+            .get(transaction_index)
+            .ok_or(NodeError::ProofDataUnavailable(
+                "finalized transaction index is outside its block",
+            ))?
+            .clone();
+        if transaction.transaction_id()? != transaction_id {
+            return Err(NodeError::ProofDataUnavailable(
+                "finalized transaction index identifies another transaction",
+            ));
+        }
+        let receipt = target_block
+            .receipts
+            .get(transaction_index)
+            .ok_or(NodeError::ProofDataUnavailable(
+                "finalized receipt index is outside its block",
+            ))?
+            .clone();
+
+        let mut authority_transitions = Vec::new();
+        if target_block.header.height > checkpoint_height {
+            let mut anchor = checkpoint.next_anchor(self.config.staking.blocks_per_epoch)?;
+            while anchor.epoch() < target_block.header.epoch {
+                if authority_transitions.len() == MAX_AUTHORITY_TRANSITIONS_V1 {
+                    return Err(NodeError::InvalidProofRequest(
+                        "target requires more authority transitions than one proof permits",
+                    ));
+                }
+                let next_epoch =
+                    anchor
+                        .epoch()
+                        .checked_next()
+                        .ok_or(NodeError::InvalidProofRequest(
+                            "authority epoch is exhausted",
+                        ))?;
+                let boundary_height = next_epoch
+                    .get()
+                    .checked_mul(self.config.staking.blocks_per_epoch)
+                    .map(BlockHeight::new)
+                    .ok_or(NodeError::InvalidProofRequest(
+                        "epoch boundary height is exhausted",
+                    ))?;
+                if boundary_height <= anchor.minimum_height()
+                    || boundary_height >= target_block.header.height
+                {
+                    return Err(NodeError::ProofDataUnavailable(
+                        "required authority transition height is inconsistent",
+                    ));
+                }
+                let transition_block = self.store.block_v4_by_height(boundary_height)?.ok_or(
+                    NodeError::ProofDataUnavailable("authority transition block is not retained"),
+                )?;
+                let transition_certificate = self.store.certificate(boundary_height.get())?.ok_or(
+                    NodeError::ProofDataUnavailable(
+                        "authority transition certificate is not retained",
+                    ),
+                )?;
+                let outgoing_authority_set = self
+                    .store
+                    .finality_authority_set_v1(anchor.epoch())?
+                    .ok_or(NodeError::ProofDataUnavailable(
+                        "outgoing transition authority set is not retained",
+                    ))?;
+                let incoming_authority_set = self
+                    .store
+                    .finality_authority_set_v1(next_epoch)?
+                    .ok_or(NodeError::ProofDataUnavailable(
+                        "incoming transition authority set is not retained",
+                    ))?;
+                let transition = AuthoritySetTransitionV1 {
+                    version: AUTHORITY_SET_TRANSITION_V1,
+                    header: transition_block.header,
+                    certificate: transition_certificate,
+                    outgoing_authority_set,
+                    incoming_authority_set,
+                };
+                anchor = verify_authority_set_transition_v1(&transition, &anchor)?;
+                authority_transitions.push(transition);
+            }
+        }
+
+        let transaction_leaves = target_block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(position, transaction)| {
+                let position = u32::try_from(position)
+                    .map(webc_chain::TransactionIndex::new)
+                    .map_err(|_| {
+                        NodeError::ProofDataUnavailable(
+                            "target transaction position exceeds the V1 index",
+                        )
+                    })?;
+                let transaction_id = transaction.transaction_id()?;
+                webc_chain::transaction_leaf_v1(
+                    webc_chain::BlockPositionV1::new(target_block.header.height, position),
+                    transaction_id,
+                )
+                .map_err(|_| NodeError::ProofDataUnavailable("transaction leaf is invalid"))
+            })
+            .collect::<Result<Vec<_>, NodeError>>()?;
+        let receipt_leaves = target_block
+            .receipts
+            .iter()
+            .map(|receipt| {
+                receipt
+                    .leaf()
+                    .map_err(|_| NodeError::ProofDataUnavailable("receipt leaf is invalid"))
+            })
+            .collect::<Result<Vec<_>, NodeError>>()?;
+        let transaction_proof = build_indexed_merkle_proof(&transaction_leaves, transaction_index)
+            .map_err(|_| NodeError::ProofDataUnavailable("transaction path cannot be built"))?;
+        let receipt_proof = build_indexed_merkle_proof(&receipt_leaves, transaction_index)
+            .map_err(|_| NodeError::ProofDataUnavailable("receipt path cannot be built"))?;
+
+        let proof = FinalizedTransactionProofV1 {
+            version: FINALIZED_TRANSACTION_PROOF_V1,
+            authority_transitions,
+            target_header: target_block.header,
+            target_certificate,
+            target_authority_set,
+            transaction,
+            receipt,
+            transaction_proof,
+            receipt_proof,
+        };
+        verify_finalized_transaction_proof_v1(
+            &proof,
+            &checkpoint,
+            &FinalizedTransactionProofRequirementsV1::new(
+                self.config.chain_id.clone(),
+                transaction_id,
+                self.config.staking.blocks_per_epoch,
+            ),
+        )?;
+        Ok(Some(FinalizedTransactionProofBundleV1 {
+            checkpoint_candidate,
+            proof,
+        }))
     }
 
     /// Replays and atomically commits one certified protocol-2 V4 block.

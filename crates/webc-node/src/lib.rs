@@ -43,7 +43,7 @@ pub use mempool::{InsertOutcome, Mempool, MempoolConfig, MempoolError};
 pub use mempool_v1::{
     V5AdmissionPlan, V5InsertOutcome, V5Mempool, V5MempoolConfig, V5MempoolError,
 };
-pub use node::{Node, NodeError, V4FinalizationResult};
+pub use node::{FinalizedTransactionProofBundleV1, Node, NodeError, V4FinalizationResult};
 pub use run_v1::{
     load_consensus_credentials, load_protocol2_genesis, start_protocol2, Protocol2Node,
     Protocol2RunConfig,

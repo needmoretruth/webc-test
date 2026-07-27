@@ -33,8 +33,8 @@ use webc_storage::{
 };
 
 use crate::{
-    Node, NodeError, V4FinalizationResult, V5InsertOutcome, V5Mempool, V5MempoolConfig,
-    V5MempoolError,
+    FinalizedTransactionProofBundleV1, Node, NodeError, V4FinalizationResult, V5InsertOutcome,
+    V5Mempool, V5MempoolConfig, V5MempoolError,
 };
 
 /// Default maximum number of commands waiting for the single runtime owner.
@@ -216,6 +216,27 @@ impl NodeHandle {
         self.sender
             .try_send(Command::Receipt {
                 transaction_id,
+                response,
+            })
+            .map_err(map_send_error)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
+    /// Builds a self-verified finalized proof relative to a stored checkpoint.
+    ///
+    /// A full API queue returns backpressure instead of retaining unbounded proof
+    /// work. `None` means the transaction is not finalized; an unavailable or
+    /// inconsistent checkpoint is a typed failure.
+    pub async fn finalized_proof(
+        &self,
+        transaction_id: TransactionId,
+        checkpoint_height: BlockHeight,
+    ) -> Result<Option<FinalizedTransactionProofBundleV1>, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Command::FinalizedProof {
+                transaction_id,
+                checkpoint_height,
                 response,
             })
             .map_err(map_send_error)?;
@@ -406,6 +427,12 @@ enum Command {
         transaction_id: TransactionId,
         response: oneshot::Sender<Result<Option<ReceiptV1>, NodeRuntimeError>>,
     },
+    FinalizedProof {
+        transaction_id: TransactionId,
+        checkpoint_height: BlockHeight,
+        response:
+            oneshot::Sender<Result<Option<FinalizedTransactionProofBundleV1>, NodeRuntimeError>>,
+    },
     Expire {
         now_ms: LocalTimestampMs,
         response: oneshot::Sender<Result<usize, NodeRuntimeError>>,
@@ -555,6 +582,17 @@ where
                         .node
                         .store()
                         .finalized_receipt_v1(transaction_id)
+                        .map_err(NodeRuntimeError::from);
+                    let _response_canceled = response.send(result);
+                }
+                Command::FinalizedProof {
+                    transaction_id,
+                    checkpoint_height,
+                    response,
+                } => {
+                    let result = self
+                        .node
+                        .finalized_transaction_proof_v1(transaction_id, checkpoint_height)
                         .map_err(NodeRuntimeError::from);
                     let _response_canceled = response.send(result);
                 }
@@ -1217,6 +1255,97 @@ mod tests {
             candidate.block.header.hash().unwrap()
         );
         assert_eq!(stored.next_authority_set, candidate.next_authority_set);
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn finalized_proof_is_assembled_from_the_durable_certified_block() {
+        let validator = Keypair::from_seed([0x21; 32]);
+        let recipient = Keypair::from_seed([0x22; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let node = Node::open(MemoryKvStore::new(), &genesis).expect("test node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+        let transaction = transfer(&validator, &recipient, 0, 5);
+        let transaction_id = transaction
+            .transaction_id()
+            .expect("test transaction has an ID");
+
+        handle
+            .submit(transaction, LocalTimestampMs::new(NOW))
+            .await
+            .expect("transaction enters the durable mempool");
+        assert!(handle
+            .finalized_proof(transaction_id, BlockHeight::new(1))
+            .await
+            .expect("a pending transaction has no finalized proof")
+            .is_none());
+
+        let candidate = handle
+            .build_candidate_v4(
+                validator.address(),
+                NOW + 1,
+                LocalTimestampMs::new(NOW + 1),
+                Vec::new(),
+            )
+            .await
+            .expect("candidate builds");
+        let target_height = candidate.block.header.height;
+        let target_epoch = candidate.block.header.epoch;
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+        handle
+            .finalize_v4(candidate.block, candidate.next_authority_set, certificate)
+            .await
+            .expect("candidate finalizes");
+
+        let bundle = handle
+            .finalized_proof(transaction_id, target_height)
+            .await
+            .expect("proof assembly succeeds")
+            .expect("finalized transaction has a proof");
+        assert!(bundle.proof.authority_transitions.is_empty());
+        assert_eq!(bundle.proof.target_header.height, target_height);
+
+        // Re-run the pure verifier as a light client would. The served
+        // checkpoint remains only a candidate until the caller applies its own
+        // trust policy; this test supplies exact local requirements explicitly.
+        let checkpoint = webc_proof::validate_checkpoint_v1(
+            bundle.checkpoint_candidate,
+            &webc_proof::CheckpointRequirementsV1::new(
+                genesis.chain.chain_id.clone(),
+                target_height,
+                target_epoch,
+            ),
+        )
+        .expect("checkpoint candidate validates structurally");
+        let verified = webc_proof::verify_finalized_transaction_proof_v1(
+            &bundle.proof,
+            &checkpoint,
+            &webc_proof::FinalizedTransactionProofRequirementsV1::new(
+                genesis.chain.chain_id.clone(),
+                transaction_id,
+                genesis.chain.staking.blocks_per_epoch,
+            ),
+        )
+        .expect("assembled proof verifies independently");
+        assert_eq!(verified.transaction_id, transaction_id);
+        assert_eq!(verified.position.height, target_height);
+
+        assert!(matches!(
+            handle
+                .finalized_proof(transaction_id, BlockHeight::new(0))
+                .await,
+            Err(NodeRuntimeError::Node(NodeError::InvalidProofRequest(_)))
+        ));
 
         handle.shutdown().await.expect("shutdown is acknowledged");
         task.await

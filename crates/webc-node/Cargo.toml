@@ -21,6 +21,7 @@ webc-chain = { path = "../webc-chain" }
 webc-crypto = { path = "../webc-crypto" }
 webc-storage = { path = "../webc-storage" }
 webc-net = { path = "../webc-net" }
+webc-proof = { path = "../webc-proof" }
 thiserror.workspace = true
 hex.workspace = true
 # Consensus credentials erase their retained seed on drop. zeroize is
