@@ -53,6 +53,14 @@ confidence-threshold = 0.9
 # so a future dependency under them does not fail the gate spuriously; do not
 # warn that they are currently unused.
 unused-allowed-license = "allow"
+# libFuzzer's vendored engine is NCSA-licensed. NCSA is OSI-approved and the
+# Apache Software Foundation classifies it as an Apache-like Category A
+# license, but keep the allowance scoped to the exact test-only crate/version
+# instead of widening the shipped dependency policy:
+# https://www.apache.org/legal/resolved.html#category-a
+exceptions = [
+    { allow = ["NCSA"], crate = "libfuzzer-sys@0.4.13" },
+]
 
 [bans]
 # Duplicate major versions (finding D3). The one duplicate we directly
