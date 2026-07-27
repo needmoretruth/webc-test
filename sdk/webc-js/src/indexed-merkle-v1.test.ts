@@ -44,4 +44,3 @@ describe("indexed Merkle proof V1", () => {
       .rejects.toThrow("root mismatch");
   });
 });
-

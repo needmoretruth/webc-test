@@ -117,4 +117,3 @@ export function compareAddressBytes(left: string, right: string): number {
   }
   return 0;
 }
-

@@ -1233,17 +1233,35 @@ authority checkpoint, so a browser must still trust the queried node. Localized
 multi-namespace receipt pricing remains a separately versioned follow-up, and
 Windows validator-key ACLs require deployment enforcement.
 
-Exact next item: implement finalized checkpoint and proof verification without
-inventing another Merkle tree. Extend `webc-proof` around the existing indexed
-Merkle proof, define bounded versioned authority checkpoints/transitions, and
-assemble a finalized transaction plus receipt proof from the atomically stored
-V4 block, receipt index, certificate, and authority snapshots. Expose it through
-a bounded V2 route, then add byte-identical TypeScript verification so the
-browser verifies block roots, certificate quorum, authority transitions, and
-the requested transaction/receipt binding independently of the serving node.
-Include tampered position/sibling/root, duplicate/foreign signer, wrong chain or
-epoch, skipped authority transition, hostile length, stale checkpoint, and
-cross-language fixture tests before calling the proof path complete.
+The finalized-proof path is now implemented through commit `0acc5c9`.
+`webc-proof` reuses the indexed Merkle implementation for bounded V1 authority
+checkpoints and transitions (`725922c`) and complete transaction/receipt proofs
+(`2e32845`). The node assembles and self-verifies those proofs only from durable
+blocks, certificates, receipt indexes, and authority snapshots (`2474dd7`), then
+serves them through a concurrency- and size-bounded V2 route (`b2f733e`). A
+checkpoint remains explicitly untrusted until configured source identities
+reach exact quorum agreement or an operator deliberately selects visibly
+labelled explicit trust (`3f2860a`). The browser SDK mirrors every signature,
+quorum, transition, indexed Merkle, V5 identity, validity, and receipt/fee rule;
+Rust generates the exact shared JSON fixture consumed by TypeScript, and the SDK
+fetches the V2 envelope without silently trusting its checkpoint (`0acc5c9`).
+
+The focused gates passed 25 Rust proof tests, strict all-target proof Clippy,
+Rustdoc, both SDK package builds, 273 browser SDK tests, 3 widget tests, package
+entry validation, and documentation-link validation. Tampered transactions,
+fees, positions, siblings, roots, certificate signatures, missing/skipped
+transitions, excessive collections, stale/wrong-chain candidates, configured
+source disagreement/invalidity, and JavaScript mutation during asynchronous
+verification all fail closed.
+
+Exact next item: red-team the assembled node path across a real epoch boundary
+(checkpoint below the target) and at maximum practical block size. Add a
+repeatable proof-assembly benchmark and bounded-memory/resource-abuse tests; if
+measurement shows actor starvation, split durable proof-material loading from
+CPU-heavy hashing and signature verification so consensus traffic is not held
+behind proof requests. Then run the full workspace/security gates, reconcile
+the branch with the latest `main`, and update the global status documents only
+when the branch is ready for integration.
 
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 

@@ -162,4 +162,3 @@ function validateQuorumConfiguration(
     distinct.add(source);
   }
 }
-
