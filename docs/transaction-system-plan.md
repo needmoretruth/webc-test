@@ -1354,6 +1354,17 @@ dependencies), 275 SDK tests, 3 widget tests, both TypeScript builds, package
 entry validation, and documentation-link validation pass with no known
 vulnerability remaining.
 
+The Rust root and fuzz lockfiles pass advisory, license, source, and banned-crate
+checks. The workspace-owned `thiserror` dependency was upgraded from 1.x to the
+MIT-or-Apache-2.0 2.x line already required by Tungstenite, removing the direct
+duplicate and its procedural macro duplicate without source changes. Remaining
+warnings are incompatible transitive generations of `getrandom`/`rand_core` and
+target-only `r-efi`, fuzz-only procedural-macro `syn` generations, plus Wasmi's
+older parser beside the protocol validator's newer `wasmparser`; replacing
+those would require a cryptography, test-runtime, macro-toolchain, or WASM-engine
+migration rather than a safe lockfile unification. They carry no known advisory
+and remain visible to `cargo deny` instead of being hidden.
+
 Exact next item: finish the complete workspace format/lint/test/doc/demo, exact
 pnpm, dependency/advisory, strict production panic, unsafe, secret, and branch
 red-team inventory gates. Record every remaining limitation as passed,
