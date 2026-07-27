@@ -239,6 +239,25 @@ fn verifies_transition_certificate_and_both_merkle_roots() {
     let (checkpoint, proof, requirements) = fixture();
     let verified = verify_finalized_transaction_proof_v1(&proof, &checkpoint, &requirements)
         .expect("complete finalized proof");
+    let generated = serde_json::to_string(&serde_json::json!({
+        "api_version": "v2",
+        "checkpoint_candidate": checkpoint.checkpoint(),
+        "proof": proof,
+        "requirements": {
+            "chain_id": requirements.chain_id,
+            "transaction_id": requirements.transaction_id,
+            "blocks_per_epoch": requirements.blocks_per_epoch.to_string(),
+        },
+        "expected": {
+            "checkpoint_digest": verified.checkpoint_digest,
+            "block_hash": verified.block_hash,
+        }
+    }))
+    .expect("fixture JSON");
+    assert_eq!(
+        generated,
+        include_str!("../../../fixtures/finalized-transaction-proof-v1.json").trim()
+    );
     assert_eq!(verified.transaction_id, requirements.transaction_id);
     assert_eq!(verified.position, proof.receipt.position);
     assert_eq!(verified.block_hash, proof.target_header.hash().unwrap());

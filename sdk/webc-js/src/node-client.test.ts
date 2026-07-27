@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 import {
   NodeApiError,
@@ -16,7 +17,8 @@ function fakeFetch(
   const fetchImpl: FetchLike = async (url, init) => {
     const method = init?.method ?? "GET";
     calls.push({ url, method, body: init?.body });
-    const path = url.slice(url.indexOf("/v1"));
+    const parsedUrl = new URL(url);
+    const path = `${parsedUrl.pathname}${parsedUrl.search}`;
     const route = routes[`${method} ${path}`];
     if (!route) {
       return { ok: false, status: 404, text: async () => JSON.stringify({ error: "nf", kind: "not_found" }) };
@@ -31,6 +33,19 @@ function fakeFetch(
 }
 
 const HASH = "a".repeat(64);
+
+const finalizedProofFixture = JSON.parse(
+  readFileSync(
+    new URL("../../../fixtures/finalized-transaction-proof-v1.json", import.meta.url),
+    "utf8",
+  ),
+) as Record<string, unknown>;
+
+const finalizedProofResponse = {
+  api_version: "v2",
+  checkpoint_candidate: finalizedProofFixture.checkpoint_candidate,
+  proof: finalizedProofFixture.proof,
+};
 
 describe("WebcNodeClient HTTP", () => {
   it("parses health", async () => {
@@ -115,6 +130,63 @@ describe("WebcNodeClient HTTP", () => {
     expect(receipt.txHash).toBe(HASH);
     // The request carried the JSON body.
     expect(calls[0].body).toBe(JSON.stringify({ any: "tx" }));
+  });
+
+  it("fetches a bounded V2 finalized proof without trusting its checkpoint", async () => {
+    const transactionId = (finalizedProofFixture.requirements as { transaction_id: string })
+      .transaction_id;
+    const { fetchImpl, calls } = fakeFetch({
+      [`GET /v2/transactions/${transactionId}/proof?checkpoint_height=9`]: {
+        ok: true,
+        status: 200,
+        body: finalizedProofResponse,
+      },
+    });
+    const client = new WebcNodeClient("http://node.test/", { fetchImpl });
+    const response = await client.finalizedTransactionProof(transactionId, 9n);
+    expect(response.api_version).toBe("v2");
+    expect(response.checkpoint_candidate.header.height).toBe("9");
+    expect(calls[0]?.url).toBe(
+      `http://node.test/v2/transactions/${transactionId}/proof?checkpoint_height=9`,
+    );
+  });
+
+  it("rejects malformed proof request identities before network I/O", async () => {
+    let calls = 0;
+    const fetchImpl: FetchLike = async () => {
+      calls += 1;
+      throw new Error("must not fetch");
+    };
+    const client = new WebcNodeClient("http://node.test", { fetchImpl });
+    await expect(client.finalizedTransactionProof("A".repeat(64), 1n)).rejects.toThrow(
+      /transactionId/u,
+    );
+    await expect(client.finalizedTransactionProof(HASH, 0n)).rejects.toThrow(
+      /checkpointHeight/u,
+    );
+    await expect(client.finalizedTransactionProof(HASH, 1n << 64n)).rejects.toThrow(
+      /checkpointHeight/u,
+    );
+    expect(calls).toBe(0);
+  });
+
+  it("enforces a proof-specific response cap", async () => {
+    const transactionId = (finalizedProofFixture.requirements as { transaction_id: string })
+      .transaction_id;
+    const { fetchImpl } = fakeFetch({
+      [`GET /v2/transactions/${transactionId}/proof?checkpoint_height=9`]: {
+        ok: true,
+        status: 200,
+        body: finalizedProofResponse,
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", {
+      fetchImpl,
+      maxFinalizedProofResponseBytes: 128,
+    });
+    await expect(client.finalizedTransactionProof(transactionId, 9n)).rejects.toThrow(
+      /maximum allowed size/u,
+    );
   });
 
   it("requests a faucet drip and surfaces the disclaimer", async () => {

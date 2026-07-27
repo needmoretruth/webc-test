@@ -7,6 +7,17 @@
  */
 
 import { canonicalJsonHashHex } from "./canonical.js";
+import {
+  compareAddressBytes,
+  proofAddress,
+  proofArray,
+  proofChainId,
+  proofExactKeys,
+  proofHex,
+  proofRecord,
+  proofU128,
+  proofU64,
+} from "./proof-json-v1.js";
 import type { HexString, WebcAddress } from "./types.js";
 
 /** Schema version of the first finality-authority set. */
@@ -14,6 +25,8 @@ export const FINALITY_AUTHORITY_SET_V1 = 1;
 
 /** Independent commitment domain for authority sets. */
 export const FINALITY_AUTHORITY_SET_V1_DOMAIN = "WEBC_FINALITY_AUTHORITY_SET_V1";
+/** Absolute Rust/browser authority-entry cap. */
+export const MAX_FINALITY_AUTHORITIES_V1 = 16_384;
 
 /** One authority entry in strict validator-ID order. */
 export interface FinalityAuthorityV1Json {
@@ -49,4 +62,57 @@ export function finalityAuthoritySetV1CommitmentHex(
     domain: FINALITY_AUTHORITY_SET_V1_DOMAIN,
     authority_set: authoritySet,
   });
+}
+
+/** Validates the complete bounded authority set before certificate work. */
+export function validateFinalityAuthoritySetV1(
+  value: unknown,
+): asserts value is FinalityAuthoritySetV1Json {
+  const set = proofRecord(value, "V1 finality authority set");
+  proofExactKeys(
+    set,
+    ["version", "protocol_version", "chain_id", "epoch", "authorities", "total_power"],
+    "V1 finality authority set",
+  );
+  if (set.version !== FINALITY_AUTHORITY_SET_V1 || set.protocol_version !== 2) {
+    throw new Error("unsupported V1 finality authority set version");
+  }
+  proofChainId(set.chain_id, "authority chain ID");
+  proofU64(set.epoch, "authority epoch");
+  const authorities = proofArray(
+    set.authorities,
+    MAX_FINALITY_AUTHORITIES_V1,
+    "finality authorities",
+  );
+  if (authorities.length === 0) throw new Error("finality authority set must not be empty");
+
+  let previousValidator: string | undefined;
+  let total = 0n;
+  const consensusKeys = new Set<string>();
+  for (const rawAuthority of authorities) {
+    const authority = proofRecord(rawAuthority, "V1 finality authority");
+    proofExactKeys(
+      authority,
+      ["validator_id", "consensus_key", "voting_power"],
+      "V1 finality authority",
+    );
+    proofAddress(authority.validator_id, "authority validator ID");
+    proofHex(authority.consensus_key, 32, "authority consensus key");
+    const power = proofU128(authority.voting_power, "authority voting power");
+    if (power === 0n) throw new Error("authority voting power must be non-zero");
+    if (previousValidator !== undefined
+      && compareAddressBytes(previousValidator, authority.validator_id) >= 0) {
+      throw new Error("finality authorities are not strictly sorted");
+    }
+    previousValidator = authority.validator_id;
+    if (consensusKeys.has(authority.consensus_key)) {
+      throw new Error("finality authorities reuse a consensus key");
+    }
+    consensusKeys.add(authority.consensus_key);
+    total += power;
+    if (total >= (1n << 128n)) throw new Error("finality authority power overflows u128");
+  }
+  if (total !== proofU128(set.total_power, "authority total power")) {
+    throw new Error("finality authority total power mismatch");
+  }
 }

@@ -230,17 +230,34 @@ export async function verifyTransactionReceiptBindingV1(
     const id = await transactionV5IdHex(transaction);
     if (seen.has(id)) throw new Error("duplicate transaction ID");
     seen.add(id);
-    if (receipt.transaction_id !== id) throw new Error("receipt transaction ID mismatch");
-    if (receipt.sender !== transaction.sender) throw new Error("receipt sender mismatch");
-    validateFeeBinding(transaction, receipt.fee_summary);
-    const actionCount = "Actions" in transaction.kind ? transaction.kind.Actions.actions.length : 0;
-    for (const event of receipt.events) {
-      if (event.action_index >= actionCount) throw new Error("event action index is out of range");
-    }
-    const failedIndex = validateStatus(receipt.status);
-    if (failedIndex !== undefined && failedIndex !== null && failedIndex >= actionCount) {
-      throw new Error("failed action index is out of range");
-    }
+    await verifyTransactionReceiptPairV1(transaction, receipt, id);
+  }
+}
+
+/**
+ * Verifies one signed V5 transaction and V1 receipt at the receipt's position.
+ *
+ * The containing block or finalized proof remains responsible for checking the
+ * position against its Merkle index and target height.
+ */
+export async function verifyTransactionReceiptPairV1(
+  transaction: SignedTransactionV5Json,
+  receipt: ReceiptV1Json,
+  knownTransactionId?: string,
+): Promise<void> {
+  validateTransactionV5Structure(transaction);
+  validateReceiptV1(receipt);
+  const id = knownTransactionId ?? await transactionV5IdHex(transaction);
+  if (receipt.transaction_id !== id) throw new Error("receipt transaction ID mismatch");
+  if (receipt.sender !== transaction.sender) throw new Error("receipt sender mismatch");
+  validateFeeBinding(transaction, receipt.fee_summary);
+  const actionCount = "Actions" in transaction.kind ? transaction.kind.Actions.actions.length : 0;
+  for (const event of receipt.events) {
+    if (event.action_index >= actionCount) throw new Error("event action index is out of range");
+  }
+  const failedIndex = validateStatus(receipt.status);
+  if (failedIndex !== undefined && failedIndex !== null && failedIndex >= actionCount) {
+    throw new Error("failed action index is out of range");
   }
 }
 
@@ -250,14 +267,17 @@ async function merkleRootHex(leaves: readonly string[]): Promise<string> {
   while (layer.length > 1) {
     const next: string[] = [];
     for (let index = 0; index < layer.length; index += 2) {
-      next.push(await merkleParentHex(layer[index], layer[index + 1] ?? layer[index]));
+      next.push(await merkleParentV1Hex(layer[index], layer[index + 1] ?? layer[index]));
     }
     layer = next;
   }
   return layer[0];
 }
 
-async function merkleParentHex(left: string, right: string): Promise<string> {
+/** Computes the shared duplicate-last V1 Merkle parent hash. */
+export async function merkleParentV1Hex(left: string, right: string): Promise<string> {
+  hash256(left, "left Merkle child");
+  hash256(right, "right Merkle child");
   const domain = new TextEncoder().encode(MERKLE_V1_DOMAIN);
   const bytes = new Uint8Array(domain.length + 64);
   bytes.set(domain);

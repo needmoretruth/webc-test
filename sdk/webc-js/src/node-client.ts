@@ -19,6 +19,11 @@
  */
 
 import { addressToBytes } from "./address.js";
+import {
+  MAX_FINALIZED_PROOF_BUNDLE_V1_JSON_BYTES,
+  parseFinalizedTransactionProofBundleV1,
+  type FinalizedTransactionProofBundleV1Json,
+} from "./finalized-proof-v1.js";
 import type { ServiceEntry } from "./http402.js";
 import type {
   GovernanceActionJson,
@@ -46,6 +51,9 @@ export const NODE_API_VERSION = "v1";
 
 /** Upper bound on a single API response body, to cap hostile payloads. */
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+/** Largest unsigned 64-bit checkpoint height accepted by the node protocol. */
+const MAX_U64 = 18_446_744_073_709_551_615n;
 
 /** Upper bound on a node-supplied error string surfaced into host UI. */
 const MAX_ERROR_STRING_CHARS = 256;
@@ -305,6 +313,11 @@ export interface WebcNodeClientOptions {
    * A streamed body is aborted as soon as the running byte count exceeds this.
    */
   readonly maxResponseBytes?: number;
+  /**
+   * Maximum finalized-proof response size in bytes. Defaults to the protocol's
+   * absolute 24 MiB envelope limit and can only be lowered by callers.
+   */
+  readonly maxFinalizedProofResponseBytes?: number;
 }
 
 /**
@@ -318,6 +331,7 @@ export class WebcNodeClient {
   readonly #fetch: FetchLike;
   readonly #webSocket: WebSocketConstructor | undefined;
   readonly #maxResponseBytes: number;
+  readonly #maxFinalizedProofResponseBytes: number;
 
   constructor(baseUrl: string, options: WebcNodeClientOptions = {}) {
     // Normalize away a trailing slash so path joins are unambiguous.
@@ -335,6 +349,19 @@ export class WebcNodeClient {
       throw new Error("maxResponseBytes must be a positive integer");
     }
     this.#maxResponseBytes = maxBytes;
+    const maxProofBytes =
+      options.maxFinalizedProofResponseBytes
+      ?? MAX_FINALIZED_PROOF_BUNDLE_V1_JSON_BYTES;
+    if (
+      !Number.isSafeInteger(maxProofBytes)
+      || maxProofBytes <= 0
+      || maxProofBytes > MAX_FINALIZED_PROOF_BUNDLE_V1_JSON_BYTES
+    ) {
+      throw new Error(
+        "maxFinalizedProofResponseBytes must be a positive integer no greater than the protocol limit",
+      );
+    }
+    this.#maxFinalizedProofResponseBytes = maxProofBytes;
   }
 
   /** Returns node health and identity. */
@@ -589,6 +616,31 @@ export class WebcNodeClient {
   }
 
   /**
+   * Fetches a checkpoint-relative finalized transaction proof from the V2 API.
+   *
+   * `transactionId` is an exact lowercase 32-byte hex transaction identity and
+   * `checkpointHeight` is a non-zero unsigned 64-bit height. The returned
+   * checkpoint is only a candidate: callers must establish it with an explicit
+   * trust policy before passing the proof to the cryptographic verifier.
+   */
+  async finalizedTransactionProof(
+    transactionId: string,
+    checkpointHeight: bigint,
+  ): Promise<FinalizedTransactionProofBundleV1Json> {
+    if (!/^[0-9a-f]{64}$/.test(transactionId)) {
+      throw new Error("transactionId must be a lowercase 32-byte hex string");
+    }
+    if (checkpointHeight <= 0n || checkpointHeight > MAX_U64) {
+      throw new Error("checkpointHeight must be a non-zero unsigned 64-bit integer");
+    }
+    const value = await this.#get(
+      `/v2/transactions/${transactionId}/proof?checkpoint_height=${checkpointHeight}`,
+      this.#maxFinalizedProofResponseBytes,
+    );
+    return parseFinalizedTransactionProofBundleV1(value);
+  }
+
+  /**
    * Submits a signed transaction. `transaction` must be the canonical JSON object
    * produced by the wallet/transaction APIs (already signed).
    */
@@ -641,9 +693,9 @@ export class WebcNodeClient {
     return `ws://${this.#baseUrl}`;
   }
 
-  async #get(path: string): Promise<unknown> {
+  async #get(path: string, successBodyLimit = this.#maxResponseBytes): Promise<unknown> {
     const response = await this.#fetch(`${this.#baseUrl}${path}`, { method: "GET" });
-    return this.#handle(response);
+    return this.#handle(response, successBodyLimit);
   }
 
   async #post(path: string, body: unknown): Promise<unknown> {
@@ -652,7 +704,7 @@ export class WebcNodeClient {
       headers: body === undefined ? {} : { "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    return this.#handle(response);
+    return this.#handle(response, this.#maxResponseBytes);
   }
 
   async #handle(response: {
@@ -660,8 +712,13 @@ export class WebcNodeClient {
     status: number;
     text(): Promise<string>;
     body?: ByteStream | null;
-  }): Promise<unknown> {
-    const text = await this.#readBody(response);
+  }, successBodyLimit: number): Promise<unknown> {
+    // Error bodies always retain the smaller general API cap. A hostile node
+    // cannot exploit the larger proof allowance merely by returning an error.
+    const text = await this.#readBody(
+      response,
+      response.ok ? successBodyLimit : this.#maxResponseBytes,
+    );
     const value = text.length > 0 ? decodeJson(text) : null;
     if (!response.ok) {
       // The node returns { error, kind } on failure; surface both, but truncate
@@ -688,24 +745,24 @@ export class WebcNodeClient {
   async #readBody(response: {
     text(): Promise<string>;
     body?: ByteStream | null;
-  }): Promise<string> {
+  }, maximumBytes: number): Promise<string> {
     const body = response.body;
     if (body && typeof body.getReader === "function") {
-      return this.#readStreamCapped(body);
+      return this.#readStreamCapped(body, maximumBytes);
     }
     const text = await response.text();
     // UTF-8 byte length is always >= UTF-16 unit length, so a unit count over the
     // cap already exceeds it; otherwise measure exact bytes (bounded work).
     if (
-      text.length > this.#maxResponseBytes ||
-      utf8ByteLength(text) > this.#maxResponseBytes
+      text.length > maximumBytes ||
+      utf8ByteLength(text) > maximumBytes
     ) {
       throw new Error("node response exceeds the maximum allowed size");
     }
     return text;
   }
 
-  async #readStreamCapped(body: ByteStream): Promise<string> {
+  async #readStreamCapped(body: ByteStream, maximumBytes: number): Promise<string> {
     const reader = body.getReader();
     const chunks: Uint8Array[] = [];
     let total = 0;
@@ -715,7 +772,7 @@ export class WebcNodeClient {
         if (done) break;
         if (value && value.byteLength > 0) {
           total += value.byteLength;
-          if (total > this.#maxResponseBytes) {
+          if (total > maximumBytes) {
             throw new Error("node response exceeds the maximum allowed size");
           }
           chunks.push(value);
