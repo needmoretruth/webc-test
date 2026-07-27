@@ -1263,6 +1263,73 @@ behind proof requests. Then run the full workspace/security gates, reconcile
 the branch with the latest `main`, and update the global status documents only
 when the branch is ready for integration.
 
+### Proof/resource red-team and capacity checkpoint (2026-07-27)
+
+Commits `b2ceecf`, `ea44ba3`, `13656f7`, `ab7ce9c`, `cef9503`, `6406860`,
+and `9cd006b` close the proof/resource work named above. A durable three-block
+fixture now proves checkpoint-below-target assembly across a real epoch
+transition. The finalized-proof benchmark constructs the largest practical V4
+block accepted on this host (1,750 transactions, 4,042,951 canonical bytes),
+then assembles and self-verifies a 7,753-byte proof. The original actor-held
+path averaged 1,205.880 ms over ten release iterations; same-block reuse reduced
+that to 668.325 ms, and bounded proof-only loading plus off-actor assembly
+reduced the final direct average to 109.380 ms. These are local indicative
+measurements, not a public throughput claim.
+
+Proof work now uses at most two `spawn_blocking` workers. A third concurrent
+request fails immediately with typed `ProofWorkersBusy`/HTTP 503 while actor
+statistics remain responsive, and shutdown drains active workers. The
+near-limit benchmark's conservative Merkle hash workspace estimate is 224,000
+bytes. Checkpoint and complete finalized-proof JSON decoders are registered as
+separate libFuzzer targets using the exact shared valid fixture as the empty
+seed. The Rust decoders and both root/fuzz dependency audits pass; actual
+libFuzzer execution remains pending on the repository's Linux nightly CI because
+the local Windows GNU toolchain cannot build `libfuzzer-sys`'s Windows MSVC
+source.
+
+The browser transport now rejects malformed streamed UTF-8 instead of silently
+substituting a replacement character, preserves valid multibyte scalars split
+across chunks, and decodes each chunk immediately rather than retaining all
+network backing buffers plus a concatenated byte copy. The failing attack was
+reproduced before the fix; the full SDK gate then passed 275 `webc-js` and 3
+widget tests plus both builds, package-entry validation, and documentation
+links.
+
+A non-voting protocol-2 observer now starts after three validators have
+finalized a transaction, requests certified V4 blocks from genesis, replays the
+exact blocks/certificates across the height-2 epoch boundary, and reconstructs
+the durable receipt. The two V4 convergence tests and strict all-target node
+Clippy pass.
+
+The sponsor-grant activation capacity gate is also objective now. An opt-in
+release benchmark constructs all 163,840 live records and measures clone,
+state-root, and empty V4 block work. Three runs on Windows 11 10.0.26200,
+Ryzen 5 7500F (6 cores/12 threads), 32 GiB RAM, Rust 1.96.0 GNU produced:
+
+```text
+run  clone_ms  state_root_ms  block_execute_ms  peak_working_set_mib
+1    23.483    728.619        758.123           157.773
+2    23.422    733.375        755.121           141.879
+3    24.116    737.483        750.826           141.910
+```
+
+All runs produced state root
+`f92aa8bdc2af847b9c401ed154750e6659470adc603e62884b6944bc518e4974`.
+The default 2,000,000-unit policy permits at most 20 materializations per block
+against 256 removals (12.8x cleanup capacity). Protocol-2 genesis now enforces
+the required fourfold headroom: 6,499,999 units (64 records, 256 required
+removals) passes while 6,500,000 (65 records, 260 required) fails before state
+allocation. The focused full chain gate passed 550 unit tests, the randomized
+supply invariant, 8 parallel-execution tests, strict Clippy, and Rustdoc.
+
+Exact next item: run the complete workspace format/lint/test/doc/demo, exact
+pnpm, dependency/advisory, unsafe/panic/secret, and branch red-team inventory
+gates. Record every remaining limitation as passed, intentionally deferred with
+a concrete reason, or unverified. Then confirm `origin/main` is still fully
+contained, reconcile the two global status documents, push, open the CI-bearing
+integration PR, and require Linux fuzz plus every other CI job green before any
+merge.
+
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
