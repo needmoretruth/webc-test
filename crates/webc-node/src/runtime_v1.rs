@@ -1354,6 +1354,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_proof_loads_only_the_required_epoch_boundary() {
+        let validator = Keypair::from_seed([0x23; 32]);
+        let recipient = Keypair::from_seed([0x24; 32]);
+        let mut genesis = genesis_with_validator(&validator);
+        genesis.chain.staking.blocks_per_epoch = 2;
+        let node = Node::open(MemoryKvStore::new(), &genesis).expect("test node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+
+        // Height 1 is the trusted checkpoint. Height 2 is the only authority
+        // transition needed to reach the target in epoch 1.
+        for offset in 1..=2 {
+            let timestamp = NOW + offset;
+            let candidate = handle
+                .build_candidate_v4(
+                    validator.address(),
+                    timestamp,
+                    LocalTimestampMs::new(timestamp),
+                    Vec::new(),
+                )
+                .await
+                .expect("empty boundary history builds");
+            assert_eq!(candidate.block.header.height, BlockHeight::new(offset));
+            assert_eq!(candidate.block.header.epoch, webc_chain::Epoch::new(0));
+            let certificate = certificate_for(&genesis, &validator, &candidate.block);
+            handle
+                .finalize_v4(candidate.block, candidate.next_authority_set, certificate)
+                .await
+                .expect("boundary history finalizes");
+        }
+
+        let transaction = transfer(&validator, &recipient, 0, 5);
+        let transaction_id = transaction
+            .transaction_id()
+            .expect("test transaction has an ID");
+        handle
+            .submit(transaction, LocalTimestampMs::new(NOW + 3))
+            .await
+            .expect("target transaction enters the durable mempool");
+        let candidate = handle
+            .build_candidate_v4(
+                validator.address(),
+                NOW + 3,
+                LocalTimestampMs::new(NOW + 3),
+                Vec::new(),
+            )
+            .await
+            .expect("epoch-one target builds");
+        assert_eq!(candidate.block.header.height, BlockHeight::new(3));
+        assert_eq!(candidate.block.header.epoch, webc_chain::Epoch::new(1));
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+        handle
+            .finalize_v4(candidate.block, candidate.next_authority_set, certificate)
+            .await
+            .expect("epoch-one target finalizes");
+
+        let bundle = handle
+            .finalized_proof(transaction_id, BlockHeight::new(1))
+            .await
+            .expect("cross-epoch proof assembly succeeds")
+            .expect("finalized transaction has a proof");
+        assert_eq!(bundle.proof.authority_transitions.len(), 1);
+        let transition = &bundle.proof.authority_transitions[0];
+        assert_eq!(transition.header.height, BlockHeight::new(2));
+        assert_eq!(
+            transition.outgoing_authority_set.epoch,
+            webc_chain::Epoch::new(0)
+        );
+        assert_eq!(
+            transition.incoming_authority_set.epoch,
+            webc_chain::Epoch::new(1)
+        );
+
+        let checkpoint = webc_proof::validate_checkpoint_v1(
+            bundle.checkpoint_candidate,
+            &webc_proof::CheckpointRequirementsV1::new(
+                genesis.chain.chain_id.clone(),
+                BlockHeight::new(1),
+                webc_chain::Epoch::new(0),
+            ),
+        )
+        .expect("checkpoint candidate validates structurally");
+        let verified = webc_proof::verify_finalized_transaction_proof_v1(
+            &bundle.proof,
+            &checkpoint,
+            &webc_proof::FinalizedTransactionProofRequirementsV1::new(
+                genesis.chain.chain_id.clone(),
+                transaction_id,
+                genesis.chain.staking.blocks_per_epoch,
+            ),
+        )
+        .expect("cross-epoch proof verifies independently");
+        assert_eq!(verified.position.height, BlockHeight::new(3));
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
     async fn submission_is_durable_idempotent_and_queryable() {
         let alice = Keypair::from_seed([31; 32]);
         let bob = Keypair::from_seed([32; 32]);
