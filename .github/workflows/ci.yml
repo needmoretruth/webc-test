@@ -23,6 +23,13 @@ jobs:
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Reject production panic shortcuts
+        run: >-
+          cargo clippy --workspace --lib --bins --
+          -D warnings
+          -D clippy::unwrap_used
+          -D clippy::expect_used
+          -D clippy::panic
       - run: cargo test --workspace
       - run: cargo doc --workspace --no-deps
 
@@ -50,12 +57,15 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
+      - name: Audit fuzz dependency graph
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          manifest-path: fuzz/Cargo.toml
 
-  # JavaScript dependency advisory scan (findings D2). Scoped to PRODUCTION
-  # dependencies — the shipped SDK crypto deps (@noble/*, @scure/*,
-  # micro-key-producer) — because those are what ship to browsers. Dev-only
-  # tooling advisories (e.g. the vitest/esbuild dev-server issue) do not reach
-  # shipped code and must not block the merge gate; audit them out of band.
+  # JavaScript dependency advisory scan (findings D2). Development tools execute
+  # repository code and expose local servers in CI/developer environments, so
+  # their moderate-or-higher advisories block the merge alongside shipped deps.
   pnpm-audit:
     runs-on: ubuntu-latest
     steps:
@@ -68,7 +78,7 @@ jobs:
           node-version: 24.18.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --audit-level=high --prod
+      - run: pnpm audit --audit-level=moderate
 
   # Fuzz targets build (and run a short smoke pass) so the harnesses cannot rot.
   # Deep fuzzing runs out-of-band; CI only proves the targets compile and each

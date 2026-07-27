@@ -1365,6 +1365,14 @@ those would require a cryptography, test-runtime, macro-toolchain, or WASM-engin
 migration rather than a safe lockfile unification. They carry no known advisory
 and remain visible to `cargo deny` instead of being hidden.
 
+The merge gate now preserves those audit properties instead of relying on this
+one review run. CI denies production `unwrap`/`expect`/explicit panic shortcuts
+on both supported operating systems, audits the separately locked fuzz graph in
+addition to the root Rust graph, and scans all pnpm dependencies (including
+development tooling) at moderate severity or higher. This closes the prior gap
+where a critical test-server advisory could pass because only shipped browser
+packages were scanned.
+
 Exact next item: finish the complete workspace format/lint/test/doc/demo, exact
 pnpm, dependency/advisory, strict production panic, unsafe, secret, and branch
 red-team inventory gates. Record every remaining limitation as passed,
