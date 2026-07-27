@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod checkpoint;
+mod checkpoint_trust;
 mod finalized_transaction;
 mod indexed_merkle;
 
@@ -23,6 +24,14 @@ pub use checkpoint::{
     ValidatedCheckpointV1, AUTHORITY_SET_TRANSITION_V1, AUTHORITY_SET_TRANSITION_V1_DOMAIN,
     CHECKPOINT_V1, CHECKPOINT_V1_DOMAIN, MAX_AUTHORITY_SET_TRANSITION_V1_JSON_BYTES,
     MAX_CHECKPOINT_V1_JSON_BYTES,
+};
+pub use checkpoint_trust::{
+    observe_checkpoint_source_v1, AcceptedCheckpointV1, CheckpointSourceFutureV1,
+    CheckpointSourceObservationV1, CheckpointSourceResultV1, CheckpointSourceUnavailableV1,
+    CheckpointSourceV1, CheckpointTrustConfigErrorV1, CheckpointTrustErrorV1,
+    CheckpointTrustLabelV1, CheckpointTrustPolicyV1, ExplicitOperatorTrustV1, OperatorTrustLabelV1,
+    QuorumAgreementV1, SourceIdentityV1, MAX_CHECKPOINT_SOURCES_V1,
+    MAX_OPERATOR_TRUST_LABEL_V1_BYTES, MAX_SOURCE_IDENTITY_V1_BYTES,
 };
 pub use finalized_transaction::{
     verify_finalized_transaction_proof_v1, FinalizedTransactionProofErrorV1,

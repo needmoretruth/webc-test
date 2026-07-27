@@ -99,12 +99,32 @@ impl CheckpointRequirementsV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedCheckpointV1 {
     /// Fully validated checkpoint value.
-    pub checkpoint: CheckpointV1,
+    checkpoint: CheckpointV1,
     /// Domain-separated canonical digest used by source agreement policies.
-    pub digest: Hash256,
+    digest: Hash256,
 }
 
 impl ValidatedCheckpointV1 {
+    /// Returns the fully validated checkpoint value.
+    pub const fn checkpoint(&self) -> &CheckpointV1 {
+        &self.checkpoint
+    }
+
+    /// Returns the validated checkpoint header.
+    pub const fn header(&self) -> &BlockHeaderV4 {
+        &self.checkpoint.header
+    }
+
+    /// Returns the domain-separated canonical digest used for agreement.
+    pub const fn digest(&self) -> Hash256 {
+        self.digest
+    }
+
+    /// Consumes the validation wrapper and returns its checkpoint value.
+    pub fn into_checkpoint(self) -> CheckpointV1 {
+        self.checkpoint
+    }
+
     /// Returns the authority root and epoch that may certify the next height.
     ///
     /// An epoch-boundary checkpoint commits the incoming set by root but does
@@ -654,14 +674,17 @@ mod tests {
     fn checkpoint_validates_and_has_a_stable_domain_digest() {
         let validated = validate_checkpoint_v1(checkpoint(), &requirements()).expect("valid");
         assert_ne!(
-            validated.digest,
-            validated.checkpoint.header.hash().unwrap()
+            validated.digest(),
+            validated.checkpoint().header.hash().unwrap()
         );
         assert_eq!(
             validated.next_anchor(10).unwrap(),
             AuthorityTransitionAnchorV1::new(
                 ChainId::devnet(),
-                validated.checkpoint.header.next_finality_authority_set_root,
+                validated
+                    .checkpoint()
+                    .header
+                    .next_finality_authority_set_root,
                 Epoch::new(0),
                 BlockHeight::new(9),
                 10,

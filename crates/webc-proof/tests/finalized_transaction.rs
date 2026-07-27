@@ -242,7 +242,7 @@ fn verifies_transition_certificate_and_both_merkle_roots() {
     assert_eq!(verified.transaction_id, requirements.transaction_id);
     assert_eq!(verified.position, proof.receipt.position);
     assert_eq!(verified.block_hash, proof.target_header.hash().unwrap());
-    assert_eq!(verified.checkpoint_digest, checkpoint.digest);
+    assert_eq!(verified.checkpoint_digest, checkpoint.digest());
     assert_ne!(proof.digest().unwrap(), verified.block_hash);
 }
 

@@ -168,12 +168,12 @@ pub fn verify_finalized_transaction_proof_v1(
         .target_header
         .validate()
         .map_err(|_| FinalizedTransactionProofErrorV1::InvalidTargetHeader)?;
-    if requirements.chain_id != checkpoint.checkpoint.header.chain_id
+    if requirements.chain_id != checkpoint.header().chain_id
         || proof.target_header.chain_id != requirements.chain_id
     {
         return Err(FinalizedTransactionProofErrorV1::WrongChain);
     }
-    if proof.target_header.height < checkpoint.checkpoint.header.height {
+    if proof.target_header.height < checkpoint.header().height {
         return Err(FinalizedTransactionProofErrorV1::TargetBeforeCheckpoint);
     }
     if proof.receipt.position.height != proof.target_header.height {
@@ -239,7 +239,7 @@ pub fn verify_finalized_transaction_proof_v1(
         transaction_id,
         position: proof.receipt.position,
         block_hash,
-        checkpoint_digest: checkpoint.digest,
+        checkpoint_digest: checkpoint.digest(),
     })
 }
 
@@ -248,10 +248,8 @@ fn verify_target_authority(
     checkpoint: &ValidatedCheckpointV1,
     blocks_per_epoch: u64,
 ) -> Result<(), FinalizedTransactionProofErrorV1> {
-    if proof.target_header.height == checkpoint.checkpoint.header.height {
-        if !proof.authority_transitions.is_empty()
-            || proof.target_header != checkpoint.checkpoint.header
-        {
+    if proof.target_header.height == checkpoint.header().height {
+        if !proof.authority_transitions.is_empty() || proof.target_header != *checkpoint.header() {
             return Err(FinalizedTransactionProofErrorV1::CheckpointTargetMismatch);
         }
         verify_authority_domain(
