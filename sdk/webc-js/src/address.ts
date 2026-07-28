@@ -35,9 +35,15 @@ export function addressToBytes(address: string): Uint8Array {
   if (!address.startsWith(ADDRESS_PREFIX)) {
     throw new Error("invalid WEBC address: missing webc1 prefix");
   }
-  const bytes = base58Decode(address.slice(ADDRESS_PREFIX.length));
+  const encoded = address.slice(ADDRESS_PREFIX.length);
+  const bytes = base58Decode(encoded);
   if (bytes.length !== 32) {
     throw new Error("invalid WEBC address: must decode to 32 bytes");
+  }
+  // A fixed byte string has exactly one base58 representation. Re-encoding
+  // rejects alternate spellings before an address enters a signed/hash path.
+  if (base58Encode(bytes) !== encoded) {
+    throw new Error("invalid WEBC address: non-canonical base58 encoding");
   }
   return bytes;
 }
@@ -56,6 +62,7 @@ const BASE58_ALPHABET =
 function base58Encode(bytes: Uint8Array): string {
   let zeros = 0;
   while (zeros < bytes.length && bytes[zeros] === 0) zeros += 1;
+  if (zeros === bytes.length) return "1".repeat(zeros);
 
   const digits: number[] = [0];
   for (const byte of bytes) {
@@ -83,6 +90,7 @@ function base58Encode(bytes: Uint8Array): string {
 function base58Decode(value: string): Uint8Array {
   let zeros = 0;
   while (zeros < value.length && value[zeros] === "1") zeros += 1;
+  if (zeros === value.length) return new Uint8Array(zeros);
 
   const bytes: number[] = [0];
   for (const char of value) {
