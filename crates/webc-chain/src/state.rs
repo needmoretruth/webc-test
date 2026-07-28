@@ -49,7 +49,7 @@ use crate::service_registry::{
 };
 use crate::session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
-    SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyId,
+    SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
 };
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
@@ -1580,6 +1580,37 @@ impl<'a> NativeActionEffects<'a> {
         events: &'a mut Vec<Event>,
     ) -> Self {
         Self { access, events }
+    }
+}
+
+/// Envelope coordinates shared by recovery-root-authorized native controls.
+///
+/// Grouping these values prevents V4/V5 call sites from accidentally mixing a
+/// live account with another transaction's chain domain or pre-advance nonce.
+pub(crate) struct NativeAccountControlContext<'chain, 'effects> {
+    sender: Address,
+    authorization_lane: AuthorizationLaneId,
+    chain_id: &'chain ChainId,
+    signed_nonce: u64,
+    effects: NativeActionEffects<'effects>,
+}
+
+impl<'chain, 'effects> NativeAccountControlContext<'chain, 'effects> {
+    /// Creates context from an already authenticated transaction envelope.
+    pub(crate) const fn new(
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        chain_id: &'chain ChainId,
+        signed_nonce: u64,
+        effects: NativeActionEffects<'effects>,
+    ) -> Self {
+        Self {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        }
     }
 }
 
@@ -3182,235 +3213,67 @@ impl ChainState {
                 constraints,
                 post_quantum_root_reveal,
             } => {
-                // Installing a session key is a critical action: it must use the
-                // default lane and prove knowledge of the account's committed
-                // post-quantum root. A legacy account without a policy has no
-                // root to gate the action and therefore cannot own session keys.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
-                }
-                let (policy_revision, root) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (policy.revision(), *policy.post_quantum_root())
-                };
-                // The root must sign this exact install (its lane-bound
-                // constraints and session key) under the current policy revision
-                // and account nonce, not merely prove knowledge of the public
-                // root key. A signature captured for any other action, nonce, or
-                // policy revision rebuilds a different message and fails here.
-                let authorization = SessionKeyAuthorizationAction::Install {
-                    session_public_key: *session_public_key,
-                    constraints: constraints.clone(),
-                };
-                let message = session_key_authorization_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    &authorization,
-                )?;
-                if !post_quantum_root_reveal.verify(&root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                constraints.validate()?;
-                if constraints.lifetime_epochs > config.session_keys.max_lifetime_epochs {
-                    return Err(ChainError::SessionKeyLifetimeTooLong);
-                }
-                // Expiry is an absolute epoch derived from the install epoch, so
-                // the deadline never depends on a wall clock.
-                let expires_after_epoch = Epoch::new(
-                    self.current_epoch
-                        .checked_add(constraints.lifetime_epochs)
-                        .ok_or(ChainError::ArithmeticOverflow)?,
-                );
-                let id = SessionKeyId::derive(session_public_key);
-                access.write(StateKey::session_key(tx.sender, id))?;
-                if self.session_keys.contains_key(&(tx.sender, id)) {
-                    return Err(ChainError::SessionKeyAlreadyExists);
-                }
-                let installed = self
-                    .session_keys
-                    .keys()
-                    .filter(|(owner, _)| *owner == tx.sender)
-                    .count();
-                if installed >= config.session_keys.max_session_keys_per_account as usize {
-                    return Err(ChainError::SessionKeyLimitExceeded);
-                }
-                let record = SessionKey::new(
-                    tx.sender,
+                self.apply_native_install_session_key(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
                     *session_public_key,
-                    policy_revision,
-                    constraints.clone(),
-                    expires_after_epoch,
+                    constraints,
+                    post_quantum_root_reveal,
+                    &config.session_keys,
                 )?;
-                self.session_keys.insert((tx.sender, id), record);
-                events.push(Event::SessionKeyInstalled {
-                    owner: tx.sender,
-                    session_key: id,
-                    expires_after_epoch,
-                });
             }
             Operation::RevokeSessionKey {
                 session_key,
                 post_quantum_root_reveal,
             } => {
-                // Revocation is immediate and unconditional so a compromised key
-                // can be killed at once. It is a critical action under the same
-                // default-lane and post-quantum-root gate as installation.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
-                }
-                let (policy_revision, root) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (policy.revision(), *policy.post_quantum_root())
-                };
-                // Revocation is gated by the same root signature as installation,
-                // bound to this exact session-key id, policy revision, and nonce.
-                let authorization = SessionKeyAuthorizationAction::Revoke {
-                    session_key: *session_key,
-                };
-                let message = session_key_authorization_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    &authorization,
+                self.apply_native_revoke_session_key(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *session_key,
+                    post_quantum_root_reveal,
                 )?;
-                if !post_quantum_root_reveal.verify(&root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                access.write(StateKey::session_key(tx.sender, *session_key))?;
-                if self
-                    .session_keys
-                    .remove(&(tx.sender, *session_key))
-                    .is_none()
-                {
-                    return Err(ChainError::SessionKeyNotFound);
-                }
-                events.push(Event::SessionKeyRevoked {
-                    owner: tx.sender,
-                    session_key: *session_key,
-                });
             }
             Operation::RotateActiveTransactionKey {
                 new_active_transaction_key,
                 post_quantum_root_reveal,
             } => {
-                // Rotating the sole active key is the account recovery path and a
-                // critical action: default lane, an installed policy with a
-                // post-quantum root, and a real root signature over this exact
-                // rotation. A legacy account without a policy has no root to gate
-                // the change and therefore cannot rotate this way.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::ActiveKeyRotationRequiresDefaultLane);
-                }
-                let (policy_revision, root, current_active) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (
-                        policy.revision(),
-                        *policy.post_quantum_root(),
-                        *policy.active_transaction_key(),
-                    )
-                };
-                // A no-op rotation would waste a revision and could be used to
-                // grief outstanding session keys without any real key change.
-                if *new_active_transaction_key == current_active {
-                    return Err(ChainError::ActiveKeyRotationToSameKey);
-                }
-                // The root must sign this exact new key under the current policy
-                // revision and account nonce. A signature captured for any other
-                // key, nonce, or revision rebuilds a different message and fails,
-                // so it cannot be replayed after this rotation bumps the revision.
-                let message = active_key_rotation_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    new_active_transaction_key,
+                self.apply_native_rotate_active_transaction_key(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *new_active_transaction_key,
+                    post_quantum_root_reveal,
                 )?;
-                if !post_quantum_root_reveal.verify(&root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                // The policy state key was already recorded as a write at the top
-                // of apply, so the rotation conflicts with concurrent spends.
-                let rotated = self
-                    .authorization_policies
-                    .get(&tx.sender)
-                    .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?
-                    .rotate_active_key(*new_active_transaction_key)?;
-                let new_revision = rotated.revision();
-                self.authorization_policies.insert(tx.sender, rotated);
-                events.push(Event::ActiveTransactionKeyRotated {
-                    owner: tx.sender,
-                    new_revision,
-                    new_active_transaction_key: *new_active_transaction_key,
-                });
             }
             Operation::RotatePostQuantumRoot {
                 new_post_quantum_root,
                 post_quantum_root_reveal,
             } => {
-                // Replacing the recovery root is a critical action gated on a
-                // signature by the CURRENT root, so only the present recovery-root
-                // holder can change it. The envelope is signed by the active key
-                // (the AccountKey path), so a stolen root alone cannot rotate the
-                // root without also holding the active key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::PostQuantumRootRotationRequiresDefaultLane);
-                }
-                let (policy_revision, current_root) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (policy.revision(), *policy.post_quantum_root())
-                };
-                new_post_quantum_root.validate()?;
-                // A no-op rotation would waste a revision and needlessly grief
-                // outstanding session keys without changing the root.
-                if *new_post_quantum_root == current_root {
-                    return Err(ChainError::PostQuantumRootRotationToSameRoot);
-                }
-                // The CURRENT root must sign this exact new commitment under the
-                // current revision and nonce. A signature captured for any other
-                // root, nonce, or revision rebuilds a different message and fails.
-                let message = post_quantum_root_rotation_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    new_post_quantum_root,
+                self.apply_native_rotate_post_quantum_root(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *new_post_quantum_root,
+                    post_quantum_root_reveal,
                 )?;
-                if !post_quantum_root_reveal.verify(&current_root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                // The policy state key was already recorded as a write at the top
-                // of apply, so the rotation conflicts with concurrent spends.
-                let rotated = self
-                    .authorization_policies
-                    .get(&tx.sender)
-                    .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?
-                    .rotate_post_quantum_root(*new_post_quantum_root)?;
-                let new_revision = rotated.revision();
-                self.authorization_policies.insert(tx.sender, rotated);
-                events.push(Event::PostQuantumRootRotated {
-                    owner: tx.sender,
-                    new_revision,
-                    new_post_quantum_root: *new_post_quantum_root,
-                });
             }
             Operation::CreateObject {
                 object_id,
@@ -3548,108 +3411,20 @@ impl ChainState {
                 )?;
             }
             Operation::CompoundValidatorRewards => {
-                access.write(StateKey::validator(tx.sender))?;
-                access.write(StateKey::account(tx.sender))?;
-                // Move accumulated operator rewards straight into self-stake. This
-                // shifts units from the pending-rewards bucket to the staked
-                // bucket (supply-neutral) without a claim-then-restake round trip.
-                let reward = {
-                    let validator = self
-                        .validators
-                        .get_mut(&tx.sender)
-                        .ok_or(ChainError::ValidatorNotFound(tx.sender))?;
-                    let reward = validator.accumulated_rewards;
-                    validator.accumulated_rewards = Amount::ZERO;
-                    validator.self_stake = validator
-                        .self_stake
-                        .checked_add(reward)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    validator.refresh_stake_status(&config.staking)?;
-                    reward
-                };
-                let account = self.account_mut(tx.sender)?;
-                account.staked = account
-                    .staked
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::ValidatorRewardsCompounded {
-                    validator: tx.sender,
-                    amount: reward,
-                });
+                self.apply_native_compound_validator_rewards(
+                    tx.sender,
+                    &config.staking,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::CompoundDelegatorRewards { validator } => {
-                access.write(StateKey::validator(*validator))?;
-                access.write(StateKey::delegation(tx.sender, *validator))?;
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::unbonding_queue(*validator))?;
-                let target = self
-                    .validators
-                    .get(validator)
-                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
-                if matches!(
-                    target.status,
-                    ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
-                ) {
-                    return Err(ChainError::ValidatorNotActive(*validator));
-                }
-                let reward = self
-                    .delegations
-                    .get(&(tx.sender, *validator))
-                    .ok_or(ChainError::DelegationNotFound)?
-                    .accumulated_rewards;
-                // Adding the reward to the position must respect the operator/
-                // delegator ratio, exactly as a fresh delegation would (a queued
-                // operator exit still cannot back new delegated stake).
-                let queued_operator_stake = self.unbonding.queued_for(
+                self.apply_native_compound_delegator_rewards(
+                    tx.sender,
                     *validator,
-                    *validator,
-                    UnbondingKind::OperatorStake,
+                    &config.staking,
+                    None,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                let available_operator_stake = target
-                    .self_stake
-                    .checked_sub(queued_operator_stake)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let maximum_delegated = available_operator_stake
-                    .checked_mul_u64(4)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let proposed_delegated = target
-                    .delegated_stake
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                if proposed_delegated > maximum_delegated {
-                    return Err(ChainError::DelegationRatioExceeded);
-                }
-
-                {
-                    let delegation = self
-                        .delegations
-                        .get_mut(&(tx.sender, *validator))
-                        .ok_or(ChainError::DelegationNotFound)?;
-                    delegation.accumulated_rewards = Amount::ZERO;
-                    delegation.amount = delegation
-                        .amount
-                        .checked_add(reward)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                let validator_state = self
-                    .validators
-                    .get_mut(validator)
-                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
-                validator_state.delegated_stake = validator_state
-                    .delegated_stake
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                validator_state.refresh_stake_status(&config.staking)?;
-                let account = self.account_mut(tx.sender)?;
-                account.delegated = account
-                    .delegated
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::DelegatorRewardsCompounded {
-                    delegator: tx.sender,
-                    validator: *validator,
-                    amount: reward,
-                });
             }
             Operation::SubmitSlashingEvidence { evidence } => {
                 let outcome = self.apply_slashing_evidence(evidence, config, Some(&mut access))?;
@@ -6290,6 +6065,389 @@ impl ChainState {
             .ok_or(ChainError::AccountNotFound(address))?
             .balance = next_balance;
         self.storage_deposits = next_storage_deposits;
+        Ok(())
+    }
+
+    /// Installs one root-authorized constrained session key.
+    ///
+    /// `signed_nonce` is the nonce carried by the surrounding transaction before
+    /// its parent overlay advances replay state. Both transaction envelope
+    /// versions call this exact transition, so the root-signature domain,
+    /// lifetime calculation, account limit, access recording, and event stay
+    /// byte-for-byte aligned.
+    pub(crate) fn apply_native_install_session_key(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        session_public_key: webc_crypto::PublicKeyBytes,
+        constraints: &SessionKeyConstraints,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+        config: &SessionKeyConfig,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+        }
+        let (policy_revision, root) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (policy.revision(), *policy.post_quantum_root())
+        };
+        let authorization = SessionKeyAuthorizationAction::Install {
+            session_public_key,
+            constraints: constraints.clone(),
+        };
+        let message = session_key_authorization_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &authorization,
+        )?;
+        if !post_quantum_root_reveal.verify(&root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        constraints.validate()?;
+        if constraints.lifetime_epochs > config.max_lifetime_epochs {
+            return Err(ChainError::SessionKeyLifetimeTooLong);
+        }
+        let expires_after_epoch = Epoch::new(
+            self.current_epoch
+                .checked_add(constraints.lifetime_epochs)
+                .ok_or(ChainError::ArithmeticOverflow)?,
+        );
+        let id = SessionKeyId::derive(&session_public_key);
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::session_key(sender, id))?;
+        if self.session_keys.contains_key(&(sender, id)) {
+            return Err(ChainError::SessionKeyAlreadyExists);
+        }
+        let installed = self
+            .session_keys
+            .keys()
+            .filter(|(owner, _)| *owner == sender)
+            .count();
+        if installed >= config.max_session_keys_per_account as usize {
+            return Err(ChainError::SessionKeyLimitExceeded);
+        }
+        let record = SessionKey::new(
+            sender,
+            session_public_key,
+            policy_revision,
+            constraints.clone(),
+            expires_after_epoch,
+        )?;
+        self.session_keys.insert((sender, id), record);
+        events.push(Event::SessionKeyInstalled {
+            owner: sender,
+            session_key: id,
+            expires_after_epoch,
+        });
+        Ok(())
+    }
+
+    /// Immediately removes one root-authorized session key.
+    ///
+    /// The root signature binds the current policy revision and signed nonce;
+    /// therefore a captured revocation cannot be replayed after either the
+    /// transaction or policy advances.
+    pub(crate) fn apply_native_revoke_session_key(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        session_key: SessionKeyId,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+        }
+        let (policy_revision, root) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (policy.revision(), *policy.post_quantum_root())
+        };
+        let authorization = SessionKeyAuthorizationAction::Revoke { session_key };
+        let message = session_key_authorization_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &authorization,
+        )?;
+        if !post_quantum_root_reveal.verify(&root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::session_key(sender, session_key))?;
+        if self.session_keys.remove(&(sender, session_key)).is_none() {
+            return Err(ChainError::SessionKeyNotFound);
+        }
+        events.push(Event::SessionKeyRevoked {
+            owner: sender,
+            session_key,
+        });
+        Ok(())
+    }
+
+    /// Replaces an account's active transaction key under its recovery root.
+    ///
+    /// The transition deliberately leaves session records in place: advancing
+    /// the policy revision invalidates them lazily without scanning an
+    /// attacker-sized per-account collection.
+    pub(crate) fn apply_native_rotate_active_transaction_key(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        new_active_transaction_key: webc_crypto::PublicKeyBytes,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::ActiveKeyRotationRequiresDefaultLane);
+        }
+        let (policy_revision, root, current_active) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (
+                policy.revision(),
+                *policy.post_quantum_root(),
+                *policy.active_transaction_key(),
+            )
+        };
+        if new_active_transaction_key == current_active {
+            return Err(ChainError::ActiveKeyRotationToSameKey);
+        }
+        let message = active_key_rotation_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &new_active_transaction_key,
+        )?;
+        if !post_quantum_root_reveal.verify(&root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::authorization_policy(sender))?;
+        let rotated = self
+            .authorization_policies
+            .get(&sender)
+            .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?
+            .rotate_active_key(new_active_transaction_key)?;
+        let new_revision = rotated.revision();
+        self.authorization_policies.insert(sender, rotated);
+        events.push(Event::ActiveTransactionKeyRotated {
+            owner: sender,
+            new_revision,
+            new_active_transaction_key,
+        });
+        Ok(())
+    }
+
+    /// Replaces an account's recovery root under its current recovery root.
+    ///
+    /// The active transaction key still authorizes the envelope, while this
+    /// helper verifies the independent root signature over the exact new root.
+    pub(crate) fn apply_native_rotate_post_quantum_root(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        new_post_quantum_root: crate::PostQuantumRoot,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::PostQuantumRootRotationRequiresDefaultLane);
+        }
+        let (policy_revision, current_root) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (policy.revision(), *policy.post_quantum_root())
+        };
+        new_post_quantum_root.validate()?;
+        if new_post_quantum_root == current_root {
+            return Err(ChainError::PostQuantumRootRotationToSameRoot);
+        }
+        let message = post_quantum_root_rotation_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &new_post_quantum_root,
+        )?;
+        if !post_quantum_root_reveal.verify(&current_root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::authorization_policy(sender))?;
+        let rotated = self
+            .authorization_policies
+            .get(&sender)
+            .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?
+            .rotate_post_quantum_root(new_post_quantum_root)?;
+        let new_revision = rotated.revision();
+        self.authorization_policies.insert(sender, rotated);
+        events.push(Event::PostQuantumRootRotated {
+            owner: sender,
+            new_revision,
+            new_post_quantum_root,
+        });
+        Ok(())
+    }
+
+    /// Moves all pending operator rewards directly into self stake.
+    pub(crate) fn apply_native_compound_validator_rewards(
+        &mut self,
+        sender: Address,
+        staking: &StakingConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::validator(sender))?;
+        access.write(StateKey::account(sender))?;
+        let reward = {
+            let validator = self
+                .validators
+                .get_mut(&sender)
+                .ok_or(ChainError::ValidatorNotFound(sender))?;
+            let reward = validator.accumulated_rewards;
+            validator.accumulated_rewards = Amount::ZERO;
+            validator.self_stake = validator
+                .self_stake
+                .checked_add(reward)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            validator.refresh_stake_status(staking)?;
+            reward
+        };
+        let account = self.account_mut(sender)?;
+        account.staked = account
+            .staked
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::ValidatorRewardsCompounded {
+            validator: sender,
+            amount: reward,
+        });
+        Ok(())
+    }
+
+    /// Moves all pending delegation rewards into the same delegation position.
+    ///
+    /// The ratio check includes queued operator exits, matching a fresh
+    /// delegation and preventing compounding from exceeding pool capacity.
+    pub(crate) fn apply_native_compound_delegator_rewards(
+        &mut self,
+        sender: Address,
+        validator: Address,
+        staking: &StakingConfig,
+        unbonding_requests: Option<&UnbondingRequestJournalV1>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::validator(validator))?;
+        access.write(StateKey::delegation(sender, validator))?;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::unbonding_queue(validator))?;
+        let target = self
+            .validators
+            .get(&validator)
+            .ok_or(ChainError::ValidatorNotFound(validator))?;
+        if matches!(
+            target.status,
+            ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
+        ) {
+            return Err(ChainError::ValidatorNotActive(validator));
+        }
+        let reward = self
+            .delegations
+            .get(&(sender, validator))
+            .ok_or(ChainError::DelegationNotFound)?
+            .accumulated_rewards;
+        let queued_operator_stake = match unbonding_requests {
+            Some(journal) => {
+                journal.queued_for(validator, validator, UnbondingKind::OperatorStake)?
+            }
+            None => {
+                self.unbonding
+                    .queued_for(validator, validator, UnbondingKind::OperatorStake)?
+            }
+        };
+        let available_operator_stake = target
+            .self_stake
+            .checked_sub(queued_operator_stake)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let maximum_delegated = available_operator_stake
+            .checked_mul_u64(4)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let proposed_delegated = target
+            .delegated_stake
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if proposed_delegated > maximum_delegated {
+            return Err(ChainError::DelegationRatioExceeded);
+        }
+
+        let delegation = self
+            .delegations
+            .get_mut(&(sender, validator))
+            .ok_or(ChainError::DelegationNotFound)?;
+        delegation.accumulated_rewards = Amount::ZERO;
+        delegation.amount = delegation
+            .amount
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let validator_state = self
+            .validators
+            .get_mut(&validator)
+            .ok_or(ChainError::ValidatorNotFound(validator))?;
+        validator_state.delegated_stake = validator_state
+            .delegated_stake
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        validator_state.refresh_stake_status(staking)?;
+        let account = self.account_mut(sender)?;
+        account.delegated = account
+            .delegated
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::DelegatorRewardsCompounded {
+            delegator: sender,
+            validator,
+            amount: reward,
+        });
         Ok(())
     }
 
