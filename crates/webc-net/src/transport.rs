@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -270,6 +270,7 @@ pub struct NetworkHandle {
     local_peer_id: PeerId,
     local_addr: Option<SocketAddr>,
     connected: Arc<AtomicUsize>,
+    peer_generation: Arc<AtomicU64>,
 }
 
 impl NetworkHandle {
@@ -279,6 +280,20 @@ impl NetworkHandle {
     pub fn broadcast(&self, message: NetMessage) -> Result<(), NetError> {
         self.commands
             .send(Command::Broadcast(Box::new(message)))
+            .map_err(|_| NetError::WorkerStopped)
+    }
+
+    /// Replays locally retained availability data to the currently connected peers.
+    ///
+    /// Unlike [`Self::broadcast`], this deliberately bypasses only this node's
+    /// local seen-cache check so a transaction first announced while disconnected
+    /// can reach a later peer. Receivers still apply their ordinary seen cache,
+    /// preventing reflood loops and duplicate local delivery. Callers must page
+    /// and pace replay data so the local command channel cannot grow without
+    /// bound.
+    pub fn rebroadcast(&self, message: NetMessage) -> Result<(), NetError> {
+        self.commands
+            .send(Command::Rebroadcast(Box::new(message)))
             .map_err(|_| NetError::WorkerStopped)
     }
 
@@ -309,11 +324,21 @@ impl NetworkHandle {
     pub fn connected_peers(&self) -> usize {
         self.connected.load(Ordering::Relaxed)
     }
+
+    /// Returns a node-local generation incremented on peer connect/disconnect.
+    ///
+    /// Availability helpers use this monotonic signal instead of sampling only
+    /// the current count, which could miss a fast disconnect/reconnect between
+    /// polls. It is operational state and never consensus input.
+    pub fn peer_generation(&self) -> u64 {
+        self.peer_generation.load(Ordering::Relaxed)
+    }
 }
 
 /// Commands sent from a [`NetworkHandle`] to the worker.
 enum Command {
     Broadcast(Box<NetMessage>),
+    Rebroadcast(Box<NetMessage>),
     SendTo(PeerId, Box<NetMessage>),
 }
 
@@ -354,6 +379,7 @@ pub async fn spawn_network(
     let (commands_tx, commands_rx) = mpsc::unbounded_channel::<Command>();
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(config.inbound_capacity.max(1));
     let connected = Arc::new(AtomicUsize::new(0));
+    let peer_generation = Arc::new(AtomicU64::new(0));
 
     let local_addr = match config.listen_addr {
         Some(addr) => {
@@ -381,6 +407,7 @@ pub async fn spawn_network(
         commands_rx,
         inbound_tx,
         connected.clone(),
+        peer_generation.clone(),
         config.peer_rate_capacity,
         config.peer_rate_per_sec,
     ));
@@ -391,6 +418,7 @@ pub async fn spawn_network(
             local_peer_id,
             local_addr,
             connected,
+            peer_generation,
         },
         inbound_rx,
     ))
@@ -627,6 +655,7 @@ async fn worker(
     mut commands_rx: mpsc::UnboundedReceiver<Command>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     connected: Arc<AtomicUsize>,
+    peer_generation: Arc<AtomicU64>,
     peer_rate_capacity: u32,
     peer_rate_per_sec: u32,
 ) {
@@ -647,6 +676,16 @@ async fn worker(
                             if seen.insert(message_id(&bytes)) {
                                 flood(&peers, None, Arc::new(bytes));
                             }
+                        }
+                    }
+                    Some(Command::Rebroadcast(message)) => {
+                        if let Ok(bytes) = encode_message(&message) {
+                            // Recovery/reconnection replay must cross a peer set
+                            // that did not exist for the first local broadcast.
+                            // Keep the ID marked locally but intentionally do not
+                            // use the insertion result as a send predicate.
+                            seen.insert(message_id(&bytes));
+                            flood(&peers, None, Arc::new(bytes));
                         }
                     }
                     Some(Command::SendTo(peer, message)) => {
@@ -675,11 +714,13 @@ async fn worker(
                             ),
                         );
                         connected.store(peers.len(), Ordering::Relaxed);
+                        peer_generation.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(Event::Disconnected { peer }) => {
                         peers.retain(|(existing, _)| *existing != peer);
                         rate_limits.remove(&peer);
                         connected.store(peers.len(), Ordering::Relaxed);
+                        peer_generation.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(Event::Frame { from, bytes }) => {
                         // Parse only the clear header/compression metadata, then
@@ -1076,6 +1117,37 @@ mod tests {
             second.is_err(),
             "duplicate frame must not be delivered again"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_rebroadcast_reaches_a_peer_that_connected_late() {
+        let chain = ChainId::devnet();
+        let (a_handle, _a_rx, a_addr) = spawn_listener(5, chain.clone()).await;
+        let transaction = sample_tx(61);
+        let expected_hash = transaction.hash().unwrap();
+        let message = NetMessage::Transaction(Box::new(transaction));
+
+        // The normal local broadcast is remembered even though no peer existed.
+        a_handle.broadcast(message.clone()).unwrap();
+        let (b_handle, mut b_rx) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([6u8; 32]),
+            chain,
+            Some(loopback()),
+            vec![a_addr],
+        ))
+        .await
+        .unwrap();
+        await_connected(&a_handle, &b_handle).await;
+
+        a_handle.rebroadcast(message).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), b_rx.recv())
+            .await
+            .expect("late peer receives the explicit availability replay")
+            .expect("inbound channel remains open");
+        let NetMessage::Transaction(transaction) = received.message else {
+            panic!("expected a transaction message");
+        };
+        assert_eq!(transaction.hash().unwrap(), expected_hash);
     }
 
     #[tokio::test]

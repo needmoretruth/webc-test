@@ -179,6 +179,27 @@ impl NodeHandle {
         receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
     }
 
+    /// Returns one bounded ID-ordered pending page for availability gossip.
+    ///
+    /// This crate-private command is used only after restart or reconnection.
+    /// The mempool enforces the page ceiling before cloning transaction bodies,
+    /// and a full actor mailbox returns immediate backpressure.
+    pub(crate) async fn pending_gossip_page(
+        &self,
+        after: Option<TransactionId>,
+        limit: usize,
+    ) -> Result<Vec<TransactionV5>, NodeRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Command::PendingGossipPage {
+                after,
+                limit,
+                response,
+            })
+            .map_err(map_send_error)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
     /// Returns the latest durable lifecycle for one transaction ID, if known.
     pub async fn lifecycle(
         &self,
@@ -424,6 +445,11 @@ enum Command {
     Stats {
         response: oneshot::Sender<Result<V5RuntimeStats, NodeRuntimeError>>,
     },
+    PendingGossipPage {
+        after: Option<TransactionId>,
+        limit: usize,
+        response: oneshot::Sender<Result<Vec<TransactionV5>, NodeRuntimeError>>,
+    },
     Lifecycle {
         transaction_id: TransactionId,
         response: oneshot::Sender<Result<Option<TransactionLifecycleV1>, NodeRuntimeError>>,
@@ -558,6 +584,17 @@ where
                 }
                 Command::Stats { response } => {
                     let _response_canceled = response.send(self.stats());
+                }
+                Command::PendingGossipPage {
+                    after,
+                    limit,
+                    response,
+                } => {
+                    let result = self
+                        .mempool
+                        .pending_gossip_page(after, limit)
+                        .map_err(NodeRuntimeError::from);
+                    let _response_canceled = response.send(result);
                 }
                 Command::Lifecycle {
                     transaction_id,

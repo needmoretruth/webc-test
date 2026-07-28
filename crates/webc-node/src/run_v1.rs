@@ -23,17 +23,19 @@ use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use webc_chain::{
-    GenesisConfig, GENESIS_TOTAL_SUPPLY, MAX_FINALITY_AUTHORITIES_V1,
+    GenesisConfig, TransactionV5, GENESIS_TOTAL_SUPPLY, MAX_FINALITY_AUTHORITIES_V1,
     TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Keypair};
-use webc_net::{spawn_network, NetworkConfig, PeerId};
+use webc_net::{spawn_network, NetMessage, NetworkConfig, NetworkHandle, PeerId};
 use webc_storage::{LocalTimestampMs, RedbKvStore};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::mempool_v1::MAX_V5_GOSSIP_PAGE_TRANSACTIONS;
 use crate::{
     serve_v2, ConsensusCredentialsV1, ConsensusDriverV1, DriverExitV1, DriverTimeouts, Node,
     NodeHandle, NodeRuntime, NodeRuntimeError, V2AppState, V5MempoolConfig,
@@ -45,6 +47,10 @@ pub const MAX_PROTOCOL2_GENESIS_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROTOCOL2_GENESIS_ACCOUNTS: usize = 65_536;
 /// Maximum bytes read from a small protected credential JSON file.
 pub const MAX_PROTECTED_KEY_FILE_BYTES: usize = 512;
+/// Poll interval for detecting a disconnected-to-connected peer transition.
+const PENDING_GOSSIP_PEER_POLL: Duration = Duration::from_millis(100);
+/// Minimum delay between recovered transaction replay commands.
+const PENDING_GOSSIP_SEND_DELAY: Duration = Duration::from_millis(20);
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +104,7 @@ pub struct Protocol2Node {
     runtime_task: tokio::task::JoinHandle<Result<(), NodeRuntimeError>>,
     driver_task: tokio::task::JoinHandle<DriverExitV1>,
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    pending_gossip_task: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl Protocol2Node {
@@ -121,6 +128,7 @@ impl Protocol2Node {
         tokio::select! {
             server = &mut self.server_task => {
                 self.driver_task.abort();
+                self.pending_gossip_task.abort();
                 stop_actor(&self.runtime, &mut self.runtime_task).await;
                 match server {
                     Ok(Ok(())) => bail!("protocol-2 API server stopped unexpectedly"),
@@ -130,6 +138,7 @@ impl Protocol2Node {
             }
             driver = &mut self.driver_task => {
                 self.server_task.abort();
+                self.pending_gossip_task.abort();
                 stop_actor(&self.runtime, &mut self.runtime_task).await;
                 let exit = driver.context("protocol-2 consensus task failed")?;
                 bail!("protocol-2 consensus stopped: {exit}")
@@ -137,10 +146,21 @@ impl Protocol2Node {
             runtime = &mut self.runtime_task => {
                 self.driver_task.abort();
                 self.server_task.abort();
+                self.pending_gossip_task.abort();
                 match runtime {
                     Ok(Ok(())) => bail!("protocol-2 node runtime stopped unexpectedly"),
                     Ok(Err(error)) => Err(error).context("protocol-2 node runtime failed"),
                     Err(error) => Err(error).context("protocol-2 node runtime task failed"),
+                }
+            }
+            pending_gossip = &mut self.pending_gossip_task => {
+                self.driver_task.abort();
+                self.server_task.abort();
+                stop_actor(&self.runtime, &mut self.runtime_task).await;
+                match pending_gossip {
+                    Ok(Ok(())) => bail!("protocol-2 pending gossip task stopped unexpectedly"),
+                    Ok(Err(error)) => Err(error).context("protocol-2 pending gossip task failed"),
+                    Err(error) => Err(error).context("protocol-2 pending gossip task crashed"),
                 }
             }
         }
@@ -150,6 +170,7 @@ impl Protocol2Node {
     pub async fn shutdown(self) -> Result<()> {
         self.server_task.abort();
         self.driver_task.abort();
+        self.pending_gossip_task.abort();
         self.runtime
             .shutdown()
             .await
@@ -210,6 +231,7 @@ pub async fn start_protocol2(config: Protocol2RunConfig) -> Result<Protocol2Node
     .context("start single-owner protocol-2 runtime")?;
     let app_state = V2AppState::with_network(runtime.clone(), network.clone());
     let server_task = tokio::spawn(serve_v2(listener, app_state));
+    let pending_gossip_task = tokio::spawn(run_pending_regossip(runtime.clone(), network.clone()));
     let driver_task = tokio::spawn(
         ConsensusDriverV1::new_with_credentials(
             runtime.clone(),
@@ -228,7 +250,78 @@ pub async fn start_protocol2(config: Protocol2RunConfig) -> Result<Protocol2Node
         runtime_task,
         driver_task,
         server_task,
+        pending_gossip_task,
     })
+}
+
+/// Replays bounded pending pages whenever this node gains a peer generation.
+///
+/// The actor revalidated every recovered record before this task starts. A
+/// connection-generation change triggers one deterministic ID-ordered
+/// scan, bounded to 16 cloned transactions (at most 4 MiB) per actor response.
+/// Individual sends are paced so the network worker's command/outbound queues
+/// cannot be flooded by a full recovered mempool. The explicit network replay
+/// bypasses only the sender's stale seen marker; peers still suppress duplicates.
+async fn run_pending_regossip(runtime: NodeHandle, network: NetworkHandle) -> Result<()> {
+    let mut observed_generation = None;
+    let mut poll = tokio::time::interval(PENDING_GOSSIP_PEER_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        poll.tick().await;
+        let generation = network.peer_generation();
+        let connected = network.connected_peers() > 0;
+        if connected && observed_generation != Some(generation) {
+            replay_pending_once(&runtime, &network).await?;
+        }
+        // Keep the generation captured before replay. A peer change during the
+        // scan therefore remains visible and triggers a complete next sweep,
+        // ensuring the newcomer cannot miss an earlier page.
+        observed_generation = Some(generation);
+    }
+}
+
+async fn replay_pending_once(runtime: &NodeHandle, network: &NetworkHandle) -> Result<()> {
+    let mut cursor = None;
+    loop {
+        if network.connected_peers() == 0 {
+            return Ok(());
+        }
+        let page = loop {
+            match runtime
+                .pending_gossip_page(cursor, MAX_V5_GOSSIP_PAGE_TRANSACTIONS)
+                .await
+            {
+                Ok(page) => break page,
+                Err(NodeRuntimeError::QueueFull) => {
+                    if network.connected_peers() == 0 {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(PENDING_GOSSIP_SEND_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(error).context("load bounded pending gossip page");
+                }
+            }
+        };
+        if page.is_empty() {
+            return Ok(());
+        }
+        let next_cursor = page
+            .last()
+            .map(TransactionV5::transaction_id)
+            .transpose()
+            .context("identify revalidated pending transaction")?;
+        for transaction in page {
+            if network.connected_peers() == 0 {
+                return Ok(());
+            }
+            network
+                .rebroadcast(NetMessage::TransactionV5(Box::new(transaction)))
+                .context("replay pending transaction")?;
+            tokio::time::sleep(PENDING_GOSSIP_SEND_DELAY).await;
+        }
+        cursor = next_cursor;
+    }
 }
 
 /// Loads and validates a bounded protocol-2 genesis file.
@@ -376,7 +469,11 @@ fn validate_key_file_permissions(_file: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webc_chain::{Amount, ChainConfig, GenesisAccount, GenesisValidator};
+    use webc_chain::{
+        ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight,
+        ChainConfig, ChainId, FeeBid, FeePaymentV1, GenesisAccount, GenesisValidator, Nonce,
+        Operation, TransactionAuthorizationV1, ValidityWindowV1,
+    };
 
     fn genesis(operator: &Keypair, consensus: &Keypair) -> GenesisConfig {
         GenesisConfig {
@@ -406,6 +503,33 @@ mod tests {
             std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))
                 .expect("test key permissions set");
         }
+    }
+
+    fn pending_transfer(sender: &Keypair, recipient: &Keypair) -> TransactionV5 {
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            sender.address(),
+            sender.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision: AuthorizationPolicyRevision::new(0),
+                nonce: Nonce::new(0),
+            },
+            ValidityWindowV1::new(BlockHeight::new(1), BlockHeight::new(20)),
+            vec![ActionV1::native(Operation::Transfer {
+                to: recipient.address(),
+                amount: Amount::from_units(1),
+            })],
+            FeeBid {
+                gas_limit: 1_000,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("test transfer shape is valid");
+        transaction.sign(sender).expect("test transfer signs");
+        transaction
     }
 
     #[test]
@@ -531,5 +655,116 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"protocol_version\":2"));
         node.shutdown().await.expect("public node shuts down");
+    }
+
+    #[tokio::test]
+    async fn recovered_pending_replays_when_the_first_peer_connects_late() {
+        const TEST_NOW: u64 = 1_700_000_000_000;
+
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let database_path = directory.path().join("chain.redb");
+        let operator = Keypair::from_seed([0x61; 32]);
+        let consensus = Keypair::from_seed([0x62; 32]);
+        let recipient = Keypair::from_seed([0x63; 32]);
+        let genesis = genesis(&operator, &consensus);
+        let transaction = pending_transfer(&operator, &recipient);
+        let transaction_id = transaction
+            .transaction_id()
+            .expect("test transaction has an ID");
+
+        {
+            let store = RedbKvStore::open(&database_path).expect("first redb opens");
+            let node = Node::open(store, &genesis).expect("first node opens");
+            let (runtime, runtime_task) = NodeRuntime::spawn(
+                node,
+                V5MempoolConfig::default(),
+                32,
+                LocalTimestampMs::new(TEST_NOW),
+            )
+            .expect("first runtime starts");
+            runtime
+                .submit(transaction, LocalTimestampMs::new(TEST_NOW))
+                .await
+                .expect("pending transaction becomes durable");
+            runtime.shutdown().await.expect("first runtime shuts down");
+            runtime_task
+                .await
+                .expect("first runtime does not panic")
+                .expect("first runtime exits cleanly");
+        }
+
+        let store = RedbKvStore::open(&database_path).expect("restart redb opens");
+        let node = Node::open(store, &genesis).expect("restart node opens");
+        let (runtime, runtime_task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            32,
+            LocalTimestampMs::new(TEST_NOW + 1),
+        )
+        .expect("restart runtime recovers");
+        assert_eq!(
+            runtime
+                .stats()
+                .await
+                .expect("restart stats read")
+                .mempool_size,
+            1
+        );
+
+        let (source_network, _source_inbound) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([0x64; 32]),
+            ChainId::devnet(),
+            Some("127.0.0.1:0".parse().expect("source listen parses")),
+            Vec::new(),
+        ))
+        .await
+        .expect("source network starts");
+        let source_address = source_network.local_addr().expect("source listens");
+        let replay_task = tokio::spawn(run_pending_regossip(
+            runtime.clone(),
+            source_network.clone(),
+        ));
+        tokio::time::sleep(PENDING_GOSSIP_PEER_POLL + PENDING_GOSSIP_PEER_POLL).await;
+
+        let (late_network, mut late_inbound) = spawn_network(NetworkConfig::new(
+            Keypair::from_seed([0x65; 32]),
+            ChainId::devnet(),
+            Some("127.0.0.1:0".parse().expect("late listen parses")),
+            vec![source_address],
+        ))
+        .await
+        .expect("late network starts");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while source_network.connected_peers() == 0 || late_network.connected_peers() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "late peer did not authenticate"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let received = tokio::time::timeout(Duration::from_secs(5), late_inbound.recv())
+            .await
+            .expect("recovered transaction arrives")
+            .expect("late inbound remains open");
+        let NetMessage::TransactionV5(received) = received.message else {
+            panic!("expected a protocol-2 transaction");
+        };
+        assert_eq!(
+            received.transaction_id().expect("replayed transaction ID"),
+            transaction_id
+        );
+
+        replay_task.abort();
+        drop(late_network);
+        drop(source_network);
+        runtime
+            .shutdown()
+            .await
+            .expect("restart runtime shuts down");
+        runtime_task
+            .await
+            .expect("restart runtime does not panic")
+            .expect("restart runtime exits cleanly");
     }
 }

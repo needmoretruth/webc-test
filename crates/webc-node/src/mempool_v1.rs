@@ -50,6 +50,11 @@ pub const DEFAULT_V5_MEMPOOL_FUTURE_START_BLOCKS: u64 = 128;
 pub const DEFAULT_V5_MEMPOOL_TTL_MS: u64 = 120_000;
 /// Default replacement bump in basis points (10%).
 pub const DEFAULT_V5_REPLACEMENT_BUMP_BPS: u64 = 1_000;
+/// Maximum transactions cloned into one restart/reconnection gossip page.
+///
+/// At the 256 KiB transaction ceiling this bounds one response to 4 MiB before
+/// the caller paces individual network broadcasts.
+pub const MAX_V5_GOSSIP_PAGE_TRANSACTIONS: usize = 16;
 
 /// Bounded, node-local policy for protocol-2 pending transactions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +170,9 @@ pub enum V5MempoolError {
     /// Count, byte, or sender/lane capacity cannot admit this transaction.
     #[error("protocol-2 mempool capacity cannot admit this transaction")]
     Capacity,
+    /// A restart/reconnection gossip scan requested an empty or oversized page.
+    #[error("protocol-2 pending gossip page limit is invalid")]
+    InvalidGossipPageLimit,
     /// JSON encoding failed after protocol validation.
     #[error("validated V5 transaction could not be measured")]
     Encoding,
@@ -272,6 +280,35 @@ impl V5Mempool {
     /// Returns one retained durable record by transaction ID.
     pub fn get(&self, transaction_id: TransactionId) -> Option<&PendingTransactionRecordV1> {
         self.by_id.get(&transaction_id).map(|entry| &entry.record)
+    }
+
+    /// Clones one bounded deterministic page for restart/reconnection gossip.
+    ///
+    /// `after` is an exclusive transaction-ID cursor. Callers must pass a limit
+    /// from 1 through [`MAX_V5_GOSSIP_PAGE_TRANSACTIONS`], then pace each returned
+    /// transaction through the bounded network queues. The fixed cap prevents a
+    /// full 64 MiB mempool (or its decoded object overhead) from being cloned in
+    /// one actor response. This is node-local availability data, never consensus
+    /// ordering.
+    pub(crate) fn pending_gossip_page(
+        &self,
+        after: Option<TransactionId>,
+        limit: usize,
+    ) -> Result<Vec<TransactionV5>, V5MempoolError> {
+        if limit == 0 || limit > MAX_V5_GOSSIP_PAGE_TRANSACTIONS {
+            return Err(V5MempoolError::InvalidGossipPageLimit);
+        }
+        let range = match after {
+            Some(cursor) => self.by_id.range((
+                std::ops::Bound::Excluded(cursor),
+                std::ops::Bound::Unbounded,
+            )),
+            None => self.by_id.range(..),
+        };
+        Ok(range
+            .take(limit)
+            .map(|(_transaction_id, entry)| entry.record.transaction.clone())
+            .collect())
     }
 
     /// Purely validates and plans one admission without changing memory.
@@ -1144,6 +1181,49 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered.total_bytes(), pool.total_bytes());
         assert!(recovered.get(parked_id).is_none());
+    }
+
+    #[test]
+    fn pending_gossip_pages_are_bounded_and_cursor_stable() {
+        let alice = Keypair::from_seed([41; 32]);
+        let recipient = Keypair::from_seed([42; 32]);
+        let (state, config) = state_and_config(&[&alice]);
+        let mut pool = V5Mempool::new(V5MempoolConfig::default()).unwrap();
+        let mut expected = Vec::new();
+        for nonce in 0..3 {
+            let transaction = transfer(&alice, &recipient, nonce, 5, 1);
+            expected.push(transaction.transaction_id().unwrap());
+            let plan = pool
+                .plan_admission(
+                    transaction,
+                    &state,
+                    &config,
+                    BlockHeight::new(10),
+                    LocalTimestampMs::new(NOW),
+                )
+                .unwrap();
+            pool.apply_committed(plan);
+        }
+        expected.sort_unstable();
+
+        let first = pool.pending_gossip_page(None, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        let cursor = first.last().unwrap().transaction_id().unwrap();
+        let second = pool.pending_gossip_page(Some(cursor), 2).unwrap();
+        let observed = first
+            .into_iter()
+            .chain(second)
+            .map(|transaction| transaction.transaction_id().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+        assert!(matches!(
+            pool.pending_gossip_page(None, 0),
+            Err(V5MempoolError::InvalidGossipPageLimit)
+        ));
+        assert!(matches!(
+            pool.pending_gossip_page(None, MAX_V5_GOSSIP_PAGE_TRANSACTIONS + 1),
+            Err(V5MempoolError::InvalidGossipPageLimit)
+        ));
     }
 
     #[test]

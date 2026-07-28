@@ -812,8 +812,13 @@ async fn submit_transaction(
         if let Some(network) = &state.inner.network {
             // The durable actor transition already succeeded. Gossip is
             // best-effort availability and cannot roll it back or change the
-            // client result if the network worker is stopping.
-            let _ = network.broadcast(NetMessage::TransactionV5(Box::new(gossip_copy)));
+            // client result if the network worker is stopping. Do not consume
+            // the network seen marker while disconnected: the public assembly's
+            // bounded reconnection sweep will replay this durable transaction
+            // when a peer becomes available.
+            if network.connected_peers() > 0 {
+                let _ = network.broadcast(NetMessage::TransactionV5(Box::new(gossip_copy)));
+            }
         }
     }
     Ok(Json(receipt.into()))
