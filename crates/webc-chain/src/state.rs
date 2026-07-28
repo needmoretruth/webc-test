@@ -3598,151 +3598,46 @@ impl ChainState {
                 // and leaves the record unchanged (the whole tx rolls back).
             }
             Operation::CreateFeed { feed_id } => {
-                // Permissionless-for-a-fee (§15.6): default lane only (the creation
-                // fee draws from the sender's liquid balance) and the fee is BURNED,
-                // so a creation is never free. Supply-neutral: liquid -> burned.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_feed(*feed_id))?;
-                if self.oracle_feeds.contains_key(feed_id) {
-                    return Err(ChainError::OracleFeedAlreadyExists);
-                }
-                let creation_fee = config.oracle.feed_creation_fee;
-                self.debit_native(tx.sender, creation_fee)?;
-                self.burned_fees = self
-                    .burned_fees
-                    .checked_add(creation_fee)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let bond = config.oracle.min_reporter_bond;
-                self.oracle_feeds
-                    .insert(*feed_id, Feed::new(tx.sender, bond));
-                events.push(Event::FeedCreated {
-                    feed_id: *feed_id,
-                    creator: tx.sender,
-                    bond,
-                    fee_burned: creation_fee,
-                });
+                self.apply_native_create_feed(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    &config.oracle,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::RegisterReporter { feed_id } => {
-                // Default lane only: the bond draws from the sender's liquid
-                // balance. Supply-neutral: liquid -> oracle_bonds.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.read(StateKey::oracle_feed(*feed_id))?;
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
-                // The bond is the feed's frozen bond class (reading it also
-                // confirms the feed exists).
-                let bond = self
-                    .oracle_feeds
-                    .get(feed_id)
-                    .ok_or(ChainError::OracleFeedNotFound)?
-                    .bond;
-                if self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
-                    return Err(ChainError::OracleReporterAlreadyRegistered);
-                }
-                self.debit_native(tx.sender, bond)?;
-                self.oracle_bonds = self
-                    .oracle_bonds
-                    .checked_add(bond)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.oracle_reporters
-                    .insert((*feed_id, tx.sender), OracleReporter::new());
-                events.push(Event::ReporterRegistered {
-                    feed_id: *feed_id,
-                    reporter: tx.sender,
-                    bond,
-                });
+                self.apply_native_register_reporter(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::DeregisterReporter { feed_id } => {
-                // Default lane only: the bond returns to the sender's liquid
-                // balance. Supply-neutral: oracle_bonds -> liquid.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.read(StateKey::oracle_feed(*feed_id))?;
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
-                // The reporter's locked bond equals its feed's frozen bond.
-                let bond = self
-                    .oracle_feeds
-                    .get(feed_id)
-                    .ok_or(ChainError::OracleFeedNotFound)?
-                    .bond;
-                if !self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
-                    return Err(ChainError::OracleReporterNotFound);
-                }
-                self.oracle_bonds = self
-                    .oracle_bonds
-                    .checked_sub(bond)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.oracle_reporters.remove(&(*feed_id, tx.sender));
-                self.credit_native(tx.sender, bond)?;
-                events.push(Event::ReporterDeregistered {
-                    feed_id: *feed_id,
-                    reporter: tx.sender,
-                    bond,
-                });
+                self.apply_native_deregister_reporter(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::SubmitReport { feed_id, value } => {
-                // Reporting moves no native units (only the ordinary tx fee), so it
-                // may run on any authorization lane. It records the value and the
-                // epoch it was reported for (liveness).
-                access.read(StateKey::oracle_feed(*feed_id))?;
-                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
-                if !self.oracle_feeds.contains_key(feed_id) {
-                    return Err(ChainError::OracleFeedNotFound);
-                }
-                let epoch = self.current_epoch;
-                let reporter = self
-                    .oracle_reporters
-                    .get_mut(&(*feed_id, tx.sender))
-                    .ok_or(ChainError::OracleReporterNotFound)?;
-                reporter.value = Some(*value);
-                reporter.reported_epoch = epoch;
-                events.push(Event::ReportSubmitted {
-                    feed_id: *feed_id,
-                    reporter: tx.sender,
-                    value: *value,
-                    epoch,
-                });
+                self.apply_native_submit_report(
+                    tx.sender,
+                    *feed_id,
+                    *value,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::PayFeedRead { feed_id, amount } => {
-                // A consumer pays a read fee into the feed's revenue pool
-                // (§15.17). Default lane only: the payment draws from the payer's
-                // liquid balance. Supply-neutral: liquid -> oracle_revenue.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_feed(*feed_id))?;
-                if amount.is_zero() {
-                    return Err(ChainError::OracleReadAmountZero);
-                }
-                if !self.oracle_feeds.contains_key(feed_id) {
-                    return Err(ChainError::OracleFeedNotFound);
-                }
-                self.debit_native(tx.sender, *amount)?;
-                self.oracle_revenue = self
-                    .oracle_revenue
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let feed = self
-                    .oracle_feeds
-                    .get_mut(feed_id)
-                    .ok_or(ChainError::OracleFeedNotFound)?;
-                feed.revenue = feed
-                    .revenue
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::FeedReadPaid {
-                    feed_id: *feed_id,
-                    payer: tx.sender,
-                    amount: *amount,
-                });
+                self.apply_native_pay_feed_read(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    *amount,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::SubmitOrder {
                 order_id,
@@ -6680,6 +6575,186 @@ impl ChainState {
             namespace,
             from: sender,
             to: new_owner,
+        });
+        Ok(())
+    }
+
+    /// Creates a permissionless oracle feed and burns its configured fee.
+    pub(crate) fn apply_native_create_feed(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        config: &OracleConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_feed(feed_id))?;
+        if self.oracle_feeds.contains_key(&feed_id) {
+            return Err(ChainError::OracleFeedAlreadyExists);
+        }
+        self.debit_native(sender, config.feed_creation_fee)?;
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(config.feed_creation_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.oracle_feeds
+            .insert(feed_id, Feed::new(sender, config.min_reporter_bond));
+        events.push(Event::FeedCreated {
+            feed_id,
+            creator: sender,
+            bond: config.min_reporter_bond,
+            fee_burned: config.feed_creation_fee,
+        });
+        Ok(())
+    }
+
+    /// Bonds the sender as a reporter on an existing oracle feed.
+    pub(crate) fn apply_native_register_reporter(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::oracle_feed(feed_id))?;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_reporter(feed_id, sender))?;
+        let bond = self
+            .oracle_feeds
+            .get(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?
+            .bond;
+        if self.oracle_reporters.contains_key(&(feed_id, sender)) {
+            return Err(ChainError::OracleReporterAlreadyRegistered);
+        }
+        self.debit_native(sender, bond)?;
+        self.oracle_bonds = self
+            .oracle_bonds
+            .checked_add(bond)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.oracle_reporters
+            .insert((feed_id, sender), OracleReporter::new());
+        events.push(Event::ReporterRegistered {
+            feed_id,
+            reporter: sender,
+            bond,
+        });
+        Ok(())
+    }
+
+    /// Removes one reporter and returns its feed-frozen bond.
+    pub(crate) fn apply_native_deregister_reporter(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::oracle_feed(feed_id))?;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_reporter(feed_id, sender))?;
+        let bond = self
+            .oracle_feeds
+            .get(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?
+            .bond;
+        if !self.oracle_reporters.contains_key(&(feed_id, sender)) {
+            return Err(ChainError::OracleReporterNotFound);
+        }
+        self.oracle_bonds = self
+            .oracle_bonds
+            .checked_sub(bond)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.oracle_reporters.remove(&(feed_id, sender));
+        self.credit_native(sender, bond)?;
+        events.push(Event::ReporterDeregistered {
+            feed_id,
+            reporter: sender,
+            bond,
+        });
+        Ok(())
+    }
+
+    /// Records the reporter's latest value at the deterministic current epoch.
+    pub(crate) fn apply_native_submit_report(
+        &mut self,
+        sender: Address,
+        feed_id: FeedId,
+        value: FeedValue,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::oracle_feed(feed_id))?;
+        access.write(StateKey::oracle_reporter(feed_id, sender))?;
+        if !self.oracle_feeds.contains_key(&feed_id) {
+            return Err(ChainError::OracleFeedNotFound);
+        }
+        let reporter = self
+            .oracle_reporters
+            .get_mut(&(feed_id, sender))
+            .ok_or(ChainError::OracleReporterNotFound)?;
+        reporter.value = Some(value);
+        reporter.reported_epoch = self.current_epoch;
+        events.push(Event::ReportSubmitted {
+            feed_id,
+            reporter: sender,
+            value,
+            epoch: self.current_epoch,
+        });
+        Ok(())
+    }
+
+    /// Moves a consumer payment into one feed's revenue pool.
+    pub(crate) fn apply_native_pay_feed_read(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        amount: Amount,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_feed(feed_id))?;
+        if amount.is_zero() {
+            return Err(ChainError::OracleReadAmountZero);
+        }
+        if !self.oracle_feeds.contains_key(&feed_id) {
+            return Err(ChainError::OracleFeedNotFound);
+        }
+        self.debit_native(sender, amount)?;
+        self.oracle_revenue = self
+            .oracle_revenue
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let feed = self
+            .oracle_feeds
+            .get_mut(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?;
+        feed.revenue = feed
+            .revenue
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::FeedReadPaid {
+            feed_id,
+            payer: sender,
+            amount,
         });
         Ok(())
     }
