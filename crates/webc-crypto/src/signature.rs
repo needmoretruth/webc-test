@@ -9,6 +9,7 @@ use crate::{Address, CryptoError};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroize;
 
 /// Raw Ed25519 public key bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -133,11 +134,25 @@ impl Keypair {
         }
     }
 
-    /// Creates a keypair from a 32-byte seed. Useful for deterministic tests and
-    /// future encrypted wallet imports.
-    pub fn from_seed(seed: [u8; 32]) -> Self {
+    /// Creates a keypair from a by-value 32-byte seed and erases that parameter.
+    ///
+    /// Callers must still erase any separate original they copied the array from.
+    /// Key loaders retaining a zeroizing seed should prefer
+    /// [`Self::from_seed_ref`] to avoid this additional by-value stack input.
+    pub fn from_seed(mut seed: [u8; 32]) -> Self {
+        let keypair = Self::from_seed_ref(&seed);
+        seed.zeroize();
+        keypair
+    }
+
+    /// Creates a keypair while borrowing a protected 32-byte seed.
+    ///
+    /// The caller remains responsible for erasing its buffer. The resulting
+    /// dalek signing key necessarily owns its secret state and zeroizes it when
+    /// dropped; this method does not create another caller-visible seed array.
+    pub fn from_seed_ref(seed: &[u8; 32]) -> Self {
         Self {
-            signing_key: SigningKey::from_bytes(&seed),
+            signing_key: SigningKey::from_bytes(seed),
         }
     }
 

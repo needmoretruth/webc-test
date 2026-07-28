@@ -89,8 +89,10 @@ pub enum DriverExitV1 {
 ///
 /// The operator identity and consensus key are deliberately separate: genesis
 /// may register a dedicated consensus public key that is not the operator's
-/// account key. The seed is never exposed, logged, serialized, cloned, or
-/// debug-formatted and is erased when these credentials are dropped.
+/// account key. The retained seed is never exposed, logged, serialized, cloned,
+/// or debug-formatted and is erased when these credentials are dropped. Key
+/// construction necessarily creates dalek's owned signing state; protected file
+/// loading avoids an additional by-value seed copy on that path.
 pub struct ConsensusCredentialsV1 {
     operator: Address,
     consensus_seed: Zeroizing<[u8; 32]>,
@@ -105,13 +107,22 @@ impl ConsensusCredentialsV1 {
         }
     }
 
+    /// Takes ownership of an already-zeroizing loader buffer without requesting
+    /// another by-value seed at this API boundary.
+    pub(crate) fn from_zeroizing(operator: Address, consensus_seed: Zeroizing<[u8; 32]>) -> Self {
+        Self {
+            operator,
+            consensus_seed,
+        }
+    }
+
     /// Public operator address represented by these credentials.
     pub fn operator(&self) -> Address {
         self.operator
     }
 
     fn identity_for(&self, set: &webc_chain::ValidatorSet) -> Option<ValidatorIdentity> {
-        let consensus_key = Keypair::from_seed(*self.consensus_seed);
+        let consensus_key = Keypair::from_seed_ref(&self.consensus_seed);
         if set.consensus_key_of(self.operator)? != consensus_key.public_key() {
             return None;
         }
@@ -143,7 +154,7 @@ impl ConsensusDriverV1 {
         timeouts: DriverTimeouts,
     ) -> Self {
         let credentials = consensus_seed.map(|seed| {
-            let operator = Keypair::from_seed(seed).address();
+            let operator = Keypair::from_seed_ref(&seed).address();
             ConsensusCredentialsV1::new(operator, seed)
         });
         Self::new_with_credentials(runtime, network, credentials, timeouts)

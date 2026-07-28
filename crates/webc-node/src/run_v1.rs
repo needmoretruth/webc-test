@@ -15,10 +15,12 @@
 //!
 //! Security boundary: local files are hostile and bounded before JSON work.
 //! Consensus seed bytes come only from a file (never argv/environment/logs), are
-//! retained in a non-Debug/non-Serialize zeroizing type, and must match the
-//! registered operator/consensus public key. Unix group/other-readable key files
-//! are rejected; Windows operators must protect the file with an ACL.
+//! decoded into non-Debug/non-Serialize zeroizing-on-drop storage, and must match
+//! the registered operator/consensus public key. The long-lived credential uses
+//! `Zeroizing`; Unix group/other-readable key files are rejected, while Windows
+//! operators must protect the file with an ACL.
 
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -46,31 +48,126 @@ pub const MAX_PROTOCOL2_GENESIS_ACCOUNTS: usize = 65_536;
 /// Maximum bytes read from a small protected credential JSON file.
 pub const MAX_PROTECTED_KEY_FILE_BYTES: usize = 512;
 
+/// Fixed-size seed decoded directly from borrowed key-file text.
+///
+/// This type deliberately implements neither `Debug`, `Clone`, nor `Serialize`.
+/// Its custom deserializer creates no owned plaintext `String`, and its drop path
+/// erases successfully decoded bytes even if an enclosing map later fails on a
+/// duplicate field, unknown field, missing field, or trailing JSON.
+struct ProtectedSeedV1 {
+    bytes: [u8; 32],
+}
+
+impl ProtectedSeedV1 {
+    fn into_zeroizing(mut self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(std::mem::take(&mut self.bytes))
+    }
+}
+
+impl Drop for ProtectedSeedV1 {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let contained_secret = self.bytes.iter().any(|byte| *byte != 0);
+        self.bytes.zeroize();
+        #[cfg(test)]
+        if contained_secret && self.bytes.iter().all(|byte| *byte == 0) {
+            PROTECTED_SEED_ZEROIZED_DROPS.with(|count| count.set(count.get().saturating_add(1)));
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ProtectedSeedV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProtectedSeedVisitorV1;
+
+        impl ProtectedSeedVisitorV1 {
+            fn decode<E>(value: &str) -> Result<ProtectedSeedV1, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(E::custom("protected seed encoding is invalid"));
+                }
+                let mut decoded = Zeroizing::new([0u8; 32]);
+                hex::decode_to_slice(value.as_bytes(), &mut *decoded)
+                    .map_err(|_| E::custom("protected seed encoding is invalid"))?;
+                Ok(ProtectedSeedV1 {
+                    bytes: std::mem::take(&mut *decoded),
+                })
+            }
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ProtectedSeedVisitorV1 {
+            type Value = ProtectedSeedV1;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("exactly 64 lowercase hexadecimal seed characters")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Self::decode(value)
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                #[cfg(test)]
+                PROTECTED_SEED_BORROWED_VISITS
+                    .with(|count| count.set(count.get().saturating_add(1)));
+                Self::decode(value)
+            }
+        }
+
+        deserializer.deserialize_str(ProtectedSeedVisitorV1)
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ValidatorKeyFileV1 {
     version: u8,
     operator: Address,
-    seed_hex: String,
-}
-
-impl Drop for ValidatorKeyFileV1 {
-    fn drop(&mut self) {
-        self.seed_hex.zeroize();
-    }
+    #[serde(rename = "seed_hex")]
+    seed: ProtectedSeedV1,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DevnetKeyFileV1 {
     version: u8,
-    seed_hex: String,
+    #[serde(rename = "seed_hex")]
+    seed: ProtectedSeedV1,
 }
 
-impl Drop for DevnetKeyFileV1 {
-    fn drop(&mut self) {
-        self.seed_hex.zeroize();
-    }
+#[cfg(test)]
+thread_local! {
+    static PROTECTED_SEED_ZEROIZED_DROPS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static PROTECTED_SEED_BORROWED_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn protected_seed_zeroized_drop_count() -> usize {
+    PROTECTED_SEED_ZEROIZED_DROPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn protected_seed_borrowed_visit_count() -> usize {
+    PROTECTED_SEED_BORROWED_VISITS.with(std::cell::Cell::get)
 }
 
 /// Filesystem and socket inputs required to start one protocol-2 node.
@@ -264,18 +361,18 @@ pub fn load_consensus_credentials(
     if key_file.version != 1 {
         bail!("validator key schema is invalid");
     }
-    let mut seed = decode_seed(&key_file.seed_hex, "validator key")?;
-    let consensus_public_key = Keypair::from_seed(seed).public_key();
+    let seed = key_file.seed.into_zeroizing();
+    let consensus_public_key = Keypair::from_seed_ref(&seed).public_key();
     let matches_genesis = genesis.validators.iter().any(|validator| {
         validator.operator == key_file.operator && validator.consensus_key == consensus_public_key
     });
     if !matches_genesis {
-        seed.zeroize();
         bail!("validator key does not match a genesis authority");
     }
-    let credentials = ConsensusCredentialsV1::new(key_file.operator, seed);
-    seed.zeroize();
-    Ok(credentials)
+    Ok(ConsensusCredentialsV1::from_zeroizing(
+        key_file.operator,
+        seed,
+    ))
 }
 
 /// Loads a devnet signing key from a bounded, protected JSON file.
@@ -289,10 +386,8 @@ pub fn load_devnet_keypair(path: &Path) -> Result<Keypair> {
     if key_file.version != 1 {
         bail!("devnet key schema is invalid");
     }
-    let mut seed = decode_seed(&key_file.seed_hex, "devnet key")?;
-    let keypair = Keypair::from_seed(seed);
-    seed.zeroize();
-    Ok(keypair)
+    let seed = key_file.seed.into_zeroizing();
+    Ok(Keypair::from_seed_ref(&seed))
 }
 
 fn read_protected_key_json<T: serde::de::DeserializeOwned>(
@@ -306,23 +401,14 @@ fn read_protected_key_json<T: serde::de::DeserializeOwned>(
         MAX_PROTECTED_KEY_FILE_BYTES,
         label,
     )?);
+    // Escaped JSON strings require serde_json to allocate a decoded scratch
+    // buffer that it cannot zeroize. The exact key schemas need no escapes, so
+    // reject them lexically before deserialization and keep every string borrowed
+    // from this zeroizing input allocation.
+    if bytes.contains(&b'\\') {
+        bail!("{label} JSON is malformed");
+    }
     serde_json::from_slice(&bytes).with_context(|| format!("{label} JSON is malformed"))
-}
-
-fn decode_seed(seed_hex: &str, label: &'static str) -> Result<[u8; 32]> {
-    if seed_hex.len() != 64
-        || !seed_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("{label} seed is invalid");
-    }
-    let mut seed = [0u8; 32];
-    if hex::decode_to_slice(seed_hex.as_bytes(), &mut seed).is_err() {
-        seed.zeroize();
-        bail!("{label} seed is invalid");
-    }
-    Ok(seed)
 }
 
 fn read_bounded(path: &Path, maximum: usize, label: &'static str) -> Result<Vec<u8>> {
@@ -377,6 +463,35 @@ fn validate_key_file_permissions(_file: &File) -> Result<()> {
 mod tests {
     use super::*;
     use webc_chain::{Amount, ChainConfig, GenesisAccount, GenesisValidator};
+
+    macro_rules! assert_not_impl {
+        ($type:ty, $trait:path) => {
+            const _: fn() = || {
+                trait AmbiguousIfImpl<A> {
+                    fn marker() {}
+                }
+                impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+                impl<T: ?Sized + $trait> AmbiguousIfImpl<u8> for T {}
+                let _ = <$type as AmbiguousIfImpl<_>>::marker;
+            };
+        };
+    }
+
+    assert_not_impl!(ProtectedSeedV1, std::fmt::Debug);
+    assert_not_impl!(ProtectedSeedV1, Clone);
+    assert_not_impl!(ProtectedSeedV1, serde::Serialize);
+    assert_not_impl!(ValidatorKeyFileV1, std::fmt::Debug);
+    assert_not_impl!(ValidatorKeyFileV1, Clone);
+    assert_not_impl!(ValidatorKeyFileV1, serde::Serialize);
+    assert_not_impl!(DevnetKeyFileV1, std::fmt::Debug);
+    assert_not_impl!(DevnetKeyFileV1, Clone);
+    assert_not_impl!(DevnetKeyFileV1, serde::Serialize);
+    assert_not_impl!(ConsensusCredentialsV1, std::fmt::Debug);
+    assert_not_impl!(ConsensusCredentialsV1, Clone);
+    assert_not_impl!(ConsensusCredentialsV1, serde::Serialize);
+    assert_not_impl!(Keypair, std::fmt::Debug);
+    assert_not_impl!(Keypair, Clone);
+    assert_not_impl!(Keypair, serde::Serialize);
 
     fn genesis(operator: &Keypair, consensus: &Keypair) -> GenesisConfig {
         GenesisConfig {
@@ -446,16 +561,29 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&json).expect("JSON encodes"))
             .expect("test key writes");
         protect_key_file(&path);
+        let borrowed_before = protected_seed_borrowed_visit_count();
         let keypair = load_devnet_keypair(&path).expect("strict devnet key loads");
         assert_eq!(keypair.address(), Keypair::from_seed([0x42; 32]).address());
+        assert_eq!(
+            protected_seed_borrowed_visit_count(),
+            borrowed_before + 1,
+            "unescaped seed text must be borrowed from the zeroizing file buffer"
+        );
 
         let duplicate = format!(r#"{{"version":1,"seed_hex":"{secret}","seed_hex":"{secret}"}}"#);
+        let zeroized_before_duplicate = protected_seed_zeroized_drop_count();
         std::fs::write(&path, duplicate).expect("duplicate-field key writes");
         let duplicate_error = load_devnet_keypair(&path)
             .err()
             .expect("duplicate field is rejected");
         assert!(!duplicate_error.to_string().contains(&secret));
+        assert_eq!(
+            protected_seed_zeroized_drop_count(),
+            zeroized_before_duplicate + 1,
+            "the first decoded seed is erased when a duplicate field aborts the map"
+        );
 
+        let zeroized_before_unknown = protected_seed_zeroized_drop_count();
         std::fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({
@@ -470,6 +598,31 @@ mod tests {
             .err()
             .expect("unknown field is rejected");
         assert!(!unknown_error.to_string().contains(&secret));
+        assert_eq!(
+            protected_seed_zeroized_drop_count(),
+            zeroized_before_unknown + 1,
+            "decoded seed bytes are erased when a later unknown field aborts the map"
+        );
+
+        let zeroized_before_trailing = protected_seed_zeroized_drop_count();
+        let trailing = format!(r#"{{"version":1,"seed_hex":"{secret}"}} trailing"#);
+        std::fs::write(&path, trailing).expect("trailing-data key writes");
+        let trailing_error = load_devnet_keypair(&path)
+            .err()
+            .expect("trailing JSON is rejected");
+        assert!(!trailing_error.to_string().contains(&secret));
+        assert_eq!(
+            protected_seed_zeroized_drop_count(),
+            zeroized_before_trailing + 1,
+            "decoded seed bytes are erased when trailing JSON fails"
+        );
+
+        let escaped = format!(r#"{{"version":1,"seed_hex":"\u0034{}"}}"#, &secret[1..]);
+        std::fs::write(&path, escaped).expect("escaped key writes");
+        let escaped_error = load_devnet_keypair(&path)
+            .err()
+            .expect("escaped secret text is rejected before JSON scratch allocation");
+        assert!(!escaped_error.to_string().contains(&secret));
 
         std::fs::write(&path, vec![b'x'; MAX_PROTECTED_KEY_FILE_BYTES + 1])
             .expect("oversized key writes");

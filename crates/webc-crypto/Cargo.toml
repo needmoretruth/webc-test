@@ -21,3 +21,5 @@ rand_core.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# Seed inputs are erased after key construction; zeroize is MIT OR Apache-2.0.
+zeroize.workspace = true
