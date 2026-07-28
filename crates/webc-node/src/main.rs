@@ -1,3 +1,18 @@
+//! Purpose: provide the `webc-node` process entry point and its development CLI.
+//!
+//! Responsibilities: parse commands, validate operator-supplied configuration,
+//! assemble node adapters, and dispatch devnet, demo, benchmark, and staking flows.
+//! Non-responsibilities: consensus transitions, transaction authorization,
+//! persistence semantics, peer protocols, and HTTP behavior remain in their
+//! dedicated library crates.
+//! Data flow: command-line values and referenced files enter here, are converted
+//! into typed library configuration, and then produce explicit terminal output or
+//! a long-running node service.
+//! Security boundary: every argument, path, file, and network address is hostile;
+//! this layer must preserve library validation and resource limits, keep secret
+//! seed material out of arguments and diagnostics, and fail before launching a
+//! partially configured validator.
+
 mod proof_bench;
 
 use std::net::SocketAddr;
