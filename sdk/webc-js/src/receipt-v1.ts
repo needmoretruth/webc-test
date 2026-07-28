@@ -8,6 +8,7 @@
  */
 
 import { addressToBytes } from "./address.js";
+import { boundedJsonSnapshot, wellFormedUtf8ByteLength } from "./bounded-json.js";
 import { canonicalJsonBytes, canonicalJsonHashHex } from "./canonical.js";
 import { bytesToHex, hexToBytes } from "./hex.js";
 import {
@@ -33,6 +34,15 @@ export const MAX_RECEIPT_V1_JSON_BYTES = 256 * 1024;
 export const MAX_NATIVE_EVENT_JSON_DEPTH_V1 = 8;
 /** Maximum primitive and object nodes traversed beneath one native event body. */
 export const MAX_NATIVE_EVENT_JSON_NODES_V1 = 64;
+/** Conservative UTF-8 ceiling for an external asset's display symbol. */
+export const MAX_EXTERNAL_ASSET_SYMBOL_V1_UTF8_BYTES = 64;
+/** Conservative UTF-8 ceiling for an external asset contract/mint identity. */
+export const MAX_EXTERNAL_ASSET_CONTRACT_V1_UTF8_BYTES = 512;
+/** Conservative UTF-8 ceiling for a deterministic slashing reason. */
+export const MAX_SLASHING_REASON_V1_UTF8_BYTES = 1024;
+
+const MAX_RECEIPT_JSON_DEPTH_V1 = 12;
+const MAX_RECEIPT_JSON_NODES_V1 = MAX_RECEIPT_EVENTS_V1 * (MAX_NATIVE_EVENT_JSON_NODES_V1 + 6) + 64;
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
@@ -97,6 +107,10 @@ export interface ReceiptV1Json {
 }
 
 export function validateEventV1(value: unknown): asserts value is EventV1Json {
+  validatedEventSnapshotV1(value);
+}
+
+function validateEventSnapshotV1(value: unknown): asserts value is EventV1Json {
   const event = record(value, "V1 event");
   exactKeys(event, ["version", "transaction_id", "action_index", "event_index", "body"], "V1 event");
   if (event.version !== EVENT_V1) throw new Error("unsupported V1 event version");
@@ -149,6 +163,10 @@ export function validateFeeSummaryV1(value: unknown): asserts value is FeeSummar
 }
 
 export function validateReceiptV1(value: unknown): asserts value is ReceiptV1Json {
+  validatedReceiptSnapshotV1(value);
+}
+
+function validateReceiptSnapshotV1(value: unknown): asserts value is ReceiptV1Json {
   const receipt = record(value, "V1 receipt");
   exactKeys(receipt, ["version", "position", "transaction_id", "sender", "status", "fee_summary", "events"], "V1 receipt");
   if (receipt.version !== RECEIPT_V1) throw new Error("unsupported V1 receipt version");
@@ -167,7 +185,7 @@ export function validateReceiptV1(value: unknown): asserts value is ReceiptV1Jso
   let previousAction = -1;
   for (let index = 0; index < receipt.events.length; index += 1) {
     const event = receipt.events[index];
-    validateEventV1(event);
+    validateEventSnapshotV1(event);
     if (event.event_index !== index) throw new Error("event index does not match array position");
     if (event.action_index < previousAction) throw new Error("events are not ordered by action index");
     if (event.transaction_id !== receipt.transaction_id) throw new Error("event names another transaction");
@@ -175,19 +193,53 @@ export function validateReceiptV1(value: unknown): asserts value is ReceiptV1Jso
   }
 }
 
+/** Copies, validates, and byte-bounds an event before any hash reads it. */
+function validatedEventSnapshotV1(value: unknown): EventV1Json {
+  const snapshot = boundedJsonSnapshot(value, receiptSnapshotLimits("V1 event"));
+  validateEventSnapshotV1(snapshot);
+  enforceReceiptJsonByteLimit(snapshot, "V1 event");
+  return snapshot;
+}
+
+/** Copies, validates, and byte-bounds a receipt before any async or hash use. */
+function validatedReceiptSnapshotV1(value: unknown): ReceiptV1Json {
+  const snapshot = boundedJsonSnapshot(value, receiptSnapshotLimits("V1 receipt"));
+  validateReceiptSnapshotV1(snapshot);
+  enforceReceiptJsonByteLimit(snapshot, "V1 receipt");
+  return snapshot;
+}
+
+function receiptSnapshotLimits(label: string) {
+  return {
+    label,
+    maxDepth: MAX_RECEIPT_JSON_DEPTH_V1,
+    maxNodes: MAX_RECEIPT_JSON_NODES_V1,
+    maxArrayLength: MAX_RECEIPT_EVENTS_V1,
+    maxStringBytes: MAX_RECEIPT_V1_JSON_BYTES,
+    stringByteLimitLabel: "256 KiB",
+    arrayLimitLabel: "receipt event array",
+  } as const;
+}
+
+function enforceReceiptJsonByteLimit(value: unknown, label: string): void {
+  if (canonicalJsonBytes(value).byteLength > MAX_RECEIPT_V1_JSON_BYTES) {
+    throw new Error(`${label} exceeds the 256 KiB V1 limit`);
+  }
+}
+
 export async function eventV1DigestHex(event: EventV1Json): Promise<string> {
-  validateEventV1(event);
-  return canonicalJsonHashHex({ domain: EVENT_V1_DOMAIN, event });
+  const snapshot = validatedEventSnapshotV1(event);
+  return canonicalJsonHashHex({ domain: EVENT_V1_DOMAIN, event: snapshot });
 }
 
 export async function receiptV1DigestHex(receipt: ReceiptV1Json): Promise<string> {
-  validateReceiptV1(receipt);
-  return canonicalJsonHashHex({ domain: RECEIPT_V1_DOMAIN, receipt });
+  const snapshot = validatedReceiptSnapshotV1(receipt);
+  return canonicalJsonHashHex({ domain: RECEIPT_V1_DOMAIN, receipt: snapshot });
 }
 
 export async function receiptV1LeafHex(receipt: ReceiptV1Json): Promise<string> {
-  validateReceiptV1(receipt);
-  return canonicalJsonHashHex({ domain: RECEIPT_LEAF_V1_DOMAIN, receipt });
+  const snapshot = validatedReceiptSnapshotV1(receipt);
+  return canonicalJsonHashHex({ domain: RECEIPT_LEAF_V1_DOMAIN, receipt: snapshot });
 }
 
 export async function transactionV1LeafHex(position: BlockPositionV1Json, transactionId: string): Promise<string> {
@@ -225,16 +277,15 @@ export async function verifyTransactionReceiptBindingV1(
   const seen = new Set<string>();
   for (let index = 0; index < transactions.length; index += 1) {
     const transaction = transactions[index];
-    const receipt = receipts[index];
+    const receipt = validatedReceiptSnapshotV1(receipts[index]);
     validateTransactionV5Structure(transaction);
-    validateReceiptV1(receipt);
     if (receipt.position.height !== height || receipt.position.transaction_index !== index) {
       throw new Error("receipt position mismatch");
     }
     const id = await transactionV5IdHex(transaction);
     if (seen.has(id)) throw new Error("duplicate transaction ID");
     seen.add(id);
-    await verifyTransactionReceiptPairV1(transaction, receipt, id);
+    await verifyTransactionReceiptPairSnapshotV1(transaction, receipt, id);
   }
 }
 
@@ -249,8 +300,16 @@ export async function verifyTransactionReceiptPairV1(
   receipt: ReceiptV1Json,
   knownTransactionId?: string,
 ): Promise<void> {
+  const snapshot = validatedReceiptSnapshotV1(receipt);
+  await verifyTransactionReceiptPairSnapshotV1(transaction, snapshot, knownTransactionId);
+}
+
+async function verifyTransactionReceiptPairSnapshotV1(
+  transaction: SignedTransactionV5Json,
+  receipt: ReceiptV1Json,
+  knownTransactionId?: string,
+): Promise<void> {
   validateTransactionV5Structure(transaction);
-  validateReceiptV1(receipt);
   const id = knownTransactionId ?? await transactionV5IdHex(transaction);
   if (receipt.transaction_id !== id) throw new Error("receipt transaction ID mismatch");
   if (receipt.sender !== transaction.sender) throw new Error("receipt sender mismatch");
@@ -444,8 +503,11 @@ function validateFields(value: unknown, schema: NativeEventSchema, label: string
   for (const field of fields) schema[field](object[field], `${label}.${field}`);
 }
 
-function jsonString(value: unknown, label: string): void {
+function boundedJsonString(value: unknown, label: string, maximumUtf8Bytes: number): void {
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  if (wellFormedUtf8ByteLength(value, label) > maximumUtf8Bytes) {
+    throw new Error(`${label} exceeds ${maximumUtf8Bytes} UTF-8 bytes`);
+  }
 }
 
 function jsonBoolean(value: unknown, label: string): void {
@@ -508,7 +570,7 @@ function validateSlashingOutcome(value: unknown, label: string): void {
     delegated_slashed: AMOUNT_FIELD,
     jailed: BOOLEAN_FIELD,
     tombstoned: BOOLEAN_FIELD,
-    reason: STRING_FIELD,
+    reason: SLASHING_REASON_FIELD,
   }, label);
 }
 
@@ -524,8 +586,8 @@ function validateAssetId(value: unknown, label: string): void {
     case "External":
       validateFields(tagged.External, {
         origin_chain: EXTERNAL_CHAIN_FIELD,
-        symbol: STRING_FIELD,
-        contract_or_mint: STRING_FIELD,
+        symbol: EXTERNAL_ASSET_SYMBOL_FIELD,
+        contract_or_mint: EXTERNAL_ASSET_CONTRACT_FIELD,
       }, `${label}.External`);
       return;
     default:
@@ -574,11 +636,19 @@ const ADDRESS_FIELD: JsonFieldValidator = (value, label) => { address(value, lab
 const HASH_FIELD: JsonFieldValidator = (value, label) => { hash256(value, label); };
 const AMOUNT_FIELD: JsonFieldValidator = (value, label) => { u128(value, label); };
 const SAFE_U64_NUMBER_FIELD: JsonFieldValidator = safeU64Number;
-const STRING_FIELD: JsonFieldValidator = jsonString;
 const BOOLEAN_FIELD: JsonFieldValidator = jsonBoolean;
 const BRIDGE_ADDRESS_FIELD: JsonFieldValidator = boundedBridgeAddress;
 const FEED_VALUE_FIELD: JsonFieldValidator = signedI128;
 const PRICE_FIELD: JsonFieldValidator = AMOUNT_FIELD;
+const EXTERNAL_ASSET_SYMBOL_FIELD: JsonFieldValidator = (value, label) => {
+  boundedJsonString(value, `${label} external asset symbol`, MAX_EXTERNAL_ASSET_SYMBOL_V1_UTF8_BYTES);
+};
+const EXTERNAL_ASSET_CONTRACT_FIELD: JsonFieldValidator = (value, label) => {
+  boundedJsonString(value, `${label} external asset contract or mint`, MAX_EXTERNAL_ASSET_CONTRACT_V1_UTF8_BYTES);
+};
+const SLASHING_REASON_FIELD: JsonFieldValidator = (value, label) => {
+  boundedJsonString(value, `${label} slashing reason`, MAX_SLASHING_REASON_V1_UTF8_BYTES);
+};
 const EXTERNAL_CHAIN_FIELD: JsonFieldValidator = (value, label) => {
   oneOfStrings(value, ["Webc", "Ethereum", "Solana"], label);
 };

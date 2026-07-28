@@ -241,6 +241,113 @@ describe("V1 receipts and ordered roots", () => {
     expect(() => validateReceiptV1(value)).toThrow(/node budget/u);
   });
 
+  it("enforces the receipt byte ceiling for direct validation and hashing", async () => {
+    const value = await receipt(transaction());
+    value.events[0].body = {
+      Slashed: {
+        outcome: {
+          validator: SENDER,
+          self_slashed: "0",
+          delegated_slashed: "0",
+          jailed: false,
+          tombstoned: false,
+          reason: "x".repeat(300 * 1024),
+        },
+      },
+    };
+
+    expect(() => validateReceiptV1(value)).toThrow(/256 KiB/u);
+    await expect(receiptV1DigestHex(value)).rejects.toThrow(/256 KiB/u);
+  });
+
+  it("bounds variable native strings and rejects non-Rust Unicode", async () => {
+    const value = await receipt(transaction());
+    value.events[0].body = {
+      Slashed: {
+        outcome: {
+          validator: SENDER,
+          self_slashed: "0",
+          delegated_slashed: "0",
+          jailed: false,
+          tombstoned: false,
+          reason: "x".repeat(1025),
+        },
+      },
+    };
+    expect(() => validateReceiptV1(value)).toThrow(/slashing reason.*1024 UTF-8 bytes/u);
+
+    value.events[0].body = {
+      Bridge: {
+        event: {
+          Locked: {
+            message: {
+              source_chain: "Ethereum",
+              destination_chain: "Webc",
+              nonce: 9,
+              asset: {
+                External: {
+                  origin_chain: "Ethereum",
+                  symbol: "S".repeat(65),
+                  contract_or_mint: "0x1234",
+                },
+              },
+              sender: "abcd",
+              recipient: "12".repeat(32),
+              amount: "77",
+              source_tx: "77".repeat(32),
+            },
+            message_hash: "88".repeat(32),
+          },
+        },
+      },
+    };
+    expect(() => validateReceiptV1(value)).toThrow(/asset symbol.*64 UTF-8 bytes/u);
+
+    const external = ((value.events[0].body.Bridge as Record<string, unknown>).event as {
+      Locked: { message: { asset: { External: { symbol: string; contract_or_mint: string } } } };
+    }).Locked.message.asset.External;
+    external.symbol = "USDC";
+    external.contract_or_mint = "x".repeat(513);
+    expect(() => validateReceiptV1(value)).toThrow(/contract or mint.*512 UTF-8 bytes/u);
+
+    external.contract_or_mint = "0x1234";
+    external.symbol = "bad\ud800symbol";
+    expect(() => validateReceiptV1(value)).toThrow(/unpaired UTF-16 surrogate/u);
+  });
+
+  it("hashes one owned event snapshot and rejects accessor inputs", async () => {
+    const value = await receipt(transaction());
+    const plain = structuredClone(value.events[0]);
+    plain.body = { Transfer: { from: SENDER, to: RECIPIENT, amount: "1" } };
+    const expected = await eventV1DigestHex(plain);
+
+    let proxyReads = 0;
+    const transfer = new Proxy({ from: SENDER, to: RECIPIENT, amount: "1" }, {
+      get(target, property, receiver) {
+        if (property === "amount") {
+          proxyReads += 1;
+          return proxyReads === 1 ? "1" : true;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const proxied = structuredClone(value.events[0]);
+    proxied.body = { Transfer: transfer };
+    await expect(eventV1DigestHex(proxied)).resolves.toBe(expected);
+    expect(proxyReads).toBe(0);
+
+    let bodyReads = 0;
+    const accessor = structuredClone(plain);
+    Object.defineProperty(accessor, "body", {
+      enumerable: true,
+      get() {
+        bodyReads += 1;
+        return bodyReads === 1 ? plain.body : { Transfer: { from: SENDER, to: RECIPIENT, amount: true } };
+      },
+    });
+    await expect(eventV1DigestHex(accessor)).rejects.toThrow(/accessor property/u);
+  });
+
   it("rejects an oversized hostile event array before hashing", async () => {
     const value = await receipt(transaction());
     const template = value.events[0];
