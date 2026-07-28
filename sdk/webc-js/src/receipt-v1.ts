@@ -8,7 +8,7 @@
  */
 
 import { addressToBytes } from "./address.js";
-import { boundedJsonSnapshot, wellFormedUtf8ByteLength } from "./bounded-json.js";
+import { boundedJsonSnapshot } from "./bounded-json.js";
 import { canonicalJsonBytes, canonicalJsonHashHex } from "./canonical.js";
 import { bytesToHex, hexToBytes } from "./hex.js";
 import {
@@ -34,12 +34,6 @@ export const MAX_RECEIPT_V1_JSON_BYTES = 256 * 1024;
 export const MAX_NATIVE_EVENT_JSON_DEPTH_V1 = 8;
 /** Maximum primitive and object nodes traversed beneath one native event body. */
 export const MAX_NATIVE_EVENT_JSON_NODES_V1 = 64;
-/** Conservative UTF-8 ceiling for an external asset's display symbol. */
-export const MAX_EXTERNAL_ASSET_SYMBOL_V1_UTF8_BYTES = 64;
-/** Conservative UTF-8 ceiling for an external asset contract/mint identity. */
-export const MAX_EXTERNAL_ASSET_CONTRACT_V1_UTF8_BYTES = 512;
-/** Conservative UTF-8 ceiling for a deterministic slashing reason. */
-export const MAX_SLASHING_REASON_V1_UTF8_BYTES = 1024;
 
 const MAX_RECEIPT_JSON_DEPTH_V1 = 12;
 const MAX_RECEIPT_JSON_NODES_V1 = MAX_RECEIPT_EVENTS_V1 * (MAX_NATIVE_EVENT_JSON_NODES_V1 + 6) + 64;
@@ -503,11 +497,8 @@ function validateFields(value: unknown, schema: NativeEventSchema, label: string
   for (const field of fields) schema[field](object[field], `${label}.${field}`);
 }
 
-function boundedJsonString(value: unknown, label: string, maximumUtf8Bytes: number): void {
+function jsonString(value: unknown, label: string): void {
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
-  if (wellFormedUtf8ByteLength(value, label) > maximumUtf8Bytes) {
-    throw new Error(`${label} exceeds ${maximumUtf8Bytes} UTF-8 bytes`);
-  }
 }
 
 function jsonBoolean(value: unknown, label: string): void {
@@ -570,7 +561,7 @@ function validateSlashingOutcome(value: unknown, label: string): void {
     delegated_slashed: AMOUNT_FIELD,
     jailed: BOOLEAN_FIELD,
     tombstoned: BOOLEAN_FIELD,
-    reason: SLASHING_REASON_FIELD,
+    reason: STRING_FIELD,
   }, label);
 }
 
@@ -586,8 +577,8 @@ function validateAssetId(value: unknown, label: string): void {
     case "External":
       validateFields(tagged.External, {
         origin_chain: EXTERNAL_CHAIN_FIELD,
-        symbol: EXTERNAL_ASSET_SYMBOL_FIELD,
-        contract_or_mint: EXTERNAL_ASSET_CONTRACT_FIELD,
+        symbol: STRING_FIELD,
+        contract_or_mint: STRING_FIELD,
       }, `${label}.External`);
       return;
     default:
@@ -636,19 +627,11 @@ const ADDRESS_FIELD: JsonFieldValidator = (value, label) => { address(value, lab
 const HASH_FIELD: JsonFieldValidator = (value, label) => { hash256(value, label); };
 const AMOUNT_FIELD: JsonFieldValidator = (value, label) => { u128(value, label); };
 const SAFE_U64_NUMBER_FIELD: JsonFieldValidator = safeU64Number;
+const STRING_FIELD: JsonFieldValidator = jsonString;
 const BOOLEAN_FIELD: JsonFieldValidator = jsonBoolean;
 const BRIDGE_ADDRESS_FIELD: JsonFieldValidator = boundedBridgeAddress;
 const FEED_VALUE_FIELD: JsonFieldValidator = signedI128;
 const PRICE_FIELD: JsonFieldValidator = AMOUNT_FIELD;
-const EXTERNAL_ASSET_SYMBOL_FIELD: JsonFieldValidator = (value, label) => {
-  boundedJsonString(value, `${label} external asset symbol`, MAX_EXTERNAL_ASSET_SYMBOL_V1_UTF8_BYTES);
-};
-const EXTERNAL_ASSET_CONTRACT_FIELD: JsonFieldValidator = (value, label) => {
-  boundedJsonString(value, `${label} external asset contract or mint`, MAX_EXTERNAL_ASSET_CONTRACT_V1_UTF8_BYTES);
-};
-const SLASHING_REASON_FIELD: JsonFieldValidator = (value, label) => {
-  boundedJsonString(value, `${label} slashing reason`, MAX_SLASHING_REASON_V1_UTF8_BYTES);
-};
 const EXTERNAL_CHAIN_FIELD: JsonFieldValidator = (value, label) => {
   oneOfStrings(value, ["Webc", "Ethereum", "Solana"], label);
 };

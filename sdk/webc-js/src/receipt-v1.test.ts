@@ -11,6 +11,7 @@ import { canonicalJson } from "./canonical";
 import {
   eventV1DigestHex,
   MAX_RECEIPT_EVENTS_V1,
+  MAX_RECEIPT_V1_JSON_BYTES,
   receiptRootV1Hex,
   receiptV1DigestHex,
   receiptV1LeafHex,
@@ -260,7 +261,7 @@ describe("V1 receipts and ordered roots", () => {
     await expect(receiptV1DigestHex(value)).rejects.toThrow(/256 KiB/u);
   });
 
-  it("bounds variable native strings and rejects non-Rust Unicode", async () => {
+  it("accepts Rust-valid near-limit strings but rejects non-Rust Unicode", async () => {
     const value = await receipt(transaction());
     value.events[0].body = {
       Slashed: {
@@ -270,11 +271,11 @@ describe("V1 receipts and ordered roots", () => {
           delegated_slashed: "0",
           jailed: false,
           tombstoned: false,
-          reason: "x".repeat(1025),
+          reason: "x".repeat(MAX_RECEIPT_V1_JSON_BYTES - 4096),
         },
       },
     };
-    expect(() => validateReceiptV1(value)).toThrow(/slashing reason.*1024 UTF-8 bytes/u);
+    expect(() => validateReceiptV1(value)).not.toThrow();
 
     value.events[0].body = {
       Bridge: {
@@ -288,7 +289,7 @@ describe("V1 receipts and ordered roots", () => {
                 External: {
                   origin_chain: "Ethereum",
                   symbol: "S".repeat(65),
-                  contract_or_mint: "0x1234",
+                  contract_or_mint: "x".repeat(513),
                 },
               },
               sender: "abcd",
@@ -301,15 +302,11 @@ describe("V1 receipts and ordered roots", () => {
         },
       },
     };
-    expect(() => validateReceiptV1(value)).toThrow(/asset symbol.*64 UTF-8 bytes/u);
+    expect(() => validateReceiptV1(value)).not.toThrow();
 
     const external = ((value.events[0].body.Bridge as Record<string, unknown>).event as {
       Locked: { message: { asset: { External: { symbol: string; contract_or_mint: string } } } };
     }).Locked.message.asset.External;
-    external.symbol = "USDC";
-    external.contract_or_mint = "x".repeat(513);
-    expect(() => validateReceiptV1(value)).toThrow(/contract or mint.*512 UTF-8 bytes/u);
-
     external.contract_or_mint = "0x1234";
     external.symbol = "bad\ud800symbol";
     expect(() => validateReceiptV1(value)).toThrow(/unpaired UTF-16 surrogate/u);
