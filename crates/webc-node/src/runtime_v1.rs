@@ -35,6 +35,7 @@ use webc_storage::{
     MAX_PENDING_TRANSACTION_SCAN_V1,
 };
 
+use crate::node::MAX_FINALIZED_PROOF_MATERIAL_BYTES_V1;
 use crate::pending_evidence_v1::MAX_PENDING_SLASHING_EVIDENCE_V1;
 use crate::{
     FinalizedTransactionProofBundleV1, Node, NodeError, V4FinalizationResult, V5InsertOutcome,
@@ -519,6 +520,8 @@ pub struct NodeRuntime<K: KvStore> {
     mempool: V5Mempool,
     lifecycle_events: broadcast::Sender<TransactionLifecycleV1>,
     proof_workers: Arc<Semaphore>,
+    /// Maximum projected JSON bytes loaded for one proof worker snapshot.
+    proof_material_budget_bytes: usize,
 }
 
 impl<K> NodeRuntime<K>
@@ -533,10 +536,33 @@ where
     /// handle becomes reachable. A tightened capacity policy selects survivors
     /// deterministically in stored transaction-ID order.
     pub fn spawn(
+        node: Node<K>,
+        mempool_config: V5MempoolConfig,
+        queue_capacity: usize,
+        recovery_now_ms: LocalTimestampMs,
+    ) -> Result<
+        (
+            NodeHandle,
+            tokio::task::JoinHandle<Result<(), NodeRuntimeError>>,
+        ),
+        NodeRuntimeError,
+    > {
+        Self::spawn_with_proof_material_budget(
+            node,
+            mempool_config,
+            queue_capacity,
+            recovery_now_ms,
+            MAX_FINALIZED_PROOF_MATERIAL_BYTES_V1,
+        )
+    }
+
+    /// Starts the actor with an injectable proof budget for boundary tests.
+    fn spawn_with_proof_material_budget(
         mut node: Node<K>,
         mempool_config: V5MempoolConfig,
         queue_capacity: usize,
         recovery_now_ms: LocalTimestampMs,
+        proof_material_budget_bytes: usize,
     ) -> Result<
         (
             NodeHandle,
@@ -556,6 +582,7 @@ where
             mempool,
             lifecycle_events: lifecycle_events.clone(),
             proof_workers: Arc::new(Semaphore::new(DEFAULT_FINALIZED_PROOF_WORKERS)),
+            proof_material_budget_bytes,
         };
         let task = tokio::spawn(runtime.run(receiver));
         Ok((
@@ -637,9 +664,10 @@ where
                                 response.send(Err(NodeRuntimeError::ProofWorkersBusy));
                         }
                         Ok(permit) => {
-                            match self.node.load_finalized_transaction_proof_v1(
+                            match self.node.load_finalized_transaction_proof_with_budget_v1(
                                 transaction_id,
                                 checkpoint_height,
+                                self.proof_material_budget_bytes,
                             ) {
                                 Err(error) => {
                                     drop(permit);
@@ -1627,6 +1655,64 @@ mod tests {
                 .expect("finalized transaction has a proof");
             assert_eq!(proof.proof.transaction_proof.leaf_count.get(), 128);
         }
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn oversized_proof_material_releases_permit_and_actor_stays_responsive() {
+        let validator = Keypair::from_seed([0x27; 32]);
+        let recipient = Keypair::from_seed([0x28; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let mut node = Node::open(MemoryKvStore::new(), &genesis).expect("test node opens");
+        let transaction = transfer(&validator, &recipient, 0, 5);
+        let transaction_id = transaction
+            .transaction_id()
+            .expect("target transaction has an ID");
+        let candidate = node
+            .build_candidate_v4(vec![transaction], Vec::new(), validator.address(), NOW + 1)
+            .expect("proof fixture builds");
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+        node.import_finalized_block_v4(
+            candidate.block,
+            &candidate.next_authority_set,
+            &certificate,
+        )
+        .expect("proof fixture finalizes");
+        let (handle, task) = NodeRuntime::spawn_with_proof_material_budget(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW + 1),
+            1,
+        )
+        .expect("runtime starts with a tiny injected proof budget");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    handle.finalized_proof(transaction_id, BlockHeight::new(1))
+                )
+                .await
+                .expect("actor answers the bounded request"),
+                Err(NodeRuntimeError::Node(
+                    NodeError::FinalizedProofMaterialTooLarge { maximum_bytes: 1 }
+                ))
+            ));
+            assert_eq!(
+                handle
+                    .stats()
+                    .await
+                    .expect("actor remains responsive after rejection")
+                    .active_finalized_proofs,
+                0,
+                "the fail-closed loader must release its proof permit"
+            );
+        }
+
         handle.shutdown().await.expect("shutdown is acknowledged");
         task.await
             .expect("runtime task does not panic")

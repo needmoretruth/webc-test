@@ -480,6 +480,12 @@ fn classify_runtime_error(
             "required finalized proof history is unavailable on this node",
             false,
         ),
+        NodeRuntimeError::Node(NodeError::FinalizedProofMaterialTooLarge { .. }) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "proof_material_too_large",
+            "requested finalized proof exceeds the fixed proof size limit",
+            false,
+        ),
         NodeRuntimeError::Mempool(V5MempoolError::PendingRecord(_))
         | NodeRuntimeError::Mempool(V5MempoolError::InconsistentRecovery)
         | NodeRuntimeError::InvalidQueueCapacity
