@@ -51,11 +51,17 @@ export function boundedJsonSnapshot(value: unknown, limits: BoundedJsonSnapshotL
   let stringBytes = 0;
 
   const consumeString = (text: string, label: string): void => {
-    const bytes = wellFormedUtf8ByteLength(text, label);
-    stringBytes += bytes;
-    if (stringBytes > limits.maxStringBytes) {
+    const remaining = limits.maxStringBytes - stringBytes;
+    // Every UTF-16 code unit contributes at least one UTF-8 byte. Reject a
+    // huge caller-owned string in O(1) before scanning it for surrogate parity.
+    if (text.length > remaining) {
       throw new Error(`${limits.label} exceeds its ${limits.stringByteLimitLabel} string budget`);
     }
+    const bytes = wellFormedUtf8ByteLength(text, label);
+    if (bytes > remaining) {
+      throw new Error(`${limits.label} exceeds its ${limits.stringByteLimitLabel} string budget`);
+    }
+    stringBytes += bytes;
   };
 
   while (tasks.length > 0) {
