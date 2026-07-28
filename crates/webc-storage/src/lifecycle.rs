@@ -25,7 +25,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use webc_chain::{
-    AuthorizationLaneId, BlockPositionV1, BlockV4, Nonce, ReceiptV1, TransactionId, TransactionV5,
+    AuthorizationLaneId, BlockPositionV1, BlockV4, Nonce, ReceiptStatusV1, ReceiptV1,
+    TransactionId, TransactionV5,
 };
 use webc_crypto::Address;
 
@@ -186,6 +187,17 @@ pub enum LocalTransactionObservationV1 {
         /// Candidate block position observed by this node.
         position: BlockPositionV1,
     },
+    /// The node observed a candidate and retained its receipt-derived outcome.
+    ///
+    /// This variant is appended after the legacy `Included` discriminant so
+    /// existing bincode records remain readable. New candidate observations use
+    /// this form; the receipt is the sole source of the copied status.
+    IncludedWithOutcome {
+        /// Candidate block position, not yet an authoritative finality fact.
+        position: BlockPositionV1,
+        /// Execution outcome copied from the candidate's validated V1 receipt.
+        status: ReceiptStatusV1,
+    },
 }
 
 /// Durable consensus fact, always preferred over local observations in APIs.
@@ -196,6 +208,17 @@ pub enum TransactionConsensusFactV1 {
     Finalized {
         /// Authoritative finalized block position.
         position: BlockPositionV1,
+    },
+    /// A certified block finalized the receipt-derived execution outcome.
+    ///
+    /// This appended variant preserves the original `Finalized` discriminant.
+    /// Reads cross-check the projection against the canonical finalized receipt,
+    /// and legacy records are enriched from that receipt in memory.
+    FinalizedWithOutcome {
+        /// Authoritative finalized block position.
+        position: BlockPositionV1,
+        /// Execution outcome copied from the atomically stored V1 receipt.
+        status: ReceiptStatusV1,
     },
 }
 
@@ -647,6 +670,110 @@ impl<K: KvStore> ChainStore<K> {
         Ok(lifecycle)
     }
 
+    /// Atomically records receipt-derived inclusion outcomes for one built candidate.
+    ///
+    /// The complete validated block is preflighted against durable pending bytes
+    /// before a sequence or write is staged. Repeating an identical candidate is
+    /// idempotent and returns no changes, while a different position or outcome
+    /// receives a new sequence in exact transaction order. Pending bytes remain
+    /// available because a candidate is not an authoritative finality fact.
+    pub fn observe_candidate_included_v1(
+        &mut self,
+        block: &BlockV4,
+    ) -> Result<Vec<TransactionLifecycleV1>, StorageError> {
+        block.validate().map_err(|error| {
+            StorageError::InvalidRecord(format!(
+                "cannot observe an invalid protocol-2 candidate: {error}"
+            ))
+        })?;
+
+        struct CandidateObservation {
+            transaction_id: TransactionId,
+            observation: LocalTransactionObservationV1,
+            consensus_fact: Option<TransactionConsensusFactV1>,
+        }
+
+        let mut observations = Vec::with_capacity(block.transactions.len());
+        for (transaction, receipt) in block.transactions.iter().zip(&block.receipts) {
+            let transaction_id = transaction.transaction_id().map_err(|error| {
+                StorageError::InvalidRecord(format!(
+                    "cannot identify included V5 transaction: {error}"
+                ))
+            })?;
+            let pending = self
+                .pending_transaction_v1(transaction_id)?
+                .ok_or_else(|| {
+                    StorageError::InvalidRecord(
+                        "cannot observe candidate inclusion for a non-pending transaction".into(),
+                    )
+                })?;
+            if pending.transaction != *transaction {
+                return Err(StorageError::Corruption(
+                    "candidate transaction bytes differ from the durable pending record".into(),
+                ));
+            }
+            if self.pending_id_for_slot_v1(pending.slot)? != Some(transaction_id) {
+                return Err(StorageError::Inconsistent(
+                    "candidate transaction has no matching durable pending slot".into(),
+                ));
+            }
+            let previous = self
+                .transaction_lifecycle_v1(transaction_id)?
+                .ok_or_else(|| {
+                    StorageError::Inconsistent(
+                        "candidate transaction has no durable lifecycle".into(),
+                    )
+                })?;
+            if previous.consensus_fact.is_some() {
+                return Err(StorageError::Inconsistent(
+                    "a pending candidate transaction already has a finalized consensus fact".into(),
+                ));
+            }
+            let observation = LocalTransactionObservationV1::IncludedWithOutcome {
+                position: receipt.position,
+                status: receipt.status,
+            };
+            if previous.local_observation.as_ref() == Some(&observation) {
+                continue;
+            }
+            observations.push(CandidateObservation {
+                transaction_id,
+                observation,
+                consensus_fact: previous.consensus_fact,
+            });
+        }
+
+        if observations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sequence = self.latest_lifecycle_sequence_v1()?;
+        let mut batch = WriteBatch::new();
+        let mut changed = Vec::with_capacity(observations.len());
+        for observation in observations {
+            sequence = next_sequence(sequence)?;
+            let lifecycle = TransactionLifecycleV1 {
+                version: TRANSACTION_LIFECYCLE_RECORD_V1,
+                transaction_id: observation.transaction_id,
+                sequence,
+                local_observation: Some(observation.observation),
+                consensus_fact: observation.consensus_fact,
+            };
+            batch.put(
+                Table::TransactionLifecycle,
+                transaction_key(observation.transaction_id),
+                encode(StoredRecordKind::TransactionLifecycle, &lifecycle)?,
+            );
+            changed.push(lifecycle);
+        }
+        batch.put(
+            Table::Meta,
+            META_LIFECYCLE_SEQUENCE,
+            sequence.get().to_be_bytes().to_vec(),
+        );
+        self.backend_mut().commit(batch)?;
+        Ok(changed)
+    }
+
     /// Returns one pending record by transaction ID, validating key bindings.
     pub fn pending_transaction_v1(
         &self,
@@ -692,13 +819,44 @@ impl<K: KvStore> ChainStore<K> {
         else {
             return Ok(None);
         };
-        let lifecycle: TransactionLifecycleV1 =
+        let mut lifecycle: TransactionLifecycleV1 =
             decode(StoredRecordKind::TransactionLifecycle, &bytes)?;
         lifecycle.validate()?;
         if lifecycle.transaction_id != transaction_id {
             return Err(StorageError::Corruption(
                 "transaction lifecycle record does not match its table key".into(),
             ));
+        }
+        match lifecycle.consensus_fact {
+            Some(TransactionConsensusFactV1::Finalized { position }) => {
+                let receipt = self.finalized_receipt_v1(transaction_id)?.ok_or_else(|| {
+                    StorageError::Corruption(
+                        "legacy finalized lifecycle has no canonical receipt".into(),
+                    )
+                })?;
+                if receipt.position != position {
+                    return Err(StorageError::Corruption(
+                        "legacy finalized lifecycle position disagrees with its receipt".into(),
+                    ));
+                }
+                lifecycle.consensus_fact = Some(TransactionConsensusFactV1::FinalizedWithOutcome {
+                    position,
+                    status: receipt.status,
+                });
+            }
+            Some(TransactionConsensusFactV1::FinalizedWithOutcome { position, status }) => {
+                let receipt = self.finalized_receipt_v1(transaction_id)?.ok_or_else(|| {
+                    StorageError::Corruption(
+                        "finalized lifecycle outcome has no canonical receipt".into(),
+                    )
+                })?;
+                if receipt.position != position || receipt.status != status {
+                    return Err(StorageError::Corruption(
+                        "finalized lifecycle outcome disagrees with its canonical receipt".into(),
+                    ));
+                }
+            }
+            None => {}
         }
         Ok(Some(lifecycle))
     }
@@ -924,8 +1082,9 @@ impl<K: KvStore> ChainStore<K> {
                 transaction_id,
                 sequence,
                 local_observation: previous.and_then(|value| value.local_observation),
-                consensus_fact: Some(TransactionConsensusFactV1::Finalized {
+                consensus_fact: Some(TransactionConsensusFactV1::FinalizedWithOutcome {
                     position: receipt.position,
+                    status: receipt.status,
                 }),
             };
             let position_index = FinalizedTransactionIndexV1 {
@@ -1005,14 +1164,15 @@ fn transaction_id_from_key(bytes: &[u8]) -> Result<TransactionId, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bincode::Options;
     use std::collections::BTreeMap;
 
     use webc_chain::{
         calculate_fee_summary_v1, evidence_root, receipt_root_v1, transaction_root_v1, ActionV1,
         Amount, AuthorizationPolicyRevision, BlockHeaderV4, BlockHeight, ChainId, ChainState,
-        Epoch, FeeBid, FeePayerV1, FeePaymentV1, FeeRate, FinalityAuthoritySetV1,
-        FinalityCertificate, GasUnits, Operation, ReceiptStatusV1, SignedVote,
-        TransactionAuthorizationV1, TransactionIndex, ValidatorPower, ValidatorSet,
+        Epoch, ExecutionFailureCodeV1, FeeBid, FeePayerV1, FeePaymentV1, FeeRate,
+        FinalityAuthoritySetV1, FinalityCertificate, GasUnits, Operation, ReceiptStatusV1,
+        SignedVote, TransactionAuthorizationV1, TransactionIndex, ValidatorPower, ValidatorSet,
         ValidityWindowV1, Vote, VoteType, RECEIPT_V1, TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{Hash256, Keypair};
@@ -1181,6 +1341,35 @@ mod tests {
             authority_set,
             certificate,
         }
+    }
+
+    fn recertify_fixture(fixture: &mut ProtocolTwoFixture) {
+        let (consensus_key, validator_set, authority_set) = authority_fixture(100);
+        assert_eq!(fixture.authority_set, authority_set);
+        let block_hash = fixture.block.hash().unwrap();
+        let vote = SignedVote::sign(
+            Vote {
+                protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
+                chain_id: ChainId::devnet(),
+                height: fixture.block.header.height.get(),
+                round: 0,
+                vote_type: VoteType::Precommit,
+                block_hash,
+                validator: consensus_key.address(),
+            },
+            &consensus_key,
+        )
+        .unwrap();
+        fixture.certificate = FinalityCertificate::build(
+            &validator_set,
+            TRANSACTION_V5_PROTOCOL_VERSION,
+            ChainId::devnet(),
+            fixture.block.header.height.get(),
+            0,
+            block_hash,
+            &[vote],
+        )
+        .unwrap();
     }
 
     #[derive(Debug, Default)]
@@ -1457,6 +1646,214 @@ mod tests {
     }
 
     #[test]
+    fn candidate_inclusion_persists_failure_outcome_without_duplicate_sequence_churn() {
+        let mut store = open_memory();
+        let record =
+            PendingTransactionRecordV1::new(signed_transfer(25, 0, 5), LocalTimestampMs::new(NOW))
+                .unwrap();
+        store.store_pending_v1(&record, None).unwrap();
+        let mut fixture = finalized_fixture(record.transaction.clone());
+        let failure = ReceiptStatusV1::Failed {
+            code: ExecutionFailureCodeV1::Precondition,
+            failed_action_index: Some(webc_chain::ActionIndex::new(0)),
+        };
+        fixture.block.receipts[0].status = failure;
+        fixture.block.header.receipt_root = receipt_root_v1(&fixture.block.receipts).unwrap();
+
+        let first = store.observe_candidate_included_v1(&fixture.block).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].sequence, LifecycleSequence::new(2));
+        assert!(matches!(
+            first[0].local_observation,
+            Some(LocalTransactionObservationV1::IncludedWithOutcome {
+                position,
+                status,
+            }) if position == fixture.block.receipts[0].position && status == failure
+        ));
+
+        let duplicate = store.observe_candidate_included_v1(&fixture.block).unwrap();
+        assert!(duplicate.is_empty());
+        assert_eq!(store.latest_lifecycle_sequence_v1().unwrap().get(), 2);
+        assert_eq!(
+            store.pending_transaction_v1(record.transaction_id).unwrap(),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn candidate_inclusion_prevalidates_the_complete_batch_before_writing() {
+        let mut store = open_memory();
+        let retained =
+            PendingTransactionRecordV1::new(signed_transfer(26, 0, 5), LocalTimestampMs::new(NOW))
+                .unwrap();
+        store.store_pending_v1(&retained, None).unwrap();
+        let missing = signed_transfer(27, 0, 5);
+        let mut fixture = finalized_fixture(retained.transaction.clone());
+        fixture.block.transactions.push(missing.clone());
+        fixture.block.receipts.push(successful_receipt(&missing, 1));
+        fixture.block.header.tx_root =
+            transaction_root_v1(fixture.block.header.height, &fixture.block.transactions).unwrap();
+        fixture.block.header.receipt_root = receipt_root_v1(&fixture.block.receipts).unwrap();
+
+        assert!(matches!(
+            store.observe_candidate_included_v1(&fixture.block),
+            Err(StorageError::InvalidRecord(_))
+        ));
+        assert_eq!(store.latest_lifecycle_sequence_v1().unwrap().get(), 1);
+        assert!(matches!(
+            store
+                .transaction_lifecycle_v1(retained.transaction_id)
+                .unwrap()
+                .unwrap()
+                .local_observation,
+            Some(LocalTransactionObservationV1::Queued { .. })
+        ));
+    }
+
+    #[test]
+    fn candidate_failure_outcome_survives_redb_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("candidate-outcome.redb");
+        let record =
+            PendingTransactionRecordV1::new(signed_transfer(28, 0, 5), LocalTimestampMs::new(NOW))
+                .unwrap();
+        let mut fixture = finalized_fixture(record.transaction.clone());
+        let failure = ReceiptStatusV1::Failed {
+            code: ExecutionFailureCodeV1::InsufficientBalance,
+            failed_action_index: Some(webc_chain::ActionIndex::new(0)),
+        };
+        fixture.block.receipts[0].status = failure;
+        fixture.block.header.receipt_root = receipt_root_v1(&fixture.block.receipts).unwrap();
+        {
+            let backend = RedbKvStore::open(&path).unwrap();
+            let mut store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+            store.store_pending_v1(&record, None).unwrap();
+            store.observe_candidate_included_v1(&fixture.block).unwrap();
+        }
+
+        let backend = RedbKvStore::open(&path).unwrap();
+        let reopened = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        let lifecycle = reopened
+            .transaction_lifecycle_v1(record.transaction_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lifecycle.local_observation,
+            Some(LocalTransactionObservationV1::IncludedWithOutcome {
+                position,
+                status,
+            }) if position == fixture.block.receipts[0].position && status == failure
+        ));
+        assert_eq!(lifecycle.sequence, LifecycleSequence::new(2));
+        assert_eq!(
+            reopened
+                .pending_transaction_v1(record.transaction_id)
+                .unwrap(),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn appended_outcome_variants_preserve_legacy_bincode_discriminants() {
+        let position = BlockPositionV1::new(BlockHeight::new(3), TransactionIndex::new(2));
+        let legacy_included = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .with_little_endian()
+            .serialize(&LocalTransactionObservationV1::Included { position })
+            .unwrap();
+        let outcome_included = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .with_little_endian()
+            .serialize(&LocalTransactionObservationV1::IncludedWithOutcome {
+                position,
+                status: ReceiptStatusV1::Succeeded,
+            })
+            .unwrap();
+        let legacy_finalized = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .with_little_endian()
+            .serialize(&TransactionConsensusFactV1::Finalized { position })
+            .unwrap();
+        let outcome_finalized = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .with_little_endian()
+            .serialize(&TransactionConsensusFactV1::FinalizedWithOutcome {
+                position,
+                status: ReceiptStatusV1::Succeeded,
+            })
+            .unwrap();
+
+        assert_eq!(legacy_included.first(), Some(&4));
+        assert_eq!(outcome_included.first(), Some(&5));
+        assert_eq!(legacy_finalized.first(), Some(&0));
+        assert_eq!(outcome_finalized.first(), Some(&1));
+    }
+
+    #[test]
+    fn finalized_failure_outcome_is_receipt_bound_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("finalized-failure-outcome.redb");
+        let pending = PendingTransactionRecordV1::new(
+            signed_transfer(29, 0, 5),
+            LocalTimestampMs::new(NOW - 1),
+        )
+        .unwrap();
+        let mut fixture = finalized_fixture(pending.transaction.clone());
+        let failure = ReceiptStatusV1::Failed {
+            code: ExecutionFailureCodeV1::ObjectVersionMismatch,
+            failed_action_index: Some(webc_chain::ActionIndex::new(0)),
+        };
+        fixture.block.receipts[0].status = failure;
+        fixture.block.header.receipt_root = receipt_root_v1(&fixture.block.receipts).unwrap();
+        recertify_fixture(&mut fixture);
+        {
+            let backend = RedbKvStore::open(&path).unwrap();
+            let mut store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+            initialize_protocol_two(&mut store);
+            store.store_pending_v1(&pending, None).unwrap();
+            store.observe_candidate_included_v1(&fixture.block).unwrap();
+            store
+                .commit_block_v4(BlockV4Commit {
+                    block: &fixture.block,
+                    state: &fixture.state,
+                    current_authority_set: &fixture.authority_set,
+                    next_authority_set: &fixture.authority_set,
+                    certificate: &fixture.certificate,
+                })
+                .unwrap();
+        }
+
+        let backend = RedbKvStore::open(&path).unwrap();
+        let reopened = ChainStore::open(backend, &ChainId::devnet()).unwrap();
+        let lifecycle = reopened
+            .transaction_lifecycle_v1(pending.transaction_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lifecycle.local_observation,
+            Some(LocalTransactionObservationV1::IncludedWithOutcome {
+                status,
+                ..
+            }) if status == failure
+        ));
+        assert!(matches!(
+            lifecycle.consensus_fact,
+            Some(TransactionConsensusFactV1::FinalizedWithOutcome {
+                status,
+                ..
+            }) if status == failure
+        ));
+        assert_eq!(
+            reopened
+                .finalized_receipt_v1(pending.transaction_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            failure
+        );
+    }
+
+    #[test]
     fn injected_commit_failure_leaves_every_pending_index_unchanged() {
         let backend = FailNextCommitStore::default();
         let mut store = ChainStore::open(backend, &ChainId::devnet()).unwrap();
@@ -1613,7 +2010,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             lifecycle.consensus_fact,
-            Some(TransactionConsensusFactV1::Finalized { position })
+            Some(TransactionConsensusFactV1::FinalizedWithOutcome {
+                position,
+                status: ReceiptStatusV1::Succeeded,
+            })
         );
         assert!(matches!(
             lifecycle.local_observation,
@@ -1695,7 +2095,10 @@ mod tests {
         ));
         assert!(matches!(
             finalized.consensus_fact,
-            Some(TransactionConsensusFactV1::Finalized { .. })
+            Some(TransactionConsensusFactV1::FinalizedWithOutcome {
+                status: ReceiptStatusV1::Succeeded,
+                ..
+            })
         ));
         assert!(finalized.sequence > displaced.sequence);
     }
