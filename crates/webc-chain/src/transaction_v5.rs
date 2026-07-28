@@ -638,6 +638,8 @@ impl ActionV1 {
                         | Operation::DeregisterReporter { .. }
                         | Operation::SubmitReport { .. }
                         | Operation::PayFeedRead { .. }
+                        | Operation::SubmitOrder { .. }
+                        | Operation::CancelOrder { .. }
                         | Operation::ClaimUnbonded { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
@@ -1901,8 +1903,8 @@ mod tests {
     use super::*;
     use crate::{
         AssetId, BridgeMessage, ExternalChain, FeedId, FeedValue, ObjectId, ObjectVersion,
-        Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
-        SessionAllowedOperations, SessionKeyConstraints,
+        Operation, OrderId, OrderSide, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+        Price, SessionAllowedOperations, SessionKeyConstraints, TradingPair,
     };
 
     #[test]
@@ -2028,6 +2030,35 @@ mod tests {
                 feed_id,
                 amount: Amount::from_units(1),
             },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_dex_operations() {
+        let order_id = OrderId::new(Hash256([7; 32]));
+        let pair = TradingPair::new(
+            AssetId::NativeWebc,
+            AssetId::External {
+                origin_chain: ExternalChain::Ethereum,
+                symbol: "TEST".to_owned(),
+                contract_or_mint: "0x01".to_owned(),
+            },
+        );
+        let operations = [
+            Operation::SubmitOrder {
+                order_id,
+                pair,
+                side: OrderSide::Sell,
+                amount: Amount::from_units(1),
+                limit_price: Price::new(2),
+                deadline_height: 0,
+                fill_or_cancel: false,
+            },
+            Operation::CancelOrder { order_id },
         ];
 
         assert!(operations

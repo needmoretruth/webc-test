@@ -19,7 +19,8 @@ use crate::sponsor_grant_book::SponsorGrantBookError;
 use crate::sponsorship::sponsor_state_key_hash;
 use crate::state::{
     NativeAccountControlContext, NativeActionEffects, NativeApplicationContext,
-    NativeBridgeContext, NativeObjectMutation, NativeValidatorRegistration,
+    NativeBridgeContext, NativeDexOrderSubmission, NativeObjectMutation,
+    NativeValidatorRegistration,
 };
 use crate::state_key::StateAccessRecorder;
 use crate::unbonding::{
@@ -1505,6 +1506,35 @@ fn execute_native_action_v1(
             *amount,
             effects,
         ),
+        Operation::SubmitOrder {
+            order_id,
+            pair,
+            side,
+            amount,
+            limit_price,
+            deadline_height,
+            fill_or_cancel,
+        } => state.apply_native_submit_order(
+            context.sender,
+            context.authorization_lane,
+            NativeDexOrderSubmission::new(
+                *order_id,
+                pair,
+                *side,
+                *amount,
+                *limit_price,
+                *deadline_height,
+                *fill_or_cancel,
+            ),
+            &context.config.dex,
+            effects,
+        ),
+        Operation::CancelOrder { order_id } => state.apply_native_cancel_order(
+            context.sender,
+            context.authorization_lane,
+            *order_id,
+            effects,
+        ),
         Operation::CreateObject {
             object_id,
             namespace,
@@ -2000,6 +2030,14 @@ fn classify_action_failure(
         | ChainError::OracleReporterNotFound
         | ChainError::OracleRequiresDefaultLane
         | ChainError::OracleReadAmountZero
+        | ChainError::InvalidTradingPair
+        | ChainError::DexOrderAmountTooSmall
+        | ChainError::DexOrderPriceZero
+        | ChainError::DexOrderAlreadyExists
+        | ChainError::DexOrderNotFound
+        | ChainError::DexOrderNotOwner
+        | ChainError::DexOrderDeadlineInPast
+        | ChainError::DexRequiresDefaultLane
         | ChainError::ValidatorAlreadyExists(_)
         | ChainError::ValidatorNotFound(_)
         | ChainError::ValidatorNotActive(_)
@@ -2705,10 +2743,10 @@ mod tests {
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
         AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, BridgeMessage, ChainState,
         Delegation, Epoch, FeeBid, FeePaymentV1, FeedValue, Nonce, ObjectId, ObjectVersion,
-        Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+        Operation, OrderSide, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme, Price,
         SessionAllowedOperations, SessionKeyAuthorizationAction, SessionKeyConstraints,
         SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
-        StakingActionV1, StoragePricing, TransactionAuthorizationV1, TransactionIndex,
+        StakingActionV1, StoragePricing, TradingPair, TransactionAuthorizationV1, TransactionIndex,
         UnbondingKind, UnbondingRequestId, Validator, ValidatorStatus, ValidityWindowV1,
         INITIAL_AUTHORIZATION_POLICY_REVISION, MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1,
         REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, TRANSACTION_V5_PROTOCOL_VERSION,
@@ -4719,6 +4757,158 @@ mod tests {
             state
                 .supply_invariant_report()
                 .expect("failed oracle supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn native_dex_submit_cancel_preserves_escrow_and_restart_root() {
+        let sender = Keypair::from_seed([1; 32]);
+        let external_asset = AssetId::External {
+            origin_chain: ExternalChain::Ethereum,
+            symbol: "TEST".to_owned(),
+            contract_or_mint: "0x71".to_owned(),
+        };
+        let pair = TradingPair::new(AssetId::NativeWebc, external_asset.clone());
+        let sell_id = OrderId::new(Hash256([0x73; 32]));
+        let buy_id = OrderId::new(Hash256([0x74; 32]));
+        let actions = vec![
+            ActionV1::native(Operation::SubmitOrder {
+                order_id: sell_id,
+                pair: pair.clone(),
+                side: OrderSide::Sell,
+                amount: Amount::from_units(100),
+                limit_price: Price::new(2),
+                deadline_height: 0,
+                fill_or_cancel: false,
+            }),
+            ActionV1::native(Operation::SubmitOrder {
+                order_id: buy_id,
+                pair,
+                side: OrderSide::Buy,
+                amount: Amount::from_units(50),
+                limit_price: Price::new(2),
+                deadline_height: 20,
+                fill_or_cancel: true,
+            }),
+            ActionV1::native(Operation::CancelOrder { order_id: sell_id }),
+            ActionV1::native(Operation::CancelOrder { order_id: buy_id }),
+        ];
+        let gas_limit = actions.iter().map(ActionV1::required_units).sum::<u64>();
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut state = funded_state(&sender, None);
+        state.current_height = 10;
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(1_000_000);
+        state.asset_balances.insert(
+            (external_asset.clone(), sender.address()),
+            Amount::from_units(500),
+        );
+        state.minted_supply = Amount::from_units(1_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared(&state, transaction),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
+            )
+            .expect("DEX submit and cancel markers execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 2);
+        assert_eq!(state.dex_escrow, Amount::from_units(100));
+        assert_eq!(
+            state.asset_balances[&(external_asset, sender.address())],
+            Amount::from_units(400)
+        );
+        assert_eq!(state.dex_orders[&sell_id].deadline_height, 15);
+        assert!(state.dex_orders[&sell_id].cancel_requested);
+        assert!(state.dex_orders[&buy_id].cancel_requested);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("DEX escrow supply report")
+                .balanced
+        );
+        let restored: ChainState =
+            bincode::deserialize(&bincode::serialize(&state).expect("serialize DEX state"))
+                .expect("restore DEX state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("live root")
+        );
+    }
+
+    #[test]
+    fn native_dex_duplicate_rolls_back_locked_principal_but_charges_parent() {
+        let sender = Keypair::from_seed([1; 32]);
+        let order_id = OrderId::new(Hash256([0x75; 32]));
+        let pair = TradingPair::new(
+            AssetId::NativeWebc,
+            AssetId::External {
+                origin_chain: ExternalChain::Ethereum,
+                symbol: "TEST".to_owned(),
+                contract_or_mint: "0x75".to_owned(),
+            },
+        );
+        let submit = Operation::SubmitOrder {
+            order_id,
+            pair,
+            side: OrderSide::Sell,
+            amount: Amount::from_units(100),
+            limit_price: Price::new(2),
+            deadline_height: 20,
+            fill_or_cancel: false,
+        };
+        let actions = vec![ActionV1::native(submit.clone()), ActionV1::native(submit)];
+        let gas_limit = actions.iter().map(ActionV1::required_units).sum::<u64>();
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut state = funded_state(&sender, None);
+        state.current_height = 10;
+        let initial_balance = Amount::from_units(1_000_000);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = initial_balance;
+        state.minted_supply = initial_balance;
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared(&state, transaction),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
+            )
+            .expect("duplicate DEX order is a chargeable failure")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            initial_balance
+                .checked_sub(receipt.fee_summary.charged)
+                .expect("fee is below fixture balance")
+        );
+        assert!(!state.dex_orders.contains_key(&order_id));
+        assert_eq!(state.dex_escrow, Amount::ZERO);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed DEX supply report")
                 .balanced
         );
     }
