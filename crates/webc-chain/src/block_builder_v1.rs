@@ -68,6 +68,18 @@ pub struct BuiltBlockV4 {
     pub next_authority_set: FinalityAuthoritySetV1,
 }
 
+/// Pure candidate transition returned without mutating the committed caller.
+///
+/// The type intentionally does not implement `Clone`: `next_state` can contain
+/// the complete live protocol state and should be moved into persistence or
+/// dropped, never duplicated casually by orchestration code.
+pub struct BuiltBlockV4Transition {
+    /// Candidate block plus its deterministically derived successor authority set.
+    pub built: BuiltBlockV4,
+    /// Complete post-block state produced by the same atomic transition.
+    pub next_state: ChainState,
+}
+
 /// Fail-closed errors from protocol-2 whole-block construction or replay.
 #[derive(Debug, thiserror::Error)]
 pub enum BlockV4ExecutionError {
@@ -212,6 +224,33 @@ pub fn build_block_v4_with_derived_authority(
     evidence: Vec<SlashingEvidence>,
     current_authority_set: &FinalityAuthoritySetV1,
 ) -> Result<BuiltBlockV4, BlockV4ExecutionError> {
+    let transition = build_block_v4_with_derived_authority_transition(
+        state,
+        config,
+        input,
+        transactions,
+        evidence,
+        current_authority_set,
+    )?;
+    *state = transition.next_state;
+    Ok(transition.built)
+}
+
+/// Builds a candidate and returns its post-state without mutating `state`.
+///
+/// This is the orchestration seam for proposers: execution creates exactly one
+/// private state clone internally, while the caller receives both products of
+/// that transition. Dropping `next_state` is appropriate for an uncommitted
+/// proposal; adopting it is appropriate only after the matching block becomes
+/// durable.
+pub fn build_block_v4_with_derived_authority_transition(
+    state: &ChainState,
+    config: &ChainConfig,
+    input: BlockBuildInputV1,
+    transactions: Vec<TransactionV5>,
+    evidence: Vec<SlashingEvidence>,
+    current_authority_set: &FinalityAuthoritySetV1,
+) -> Result<BuiltBlockV4Transition, BlockV4ExecutionError> {
     let (block, next_state, next_authority_set) = execute_block_v4(
         state,
         config,
@@ -221,10 +260,12 @@ pub fn build_block_v4_with_derived_authority(
         current_authority_set,
         None,
     )?;
-    *state = next_state;
-    Ok(BuiltBlockV4 {
-        block,
-        next_authority_set,
+    Ok(BuiltBlockV4Transition {
+        built: BuiltBlockV4 {
+            block,
+            next_authority_set,
+        },
+        next_state,
     })
 }
 
@@ -241,6 +282,30 @@ pub fn apply_block_v4(
     current_authority_set: &FinalityAuthoritySetV1,
     next_authority_set: &FinalityAuthoritySetV1,
 ) -> Result<(), BlockV4ExecutionError> {
+    let next_state = replay_block_v4_transition(
+        state,
+        config,
+        block,
+        current_authority_set,
+        next_authority_set,
+    )?;
+    *state = next_state;
+    Ok(())
+}
+
+/// Replays an exact received V4 block and returns its post-state atomically.
+///
+/// The committed input is borrowed and can therefore never be partially
+/// mutated. Callers performing durable finalization can persist the returned
+/// state directly instead of cloning once outside this function and again in the
+/// shared executor.
+pub fn replay_block_v4_transition(
+    state: &ChainState,
+    config: &ChainConfig,
+    block: &BlockV4,
+    current_authority_set: &FinalityAuthoritySetV1,
+    next_authority_set: &FinalityAuthoritySetV1,
+) -> Result<ChainState, BlockV4ExecutionError> {
     block.validate()?;
     let input = BlockBuildInputV1 {
         chain_id: block.header.chain_id.clone(),
@@ -262,8 +327,7 @@ pub fn apply_block_v4(
     if rebuilt != *block {
         return Err(BlockV4ExecutionError::ImportedBlockMismatch);
     }
-    *state = next_state;
-    Ok(())
+    Ok(next_state)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -558,7 +622,7 @@ mod tests {
     use crate::{
         ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, FeeBid, FeePaymentV1,
         GenesisAccount, GenesisConfig, GenesisValidator, Nonce, Operation, ReceiptStatusV1,
-        TransactionAuthorizationV1, ValidityWindowV1,
+        SponsorGrantId, SponsorGrantStateV1, TransactionAuthorizationV1, ValidityWindowV1,
     };
     use webc_crypto::Keypair;
 
@@ -931,6 +995,108 @@ mod tests {
         assert_eq!(
             built.block.header.next_finality_authority_set_root,
             next.commitment().expect("next commitment")
+        );
+    }
+
+    #[test]
+    fn pure_v4_transition_matches_mutating_apis_on_large_state() {
+        const LIVE_GRANTS: usize = 2_048;
+        let Fixture {
+            config,
+            mut state,
+            validator,
+            alice,
+            ..
+        } = fixture();
+        for index in 0..LIVE_GRANTS {
+            let mut identity = [0u8; 32];
+            identity[..8].copy_from_slice(
+                &u64::try_from(index)
+                    .expect("test grant index fits u64")
+                    .to_be_bytes(),
+            );
+            identity[31] = 1;
+            state
+                .sponsor_grants
+                .set(
+                    (alice.address(), SponsorGrantId::new(Hash256(identity))),
+                    SponsorGrantStateV1::unused(
+                        Hash256::digest_many([
+                            b"WEBC_PURE_V4_TRANSITION_TEST_V1".as_slice(),
+                            identity.as_slice(),
+                        ]),
+                        BlockHeight::new(100),
+                    ),
+                )
+                .expect("large-state grant is valid");
+        }
+        let original_root = state.state_root().expect("large pre-state root computes");
+        let current = authority_set(&state, Epoch::new(0));
+        let block_input = input(&state, validator.address());
+
+        let pure = build_block_v4_with_derived_authority_transition(
+            &state,
+            &config,
+            block_input.clone(),
+            Vec::new(),
+            Vec::new(),
+            &current,
+        )
+        .expect("pure large-state transition builds");
+        assert_eq!(
+            state.state_root().expect("borrowed state root recomputes"),
+            original_root,
+            "the pure seam must leave its large caller state unchanged"
+        );
+
+        let mut wrapper_state = state.clone();
+        let wrapped = build_block_v4_with_derived_authority(
+            &mut wrapper_state,
+            &config,
+            block_input,
+            Vec::new(),
+            Vec::new(),
+            &current,
+        )
+        .expect("compatibility wrapper builds");
+        assert_eq!(pure.built, wrapped);
+        assert_eq!(pure.next_state, wrapper_state);
+
+        let replayed = replay_block_v4_transition(
+            &state,
+            &config,
+            &pure.built.block,
+            &current,
+            &pure.built.next_authority_set,
+        )
+        .expect("pure replay returns the same post-state");
+        let mut applied = state.clone();
+        apply_block_v4(
+            &mut applied,
+            &config,
+            &pure.built.block,
+            &current,
+            &pure.built.next_authority_set,
+        )
+        .expect("mutating replay wrapper succeeds");
+        assert_eq!(replayed, pure.next_state);
+        assert_eq!(applied, pure.next_state);
+
+        let mut tampered = pure.built.block.clone();
+        tampered.header.state_root = Hash256([0xFF; 32]);
+        assert!(replay_block_v4_transition(
+            &state,
+            &config,
+            &tampered,
+            &current,
+            &pure.built.next_authority_set,
+        )
+        .is_err());
+        assert_eq!(
+            state
+                .state_root()
+                .expect("failed replay leaves source intact"),
+            original_root
         );
     }
 }

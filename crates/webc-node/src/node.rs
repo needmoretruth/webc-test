@@ -27,12 +27,13 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use webc_chain::{
-    apply_block, apply_block_v4, build_block, build_block_v4_with_derived_authority, Block,
-    BlockBuildInput, BlockBuildInputV1, BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4,
-    ChainConfig, ChainError, ChainState, ConsensusWalRecord, ConsensusWalRecordV1, Epoch,
-    FinalityAuthoritySetErrorV1, FinalityAuthoritySetV1, FinalityCertificate, GenesisConfig,
-    SlashingEvidence, Transaction, TransactionId, TransactionV5, TransactionValidationErrorV1,
-    ValidatorSet, CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
+    apply_block, build_block, build_block_v4_with_derived_authority_transition,
+    replay_block_v4_transition, Block, BlockBuildInput, BlockBuildInputV1, BlockHeight, BlockV4,
+    BlockV4ExecutionError, BuiltBlockV4, ChainConfig, ChainError, ChainState, ConsensusWalRecord,
+    ConsensusWalRecordV1, Epoch, FinalityAuthoritySetErrorV1, FinalityAuthoritySetV1,
+    FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction, TransactionId,
+    TransactionV5, TransactionValidationErrorV1, ValidatorSet, CURRENT_PROTOCOL_VERSION,
+    TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Hash256};
 use webc_proof::{
@@ -749,15 +750,15 @@ impl<K: KvStore> Node<K> {
             proposer,
             timestamp_ms: self.monotonic_timestamp(timestamp_ms),
         };
-        let mut candidate_state = self.state.clone();
-        Ok(build_block_v4_with_derived_authority(
-            &mut candidate_state,
+        Ok(build_block_v4_with_derived_authority_transition(
+            &self.state,
             &self.config,
             input,
             transactions,
             evidence,
             &current_authority_set,
-        )?)
+        )?
+        .built)
     }
 
     /// Replays one received V4 proposal against committed state without mutation.
@@ -775,9 +776,8 @@ impl<K: KvStore> Node<K> {
             return Err(NodeError::ChainIdMismatch);
         }
         let current_authority_set = self.current_finality_authority_set_v1()?;
-        let mut scratch = self.state.clone();
-        apply_block_v4(
-            &mut scratch,
+        let _validated_post_state = replay_block_v4_transition(
+            &self.state,
             &self.config,
             block,
             &current_authority_set,
@@ -1091,9 +1091,8 @@ impl<K: KvStore> Node<K> {
             return Err(NodeError::ChainIdMismatch);
         }
         let current_authority_set = self.current_finality_authority_set_v1()?;
-        let mut next_state = self.state.clone();
-        apply_block_v4(
-            &mut next_state,
+        let next_state = replay_block_v4_transition(
+            &self.state,
             &self.config,
             &block,
             &current_authority_set,
