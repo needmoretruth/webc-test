@@ -1,3 +1,14 @@
+//! Native WEBC account-address derivation and text/binary encoding.
+//!
+//! This module owns the fixed 32-byte [`Address`] value, its version-1
+//! public-key commitment, and strict human-readable and binary decoding. It
+//! does not validate signatures, authorize accounts, or select a key scheme;
+//! those responsibilities remain behind the crypto and transaction layers.
+//! Trusted public-key bytes flow into a domain-separated SHA-256 commitment,
+//! while serialized address bytes are treated as hostile and accepted only at
+//! the exact native width. Callers must not treat an address as proof that the
+//! corresponding private key exists or is controlled by a requester.
+
 use crate::{CryptoError, PublicKeyBytes};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
@@ -13,6 +24,10 @@ const ADDRESS_PREFIX: &str = "webc1";
 pub struct Address(pub [u8; 32]);
 
 impl Address {
+    /// Derives the version-1 address commitment for an Ed25519 public key.
+    ///
+    /// This operation is deterministic and domain-separated with
+    /// `WEBC_ADDRESS_V1`. It performs no signature or ownership check.
     pub fn from_public_key(public_key: &PublicKeyBytes) -> Self {
         let parts: [&[u8]; 2] = [
             b"WEBC_ADDRESS_V1".as_slice(),
@@ -21,14 +36,17 @@ impl Address {
         Self(crate::Hash256::digest_many(parts).0)
     }
 
+    /// Constructs an address from an already validated 32-byte commitment.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// Borrows the exact 32-byte address commitment.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
+    /// Encodes the address as the `webc1` prefix followed by Base58 bytes.
     pub fn to_base58(self) -> String {
         format!("{}{}", ADDRESS_PREFIX, bs58::encode(self.0).into_string())
     }

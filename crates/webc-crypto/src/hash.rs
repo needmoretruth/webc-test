@@ -1,3 +1,13 @@
+//! Fixed-width SHA-256 values used at WEBC protocol boundaries.
+//!
+//! This module owns strict 32-byte hash storage, deterministic SHA-256 helpers,
+//! and hexadecimal/binary serialization. It does not define signing or hashing
+//! domains, canonicalize protocol messages, or build Merkle trees; callers must
+//! supply canonical, explicitly domain-separated bytes where the protocol
+//! requires them. Serialized values are hostile input and must decode to
+//! exactly 32 bytes, preventing truncated or oversized identities from crossing
+//! the crypto boundary.
+
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -10,12 +20,20 @@ impl Hash256 {
     /// All-zero hash, used as the empty Merkle root and genesis previous hash.
     pub const ZERO: Self = Self([0u8; 32]);
 
+    /// Hashes one byte sequence with SHA-256.
+    ///
+    /// This helper adds no domain separator. Consensus callers must include the
+    /// appropriate versioned domain in `bytes` before invoking it.
     pub fn digest(bytes: impl AsRef<[u8]>) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bytes.as_ref());
         Self(hasher.finalize().into())
     }
 
+    /// Hashes `N` byte slices in order without intermediate allocation.
+    ///
+    /// Concatenation boundaries are not encoded by this helper. Protocol
+    /// callers must use fixed-width fields or an unambiguous canonical encoding.
     pub fn digest_many<const N: usize>(parts: [&[u8]; N]) -> Self {
         let mut hasher = Sha256::new();
         for part in parts {
@@ -24,10 +42,12 @@ impl Hash256 {
         Self(hasher.finalize().into())
     }
 
+    /// Borrows the exact 32-byte SHA-256 value.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
+    /// Encodes the hash as 64 lowercase hexadecimal characters.
     pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
