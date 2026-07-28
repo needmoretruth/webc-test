@@ -27,6 +27,8 @@ export const TRANSACTION_LEAF_V1_DOMAIN = "WEBC_TRANSACTION_LEAF_V1";
 export const MERKLE_V1_DOMAIN = "WEBC_MERKLE_V1";
 /** Maximum events retained or hashed from one untrusted V1 receipt. */
 export const MAX_RECEIPT_EVENTS_V1 = 256;
+/** Maximum UTF-8 JSON bytes accepted for one untrusted V1 receipt. */
+export const MAX_RECEIPT_V1_JSON_BYTES = 256 * 1024;
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
