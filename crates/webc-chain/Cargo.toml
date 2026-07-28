@@ -31,3 +31,7 @@ thiserror.workspace = true
 proptest = { version = "1.6", default-features = false, features = ["std"] }
 # Compiles WAT text fixtures to wasm bytes for the end-to-end contract tests.
 wat = "1.253"
+# Samples this test process's resident set during the opt-in capacity benchmark.
+# sysinfo 0.39.6 is MIT-licensed, maintained, and kept test-only; disabling its
+# unrelated hardware/network features avoids pulling commodity probes we do not use.
+sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }

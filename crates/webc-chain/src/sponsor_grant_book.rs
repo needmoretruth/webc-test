@@ -334,7 +334,12 @@ pub(crate) enum SponsorGrantBookError {
 mod tests {
     use super::*;
     use std::hint::black_box;
-    use std::time::Instant;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     use webc_crypto::Keypair;
 
     use crate::{
@@ -354,6 +359,76 @@ mod tests {
         SponsorGrantStateV1::unused(Hash256([digest; 32]), BlockHeight::new(expiry))
     }
 
+    /// Polls the current process's resident set while the ignored capacity gate
+    /// runs. RSS is allocator- and operating-system-dependent, so it is recorded
+    /// as reproducible comparison evidence and never enters consensus or a
+    /// public throughput claim.
+    struct ResidentSetSampler {
+        stop: Arc<AtomicBool>,
+        peak_bytes: Arc<AtomicU64>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl ResidentSetSampler {
+        fn start() -> Result<(Self, u64), &'static str> {
+            let pid = sysinfo::get_current_pid()?;
+            let mut system = System::new();
+            refresh_process_memory(&mut system, pid);
+            let baseline_bytes = system
+                .process(pid)
+                .map(sysinfo::Process::memory)
+                .ok_or("current process is unavailable to the RSS sampler")?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak_bytes = Arc::new(AtomicU64::new(baseline_bytes));
+            let thread_stop = Arc::clone(&stop);
+            let thread_peak = Arc::clone(&peak_bytes);
+            let thread = std::thread::spawn(move || {
+                let mut system = System::new();
+                while !thread_stop.load(Ordering::Acquire) {
+                    refresh_process_memory(&mut system, pid);
+                    if let Some(process) = system.process(pid) {
+                        thread_peak.fetch_max(process.memory(), Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                refresh_process_memory(&mut system, pid);
+                if let Some(process) = system.process(pid) {
+                    thread_peak.fetch_max(process.memory(), Ordering::Relaxed);
+                }
+            });
+            Ok((
+                Self {
+                    stop,
+                    peak_bytes,
+                    thread,
+                },
+                baseline_bytes,
+            ))
+        }
+
+        fn finish(self) -> Result<u64, &'static str> {
+            self.stop.store(true, Ordering::Release);
+            self.thread
+                .join()
+                .map_err(|_| "resident-set sampler thread panicked")?;
+            Ok(self.peak_bytes.load(Ordering::Relaxed))
+        }
+    }
+
+    fn refresh_process_memory(system: &mut System, pid: sysinfo::Pid) {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+    }
+
+    fn mebibytes_with_three_decimals(bytes: u64) -> String {
+        const BYTES_PER_MEBIBYTE: u128 = 1024 * 1024;
+        let thousandths = u128::from(bytes) * 1_000 / BYTES_PER_MEBIBYTE;
+        format!("{}.{:03}", thousandths / 1_000, thousandths % 1_000)
+    }
+
     /// Runs the protocol-2 activation capacity gate on an optimized build.
     ///
     /// This is deliberately ignored by ordinary tests because it constructs the
@@ -364,6 +439,9 @@ mod tests {
     fn sponsor_grant_capacity_benchmark() {
         const LIVE_GRANTS: usize = 163_840;
         const EXPIRY_HEIGHT: u64 = 4_096;
+
+        let (memory_sampler, baseline_resident_bytes) =
+            ResidentSetSampler::start().expect("capacity benchmark can sample process RSS");
 
         let validator = Keypair::from_seed([0x71; 32]);
         let sponsor = Keypair::from_seed([0x72; 32]).address();
@@ -463,6 +541,10 @@ mod tests {
             block.header.state_root,
             state.state_root().expect("post-root")
         );
+        let peak_resident_bytes = memory_sampler
+            .finish()
+            .expect("capacity benchmark RSS sampler stops");
+        let resident_growth_bytes = peak_resident_bytes.saturating_sub(baseline_resident_bytes);
 
         println!("sponsor_grants={LIVE_GRANTS}");
         println!(
@@ -474,6 +556,18 @@ mod tests {
         println!(
             "block_execute_ms={:.3}",
             block_elapsed.as_secs_f64() * 1_000.0
+        );
+        println!(
+            "baseline_resident_set_mib={}",
+            mebibytes_with_three_decimals(baseline_resident_bytes)
+        );
+        println!(
+            "peak_resident_set_mib={}",
+            mebibytes_with_three_decimals(peak_resident_bytes)
+        );
+        println!(
+            "resident_set_growth_mib={}",
+            mebibytes_with_three_decimals(resident_growth_bytes)
         );
         println!("state_root={root}");
     }
