@@ -36,14 +36,10 @@ version = 2
 allow = [
     "MIT",
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "BSL-1.0",
     "ISC",
     "Zlib",
-    "Unicode-3.0",
     "Unlicense",
 ]
 # Require high confidence in each license identification; an ambiguous license
@@ -53,12 +49,15 @@ confidence-threshold = 0.9
 # so a future dependency under them does not fail the gate spuriously; do not
 # warn that they are currently unused.
 unused-allowed-license = "allow"
+# `unicode-ident` combines its MIT-or-Apache code license with Unicode-3.0 data;
+# keep that required data license scoped to the exact reviewed crate/version.
 # libFuzzer's vendored engine is NCSA-licensed. NCSA is OSI-approved and the
-# Apache Software Foundation classifies it as an Apache-like Category A
-# license, but keep the allowance scoped to the exact test-only crate/version
-# instead of widening the shipped dependency policy:
+# Apache Software Foundation classifies it as an Apache-like Category A license,
+# but keep the allowance scoped to the exact test-only crate/version instead of
+# widening the shipped dependency policy:
 # https://www.apache.org/legal/resolved.html#category-a
 exceptions = [
+    { allow = ["Unicode-3.0"], crate = "unicode-ident@1.0.24" },
     { allow = ["NCSA"], crate = "libfuzzer-sys@0.4.13" },
 ]
 
@@ -66,10 +65,10 @@ exceptions = [
 # Duplicate major versions (finding D3). The one duplicate we directly
 # controlled — a webc-node dev-dependency on tokio-tungstenite 0.24 while axum
 # pulls 0.29 — is now aligned to 0.29, so the WebSocket stack is single-version.
-# The remaining duplicates (getrandom, rand/rand_core, thiserror 1/2) are purely
-# transitive through crypto and error-handling crates we do not control; they
-# will collapse as those ecosystems finish moving to the new majors. Warn so
-# they stay visible without blocking the merge gate on skew we cannot yet fix.
+# The remaining duplicates (`getrandom`/`rand_core`, target-only `r-efi`, fuzz
+# `syn`, and Wasmi's parser beside the protocol validator's `wasmparser`) are
+# transitive through cryptography, target support, macros, or the WASM engine.
+# Warn so they stay visible without blocking on skew we cannot safely collapse.
 multiple-versions = "warn"
 # A wildcard ("*") version requirement pins nothing and lets an unexpected
 # release in silently; forbid it in shipped crates.
