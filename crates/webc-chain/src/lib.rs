@@ -606,6 +606,8 @@ pub enum ChainError {
     ContractStateValueTooLarge { actual: usize, maximum: usize },
     #[error("contract input is malformed")]
     ContractInvalidInput,
+    #[error("contract arithmetic overflowed")]
+    ContractArithmeticOverflow,
     #[error("wasm contract module failed validation (a forbidden feature or malformed bytes)")]
     InvalidWasmModule,
     #[error("wasm contract module is {actual} bytes, above the maximum of {maximum}")]

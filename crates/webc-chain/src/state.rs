@@ -1697,6 +1697,41 @@ impl<'a> NativeDexOrderSubmission<'a> {
     }
 }
 
+/// Borrowed specification for one native or WASM contract invocation.
+///
+/// The descriptor binds the signed module identity, namespace, footprint,
+/// input, admission units, and envelope gas cap as one value so V4 and V5 use
+/// the same manifest checks and runtime boundary.
+pub(crate) struct NativeContractInvocation<'a> {
+    code_id: Hash256,
+    namespace: Hash256,
+    declared_keys: &'a [Hash256],
+    input: &'a [u8],
+    admission_units: u64,
+    gas_limit: u64,
+}
+
+impl<'a> NativeContractInvocation<'a> {
+    /// Constructs one invocation from an authenticated transaction action.
+    pub(crate) const fn new(
+        code_id: Hash256,
+        namespace: Hash256,
+        declared_keys: &'a [Hash256],
+        input: &'a [u8],
+        admission_units: u64,
+        gas_limit: u64,
+    ) -> Self {
+        Self {
+            code_id,
+            namespace,
+            declared_keys,
+            input,
+            admission_units,
+            gas_limit,
+        }
+    }
+}
+
 /// Borrowed coordinates and replacement bytes for one owned-object mutation.
 ///
 /// Grouping the namespace/version preconditions with the target prevents V4 and
@@ -5209,33 +5244,13 @@ impl ChainState {
                 });
             }
             Operation::RegisterContract { manifest } => {
-                // Default lane only: the registration fee draws from and burns
-                // liquid (supply-neutral, like feed creation). The manifest record
-                // is committed under the reserved module key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::ContractRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::module(manifest.code_id))?;
-                // Validate the hostile manifest before touching supply or state.
-                manifest.validate(tx.sender)?;
-                if self.contracts.contains_key(&manifest.code_id) {
-                    return Err(ChainError::ContractAlreadyExists);
-                }
-                let fee = config.contracts.registration_fee;
-                self.debit_native(tx.sender, fee)?;
-                self.burned_fees = self
-                    .burned_fees
-                    .checked_add(fee)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.contracts.insert(manifest.code_id, manifest.clone());
-                events.push(Event::ContractRegistered {
-                    code_id: manifest.code_id,
-                    namespace: manifest.namespace,
-                    owner: tx.sender,
-                    builtin: manifest.builtin,
-                    fee_burned: fee,
-                });
+                self.apply_native_register_contract(
+                    tx.sender,
+                    tx.authorization_lane,
+                    manifest,
+                    &config.contracts,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::InvokeContract {
                 code_id,
@@ -5243,92 +5258,28 @@ impl ChainState {
                 declared_keys,
                 input,
             } => {
-                // Bound the hostile input before any work.
-                if input.len() > MAX_CONTRACT_INPUT_BYTES {
-                    return Err(ChainError::ContractInputTooLarge {
-                        actual: input.len(),
-                        maximum: MAX_CONTRACT_INPUT_BYTES,
-                    });
-                }
-                // Resolve the manifest through the declared (read-only) module key.
-                access.read(StateKey::module(*code_id))?;
-                let manifest = self
-                    .contracts
-                    .get(code_id)
-                    .ok_or(ChainError::ContractNotFound)?
-                    .clone();
-                // Bind the signed operation to the committed manifest so the access
-                // list and the scheduler agree with the manifest and a call cannot
-                // under- or mis-declare what it touches.
-                if *namespace != manifest.namespace {
-                    return Err(ChainError::ContractNamespaceMismatch);
-                }
-                if declared_keys.as_slice() != manifest.footprint.as_slice() {
-                    return Err(ChainError::ContractFootprintMismatch);
-                }
-                // Run the audited built-in handler over its declared footprint under
-                // the shared contract-call discipline (fresh gas meter seeded with
-                // the admission `units` and capped at `gas_limit`, working-set load,
-                // atomic write-back). The native and wasm paths differ ONLY in how the
-                // handler is resolved; the metering, access enforcement, and rollback
-                // are identical because both go through `run_contract_call`.
-                let handler = builtin_contract(manifest.builtin);
-                let (output, gas_consumed) = self.run_contract_call(
-                    ContractCall {
-                        namespace: manifest.namespace,
-                        footprint: &manifest.footprint,
-                        handler,
+                self.apply_native_invoke_contract(
+                    tx.sender,
+                    NativeContractInvocation::new(
+                        *code_id,
+                        *namespace,
+                        declared_keys,
                         input,
-                        admission_units: units,
-                        gas_limit: tx.fee.gas_limit,
-                    },
-                    &mut access,
+                        units,
+                        tx.fee.gas_limit,
+                    ),
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::ContractInvoked {
-                    code_id: *code_id,
-                    namespace: *namespace,
-                    caller: tx.sender,
-                    gas_consumed,
-                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
-                });
             }
             Operation::RegisterWasmContract { manifest, code } => {
-                // Default lane only, like the native registration: the fee draws from
-                // and burns liquid (supply-neutral). The manifest and its bytecode are
-                // committed under the reserved module key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::ContractRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::module(manifest.code_id))?;
-                // Validate the hostile manifest AND its module bytes (size cap,
-                // code-hash binding, deterministic-engine acceptance) before touching
-                // supply or state — an invalid module is never stored.
-                manifest.validate(tx.sender, code)?;
-                // A `code_id` is unique across BOTH contract paths, since both address
-                // their record by `StateKey::module(code_id)`.
-                if self.contracts.contains_key(&manifest.code_id)
-                    || self.wasm_contracts.contains_key(&manifest.code_id)
-                {
-                    return Err(ChainError::ContractAlreadyExists);
-                }
-                let fee = config.contracts.registration_fee;
-                self.debit_native(tx.sender, fee)?;
-                self.burned_fees = self
-                    .burned_fees
-                    .checked_add(fee)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.wasm_contracts
-                    .insert(manifest.code_id, manifest.clone());
-                self.wasm_code.insert(manifest.code_id, code.clone());
-                events.push(Event::WasmContractRegistered {
-                    code_id: manifest.code_id,
-                    namespace: manifest.namespace,
-                    owner: tx.sender,
-                    code_hash: manifest.code_hash,
-                    code_len: u64::try_from(code.len()).unwrap_or(u64::MAX),
-                    fee_burned: fee,
-                });
+                self.apply_native_register_wasm_contract(
+                    tx.sender,
+                    tx.authorization_lane,
+                    manifest,
+                    code,
+                    &config.contracts,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::InvokeWasmContract {
                 code_id,
@@ -5336,56 +5287,18 @@ impl ChainState {
                 declared_keys,
                 input,
             } => {
-                // Bound the hostile input before any work.
-                if input.len() > MAX_CONTRACT_INPUT_BYTES {
-                    return Err(ChainError::ContractInputTooLarge {
-                        actual: input.len(),
-                        maximum: MAX_CONTRACT_INPUT_BYTES,
-                    });
-                }
-                // Resolve the manifest through the declared (read-only) module key.
-                access.read(StateKey::module(*code_id))?;
-                let manifest = self
-                    .wasm_contracts
-                    .get(code_id)
-                    .ok_or(ChainError::ContractNotFound)?
-                    .clone();
-                // Bind the signed operation to the committed manifest (identical
-                // discipline to the native invoke): a call cannot under- or
-                // mis-declare what it touches.
-                if *namespace != manifest.namespace {
-                    return Err(ChainError::ContractNamespaceMismatch);
-                }
-                if declared_keys.as_slice() != manifest.footprint.as_slice() {
-                    return Err(ChainError::ContractFootprintMismatch);
-                }
-                // Load the immutable module bytes (committed under the same module
-                // key) and run them on the deterministic engine through the SAME
-                // shared discipline as the native path.
-                let code = self
-                    .wasm_code
-                    .get(code_id)
-                    .ok_or(ChainError::ContractNotFound)?
-                    .clone();
-                let handler = WasmContract::new(&code.0);
-                let (output, gas_consumed) = self.run_contract_call(
-                    ContractCall {
-                        namespace: manifest.namespace,
-                        footprint: &manifest.footprint,
-                        handler: &handler,
+                self.apply_native_invoke_wasm_contract(
+                    tx.sender,
+                    NativeContractInvocation::new(
+                        *code_id,
+                        *namespace,
+                        declared_keys,
                         input,
-                        admission_units: units,
-                        gas_limit: tx.fee.gas_limit,
-                    },
-                    &mut access,
+                        units,
+                        tx.fee.gas_limit,
+                    ),
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::WasmContractInvoked {
-                    code_id: *code_id,
-                    namespace: *namespace,
-                    caller: tx.sender,
-                    gas_consumed,
-                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
-                });
             }
         }
 
@@ -6831,6 +6744,191 @@ impl ChainState {
             return Err(ChainError::DexOrderNotOwner);
         }
         order.cancel_requested = true;
+        Ok(())
+    }
+
+    /// Registers one audited built-in contract and burns the configured fee.
+    pub(crate) fn apply_native_register_contract(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        manifest: &ContractManifest,
+        config: &ContractRuntimeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::ContractRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::module(manifest.code_id))?;
+        manifest.validate(sender)?;
+        // Native and WASM modules share the same state-key namespace. Check both
+        // registries in both directions so one logical key can never resolve to
+        // two handlers after a sparse overlay commit.
+        if self.contracts.contains_key(&manifest.code_id)
+            || self.wasm_contracts.contains_key(&manifest.code_id)
+        {
+            return Err(ChainError::ContractAlreadyExists);
+        }
+        self.debit_native(sender, config.registration_fee)?;
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(config.registration_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.contracts.insert(manifest.code_id, manifest.clone());
+        events.push(Event::ContractRegistered {
+            code_id: manifest.code_id,
+            namespace: manifest.namespace,
+            owner: sender,
+            builtin: manifest.builtin,
+            fee_burned: config.registration_fee,
+        });
+        Ok(())
+    }
+
+    /// Invokes one registered built-in contract through the shared gas/access core.
+    pub(crate) fn apply_native_invoke_contract(
+        &mut self,
+        sender: Address,
+        invocation: NativeContractInvocation<'_>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if invocation.input.len() > MAX_CONTRACT_INPUT_BYTES {
+            return Err(ChainError::ContractInputTooLarge {
+                actual: invocation.input.len(),
+                maximum: MAX_CONTRACT_INPUT_BYTES,
+            });
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::module(invocation.code_id))?;
+        let manifest = self
+            .contracts
+            .get(&invocation.code_id)
+            .ok_or(ChainError::ContractNotFound)?
+            .clone();
+        if invocation.namespace != manifest.namespace {
+            return Err(ChainError::ContractNamespaceMismatch);
+        }
+        if invocation.declared_keys != manifest.footprint.as_slice() {
+            return Err(ChainError::ContractFootprintMismatch);
+        }
+        let handler = builtin_contract(manifest.builtin);
+        let (output, gas_consumed) = self.run_contract_call(
+            ContractCall {
+                namespace: manifest.namespace,
+                footprint: &manifest.footprint,
+                handler,
+                input: invocation.input,
+                admission_units: invocation.admission_units,
+                gas_limit: invocation.gas_limit,
+            },
+            access,
+        )?;
+        let output_len = u64::try_from(output.len()).map_err(|_| ChainError::ArithmeticOverflow)?;
+        events.push(Event::ContractInvoked {
+            code_id: invocation.code_id,
+            namespace: invocation.namespace,
+            caller: sender,
+            gas_consumed,
+            output_len,
+        });
+        Ok(())
+    }
+
+    /// Registers one deterministic WASM module and burns the configured fee.
+    pub(crate) fn apply_native_register_wasm_contract(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        manifest: &WasmContractManifest,
+        code: &WasmBytecode,
+        config: &ContractRuntimeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::ContractRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::module(manifest.code_id))?;
+        manifest.validate(sender, code)?;
+        if self.contracts.contains_key(&manifest.code_id)
+            || self.wasm_contracts.contains_key(&manifest.code_id)
+        {
+            return Err(ChainError::ContractAlreadyExists);
+        }
+        self.debit_native(sender, config.registration_fee)?;
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(config.registration_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.wasm_contracts
+            .insert(manifest.code_id, manifest.clone());
+        self.wasm_code.insert(manifest.code_id, code.clone());
+        let code_len = u64::try_from(code.len()).map_err(|_| ChainError::ArithmeticOverflow)?;
+        events.push(Event::WasmContractRegistered {
+            code_id: manifest.code_id,
+            namespace: manifest.namespace,
+            owner: sender,
+            code_hash: manifest.code_hash,
+            code_len,
+            fee_burned: config.registration_fee,
+        });
+        Ok(())
+    }
+
+    /// Invokes one stored WASM module through the shared gas/access core.
+    pub(crate) fn apply_native_invoke_wasm_contract(
+        &mut self,
+        sender: Address,
+        invocation: NativeContractInvocation<'_>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if invocation.input.len() > MAX_CONTRACT_INPUT_BYTES {
+            return Err(ChainError::ContractInputTooLarge {
+                actual: invocation.input.len(),
+                maximum: MAX_CONTRACT_INPUT_BYTES,
+            });
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::module(invocation.code_id))?;
+        let manifest = self
+            .wasm_contracts
+            .get(&invocation.code_id)
+            .ok_or(ChainError::ContractNotFound)?
+            .clone();
+        if invocation.namespace != manifest.namespace {
+            return Err(ChainError::ContractNamespaceMismatch);
+        }
+        if invocation.declared_keys != manifest.footprint.as_slice() {
+            return Err(ChainError::ContractFootprintMismatch);
+        }
+        let code = self
+            .wasm_code
+            .get(&invocation.code_id)
+            .ok_or(ChainError::ContractNotFound)?
+            .clone();
+        let handler = WasmContract::new(&code.0);
+        let (output, gas_consumed) = self.run_contract_call(
+            ContractCall {
+                namespace: manifest.namespace,
+                footprint: &manifest.footprint,
+                handler: &handler,
+                input: invocation.input,
+                admission_units: invocation.admission_units,
+                gas_limit: invocation.gas_limit,
+            },
+            access,
+        )?;
+        let output_len = u64::try_from(output.len()).map_err(|_| ChainError::ArithmeticOverflow)?;
+        events.push(Event::WasmContractInvoked {
+            code_id: invocation.code_id,
+            namespace: invocation.namespace,
+            caller: sender,
+            gas_consumed,
+            output_len,
+        });
         Ok(())
     }
 
@@ -17802,6 +17900,36 @@ mod tests {
                 1,
                 wasm_manifest(code_id, namespace, alice.address(), &code),
                 code.clone(),
+            ),
+            Err(ChainError::ContractAlreadyExists)
+        ));
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn register_native_rejects_an_existing_wasm_code_id() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc1; 32]);
+        let namespace = Hash256([0x12; 32]);
+        let code = store_and_echo_module();
+
+        register_wasm(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            wasm_manifest(code_id, namespace, alice.address(), &code),
+            code,
+        )
+        .expect("register wasm first");
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_kv(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                kv_manifest(code_id, namespace, alice.address()),
             ),
             Err(ChainError::ContractAlreadyExists)
         ));

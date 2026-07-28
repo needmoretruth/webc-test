@@ -554,7 +554,7 @@ impl From<ContractError> for ChainError {
                 ChainError::ContractStateValueTooLarge { actual, maximum }
             }
             ContractError::InvalidInput => ChainError::ContractInvalidInput,
-            ContractError::ArithmeticOverflow => ChainError::ArithmeticOverflow,
+            ContractError::ArithmeticOverflow => ChainError::ContractArithmeticOverflow,
             ContractError::WasmTrap => ChainError::ContractWasmTrap,
             ContractError::WasmInvalidModule => ChainError::ContractWasmInvalidModule,
             ContractError::WasmOutputTooLarge => ChainError::ContractWasmOutputTooLarge,
