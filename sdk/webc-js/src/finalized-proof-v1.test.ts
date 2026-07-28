@@ -90,6 +90,43 @@ describe("finalized transaction proof V1", () => {
     });
   });
 
+  it("bounds deep receipt and non-receipt proof data before recursive canonicalization", async () => {
+    const checkpoint = await validateCheckpointV1(
+      fixture.checkpoint_candidate,
+      checkpointRequirements,
+    );
+    let nested: unknown = null;
+    for (let depth = 0; depth < 20_000; depth += 1) nested = { child: nested };
+
+    const deepReceipt = structuredClone(fixture.proof);
+    deepReceipt.receipt.events = [{
+      version: 1,
+      transaction_id: deepReceipt.receipt.transaction_id,
+      action_index: 0,
+      event_index: 0,
+      body: { Transfer: nested },
+    }];
+    const deepHeader = structuredClone(fixture.proof) as unknown as {
+      target_header: { chain_id: unknown };
+    };
+    deepHeader.target_header.chain_id = nested;
+
+    for (const hostile of [deepReceipt, deepHeader]) {
+      try {
+        await verifyFinalizedTransactionProofV1(
+          hostile,
+          checkpoint,
+          proofRequirements,
+        );
+        throw new Error("hostile deep proof unexpectedly verified");
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error);
+        expect(error).not.toBeInstanceOf(RangeError);
+        expect((error as Error).message).toMatch(/JSON depth limit/u);
+      }
+    }
+  });
+
   it("rejects transaction, receipt, path, certificate, and transition tampering", async () => {
     const checkpoint = await validateCheckpointV1(
       fixture.checkpoint_candidate,
