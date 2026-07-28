@@ -14,10 +14,12 @@
 //! parent; undeclared access, arithmetic faults, and unsupported actions discard
 //! everything as block errors.
 
+use crate::namespace::namespace_state_key_hash;
 use crate::sponsor_grant_book::SponsorGrantBookError;
+use crate::sponsorship::sponsor_state_key_hash;
 use crate::state::{
-    NativeAccountControlContext, NativeActionEffects, NativeObjectMutation,
-    NativeValidatorRegistration,
+    NativeAccountControlContext, NativeActionEffects, NativeApplicationContext,
+    NativeBridgeContext, NativeObjectMutation, NativeValidatorRegistration,
 };
 use crate::state_key::StateAccessRecorder;
 use crate::unbonding::{
@@ -30,10 +32,9 @@ use crate::{
     ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate,
     GasUnits, Nonce, ObjectId, Operation, PostQuantumRoot, ProtocolStateKey, ReceiptError,
     ReceiptStatusV1, ReceiptV1, SessionKey, SessionKeyConfig, SessionKeyId, SponsorGrantId,
-    SponsorGrantStateV1, StakingActionV1, StakingConfig, StateKey, StateKeyKind, StoragePricing,
-    TransactionKindV1, TransactionV5, TransactionValidationErrorV1, EVENT_V1,
-    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1,
-    SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+    SponsorGrantStateV1, StakingActionV1, StakingConfig, StateKey, StateKeyKind, TransactionKindV1,
+    TransactionV5, TransactionValidationErrorV1, EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION,
+    MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1, SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
@@ -168,11 +169,11 @@ struct PreparationSnapshotV1 {
     base_fee_per_unit: FeeRate,
     effective_priority_fee_per_unit: FeeRate,
     authorization: PreparedAuthorizationV1,
-    storage_pricing: StoragePricing,
-    /// Exact staking thresholds used by native compounding and staking controls.
-    staking: StakingConfig,
-    /// Exact session-key limits used by native key-management actions.
-    session_keys: SessionKeyConfig,
+    /// Complete immutable genesis configuration used by native transitions.
+    ///
+    /// Keeping one value avoids adding a stale-preparation hole whenever a newly
+    /// supported operation consumes another configuration section.
+    config: ChainConfig,
     /// Current installed root verified during preparation, absent otherwise.
     staking_root: Option<PostQuantumRoot>,
 }
@@ -244,7 +245,7 @@ enum ExecutionWriteKeyV1 {
     SlashingEvidence(Hash256),
     UnbondingQueue,
     Object(ObjectId),
-    Application,
+    Application(Hash256, Hash256),
     ProtocolBridgeNonce,
     SponsorGrant(Address, SponsorGrantId),
 }
@@ -266,6 +267,7 @@ struct SparseExecutionStateV1 {
     captured_burned_fees: Amount,
     captured_validator_fee_pool: Amount,
     captured_storage_deposits: Amount,
+    captured_sponsor_budgets: Amount,
 }
 
 impl SparseExecutionStateV1 {
@@ -284,6 +286,7 @@ impl SparseExecutionStateV1 {
             slashed_units: base.slashed_units,
             validator_fee_pool: base.validator_fee_pool,
             storage_deposits: base.storage_deposits,
+            sponsor_budgets: base.sponsor_budgets,
             minted_supply: base.minted_supply,
             inflation_year_start_supply: base.inflation_year_start_supply,
             current_base_fee_per_unit: base.current_base_fee_per_unit,
@@ -314,6 +317,7 @@ impl SparseExecutionStateV1 {
             captured_burned_fees: base.burned_fees,
             captured_validator_fee_pool: base.validator_fee_pool,
             captured_storage_deposits: base.storage_deposits,
+            captured_sponsor_budgets: base.sponsor_budgets,
         })
     }
 
@@ -340,6 +344,9 @@ impl SparseExecutionStateV1 {
         let storage_deposit_delta =
             AmountDeltaV1::between(self.state.storage_deposits, self.captured_storage_deposits)?;
         let merged_storage_deposits = storage_deposit_delta.apply(base.storage_deposits)?;
+        let sponsor_budget_delta =
+            AmountDeltaV1::between(self.state.sponsor_budgets, self.captured_sponsor_budgets)?;
+        let merged_sponsor_budgets = sponsor_budget_delta.apply(base.sponsor_budgets)?;
         let sponsor_keys = self
             .writes
             .iter()
@@ -421,7 +428,9 @@ impl SparseExecutionStateV1 {
                 ExecutionWriteKeyV1::Object(object_id) => {
                     commit_map_entry(&mut base.objects, &mut self.state.objects, object_id);
                 }
-                ExecutionWriteKeyV1::Application => {}
+                ExecutionWriteKeyV1::Application(namespace, key_hash) => {
+                    commit_application_entry(base, &mut self.state, namespace, key_hash);
+                }
                 ExecutionWriteKeyV1::ProtocolBridgeNonce => {
                     base.bridge_nonce = self.state.bridge_nonce;
                 }
@@ -431,6 +440,7 @@ impl SparseExecutionStateV1 {
         base.burned_fees = merged_burned_fees;
         base.validator_fee_pool = merged_validator_fee_pool;
         base.storage_deposits = merged_storage_deposits;
+        base.sponsor_budgets = merged_sponsor_budgets;
         Ok(())
     }
 }
@@ -508,7 +518,10 @@ fn capture_state_key(
                 (*sponsor, SponsorGrantId::new(*grant_id)),
             )
             .map_err(map_sponsor_book_execution_error)?,
-        StateKeyKind::Application { .. } => {}
+        StateKeyKind::Application {
+            namespace,
+            key_hash,
+        } => capture_application_entry(base, target, *namespace, *key_hash),
         StateKeyKind::OracleFeed { .. }
         | StateKeyKind::OracleReporter { .. }
         | StateKeyKind::DexOrder { .. }
@@ -563,7 +576,10 @@ fn execution_write_key(key: &StateKey) -> Result<ExecutionWriteKeyV1, BlockExecu
         }
         StateKeyKind::UnbondingQueue { .. } => Ok(ExecutionWriteKeyV1::UnbondingQueue),
         StateKeyKind::Object { object_id } => Ok(ExecutionWriteKeyV1::Object(*object_id)),
-        StateKeyKind::Application { .. } => Ok(ExecutionWriteKeyV1::Application),
+        StateKeyKind::Application {
+            namespace,
+            key_hash,
+        } => Ok(ExecutionWriteKeyV1::Application(*namespace, *key_hash)),
         StateKeyKind::Protocol {
             field: ProtocolStateKey::BridgeNonce,
         } => Ok(ExecutionWriteKeyV1::ProtocolBridgeNonce),
@@ -588,6 +604,46 @@ fn execution_write_key(key: &StateKey) -> Result<ExecutionWriteKeyV1, BlockExecu
         | StateKeyKind::GovernanceProposal { .. }
         | StateKeyKind::GovernanceVote { .. }
         | StateKeyKind::Module { .. } => Err(BlockExecutionErrorV1::StateAccessInvariant),
+    }
+}
+
+/// Captures the concrete record selected by one namespaced application key.
+fn capture_application_entry(
+    base: &ChainState,
+    target: &mut ChainState,
+    namespace: Hash256,
+    key_hash: Hash256,
+) {
+    if key_hash == sponsor_state_key_hash() {
+        capture_map_entry(&base.sponsors, &mut target.sponsors, &namespace);
+    } else if key_hash == namespace_state_key_hash() {
+        capture_map_entry(&base.namespaces, &mut target.namespaces, &namespace);
+    } else {
+        capture_map_entry(
+            &base.contract_state,
+            &mut target.contract_state,
+            &(namespace, key_hash),
+        );
+    }
+}
+
+/// Commits only the concrete application record named by the signed key.
+fn commit_application_entry(
+    base: &mut ChainState,
+    target: &mut ChainState,
+    namespace: Hash256,
+    key_hash: Hash256,
+) {
+    if key_hash == sponsor_state_key_hash() {
+        commit_map_entry(&mut base.sponsors, &mut target.sponsors, namespace);
+    } else if key_hash == namespace_state_key_hash() {
+        commit_map_entry(&mut base.namespaces, &mut target.namespaces, namespace);
+    } else {
+        commit_map_entry(
+            &mut base.contract_state,
+            &mut target.contract_state,
+            (namespace, key_hash),
+        );
     }
 }
 
@@ -894,9 +950,7 @@ impl ChainState {
                 transaction.fee_bid.priority_fee_per_unit.min(priority_room),
             ),
             authorization,
-            storage_pricing: config.storage_pricing,
-            staking: config.staking.clone(),
-            session_keys: config.session_keys.clone(),
+            config: config.clone(),
             staking_root,
         })
     }
@@ -923,7 +977,9 @@ impl ChainState {
                 .authorization_policies
                 .get(&prepared.validated.transaction().sender)
                 .map(|policy| *policy.post_quantum_root());
-            if prepared.snapshot.staking != config.staking || current_root != Some(expected_root) {
+            if prepared.snapshot.config.staking != config.staking
+                || current_root != Some(expected_root)
+            {
                 return Err(BlockExecutionErrorV1::StalePreparation);
             }
         }
@@ -961,6 +1017,7 @@ impl ChainState {
             captured_burned_fees,
             captured_validator_fee_pool,
             captured_storage_deposits,
+            captured_sponsor_budgets,
         } = SparseExecutionStateV1::capture(
             self,
             &transaction.access_list.read_only,
@@ -996,11 +1053,9 @@ impl ChainState {
                     transaction_id,
                     program,
                     height: position.height,
-                    storage_pricing: snapshot.storage_pricing,
                     chain_id: &transaction.chain_id,
                     signed_nonce: transaction.authorization.nonce,
-                    staking: &snapshot.staking,
-                    session_keys: &snapshot.session_keys,
+                    config: &snapshot.config,
                 },
                 &mut access,
             )?,
@@ -1057,6 +1112,7 @@ impl ChainState {
             captured_burned_fees,
             captured_validator_fee_pool,
             captured_storage_deposits,
+            captured_sponsor_budgets,
         }
         .commit(self)?;
         Ok(ExecutedTransactionV1 { receipt })
@@ -1152,12 +1208,11 @@ enum NativeActionExecutionErrorV1 {
 struct NativeActionContextV1<'a> {
     sender: Address,
     sender_public_key: PublicKeyBytes,
+    source_transaction: Hash256,
     authorization_lane: AuthorizationLaneId,
     chain_id: &'a ChainId,
     signed_nonce: Nonce,
-    storage_pricing: StoragePricing,
-    staking: &'a StakingConfig,
-    session_keys: &'a SessionKeyConfig,
+    config: &'a ChainConfig,
 }
 
 /// Executes one supported native action without owning fee or rollback policy.
@@ -1217,7 +1272,7 @@ fn execute_native_action_v1(
             *session_public_key,
             constraints,
             post_quantum_root_reveal,
-            context.session_keys,
+            &context.config.session_keys,
         ),
         Operation::RevokeSessionKey {
             session_key,
@@ -1277,17 +1332,81 @@ fn execute_native_action_v1(
             unbonding_claims,
             effects,
         ),
-        Operation::CompoundValidatorRewards => {
-            state.apply_native_compound_validator_rewards(context.sender, context.staking, effects)
-        }
+        Operation::CompoundValidatorRewards => state.apply_native_compound_validator_rewards(
+            context.sender,
+            &context.config.staking,
+            effects,
+        ),
         Operation::CompoundDelegatorRewards { validator } => state
             .apply_native_compound_delegator_rewards(
                 context.sender,
                 *validator,
-                context.staking,
+                &context.config.staking,
                 Some(unbonding_requests),
                 effects,
             ),
+        Operation::BridgeLock {
+            asset,
+            destination_chain,
+            recipient,
+            amount,
+        } => state.apply_native_bridge_lock(
+            NativeBridgeContext::new(context.sender, context.source_transaction, effects),
+            asset,
+            destination_chain,
+            recipient,
+            *amount,
+        ),
+        Operation::BridgeBurn {
+            asset,
+            destination_chain,
+            recipient,
+            amount,
+        } => state.apply_native_bridge_burn(
+            NativeBridgeContext::new(context.sender, context.source_transaction, effects),
+            asset,
+            destination_chain,
+            recipient,
+            *amount,
+        ),
+        Operation::BridgeMint { message } => {
+            state.apply_native_bridge_mint(context.sender, message, &context.config.bridge, effects)
+        }
+        Operation::BridgeRelease { message } => state.apply_native_bridge_release(
+            context.sender,
+            message,
+            &context.config.bridge,
+            effects,
+        ),
+        Operation::RegisterAppSponsor {
+            namespace,
+            daily_budget_cap,
+            initial_funding,
+        } => state.apply_native_register_app_sponsor(
+            NativeApplicationContext::new(context.sender, context.authorization_lane, effects),
+            *namespace,
+            *daily_budget_cap,
+            *initial_funding,
+            &context.config.sponsorship,
+        ),
+        Operation::FundAppSponsor { namespace, amount } => state.apply_native_fund_app_sponsor(
+            NativeApplicationContext::new(context.sender, context.authorization_lane, effects),
+            *namespace,
+            *amount,
+        ),
+        Operation::WithdrawAppSponsor { namespace, amount } => state
+            .apply_native_withdraw_app_sponsor(
+                NativeApplicationContext::new(context.sender, context.authorization_lane, effects),
+                *namespace,
+                *amount,
+            ),
+        Operation::RegisterNamespace { namespace } => {
+            state.apply_native_register_namespace(context.sender, *namespace, effects)
+        }
+        Operation::TransferNamespace {
+            namespace,
+            new_owner,
+        } => state.apply_native_transfer_namespace(context.sender, *namespace, *new_owner, effects),
         Operation::CreateObject {
             object_id,
             namespace,
@@ -1297,7 +1416,7 @@ fn execute_native_action_v1(
             *object_id,
             *namespace,
             data,
-            context.storage_pricing,
+            context.config.storage_pricing,
             effects,
         ),
         Operation::MutateObject {
@@ -1308,7 +1427,7 @@ fn execute_native_action_v1(
         } => state.apply_native_object_mutation(
             context.sender,
             NativeObjectMutation::new(*object_id, *namespace, *expected_version, data),
-            context.storage_pricing,
+            context.config.storage_pricing,
             effects,
         ),
         Operation::TransferObject {
@@ -1333,7 +1452,7 @@ fn execute_native_action_v1(
             *object_id,
             *namespace,
             *expected_version,
-            context.storage_pricing,
+            context.config.storage_pricing,
             effects,
         ),
         _ => return Err(NativeActionExecutionErrorV1::Unsupported),
@@ -1531,11 +1650,9 @@ struct ActionProgramContextV1<'a> {
     transaction_id: crate::TransactionId,
     program: &'a crate::ActionProgramV1,
     height: BlockHeight,
-    storage_pricing: StoragePricing,
     chain_id: &'a ChainId,
     signed_nonce: Nonce,
-    staking: &'a StakingConfig,
-    session_keys: &'a SessionKeyConfig,
+    config: &'a ChainConfig,
 }
 
 /// Complete child-overlay result selected for fee and sparse-state commit.
@@ -1566,11 +1683,9 @@ fn execute_action_program_v1(
         transaction_id,
         program,
         height,
-        storage_pricing,
         chain_id,
         signed_nonce,
-        staking,
-        session_keys,
+        config,
     } = context;
     let mut child = parent.clone();
     let mut child_unbonding_claims = parent_unbonding_claims.clone();
@@ -1598,12 +1713,11 @@ fn execute_action_program_v1(
                 NativeActionContextV1 {
                     sender: transaction.sender,
                     sender_public_key: transaction.sender_public_key,
+                    source_transaction: transaction_id.digest(),
                     authorization_lane: transaction.authorization.lane,
                     chain_id,
                     signed_nonce,
-                    storage_pricing,
-                    staking,
-                    session_keys,
+                    config,
                 },
                 operation,
                 access,
@@ -1619,7 +1733,7 @@ fn execute_action_program_v1(
                 &mut child,
                 &mut child_unbonding_requests,
                 transaction.sender,
-                staking,
+                &config.staking,
                 action,
                 access,
                 &mut action_events,
@@ -1765,6 +1879,23 @@ fn classify_action_failure(
         | ChainError::AuthorizationLaneNotFound
         | ChainError::SessionKeyAlreadyExists
         | ChainError::SessionKeyNotFound
+        | ChainError::UnauthorizedBridgeRelayer
+        | ChainError::BridgeReplay
+        | ChainError::BridgeDestinationMismatch
+        | ChainError::InvalidBridgeRecipient
+        | ChainError::BridgeAmountZero
+        | ChainError::InvalidBridgeAssetFlow
+        | ChainError::BridgeSourceMismatch
+        | ChainError::InsufficientBridgeEscrow { .. }
+        | ChainError::AppSponsorAlreadyExists
+        | ChainError::AppSponsorNotFound
+        | ChainError::AppSponsorNotOwner
+        | ChainError::AppSponsorDailyCapTooHigh
+        | ChainError::AppSponsorBudgetInsufficient { .. }
+        | ChainError::SponsorshipRequiresDefaultLane
+        | ChainError::NamespaceAlreadyRegistered
+        | ChainError::NamespaceNotFound
+        | ChainError::NamespaceNotOwner
         | ChainError::ValidatorAlreadyExists(_)
         | ChainError::ValidatorNotFound(_)
         | ChainError::ValidatorNotActive(_)
@@ -2468,11 +2599,11 @@ mod tests {
     use super::*;
     use crate::{
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
-        AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Delegation,
-        Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectVersion, Operation, PostQuantumRoot,
-        PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations,
+        AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, BridgeMessage, ChainState,
+        Delegation, Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectVersion, Operation,
+        PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations,
         SessionKeyAuthorizationAction, SessionKeyConstraints, SponsorGrantId, SponsorGrantV1,
-        SponsorUseCount, SponsorUseNonce, SponsorUseV1, StakingActionV1,
+        SponsorUseCount, SponsorUseNonce, SponsorUseV1, StakingActionV1, StoragePricing,
         TransactionAuthorizationV1, TransactionIndex, UnbondingKind, UnbondingRequestId, Validator,
         ValidatorStatus, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
         MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1, REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
@@ -4292,6 +4423,177 @@ mod tests {
         let restored: ChainState =
             bincode::deserialize(&bincode::serialize(&state).expect("serialize compounded state"))
                 .expect("restore compounded state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("live root")
+        );
+    }
+
+    #[test]
+    fn native_application_registry_actions_commit_sparse_state_and_restart_root() {
+        let sender = Keypair::from_seed([1; 32]);
+        let recipient = Keypair::from_seed([2; 32]);
+        let namespace = Hash256([0x61; 32]);
+        let actions = vec![
+            ActionV1::native(Operation::RegisterAppSponsor {
+                namespace,
+                daily_budget_cap: Amount::from_units(1_000),
+                initial_funding: Amount::from_units(100),
+            }),
+            ActionV1::native(Operation::FundAppSponsor {
+                namespace,
+                amount: Amount::from_units(50),
+            }),
+            ActionV1::native(Operation::WithdrawAppSponsor {
+                namespace,
+                amount: Amount::from_units(30),
+            }),
+            ActionV1::native(Operation::RegisterNamespace { namespace }),
+            ActionV1::native(Operation::TransferNamespace {
+                namespace,
+                new_owner: recipient.address(),
+            }),
+        ];
+        let gas_limit = actions.iter().map(ActionV1::required_units).sum::<u64>();
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(1_000_000);
+        state.minted_supply = Amount::from_units(1_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared(&state, transaction),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
+            )
+            .expect("application sponsor and namespace actions execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 5);
+        assert_eq!(state.sponsors[&namespace].budget, Amount::from_units(120));
+        assert_eq!(state.sponsor_budgets, Amount::from_units(120));
+        assert_eq!(state.namespaces[&namespace].owner, recipient.address());
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("application registry supply report")
+                .balanced
+        );
+        let restored: ChainState = bincode::deserialize(
+            &bincode::serialize(&state).expect("serialize application registry state"),
+        )
+        .expect("restore application registry state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("live root")
+        );
+    }
+
+    #[test]
+    fn native_bridge_round_trip_preserves_supply_and_replay_state_across_restart() {
+        let relayer = Keypair::from_seed([1; 32]);
+        let external_asset = AssetId::External {
+            origin_chain: ExternalChain::Ethereum,
+            symbol: "TEST".to_owned(),
+            contract_or_mint: "0x01".to_owned(),
+        };
+        let release = BridgeMessage {
+            source_chain: ExternalChain::Ethereum,
+            destination_chain: ExternalChain::Webc,
+            nonce: 7,
+            asset: AssetId::NativeWebc,
+            sender: vec![0x11; 20],
+            recipient: relayer.address().as_bytes().to_vec(),
+            amount: Amount::from_units(40),
+            source_tx: Hash256([0x62; 32]),
+        };
+        let mint = BridgeMessage {
+            source_chain: ExternalChain::Ethereum,
+            destination_chain: ExternalChain::Webc,
+            nonce: 8,
+            asset: external_asset.clone(),
+            sender: vec![0x22; 20],
+            recipient: relayer.address().as_bytes().to_vec(),
+            amount: Amount::from_units(50),
+            source_tx: Hash256([0x63; 32]),
+        };
+        let actions = vec![
+            ActionV1::native(Operation::BridgeLock {
+                asset: AssetId::NativeWebc,
+                destination_chain: ExternalChain::Ethereum,
+                recipient: vec![0x33; 20],
+                amount: Amount::from_units(100),
+            }),
+            ActionV1::native(Operation::BridgeRelease {
+                message: release.clone(),
+            }),
+            ActionV1::native(Operation::BridgeMint {
+                message: mint.clone(),
+            }),
+            ActionV1::native(Operation::BridgeBurn {
+                asset: external_asset.clone(),
+                destination_chain: ExternalChain::Ethereum,
+                recipient: vec![0x44; 20],
+                amount: Amount::from_units(20),
+            }),
+        ];
+        let gas_limit = actions.iter().map(ActionV1::required_units).sum::<u64>();
+        let transaction = sender_actions_fixture(&relayer, actions, gas_limit);
+        let mut config = v5_config();
+        config.bridge.incoming_messages_enabled = true;
+        config.bridge.trusted_relayers = vec![relayer.address()];
+        let mut state = funded_state(&relayer, None);
+        state
+            .accounts
+            .get_mut(&relayer.address())
+            .expect("relayer account")
+            .balance = Amount::from_units(2_000_000);
+        state.minted_supply = Amount::from_units(2_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, transaction, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("all four native bridge actions execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 4);
+        assert_eq!(state.bridge_nonce, 2);
+        assert_eq!(
+            state.native_bridge_escrow[&ExternalChain::Ethereum],
+            Amount::from_units(60)
+        );
+        assert_eq!(
+            state.asset_balances[&(external_asset, relayer.address())],
+            Amount::from_units(30)
+        );
+        assert!(state
+            .processed_bridge_messages
+            .contains(&release.hash().expect("release hash")));
+        assert!(state
+            .processed_bridge_messages
+            .contains(&mint.hash().expect("mint hash")));
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("bridge supply report")
+                .balanced
+        );
+        let restored: ChainState =
+            bincode::deserialize(&bincode::serialize(&state).expect("serialize bridge state"))
+                .expect("restore bridge state");
         assert_eq!(restored, state);
         assert_eq!(
             restored.state_root().expect("restored root"),

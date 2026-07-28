@@ -624,6 +624,15 @@ impl ActionV1 {
                         | Operation::ClaimDelegatorRewards { .. }
                         | Operation::CompoundValidatorRewards
                         | Operation::CompoundDelegatorRewards { .. }
+                        | Operation::BridgeLock { .. }
+                        | Operation::BridgeBurn { .. }
+                        | Operation::BridgeMint { .. }
+                        | Operation::BridgeRelease { .. }
+                        | Operation::RegisterAppSponsor { .. }
+                        | Operation::FundAppSponsor { .. }
+                        | Operation::WithdrawAppSponsor { .. }
+                        | Operation::RegisterNamespace { .. }
+                        | Operation::TransferNamespace { .. }
                         | Operation::ClaimUnbonded { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
@@ -1886,8 +1895,8 @@ mod fee_bid_decimal {
 mod tests {
     use super::*;
     use crate::{
-        ObjectId, ObjectVersion, Operation, PostQuantumRoot, PostQuantumRootReveal,
-        PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
+        AssetId, BridgeMessage, ExternalChain, ObjectId, ObjectVersion, Operation, PostQuantumRoot,
+        PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
     };
 
     #[test]
@@ -1930,6 +1939,66 @@ mod tests {
             Operation::CompoundValidatorRewards,
             Operation::CompoundDelegatorRewards {
                 validator: Keypair::from_seed([42; 32]).address(),
+            },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_bridge_sponsor_and_namespace_operations() {
+        let external = AssetId::External {
+            origin_chain: ExternalChain::Ethereum,
+            symbol: "TEST".to_owned(),
+            contract_or_mint: "0x01".to_owned(),
+        };
+        let message = BridgeMessage {
+            source_chain: ExternalChain::Ethereum,
+            destination_chain: ExternalChain::Webc,
+            nonce: 1,
+            asset: external.clone(),
+            sender: vec![1],
+            recipient: vec![2; 32],
+            amount: Amount::from_units(1),
+            source_tx: Hash256([4; 32]),
+        };
+        let namespace = Hash256([5; 32]);
+        let operations = [
+            Operation::BridgeLock {
+                asset: AssetId::NativeWebc,
+                destination_chain: ExternalChain::Ethereum,
+                recipient: vec![1],
+                amount: Amount::from_units(1),
+            },
+            Operation::BridgeBurn {
+                asset: external,
+                destination_chain: ExternalChain::Ethereum,
+                recipient: vec![1],
+                amount: Amount::from_units(1),
+            },
+            Operation::BridgeMint {
+                message: message.clone(),
+            },
+            Operation::BridgeRelease { message },
+            Operation::RegisterAppSponsor {
+                namespace,
+                daily_budget_cap: Amount::from_units(10),
+                initial_funding: Amount::from_units(1),
+            },
+            Operation::FundAppSponsor {
+                namespace,
+                amount: Amount::from_units(1),
+            },
+            Operation::WithdrawAppSponsor {
+                namespace,
+                amount: Amount::from_units(1),
+            },
+            Operation::RegisterNamespace { namespace },
+            Operation::TransferNamespace {
+                namespace,
+                new_owner: Keypair::from_seed([43; 32]).address(),
             },
         ];
 
