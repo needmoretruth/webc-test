@@ -14,6 +14,7 @@
  */
 
 import { blockHeaderV4HashHex } from "./block.js";
+import { boundedJsonSnapshot } from "./bounded-json.js";
 import { canonicalJson } from "./canonical.js";
 import {
   checkpointNextAnchorV1,
@@ -70,6 +71,9 @@ export const MAX_AUTHORITY_TRANSITIONS_V1 = 64;
 export const MAX_FINALIZED_TRANSACTION_PROOF_V1_JSON_BYTES = 16 * 1024 * 1024;
 /** Maximum response bytes for the 16 MiB proof plus 8 MiB checkpoint. */
 export const MAX_FINALIZED_PROOF_BUNDLE_V1_JSON_BYTES = 24 * 1024 * 1024 + 1024;
+
+const MAX_FINALIZED_PROOF_JSON_DEPTH_V1 = 20;
+const MAX_FINALIZED_PROOF_JSON_NODES_V1 = 500_000;
 
 /** Exact Rust finalized transaction proof JSON shape. */
 export interface FinalizedTransactionProofV1Json {
@@ -143,12 +147,11 @@ export async function verifyFinalizedTransactionProofV1(
   requirements: FinalizedTransactionProofRequirementsV1,
 ): Promise<VerifiedFinalizedTransactionV1> {
   validateProofRequirements(requirements);
-  validateFinalizedProofCollectionBounds(value);
-  const proof = proofRecord(value, "finalized transaction proof");
-  proofExactKeys(proof, [
-    "version", "authority_transitions", "target_header", "target_certificate",
-    "target_authority_set", "transaction", "receipt", "transaction_proof", "receipt_proof",
-  ], "finalized transaction proof");
+  const proof = finalizedProofSnapshot(value);
+  // Receipt validation owns its tighter depth/node/256 KiB ceilings. Run it
+  // before the proof's recursive canonicalizer so a hostile nested event can
+  // never reach that recursion boundary.
+  validateReceiptV1(proof.receipt);
   const canonical = canonicalJson(proof);
   if (new TextEncoder().encode(canonical).byteLength
       > MAX_FINALIZED_TRANSACTION_PROOF_V1_JSON_BYTES) {
@@ -164,7 +167,6 @@ export async function verifyFinalizedTransactionProofV1(
   if (typed.transaction.sender_signature === null) {
     throw new Error("finalized transaction is missing its sender signature");
   }
-  validateReceiptV1(typed.receipt);
   validateIndexedMerkleProofV1(typed.transaction_proof);
   validateIndexedMerkleProofV1(typed.receipt_proof);
 
@@ -275,6 +277,25 @@ async function verifyTargetAuthoritySetAndCertificate(
     proof.target_certificate,
     proof.target_authority_set,
   );
+}
+
+/** Detaches and structurally bounds a hostile proof before recursive hashing. */
+function finalizedProofSnapshot(value: unknown): FinalizedTransactionProofV1Json {
+  const snapshot = boundedJsonSnapshot(value, {
+    label: "finalized transaction proof",
+    maxDepth: MAX_FINALIZED_PROOF_JSON_DEPTH_V1,
+    maxNodes: MAX_FINALIZED_PROOF_JSON_NODES_V1,
+    maxArrayLength: MAX_FINALITY_AUTHORITIES_V1,
+    maxStringBytes: MAX_FINALIZED_TRANSACTION_PROOF_V1_JSON_BYTES,
+    stringByteLimitLabel: "16 MiB",
+  });
+  validateFinalizedProofCollectionBounds(snapshot);
+  const proof = proofRecord(snapshot, "finalized transaction proof");
+  proofExactKeys(proof, [
+    "version", "authority_transitions", "target_header", "target_certificate",
+    "target_authority_set", "transaction", "receipt", "transaction_proof", "receipt_proof",
+  ], "finalized transaction proof");
+  return proof as unknown as FinalizedTransactionProofV1Json;
 }
 
 function validateFinalizedProofCollectionBounds(value: unknown): void {
