@@ -485,6 +485,7 @@ fn classify_runtime_error(
         | NodeRuntimeError::InvalidQueueCapacity
         | NodeRuntimeError::NoAsyncRuntime
         | NodeRuntimeError::HeightExhausted
+        | NodeRuntimeError::TooManySlashingEvidenceHashes
         | NodeRuntimeError::Storage(_)
         | NodeRuntimeError::Node(_)
         | NodeRuntimeError::Inconsistent(_) => (

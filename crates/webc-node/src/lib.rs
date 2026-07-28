@@ -23,6 +23,7 @@ pub mod http_v2;
 pub mod mempool;
 pub mod mempool_v1;
 pub mod node;
+mod pending_evidence_v1;
 pub mod run_v1;
 pub mod runtime_v1;
 pub mod service;

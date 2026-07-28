@@ -20,6 +20,7 @@
 //! and a failed durable write leaves memory unchanged. Local time affects only
 //! retention and never enters consensus state.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
@@ -34,6 +35,7 @@ use webc_storage::{
     MAX_PENDING_TRANSACTION_SCAN_V1,
 };
 
+use crate::pending_evidence_v1::MAX_PENDING_SLASHING_EVIDENCE_V1;
 use crate::{
     FinalizedTransactionProofBundleV1, Node, NodeError, V4FinalizationResult, V5InsertOutcome,
     V5Mempool, V5MempoolConfig, V5MempoolError,
@@ -118,6 +120,9 @@ pub enum NodeRuntimeError {
     /// A lifecycle snapshot request exceeded its fixed transaction-ID cap.
     #[error("protocol-2 lifecycle query exceeds the {MAX_V5_LIFECYCLE_QUERY_IDS}-ID limit")]
     TooManyLifecycleIds,
+    /// A consensus evidence-status request exceeded the driver's fixed pool cap.
+    #[error("protocol-2 evidence query exceeds the {MAX_PENDING_SLASHING_EVIDENCE_V1}-hash limit")]
+    TooManySlashingEvidenceHashes,
     /// Durable storage failed; the current in-memory mutation was not applied.
     #[error("protocol-2 runtime storage error: {0}")]
     Storage(#[from] StorageError),
@@ -314,6 +319,26 @@ impl NodeHandle {
         receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
     }
 
+    /// Returns the requested evidence hashes already present in durable chain state.
+    ///
+    /// The input is capped to the driver's complete fixed-capacity pool. This
+    /// avoids cloning the chain's monotonically growing processed-evidence set
+    /// into the consensus task on every height.
+    pub async fn processed_slashing_evidence_v1(
+        &self,
+        hashes: Vec<webc_crypto::Hash256>,
+    ) -> Result<BTreeSet<webc_crypto::Hash256>, NodeRuntimeError> {
+        if hashes.len() > MAX_PENDING_SLASHING_EVIDENCE_V1 {
+            return Err(NodeRuntimeError::TooManySlashingEvidenceHashes);
+        }
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ProcessedSlashingEvidenceV1 { hashes, response })
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
     /// Replays a received authenticated V4 proposal without committing it.
     pub async fn validate_candidate_v4(
         &self,
@@ -455,6 +480,10 @@ enum Command {
     },
     ConsensusContextV1 {
         response: oneshot::Sender<Result<ConsensusContextV1, NodeRuntimeError>>,
+    },
+    ProcessedSlashingEvidenceV1 {
+        hashes: Vec<webc_crypto::Hash256>,
+        response: oneshot::Sender<Result<BTreeSet<webc_crypto::Hash256>, NodeRuntimeError>>,
     },
     ValidateCandidateV4 {
         block: Box<BlockV4>,
@@ -669,6 +698,14 @@ where
                 Command::ConsensusContextV1 { response } => {
                     let result = self.consensus_context_v1();
                     let _response_canceled = response.send(result);
+                }
+                Command::ProcessedSlashingEvidenceV1 { hashes, response } => {
+                    let processed = &self.node.state().processed_slashing_evidence;
+                    let result = hashes
+                        .into_iter()
+                        .filter(|hash| processed.contains(hash))
+                        .collect();
+                    let _response_canceled = response.send(Ok(result));
                 }
                 Command::ValidateCandidateV4 {
                     block,
@@ -2133,6 +2170,22 @@ mod tests {
                 .submit(transfer(&alice, &bob, 1, 5), LocalTimestampMs::new(NOW + 1),)
                 .await,
             Err(NodeRuntimeError::QueueFull)
+        ));
+    }
+
+    #[tokio::test]
+    async fn processed_evidence_query_rejects_more_than_the_fixed_pool_bound() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (lifecycle_events, _) = broadcast::channel(1);
+        let handle = NodeHandle {
+            sender,
+            lifecycle_events,
+        };
+        let hashes = vec![webc_crypto::Hash256([0xA5; 32]); MAX_PENDING_SLASHING_EVIDENCE_V1 + 1];
+
+        assert!(matches!(
+            handle.processed_slashing_evidence_v1(hashes).await,
+            Err(NodeRuntimeError::TooManySlashingEvidenceHashes)
         ));
     }
 }
