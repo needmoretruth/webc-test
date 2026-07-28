@@ -561,3 +561,93 @@ async fn websocket_sends_unknown_snapshot_then_live_queued_snapshot() {
         .expect("runtime does not panic")
         .expect("runtime exits cleanly");
 }
+
+#[tokio::test]
+async fn websocket_initial_snapshots_are_sequence_ordered_not_request_ordered() {
+    let (handle, task, alice, bob) = runtime();
+    let first_transaction = transaction(&alice, &bob);
+    let first_id = first_transaction
+        .transaction_id()
+        .expect("first transaction has an ID");
+    handle
+        .submit(first_transaction, LocalTimestampMs::new(NOW))
+        .await
+        .expect("first transaction commits");
+
+    let mut second_transaction = transaction(&alice, &bob);
+    second_transaction.authorization.nonce = Nonce::new(1);
+    second_transaction
+        .sign(&alice)
+        .expect("second transaction signs");
+    let second_id = second_transaction
+        .transaction_id()
+        .expect("second transaction has an ID");
+    handle
+        .submit(second_transaction, LocalTimestampMs::new(NOW))
+        .await
+        .expect("second transaction commits");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener binds");
+    let address = listener.local_addr().expect("listener has an address");
+    let server = tokio::spawn(serve_v2(listener, V2AppState::new(handle.clone())));
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/v2/transactions/ws"))
+            .await
+            .expect("WebSocket connects");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "version": 1,
+                // A hostile or merely unordered client may name the newer ID first.
+                "transaction_ids": [second_id, first_id],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("subscription sends");
+
+    let mut snapshots = Vec::new();
+    for _ in 0..2 {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("every committed initial snapshot arrives")
+            .expect("socket remains open")
+            .expect("initial message is valid");
+        snapshots.push(
+            serde_json::from_str::<serde_json::Value>(message.to_text().expect("message is text"))
+                .expect("snapshot is JSON"),
+        );
+    }
+
+    assert_eq!(snapshots[0]["type"], "snapshot");
+    assert_eq!(snapshots[1]["type"], "snapshot");
+    assert_eq!(
+        snapshots[0]["lifecycle"]["transaction_id"],
+        first_id.to_string()
+    );
+    assert_eq!(
+        snapshots[1]["lifecycle"]["transaction_id"],
+        second_id.to_string()
+    );
+    let first_sequence = snapshots[0]["lifecycle"]["sequence"]
+        .as_str()
+        .expect("sequence is a decimal string")
+        .parse::<u64>()
+        .expect("sequence parses");
+    let second_sequence = snapshots[1]["lifecycle"]["sequence"]
+        .as_str()
+        .expect("sequence is a decimal string")
+        .parse::<u64>()
+        .expect("sequence parses");
+    assert!(first_sequence < second_sequence);
+
+    drop(socket);
+    server.abort();
+    handle.shutdown().await.expect("runtime shuts down");
+    task.await
+        .expect("runtime does not panic")
+        .expect("runtime exits cleanly");
+}

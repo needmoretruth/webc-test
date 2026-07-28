@@ -1018,19 +1018,33 @@ async fn stream_transaction_lifecycle(mut socket: WebSocket, state: V2AppState) 
     let mut last_sequence = subscription
         .after_sequence
         .map_or(0, LifecycleSequence::get);
-    for (transaction_id, lifecycle) in subscription.transaction_ids.iter().copied().zip(snapshots) {
-        let response = V2LifecycleResponse::project(transaction_id, lifecycle);
+    let mut initial_responses = subscription
+        .transaction_ids
+        .iter()
+        .copied()
+        .zip(snapshots)
+        .map(|(transaction_id, lifecycle)| V2LifecycleResponse::project(transaction_id, lifecycle))
+        .filter(|response| {
+            response
+                .sequence
+                .is_none_or(|sequence| sequence.get() > last_sequence)
+        })
+        .collect::<Vec<_>>();
+    // One global cursor is safe only when committed snapshots advance it in
+    // sequence order. Request order is attacker-controlled and could otherwise
+    // make a newer ID suppress an older-but-still-unseen subscribed lifecycle.
+    // Unknown IDs have no sequence and are emitted first in stable request order.
+    initial_responses.sort_by_key(|response| response.sequence.map_or(0, LifecycleSequence::get));
+    for response in initial_responses {
         let sequence = response.sequence.map_or(0, LifecycleSequence::get);
-        let should_send = response.sequence.is_none() || sequence > last_sequence;
-        if should_send
-            && send_ws_message(
-                &mut socket,
-                &V2WsServerMessage::Snapshot {
-                    lifecycle: response,
-                },
-            )
-            .await
-            .is_err()
+        if send_ws_message(
+            &mut socket,
+            &V2WsServerMessage::Snapshot {
+                lifecycle: response,
+            },
+        )
+        .await
+        .is_err()
         {
             return;
         }
