@@ -1373,13 +1373,65 @@ development tooling) at moderate severity or higher. This closes the prior gap
 where a critical test-server advisory could pass because only shipped browser
 packages were scanned.
 
-Exact next item: finish the complete workspace format/lint/test/doc/demo, exact
-pnpm, dependency/advisory, strict production panic, unsafe, secret, and branch
-red-team inventory gates. Record every remaining limitation as passed,
-intentionally deferred with a concrete reason, or unverified. Then confirm
-`origin/main` is still fully contained, reconcile the two global status
-documents, push, open the CI-bearing integration PR, and require Linux fuzz plus
-every other CI job green before any merge.
+### Independent completion audit and remediation checkpoint (2026-07-28)
+
+Three independent reviews re-ran the transaction branch as a hostile system,
+not merely as a passing unit-test suite. They found that the previously recorded
+full local gate was green but did **not** yet prove the transaction system
+merge-ready. The following coherent remediations are already committed and
+pushed:
+
+- `00e0f71` bounds adversarial browser response fragmentation and performs one
+  fatal UTF-8 decode after geometric coalescing;
+- `952a65a` adds a table-driven free-rejection/state-preservation matrix and a
+  protocol-2 mempool libFuzzer target;
+- `0e04306`, `11e765d`, and merge `3e1093a` make CI fail closed for an empty or
+  failed fuzz-target list, restore the node demo gate, pin Actions/toolchains/
+  cargo-fuzz, require lockfiles/timeouts/non-persisted checkout credentials,
+  preserve checked conversions, and enforce Rust and JavaScript license policy;
+- `ca17640` reproduces and fixes the V2 WebSocket request-order bug where a
+  newer initial snapshot advanced the shared cursor past an older unseen one.
+
+The sponsor-capacity benchmark's clone/root/block timings and deterministic root
+are produced by the committed ignored release test. The three
+`peak_working_set_mib` values above were manually observed outside that harness;
+they are useful diagnostic context but are **not reproducible acceptance
+evidence** until a committed process-memory harness produces them.
+
+Remaining merge blockers, in execution order:
+
+1. integrate every current non-legacy-staking native `Operation` through the V5
+   shared action executor, retaining the dedicated post-quantum staking-control
+   path and free rejection of the four legacy direct-staking operations;
+2. bound/prune consensus evidence on both local finality and state sync; bound
+   proof-material retention before cloning; harden malformed key JSON
+   zeroization; remove redundant whole-state clones without changing V4/V5
+   roots or receipts;
+3. complete strict browser SDK V2 submit/lifecycle/receipt/WebSocket APIs and
+   hostile-input bounds;
+4. expose included/finalized success versus typed chargeable failure, wire
+   candidate inclusion as a real production lifecycle observation, periodically
+   expire local pending entries, and re-gossip valid recovered pending bytes
+   only after restart validation;
+5. add the required three-validator public HTTP-to-gossip-to-consensus-to-
+   finalized-query acceptance coverage across restart, duplicate submission,
+   replacement, cancellation, and expiry;
+6. add or explicitly downgrade every remaining unsupported benchmark claim,
+   close source-file documentation gaps, and reconcile review findings plus the
+   two global status documents only after behavior is final;
+7. re-fetch `origin/main`, prove it is an ancestor, run every local format/lint/
+   test/doc/demo/SDK/audit/deny gate, open a ready integration PR, and require
+   Linux fuzz-smoke and every other GitHub check green before calling the branch
+   mergeable. No force push and no merge are authorized by this checkpoint.
+
+The real STARK/ZK backend, production bridge funds, Windows deployment ACL
+enforcement, anti-eclipse work, long external fuzz campaigns, and independent
+mainnet audits remain explicitly gated follow-ups; they do not justify claiming
+those systems production-ready, but they do not replace any blocker above.
+
+Exact next item: finish and integrate blockers 1 through 3 one tested branch at
+a time, then implement lifecycle/restart/expiry acceptance blockers 4 and 5
+against the consolidated code before running the final gates.
 
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
