@@ -1392,11 +1392,26 @@ pushed:
 - `ca17640` reproduces and fixes the V2 WebSocket request-order bug where a
   newer initial snapshot advanced the shared cursor past an older unseen one.
 
-The sponsor-capacity benchmark's clone/root/block timings and deterministic root
-are produced by the committed ignored release test. The three
-`peak_working_set_mib` values above were manually observed outside that harness;
-they are useful diagnostic context but are **not reproducible acceptance
-evidence** until a committed process-memory harness produces them.
+Commit `7927450` closes the sponsor-capacity memory-evidence gap. The ignored
+release benchmark now uses pinned, test-only `sysinfo 0.39.6` (MIT) to poll its
+own resident set at one-millisecond intervals and prints the starting RSS, peak
+RSS, and peak growth alongside the existing timings and deterministic root.
+Three pre-final-integration baseline runs on the same Windows host produced:
+
+```text
+run  clone_ms  state_root_ms  block_execute_ms  peak_rss_mib  rss_growth_mib
+1    28.228    907.575        835.068           164.902       156.804
+2    25.129    820.568        819.705           152.328       144.230
+3    25.894    951.561        883.571           152.156       144.054
+```
+
+All runs retained state root
+`f92aa8bdc2af847b9c401ed154750e6659470adc603e62884b6944bc518e4974`.
+These values are a reproducible branch baseline, not a public performance
+claim. The final consolidated branch must repeat the exact command under the
+same host/toolchain and show no material regression before merge readiness is
+claimed; the earlier manually observed working-set values remain diagnostic
+only because they used a different measurement method.
 
 Remaining merge blockers, in execution order:
 
