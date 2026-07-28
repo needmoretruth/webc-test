@@ -23,6 +23,7 @@ webc-net = { path = "../crates/webc-net" }
 webc-node = { path = "../crates/webc-node" }
 webc-crypto = { path = "../crates/webc-crypto" }
 webc-proof = { path = "../crates/webc-proof" }
+webc-storage = { path = "../crates/webc-storage" }
 
 [[bin]]
 name = "wire_decode"
@@ -55,6 +56,13 @@ bench = false
 [[bin]]
 name = "v5_transaction_decode"
 path = "fuzz_targets/v5_transaction_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v5_mempool_admission"
+path = "fuzz_targets/v5_mempool_admission.rs"
 test = false
 doc = false
 bench = false

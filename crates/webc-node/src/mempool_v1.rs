@@ -874,6 +874,151 @@ mod tests {
     }
 
     #[test]
+    fn hostile_admission_rejections_are_free_and_state_preserving() {
+        #[derive(Clone, Copy)]
+        enum Expected {
+            Validation,
+            NonceTooLow,
+            NonceTooFarAhead,
+            ValidityExpired,
+            ValidityStartsTooFarAhead,
+            Preparation,
+        }
+
+        let sender = Keypair::from_seed([31; 32]);
+        let recipient = Keypair::from_seed([32; 32]);
+        let (base_state, config) = state_and_config(&[&sender]);
+        let base = transfer(&sender, &recipient, 0, 5, 1);
+        let mut cases = Vec::new();
+
+        let mut wrong_chain = base.clone();
+        wrong_chain.chain_id = ChainId::new("webc-other-1").expect("valid alternate chain");
+        wrong_chain
+            .sign(&sender)
+            .expect("alternate-chain transaction signs");
+        cases.push((
+            "wrong chain",
+            base_state.clone(),
+            wrong_chain,
+            Expected::Validation,
+        ));
+
+        let mut consumed_state = base_state.clone();
+        consumed_state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("funded sender")
+            .nonce = 1;
+        cases.push((
+            "stale nonce",
+            consumed_state,
+            base.clone(),
+            Expected::NonceTooLow,
+        ));
+
+        let mut far_nonce = base.clone();
+        far_nonce.authorization.nonce = Nonce::new(DEFAULT_V5_MEMPOOL_FUTURE_NONCE_GAP + 1);
+        far_nonce
+            .sign(&sender)
+            .expect("future nonce transaction signs");
+        cases.push((
+            "far future nonce",
+            base_state.clone(),
+            far_nonce,
+            Expected::NonceTooFarAhead,
+        ));
+
+        let mut expired = base.clone();
+        expired.validity = ValidityWindowV1::new(BlockHeight::new(1), BlockHeight::new(9));
+        expired.sign(&sender).expect("expired transaction signs");
+        cases.push((
+            "expired validity",
+            base_state.clone(),
+            expired,
+            Expected::ValidityExpired,
+        ));
+
+        let mut future_start = base.clone();
+        future_start.validity = ValidityWindowV1::new(
+            BlockHeight::new(10 + DEFAULT_V5_MEMPOOL_FUTURE_START_BLOCKS + 1),
+            BlockHeight::new(10 + DEFAULT_V5_MEMPOOL_FUTURE_START_BLOCKS + 2),
+        );
+        future_start
+            .sign(&sender)
+            .expect("future-start transaction signs");
+        cases.push((
+            "far future validity",
+            base_state.clone(),
+            future_start,
+            Expected::ValidityStartsTooFarAhead,
+        ));
+
+        let mut underpriced = base.clone();
+        underpriced.fee_bid.max_fee_per_unit = 1;
+        underpriced.fee_bid.priority_fee_per_unit = 0;
+        underpriced
+            .sign(&sender)
+            .expect("underpriced transaction signs");
+        cases.push((
+            "underpriced",
+            base_state.clone(),
+            underpriced,
+            Expected::Preparation,
+        ));
+
+        let mut unfunded_state = base_state.clone();
+        unfunded_state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("funded sender")
+            .balance = Amount::ZERO;
+        cases.push((
+            "insufficient reserve",
+            unfunded_state,
+            base,
+            Expected::Preparation,
+        ));
+
+        for (name, state, transaction, expected) in cases {
+            let state_before = state.clone();
+            let pool = V5Mempool::new(V5MempoolConfig::default()).expect("valid policy");
+            let result = pool.plan_admission(
+                transaction,
+                &state,
+                &config,
+                BlockHeight::new(10),
+                LocalTimestampMs::new(NOW),
+            );
+            let result_debug = format!("{result:?}");
+            let matched = matches!(
+                (expected, result),
+                (Expected::Validation, Err(V5MempoolError::Validation(_)))
+                    | (Expected::NonceTooLow, Err(V5MempoolError::NonceTooLow))
+                    | (
+                        Expected::NonceTooFarAhead,
+                        Err(V5MempoolError::NonceTooFarAhead)
+                    )
+                    | (
+                        Expected::ValidityExpired,
+                        Err(V5MempoolError::ValidityExpired)
+                    )
+                    | (
+                        Expected::ValidityStartsTooFarAhead,
+                        Err(V5MempoolError::ValidityStartsTooFarAhead),
+                    )
+                    | (Expected::Preparation, Err(V5MempoolError::Preparation(_)))
+            );
+            assert!(
+                matched,
+                "{name} returned an unexpected classification: {result_debug}"
+            );
+            assert_eq!(state, state_before, "{name} mutated the supplied state");
+            assert!(pool.is_empty(), "{name} mutated memory before persistence");
+            assert_eq!(pool.total_bytes(), 0, "{name} retained bytes");
+        }
+    }
+
+    #[test]
     fn replacement_requires_ten_percent_and_names_the_durable_removal() {
         let alice = Keypair::from_seed([3; 32]);
         let bob = Keypair::from_seed([4; 32]);

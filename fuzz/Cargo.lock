@@ -1422,6 +1422,7 @@ dependencies = [
  "webc-net",
  "webc-node",
  "webc-proof",
+ "webc-storage",
 ]
 
 [[package]]
