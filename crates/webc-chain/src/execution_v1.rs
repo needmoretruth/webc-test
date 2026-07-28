@@ -19,7 +19,7 @@ use crate::sponsor_grant_book::SponsorGrantBookError;
 use crate::sponsorship::sponsor_state_key_hash;
 use crate::state::{
     NativeAccountControlContext, NativeActionEffects, NativeApplicationContext,
-    NativeBridgeContext, NativeDexOrderSubmission, NativeObjectMutation,
+    NativeBridgeContext, NativeContractInvocation, NativeDexOrderSubmission, NativeObjectMutation,
     NativeValidatorRegistration,
 };
 use crate::state_key::StateAccessRecorder;
@@ -1282,6 +1282,7 @@ struct NativeActionContextV1<'a> {
     authorization_lane: AuthorizationLaneId,
     chain_id: &'a ChainId,
     signed_nonce: Nonce,
+    gas_limit: GasUnits,
     config: &'a ChainConfig,
 }
 
@@ -1533,6 +1534,56 @@ fn execute_native_action_v1(
             context.sender,
             context.authorization_lane,
             *order_id,
+            effects,
+        ),
+        Operation::RegisterContract { manifest } => state.apply_native_register_contract(
+            context.sender,
+            context.authorization_lane,
+            manifest,
+            &context.config.contracts,
+            effects,
+        ),
+        Operation::InvokeContract {
+            code_id,
+            namespace,
+            declared_keys,
+            input,
+        } => state.apply_native_invoke_contract(
+            context.sender,
+            NativeContractInvocation::new(
+                *code_id,
+                *namespace,
+                declared_keys,
+                input,
+                operation.required_units(),
+                context.gas_limit.get(),
+            ),
+            effects,
+        ),
+        Operation::RegisterWasmContract { manifest, code } => state
+            .apply_native_register_wasm_contract(
+                context.sender,
+                context.authorization_lane,
+                manifest,
+                code,
+                &context.config.contracts,
+                effects,
+            ),
+        Operation::InvokeWasmContract {
+            code_id,
+            namespace,
+            declared_keys,
+            input,
+        } => state.apply_native_invoke_wasm_contract(
+            context.sender,
+            NativeContractInvocation::new(
+                *code_id,
+                *namespace,
+                declared_keys,
+                input,
+                operation.required_units(),
+                context.gas_limit.get(),
+            ),
             effects,
         ),
         Operation::CreateObject {
@@ -1845,6 +1896,7 @@ fn execute_action_program_v1(
                     authorization_lane: transaction.authorization.lane,
                     chain_id,
                     signed_nonce,
+                    gas_limit: GasUnits::new(transaction.fee_bid.gas_limit),
                     config,
                 },
                 operation,
@@ -2038,6 +2090,25 @@ fn classify_action_failure(
         | ChainError::DexOrderNotOwner
         | ChainError::DexOrderDeadlineInPast
         | ChainError::DexRequiresDefaultLane
+        | ChainError::ContractAlreadyExists
+        | ChainError::ContractNotFound
+        | ChainError::InvalidContractManifest
+        | ChainError::UnsupportedContractAbiVersion { .. }
+        | ChainError::ContractNamespaceMismatch
+        | ChainError::ContractFootprintMismatch
+        | ChainError::ContractInputTooLarge { .. }
+        | ChainError::ContractRequiresDefaultLane
+        | ChainError::ContractOutOfGas
+        | ChainError::ContractUndeclaredKey
+        | ChainError::ContractStateValueTooLarge { .. }
+        | ChainError::ContractInvalidInput
+        | ChainError::ContractArithmeticOverflow
+        | ChainError::InvalidWasmModule
+        | ChainError::WasmModuleTooLarge { .. }
+        | ChainError::WasmCodeHashMismatch
+        | ChainError::ContractWasmTrap
+        | ChainError::ContractWasmInvalidModule
+        | ChainError::ContractWasmOutputTooLarge
         | ChainError::ValidatorAlreadyExists(_)
         | ChainError::ValidatorNotFound(_)
         | ChainError::ValidatorNotActive(_)
@@ -2740,16 +2811,18 @@ fn account_key_is_current(
 mod tests {
     use super::*;
     use crate::{
-        Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
-        AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, BridgeMessage, ChainState,
+        kv_command, Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount,
+        AuthorizationLane, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight,
+        BridgeMessage, BuiltinContract, ChainState, ContractManifest, ContractStateValue,
         Delegation, Epoch, FeeBid, FeePaymentV1, FeedValue, Nonce, ObjectId, ObjectVersion,
         Operation, OrderSide, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme, Price,
         SessionAllowedOperations, SessionKeyAuthorizationAction, SessionKeyConstraints,
         SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
         StakingActionV1, StoragePricing, TradingPair, TransactionAuthorizationV1, TransactionIndex,
         UnbondingKind, UnbondingRequestId, Validator, ValidatorStatus, ValidityWindowV1,
-        INITIAL_AUTHORIZATION_POLICY_REVISION, MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1,
-        REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, TRANSACTION_V5_PROTOCOL_VERSION,
+        WasmBytecode, WasmContractManifest, INITIAL_AUTHORIZATION_POLICY_REVISION,
+        MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1, REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+        TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{ml_dsa65_keygen, Hash256, Keypair, MlDsa65PublicKey, MlDsa65SecretKey};
 
@@ -2929,6 +3002,30 @@ mod tests {
             protocol_version: TRANSACTION_V5_PROTOCOL_VERSION,
             ..ChainConfig::default()
         }
+    }
+
+    fn wasm_store_and_echo_module(key: Hash256) -> WasmBytecode {
+        let key_hex = key
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{byte:02x}"))
+            .collect::<String>();
+        let wat = format!(
+            r#"(module
+              (import "webc" "webc_input_len" (func $input_len (result i32)))
+              (import "webc" "webc_input_read" (func $input_read (param i32)))
+              (import "webc" "webc_set" (func $set (param i32 i32 i32 i32) (result i32)))
+              (import "webc" "webc_output" (func $output (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "{key_hex}")
+              (func (export "webc_call")
+                (local $len i32)
+                (local.set $len (call $input_len))
+                (call $input_read (i32.const 64))
+                (drop (call $set (i32.const 0) (i32.const 32) (i32.const 64) (local.get $len)))
+                (call $output (i32.const 64) (local.get $len))))"#,
+        );
+        WasmBytecode(wat::parse_str(&wat).expect("valid test WASM"))
     }
 
     fn live_object_deposit_total(state: &ChainState) -> Amount {
@@ -4909,6 +5006,182 @@ mod tests {
             state
                 .supply_invariant_report()
                 .expect("failed DEX supply report")
+                .balanced
+        );
+    }
+
+    #[test]
+    fn native_contract_lifecycles_commit_sparse_state_and_restart_root() {
+        let sender = Keypair::from_seed([1; 32]);
+        let native_code_id = Hash256([0x81; 32]);
+        let native_namespace = Hash256([0x82; 32]);
+        let native_key = Hash256([0x83; 32]);
+        let native_manifest = ContractManifest::new(
+            native_code_id,
+            native_namespace,
+            BuiltinContract::KeyValue,
+            [native_key],
+            sender.address(),
+        );
+        let wasm_code_id = Hash256([0x84; 32]);
+        let wasm_namespace = Hash256([0x85; 32]);
+        let wasm_key = Hash256([0x86; 32]);
+        let wasm_code = wasm_store_and_echo_module(wasm_key);
+        let wasm_manifest = WasmContractManifest::new(
+            wasm_code_id,
+            wasm_namespace,
+            wasm_code.code_hash(),
+            [wasm_key],
+            sender.address(),
+        );
+        let actions = vec![
+            ActionV1::native(Operation::RegisterContract {
+                manifest: native_manifest.clone(),
+            }),
+            ActionV1::native(Operation::InvokeContract {
+                code_id: native_code_id,
+                namespace: native_namespace,
+                declared_keys: native_manifest.footprint.clone(),
+                input: kv_command::set(native_key, b"native"),
+            }),
+            ActionV1::native(Operation::RegisterWasmContract {
+                manifest: wasm_manifest.clone(),
+                code: wasm_code,
+            }),
+            ActionV1::native(Operation::InvokeWasmContract {
+                code_id: wasm_code_id,
+                namespace: wasm_namespace,
+                declared_keys: wasm_manifest.footprint.clone(),
+                input: b"wasm".to_vec(),
+            }),
+        ];
+        let gas_limit = actions
+            .iter()
+            .map(ActionV1::required_units)
+            .sum::<u64>()
+            .checked_add(500_000)
+            .expect("test gas cap");
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut config = v5_config();
+        config.contracts.registration_fee = Amount::from_units(100);
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(10_000_000);
+        state.minted_supply = Amount::from_units(10_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, transaction, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("native and WASM contract lifecycles execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 4);
+        assert_eq!(state.contracts[&native_code_id], native_manifest);
+        assert_eq!(state.wasm_contracts[&wasm_code_id], wasm_manifest);
+        assert_eq!(
+            state.contract_state[&(native_namespace, native_key)],
+            ContractStateValue(b"native".to_vec())
+        );
+        assert_eq!(
+            state.contract_state[&(wasm_namespace, wasm_key)],
+            ContractStateValue(b"wasm".to_vec())
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("contract lifecycle supply report")
+                .balanced
+        );
+        let restored: ChainState =
+            bincode::deserialize(&bincode::serialize(&state).expect("serialize contract state"))
+                .expect("restore contract state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("live root")
+        );
+    }
+
+    #[test]
+    fn native_contract_failure_discards_registration_and_state_but_charges_parent() {
+        let sender = Keypair::from_seed([1; 32]);
+        let code_id = Hash256([0x87; 32]);
+        let namespace = Hash256([0x88; 32]);
+        let key = Hash256([0x89; 32]);
+        let manifest = ContractManifest::new(
+            code_id,
+            namespace,
+            BuiltinContract::KeyValue,
+            [key],
+            sender.address(),
+        );
+        let actions = vec![
+            ActionV1::native(Operation::RegisterContract {
+                manifest: manifest.clone(),
+            }),
+            ActionV1::native(Operation::InvokeContract {
+                code_id,
+                namespace,
+                declared_keys: manifest.footprint,
+                input: vec![0xff],
+            }),
+        ];
+        let gas_limit = actions
+            .iter()
+            .map(ActionV1::required_units)
+            .sum::<u64>()
+            .checked_add(100_000)
+            .expect("test gas cap");
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut config = v5_config();
+        config.contracts.registration_fee = Amount::from_units(100);
+        let mut state = funded_state(&sender, None);
+        let initial_balance = Amount::from_units(2_000_000);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = initial_balance;
+        state.minted_supply = initial_balance;
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, transaction, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("malformed contract input is chargeable")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            initial_balance
+                .checked_sub(receipt.fee_summary.charged)
+                .expect("fee is below fixture balance")
+        );
+        assert!(!state.contracts.contains_key(&code_id));
+        assert!(!state.contract_state.contains_key(&(namespace, key)));
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed contract supply report")
                 .balanced
         );
     }

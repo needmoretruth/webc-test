@@ -17,7 +17,8 @@
 use crate::{
     AccessList, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainId,
     FeeBid, Nonce, Operation, PostQuantumRootReveal, ProtocolVersion, SessionKeyId, StateKey,
-    MAX_OBJECT_DATA_BYTES, MAX_TRANSACTION_STATE_KEYS,
+    MAX_CONTRACT_FOOTPRINT_KEYS, MAX_CONTRACT_INPUT_BYTES, MAX_OBJECT_DATA_BYTES,
+    MAX_TRANSACTION_STATE_KEYS, MAX_WASM_MODULE_BYTES,
 };
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -640,6 +641,10 @@ impl ActionV1 {
                         | Operation::PayFeedRead { .. }
                         | Operation::SubmitOrder { .. }
                         | Operation::CancelOrder { .. }
+                        | Operation::RegisterContract { .. }
+                        | Operation::InvokeContract { .. }
+                        | Operation::RegisterWasmContract { .. }
+                        | Operation::InvokeWasmContract { .. }
                         | Operation::ClaimUnbonded { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
@@ -734,6 +739,33 @@ impl ActionV1 {
                 post_quantum_root_reveal
                     .validate()
                     .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::RegisterContract { manifest } => manifest
+                .validate(manifest.owner)
+                .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction),
+            Operation::RegisterWasmContract { manifest, code } => {
+                if code.len() > MAX_WASM_MODULE_BYTES {
+                    return Err(TransactionValidationErrorV1::InvalidNativeAction);
+                }
+                manifest
+                    .validate(manifest.owner, code)
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::InvokeContract {
+                declared_keys,
+                input,
+                ..
+            }
+            | Operation::InvokeWasmContract {
+                declared_keys,
+                input,
+                ..
+            } if input.len() > MAX_CONTRACT_INPUT_BYTES
+                || declared_keys.is_empty()
+                || declared_keys.len() > MAX_CONTRACT_FOOTPRINT_KEYS
+                || !declared_keys.windows(2).all(|pair| pair[0] < pair[1]) =>
+            {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
             }
             Operation::CreateObject { data, .. } | Operation::MutateObject { data, .. }
                 if data.len() > MAX_OBJECT_DATA_BYTES =>
@@ -1359,14 +1391,28 @@ impl TransactionV5 {
         if let TransactionKindV1::Actions(program) = &self.kind {
             validate_native_action_lane(program, self.authorization.lane)?;
             for action in &program.actions {
-                let ActionV1::RevokeSignedSponsorGrant { grant } = action else {
-                    continue;
-                };
-                if grant.sponsor != self.sender
-                    || grant.chain_id != self.chain_id
-                    || grant.protocol_version != self.protocol_version
-                {
-                    return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
+                match action {
+                    ActionV1::RevokeSignedSponsorGrant { grant }
+                        if grant.sponsor != self.sender
+                            || grant.chain_id != self.chain_id
+                            || grant.protocol_version != self.protocol_version =>
+                    {
+                        return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
+                    }
+                    ActionV1::Native { operation } => match operation.as_ref() {
+                        Operation::RegisterContract { manifest }
+                            if manifest.owner != self.sender =>
+                        {
+                            return Err(TransactionValidationErrorV1::InvalidNativeAction);
+                        }
+                        Operation::RegisterWasmContract { manifest, .. }
+                            if manifest.owner != self.sender =>
+                        {
+                            return Err(TransactionValidationErrorV1::InvalidNativeAction);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
         }
@@ -1902,9 +1948,10 @@ mod fee_bid_decimal {
 mod tests {
     use super::*;
     use crate::{
-        AssetId, BridgeMessage, ExternalChain, FeedId, FeedValue, ObjectId, ObjectVersion,
-        Operation, OrderId, OrderSide, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
-        Price, SessionAllowedOperations, SessionKeyConstraints, TradingPair,
+        AssetId, BridgeMessage, BuiltinContract, ContractManifest, ExternalChain, FeedId,
+        FeedValue, ObjectId, ObjectVersion, Operation, OrderId, OrderSide, PostQuantumRoot,
+        PostQuantumRootReveal, PostQuantumScheme, Price, SessionAllowedOperations,
+        SessionKeyConstraints, TradingPair, WasmBytecode, WasmContractManifest,
     };
 
     #[test]
@@ -2059,6 +2106,50 @@ mod tests {
                 fill_or_cancel: false,
             },
             Operation::CancelOrder { order_id },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_contract_operations() {
+        let owner = Keypair::from_seed([44; 32]).address();
+        let native_code_id = Hash256([8; 32]);
+        let wasm_code_id = Hash256([9; 32]);
+        let namespace = Hash256([10; 32]);
+        let footprint = [Hash256([11; 32])];
+        let native_manifest = ContractManifest::new(
+            native_code_id,
+            namespace,
+            BuiltinContract::KeyValue,
+            footprint,
+            owner,
+        );
+        let code = WasmBytecode(vec![0]);
+        let wasm_manifest =
+            WasmContractManifest::new(wasm_code_id, namespace, code.code_hash(), footprint, owner);
+        let operations = [
+            Operation::RegisterContract {
+                manifest: native_manifest.clone(),
+            },
+            Operation::InvokeContract {
+                code_id: native_code_id,
+                namespace,
+                declared_keys: native_manifest.footprint,
+                input: vec![1],
+            },
+            Operation::RegisterWasmContract {
+                manifest: wasm_manifest.clone(),
+                code,
+            },
+            Operation::InvokeWasmContract {
+                code_id: wasm_code_id,
+                namespace,
+                declared_keys: wasm_manifest.footprint,
+                input: vec![2],
+            },
         ];
 
         assert!(operations
