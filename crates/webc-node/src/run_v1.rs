@@ -53,6 +53,12 @@ pub const MAX_PROTECTED_KEY_FILE_BYTES: usize = 512;
 const PENDING_GOSSIP_PEER_POLL: Duration = Duration::from_millis(100);
 /// Minimum delay between recovered transaction replay commands.
 const PENDING_GOSSIP_SEND_DELAY: Duration = Duration::from_millis(20);
+/// Default cadence for checking node-local pending retention expiry.
+pub const DEFAULT_PENDING_EXPIRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Smallest accepted cadence, bounding expiry actor commands to 200 per second.
+pub const MIN_PENDING_EXPIRY_INTERVAL: Duration = Duration::from_millis(5);
+/// Largest accepted pending-expiry cadence in a public runtime configuration.
+pub const MAX_PENDING_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Fixed-size seed decoded directly from borrowed key-file text.
 ///
@@ -192,6 +198,45 @@ pub struct Protocol2RunConfig {
     pub validator_key_path: Option<PathBuf>,
 }
 
+/// Node-local protocol-2 resource policy used by the public assembly.
+///
+/// These values never enter consensus. The signed height validity window stays
+/// authoritative, while the mempool TTL and scan cadence only bound how long
+/// this process retains an unfinalized copy. The cadence must be at least 5 ms,
+/// no greater than the TTL, and no greater than 60 seconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Protocol2RuntimeConfig {
+    /// Bounded V5 mempool limits, including the local retention TTL in milliseconds.
+    pub mempool: V5MempoolConfig,
+    /// Local wall-clock interval between durable expiry scans.
+    pub pending_expiry_interval: Duration,
+}
+
+impl Default for Protocol2RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            mempool: V5MempoolConfig::default(),
+            pending_expiry_interval: DEFAULT_PENDING_EXPIRY_INTERVAL,
+        }
+    }
+}
+
+impl Protocol2RuntimeConfig {
+    fn validate(&self) -> Result<()> {
+        let _validated_mempool = crate::V5Mempool::new(self.mempool.clone())
+            .context("invalid protocol-2 mempool policy")?;
+        if self.pending_expiry_interval < MIN_PENDING_EXPIRY_INTERVAL
+            || self.pending_expiry_interval > MAX_PENDING_EXPIRY_INTERVAL
+            || self.pending_expiry_interval > Duration::from_millis(self.mempool.ttl_ms)
+        {
+            bail!(
+                "pending expiry interval must be at least 5 milliseconds, at most 60 seconds, and no greater than the local mempool TTL"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Running protocol-2 node tasks with explicit shutdown ownership.
 pub struct Protocol2Node {
     api_addr: SocketAddr,
@@ -202,6 +247,7 @@ pub struct Protocol2Node {
     driver_task: tokio::task::JoinHandle<DriverExitV1>,
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     pending_gossip_task: tokio::task::JoinHandle<Result<()>>,
+    pending_expiry_task: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl Protocol2Node {
@@ -226,6 +272,7 @@ impl Protocol2Node {
             server = &mut self.server_task => {
                 self.driver_task.abort();
                 self.pending_gossip_task.abort();
+                abort_and_drain(&mut self.pending_expiry_task).await;
                 stop_actor(&self.runtime, &mut self.runtime_task).await;
                 match server {
                     Ok(Ok(())) => bail!("protocol-2 API server stopped unexpectedly"),
@@ -236,6 +283,7 @@ impl Protocol2Node {
             driver = &mut self.driver_task => {
                 self.server_task.abort();
                 self.pending_gossip_task.abort();
+                abort_and_drain(&mut self.pending_expiry_task).await;
                 stop_actor(&self.runtime, &mut self.runtime_task).await;
                 let exit = driver.context("protocol-2 consensus task failed")?;
                 bail!("protocol-2 consensus stopped: {exit}")
@@ -244,6 +292,7 @@ impl Protocol2Node {
                 self.driver_task.abort();
                 self.server_task.abort();
                 self.pending_gossip_task.abort();
+                abort_and_drain(&mut self.pending_expiry_task).await;
                 match runtime {
                     Ok(Ok(())) => bail!("protocol-2 node runtime stopped unexpectedly"),
                     Ok(Err(error)) => Err(error).context("protocol-2 node runtime failed"),
@@ -253,6 +302,7 @@ impl Protocol2Node {
             pending_gossip = &mut self.pending_gossip_task => {
                 self.driver_task.abort();
                 self.server_task.abort();
+                abort_and_drain(&mut self.pending_expiry_task).await;
                 stop_actor(&self.runtime, &mut self.runtime_task).await;
                 match pending_gossip {
                     Ok(Ok(())) => bail!("protocol-2 pending gossip task stopped unexpectedly"),
@@ -260,14 +310,26 @@ impl Protocol2Node {
                     Err(error) => Err(error).context("protocol-2 pending gossip task crashed"),
                 }
             }
+            pending_expiry = &mut self.pending_expiry_task => {
+                self.driver_task.abort();
+                self.server_task.abort();
+                self.pending_gossip_task.abort();
+                stop_actor(&self.runtime, &mut self.runtime_task).await;
+                match pending_expiry {
+                    Ok(Ok(())) => bail!("protocol-2 pending expiry task stopped unexpectedly"),
+                    Ok(Err(error)) => Err(error).context("protocol-2 pending expiry task failed"),
+                    Err(error) => Err(error).context("protocol-2 pending expiry task crashed"),
+                }
+            }
         }
     }
 
     /// Stops API/consensus tasks, drains the actor, and closes durable storage.
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
         self.server_task.abort();
         self.driver_task.abort();
         self.pending_gossip_task.abort();
+        abort_and_drain(&mut self.pending_expiry_task).await;
         self.runtime
             .shutdown()
             .await
@@ -277,6 +339,13 @@ impl Protocol2Node {
             .context("protocol-2 runtime task failed during shutdown")??;
         Ok(())
     }
+}
+
+/// Requests cancellation and observes completion so a periodic task cannot
+/// outlive the public node object after either shutdown or sibling failure.
+async fn abort_and_drain<T>(task: &mut tokio::task::JoinHandle<T>) {
+    task.abort();
+    let _cancelled_or_finished = task.await;
 }
 
 async fn stop_actor(
@@ -291,6 +360,18 @@ async fn stop_actor(
 
 /// Starts one public protocol-2 node without blocking on its task lifetime.
 pub async fn start_protocol2(config: Protocol2RunConfig) -> Result<Protocol2Node> {
+    start_protocol2_with_runtime_config(config, Protocol2RuntimeConfig::default()).await
+}
+
+/// Starts one public protocol-2 node with explicit local mempool/expiry limits.
+///
+/// This seam exists for operator tuning and bounded acceptance tests. Neither
+/// TTL nor cadence changes signed validity or deterministic block execution.
+pub async fn start_protocol2_with_runtime_config(
+    config: Protocol2RunConfig,
+    runtime_config: Protocol2RuntimeConfig,
+) -> Result<Protocol2Node> {
+    runtime_config.validate()?;
     let genesis = load_protocol2_genesis(&config.genesis_path)?;
     let credentials = config
         .validator_key_path
@@ -321,7 +402,7 @@ pub async fn start_protocol2(config: Protocol2RunConfig) -> Result<Protocol2Node
     let peer_id = network.local_peer_id();
     let (runtime, runtime_task) = NodeRuntime::spawn(
         node,
-        V5MempoolConfig::default(),
+        runtime_config.mempool,
         256,
         LocalTimestampMs::new(crate::http::now_ms()),
     )
@@ -329,6 +410,10 @@ pub async fn start_protocol2(config: Protocol2RunConfig) -> Result<Protocol2Node
     let app_state = V2AppState::with_network(runtime.clone(), network.clone());
     let server_task = tokio::spawn(serve_v2(listener, app_state));
     let pending_gossip_task = tokio::spawn(run_pending_regossip(runtime.clone(), network.clone()));
+    let pending_expiry_task = tokio::spawn(run_pending_expiry(
+        runtime.clone(),
+        runtime_config.pending_expiry_interval,
+    ));
     let driver_task = tokio::spawn(
         ConsensusDriverV1::new_with_credentials(
             runtime.clone(),
@@ -348,7 +433,31 @@ pub async fn start_protocol2(config: Protocol2RunConfig) -> Result<Protocol2Node
         driver_task,
         server_task,
         pending_gossip_task,
+        pending_expiry_task,
     })
+}
+
+/// Periodically applies node-local TTL policy through the single runtime owner.
+///
+/// Actor backpressure skips one scan rather than terminating the node; the next
+/// bounded tick retries. Every reported transition is committed and published
+/// by `NodeRuntime::expire` before this loop observes success.
+async fn run_pending_expiry(runtime: NodeHandle, interval: Duration) -> Result<()> {
+    if interval < MIN_PENDING_EXPIRY_INTERVAL {
+        bail!("pending expiry interval must be at least 5 milliseconds");
+    }
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        match runtime
+            .expire(LocalTimestampMs::new(crate::http::now_ms()))
+            .await
+        {
+            Ok(_) | Err(NodeRuntimeError::QueueFull) => {}
+            Err(error) => return Err(error).context("expire pending protocol-2 transactions"),
+        }
+    }
 }
 
 /// Replays bounded pending pages whenever this node gains a peer generation.
@@ -647,6 +756,53 @@ mod tests {
         transaction
     }
 
+    async fn tcp_json_request(address: SocketAddr, request: Vec<u8>) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("test API accepts TCP");
+        stream
+            .write_all(&request)
+            .await
+            .expect("test HTTP request writes");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("test HTTP response reads");
+        let body_offset = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| offset + 4)
+            .expect("HTTP response contains a header boundary");
+        let headers =
+            std::str::from_utf8(&response[..body_offset]).expect("HTTP response headers are UTF-8");
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .expect("HTTP response contains a numeric status");
+        let body =
+            serde_json::from_slice(&response[body_offset..]).expect("HTTP response contains JSON");
+        (status, body)
+    }
+
+    fn tcp_get_request(path: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").into_bytes()
+    }
+
+    fn tcp_post_json_request(path: &str, body: &[u8]) -> Vec<u8> {
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        request
+    }
+
     #[test]
     fn dedicated_consensus_key_file_is_bounded_and_genesis_bound() {
         let directory = tempfile::tempdir().expect("temporary directory exists");
@@ -754,6 +910,185 @@ mod tests {
             .err()
             .expect("oversized file is rejected");
         assert!(oversized_error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn pending_expiry_policy_rejects_too_fast_excessive_and_late_cadences() {
+        let valid = Protocol2RuntimeConfig {
+            mempool: V5MempoolConfig {
+                ttl_ms: 20,
+                ..V5MempoolConfig::default()
+            },
+            pending_expiry_interval: Duration::from_millis(5),
+        };
+        assert!(valid.validate().is_ok());
+        for pending_expiry_interval in [
+            Duration::ZERO,
+            MIN_PENDING_EXPIRY_INTERVAL - Duration::from_millis(1),
+            Duration::from_millis(21),
+            MAX_PENDING_EXPIRY_INTERVAL + Duration::from_millis(1),
+        ] {
+            assert!(Protocol2RuntimeConfig {
+                pending_expiry_interval,
+                ..valid.clone()
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_expiry_durably_removes_and_publishes_without_a_seal() {
+        let operator = Keypair::from_seed([0x2d; 32]);
+        let consensus = Keypair::from_seed([0x2e; 32]);
+        let recipient = Keypair::from_seed([0x2f; 32]);
+        let genesis = genesis(&operator, &consensus);
+        let node =
+            Node::open(webc_storage::MemoryKvStore::new(), &genesis).expect("test node opens");
+        let policy = V5MempoolConfig {
+            ttl_ms: 20,
+            ..V5MempoolConfig::default()
+        };
+        let now_ms = crate::http::now_ms();
+        let (runtime, runtime_task) =
+            NodeRuntime::spawn(node, policy, 32, LocalTimestampMs::new(now_ms))
+                .expect("runtime starts");
+        let transaction = pending_transfer(&operator, &recipient);
+        let transaction_id = transaction.transaction_id().expect("transaction ID");
+        runtime
+            .submit(transaction, LocalTimestampMs::new(now_ms))
+            .await
+            .expect("pending transaction becomes durable");
+        let mut events = runtime.subscribe_lifecycle();
+        let mut expiry_task = tokio::spawn(run_pending_expiry(
+            runtime.clone(),
+            Duration::from_millis(5),
+        ));
+
+        let expired = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let lifecycle = events.recv().await.expect("expiry stream remains open");
+                if matches!(
+                    lifecycle.local_observation,
+                    Some(webc_storage::LocalTransactionObservationV1::Expired { .. })
+                ) {
+                    break lifecycle;
+                }
+            }
+        })
+        .await
+        .expect("periodic task expires within its bounded test window");
+        assert_eq!(expired.transaction_id, transaction_id);
+        assert_eq!(
+            runtime
+                .stats()
+                .await
+                .expect("runtime remains responsive")
+                .mempool_size,
+            0
+        );
+        assert_eq!(
+            runtime
+                .lifecycle(transaction_id)
+                .await
+                .expect("durable lifecycle query succeeds"),
+            Some(expired)
+        );
+
+        expiry_task.abort();
+        let _expected_cancellation = (&mut expiry_task).await;
+        runtime.shutdown().await.expect("runtime shuts down");
+        runtime_task
+            .await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn public_tcp_api_reports_periodic_expiry_across_restart() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let operator = Keypair::from_seed([0x35; 32]);
+        let consensus = Keypair::from_seed([0x36; 32]);
+        let recipient = Keypair::from_seed([0x37; 32]);
+        let genesis_path = directory.path().join("genesis.json");
+        std::fs::write(
+            &genesis_path,
+            serde_json::to_vec(&genesis(&operator, &consensus)).expect("genesis encodes"),
+        )
+        .expect("genesis writes");
+        let data_dir = directory.path().join("data");
+        let runtime_config = Protocol2RuntimeConfig {
+            mempool: V5MempoolConfig {
+                ttl_ms: 100,
+                ..V5MempoolConfig::default()
+            },
+            pending_expiry_interval: Duration::from_millis(10),
+        };
+        let node = start_protocol2_with_runtime_config(
+            Protocol2RunConfig {
+                data_dir: data_dir.clone(),
+                api_listen: "127.0.0.1:0".parse().expect("API address parses"),
+                p2p_listen: None,
+                bootstrap_peers: Vec::new(),
+                genesis_path: genesis_path.clone(),
+                validator_key_path: None,
+            },
+            runtime_config.clone(),
+        )
+        .await
+        .expect("observer node starts");
+        let transaction = pending_transfer(&operator, &recipient);
+        let transaction_id = transaction.transaction_id().expect("transaction ID");
+        let body = serde_json::to_vec(&transaction).expect("transaction serializes");
+        let (status, submitted) = tcp_json_request(
+            node.api_addr(),
+            tcp_post_json_request("/v2/transactions", &body),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(submitted["lifecycle"]["status"]["kind"], "queued");
+
+        let status_path = format!("/v2/transactions/{transaction_id}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let expired = loop {
+            let (status, lifecycle) =
+                tcp_json_request(node.api_addr(), tcp_get_request(&status_path)).await;
+            assert_eq!(status, 200);
+            if lifecycle["status"]["kind"] == "expired" {
+                break lifecycle;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "public API did not expose periodic expiry within the bounded window"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(expired["transaction_id"], transaction_id.to_string());
+        assert!(expired["sequence"].as_str().is_some());
+        node.shutdown().await.expect("first node shuts down");
+
+        let restarted = start_protocol2_with_runtime_config(
+            Protocol2RunConfig {
+                data_dir,
+                api_listen: "127.0.0.1:0".parse().expect("API address parses"),
+                p2p_listen: None,
+                bootstrap_peers: Vec::new(),
+                genesis_path,
+                validator_key_path: None,
+            },
+            runtime_config,
+        )
+        .await
+        .expect("observer node restarts");
+        let (status, recovered) =
+            tcp_json_request(restarted.api_addr(), tcp_get_request(&status_path)).await;
+        assert_eq!(status, 200);
+        assert_eq!(recovered["status"]["kind"], "expired");
+        assert_eq!(recovered, expired);
+        restarted
+            .shutdown()
+            .await
+            .expect("restarted node shuts down");
     }
 
     #[tokio::test]
