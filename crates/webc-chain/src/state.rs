@@ -1614,6 +1614,50 @@ impl<'chain, 'effects> NativeAccountControlContext<'chain, 'effects> {
     }
 }
 
+/// Envelope coordinates shared by the four bridge transitions.
+pub(crate) struct NativeBridgeContext<'effects> {
+    sender: Address,
+    source_transaction: Hash256,
+    effects: NativeActionEffects<'effects>,
+}
+
+impl<'effects> NativeBridgeContext<'effects> {
+    /// Creates bridge context from an already authenticated envelope.
+    pub(crate) const fn new(
+        sender: Address,
+        source_transaction: Hash256,
+        effects: NativeActionEffects<'effects>,
+    ) -> Self {
+        Self {
+            sender,
+            source_transaction,
+            effects,
+        }
+    }
+}
+
+/// Sender and lane coordinates shared by application-registry transitions.
+pub(crate) struct NativeApplicationContext<'effects> {
+    sender: Address,
+    authorization_lane: AuthorizationLaneId,
+    effects: NativeActionEffects<'effects>,
+}
+
+impl<'effects> NativeApplicationContext<'effects> {
+    /// Creates application context from an authenticated transaction envelope.
+    pub(crate) const fn new(
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        effects: NativeActionEffects<'effects>,
+    ) -> Self {
+        Self {
+            sender,
+            authorization_lane,
+            effects,
+        }
+    }
+}
+
 /// Borrowed coordinates and replacement bytes for one owned-object mutation.
 ///
 /// Grouping the namespace/version preconditions with the target prevents V4 and
@@ -3436,34 +3480,17 @@ impl ChainState {
                 recipient,
                 amount,
             } => {
-                if amount.is_zero() {
-                    return Err(ChainError::BridgeAmountZero);
-                }
-                if *asset != AssetId::NativeWebc || *destination_chain == ExternalChain::Webc {
-                    return Err(ChainError::InvalidBridgeAssetFlow);
-                }
-                access.write(StateKey::bridge_escrow(destination_chain.clone()))?;
-                self.debit_asset_or_native(tx.sender, asset, *amount)?;
-                self.credit_native_bridge_escrow(destination_chain.clone(), *amount)?;
-                let message = self.next_bridge_message(
-                    OutgoingBridgeMessage {
-                        source_chain: ExternalChain::Webc,
-                        destination_chain: destination_chain.clone(),
-                        asset: asset.clone(),
-                        sender: tx.sender.as_bytes().to_vec(),
-                        recipient: recipient.clone(),
-                        amount: *amount,
-                        source_tx: tx_hash,
-                    },
-                    &mut access,
+                self.apply_native_bridge_lock(
+                    NativeBridgeContext::new(
+                        tx.sender,
+                        tx_hash,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    asset,
+                    destination_chain,
+                    recipient,
+                    *amount,
                 )?;
-                let message_hash = message.hash()?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Locked {
-                        message,
-                        message_hash,
-                    },
-                });
             }
             Operation::BridgeBurn {
                 asset,
@@ -3471,69 +3498,33 @@ impl ChainState {
                 recipient,
                 amount,
             } => {
-                if amount.is_zero() {
-                    return Err(ChainError::BridgeAmountZero);
-                }
-                let AssetId::External { origin_chain, .. } = asset else {
-                    return Err(ChainError::InvalidBridgeAssetFlow);
-                };
-                if *origin_chain != *destination_chain || *destination_chain == ExternalChain::Webc
-                {
-                    return Err(ChainError::BridgeSourceMismatch);
-                }
-                access.write(StateKey::asset_balance(asset.clone(), tx.sender))?;
-                self.debit_asset_or_native(tx.sender, asset, *amount)?;
-                let message = self.next_bridge_message(
-                    OutgoingBridgeMessage {
-                        source_chain: ExternalChain::Webc,
-                        destination_chain: destination_chain.clone(),
-                        asset: asset.clone(),
-                        sender: tx.sender.as_bytes().to_vec(),
-                        recipient: recipient.clone(),
-                        amount: *amount,
-                        source_tx: tx_hash,
-                    },
-                    &mut access,
+                self.apply_native_bridge_burn(
+                    NativeBridgeContext::new(
+                        tx.sender,
+                        tx_hash,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    asset,
+                    destination_chain,
+                    recipient,
+                    *amount,
                 )?;
-                let message_hash = message.hash()?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Burned {
-                        message,
-                        message_hash,
-                    },
-                });
             }
             Operation::BridgeMint { message } => {
-                if !config.bridge.can_submit_incoming(tx.sender) {
-                    return Err(ChainError::UnauthorizedBridgeRelayer);
-                }
-                let message_hash = self.process_incoming_bridge_message(
+                self.apply_native_bridge_mint(
+                    tx.sender,
                     message,
-                    IncomingBridgeAction::MintRepresentation,
-                    &mut access,
+                    &config.bridge,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Minted {
-                        message: message.clone(),
-                        message_hash,
-                    },
-                });
             }
             Operation::BridgeRelease { message } => {
-                if !config.bridge.can_submit_incoming(tx.sender) {
-                    return Err(ChainError::UnauthorizedBridgeRelayer);
-                }
-                let message_hash = self.process_incoming_bridge_message(
+                self.apply_native_bridge_release(
+                    tx.sender,
                     message,
-                    IncomingBridgeAction::ReleaseNative,
-                    &mut access,
+                    &config.bridge,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Released {
-                        message: message.clone(),
-                        message_hash,
-                    },
-                });
             }
             Operation::RegisterAppSponsor {
                 namespace,
@@ -3543,158 +3534,68 @@ impl ChainState {
                 // Owner financial action: default lane only (the account balance
                 // is the funding source). The sender account key is already
                 // recorded by the default-lane path; declare the sponsor state key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SponsorshipRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                self.apply_native_register_app_sponsor(
+                    NativeApplicationContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *namespace,
+                    *daily_budget_cap,
+                    *initial_funding,
+                    &config.sponsorship,
+                )?;
                 // The app-chosen per-day cap must stay within the protocol ceiling
                 // (§15.35 "within hard protocol caps").
-                if *daily_budget_cap > config.sponsorship.max_app_daily_budget {
-                    return Err(ChainError::AppSponsorDailyCapTooHigh);
-                }
-                if self.sponsors.contains_key(namespace) {
-                    return Err(ChainError::AppSponsorAlreadyExists);
-                }
                 // Lock the initial funding: liquid -> sponsor_budgets. `debit_native`
                 // fails closed if the owner cannot afford it, rolling back the tx.
-                self.debit_native(tx.sender, *initial_funding)?;
-                self.sponsor_budgets = self
-                    .sponsor_budgets
-                    .checked_add(*initial_funding)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let mut sponsor = AppSponsor::new(tx.sender, *daily_budget_cap);
-                sponsor.budget = *initial_funding;
-                self.sponsors.insert(*namespace, sponsor);
-                events.push(Event::AppSponsorRegistered {
-                    application: *namespace,
-                    owner: tx.sender,
-                    daily_budget_cap: *daily_budget_cap,
-                    funded: *initial_funding,
-                });
             }
             Operation::FundAppSponsor { namespace, amount } => {
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SponsorshipRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
-                // Validate existence and ownership before touching balances; only
-                // the owner may fund. Read-only borrow is dropped before `debit`.
-                {
-                    let sponsor = self
-                        .sponsors
-                        .get(namespace)
-                        .ok_or(ChainError::AppSponsorNotFound)?;
-                    if sponsor.owner != tx.sender {
-                        return Err(ChainError::AppSponsorNotOwner);
-                    }
-                }
-                self.debit_native(tx.sender, *amount)?;
-                self.sponsor_budgets = self
-                    .sponsor_budgets
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let sponsor = self
-                    .sponsors
-                    .get_mut(namespace)
-                    .ok_or(ChainError::AppSponsorNotFound)?;
-                sponsor.budget = sponsor
-                    .budget
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::AppSponsorFunded {
-                    application: *namespace,
-                    amount: *amount,
-                });
+                self.apply_native_fund_app_sponsor(
+                    NativeApplicationContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *namespace,
+                    *amount,
+                )?;
             }
             Operation::WithdrawAppSponsor { namespace, amount } => {
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SponsorshipRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
-                // Validate ownership and sufficient budget before moving units.
-                {
-                    let sponsor = self
-                        .sponsors
-                        .get(namespace)
-                        .ok_or(ChainError::AppSponsorNotFound)?;
-                    if sponsor.owner != tx.sender {
-                        return Err(ChainError::AppSponsorNotOwner);
-                    }
-                    if sponsor.budget < *amount {
-                        return Err(ChainError::AppSponsorBudgetInsufficient {
-                            needed: *amount,
-                            available: sponsor.budget,
-                        });
-                    }
-                }
-                // Move sponsor_budgets -> owner liquid, keeping the per-app budget
-                // and the aggregate bucket in lockstep (no mint, no loss).
-                {
-                    let sponsor = self
-                        .sponsors
-                        .get_mut(namespace)
-                        .ok_or(ChainError::AppSponsorNotFound)?;
-                    sponsor.budget = sponsor
-                        .budget
-                        .checked_sub(*amount)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                self.sponsor_budgets = self
-                    .sponsor_budgets
-                    .checked_sub(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.credit_native(tx.sender, *amount)?;
-                events.push(Event::AppSponsorWithdrawn {
-                    application: *namespace,
-                    amount: *amount,
-                });
+                self.apply_native_withdraw_app_sponsor(
+                    NativeApplicationContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *namespace,
+                    *amount,
+                )?;
             }
             Operation::RegisterNamespace { namespace } => {
                 // Claiming a namespace records an owner; it locks no native units,
                 // so the supply invariant is unaffected (only the ordinary fee
                 // moves). Any authorization lane may pay the fee — there is no
                 // account balance to draw from — so no default-lane restriction.
-                access.write(StateKey::application(
+                self.apply_native_register_namespace(
+                    tx.sender,
                     *namespace,
-                    namespace_state_key_hash(),
-                ))?;
-                if self.namespaces.contains_key(namespace) {
-                    return Err(ChainError::NamespaceAlreadyRegistered);
-                }
-                self.namespaces
-                    .insert(*namespace, NamespaceRecord::new(tx.sender));
-                events.push(Event::NamespaceRegistered {
-                    namespace: *namespace,
-                    owner: tx.sender,
-                });
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::TransferNamespace {
                 namespace,
                 new_owner,
             } => {
-                access.write(StateKey::application(
+                self.apply_native_transfer_namespace(
+                    tx.sender,
                     *namespace,
-                    namespace_state_key_hash(),
-                ))?;
+                    *new_owner,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
                 // Only the current owner may transfer. Validate existence and
                 // ownership before mutating, so a non-owner's attempt fails closed
                 // and leaves the record unchanged (the whole tx rolls back).
-                let record = self
-                    .namespaces
-                    .get_mut(namespace)
-                    .ok_or(ChainError::NamespaceNotFound)?;
-                if record.owner != tx.sender {
-                    return Err(ChainError::NamespaceNotOwner);
-                }
-                record.owner = *new_owner;
-                events.push(Event::NamespaceTransferred {
-                    namespace: *namespace,
-                    from: tx.sender,
-                    to: *new_owner,
-                });
             }
             Operation::CreateFeed { feed_id } => {
                 // Permissionless-for-a-fee (§15.6): default lane only (the creation
@@ -6447,6 +6348,338 @@ impl ChainState {
             delegator: sender,
             validator,
             amount: reward,
+        });
+        Ok(())
+    }
+
+    /// Escrows native WEBC and emits its replay-bound outgoing bridge message.
+    pub(crate) fn apply_native_bridge_lock(
+        &mut self,
+        context: NativeBridgeContext<'_>,
+        asset: &AssetId,
+        destination_chain: &ExternalChain,
+        recipient: &[u8],
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeBridgeContext {
+            sender,
+            source_transaction,
+            effects,
+        } = context;
+        if amount.is_zero() {
+            return Err(ChainError::BridgeAmountZero);
+        }
+        if *asset != AssetId::NativeWebc || *destination_chain == ExternalChain::Webc {
+            return Err(ChainError::InvalidBridgeAssetFlow);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::bridge_escrow(destination_chain.clone()))?;
+        self.debit_asset_or_native(sender, asset, amount)?;
+        self.credit_native_bridge_escrow(destination_chain.clone(), amount)?;
+        let message = self.next_bridge_message(
+            OutgoingBridgeMessage {
+                source_chain: ExternalChain::Webc,
+                destination_chain: destination_chain.clone(),
+                asset: asset.clone(),
+                sender: sender.as_bytes().to_vec(),
+                recipient: recipient.to_vec(),
+                amount,
+                source_tx: source_transaction,
+            },
+            access,
+        )?;
+        let message_hash = message.hash()?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Locked {
+                message,
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Burns an external representation and emits its origin-release message.
+    pub(crate) fn apply_native_bridge_burn(
+        &mut self,
+        context: NativeBridgeContext<'_>,
+        asset: &AssetId,
+        destination_chain: &ExternalChain,
+        recipient: &[u8],
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeBridgeContext {
+            sender,
+            source_transaction,
+            effects,
+        } = context;
+        if amount.is_zero() {
+            return Err(ChainError::BridgeAmountZero);
+        }
+        let AssetId::External { origin_chain, .. } = asset else {
+            return Err(ChainError::InvalidBridgeAssetFlow);
+        };
+        if *origin_chain != *destination_chain || *destination_chain == ExternalChain::Webc {
+            return Err(ChainError::BridgeSourceMismatch);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::asset_balance(asset.clone(), sender))?;
+        self.debit_asset_or_native(sender, asset, amount)?;
+        let message = self.next_bridge_message(
+            OutgoingBridgeMessage {
+                source_chain: ExternalChain::Webc,
+                destination_chain: destination_chain.clone(),
+                asset: asset.clone(),
+                sender: sender.as_bytes().to_vec(),
+                recipient: recipient.to_vec(),
+                amount,
+                source_tx: source_transaction,
+            },
+            access,
+        )?;
+        let message_hash = message.hash()?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Burned {
+                message,
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Applies one authorized incoming representation mint with replay defense.
+    pub(crate) fn apply_native_bridge_mint(
+        &mut self,
+        sender: Address,
+        message: &BridgeMessage,
+        config: &BridgeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !config.can_submit_incoming(sender) {
+            return Err(ChainError::UnauthorizedBridgeRelayer);
+        }
+        let NativeActionEffects { access, events } = effects;
+        let message_hash = self.process_incoming_bridge_message(
+            message,
+            IncomingBridgeAction::MintRepresentation,
+            access,
+        )?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Minted {
+                message: message.clone(),
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Applies one authorized incoming native release with replay defense.
+    pub(crate) fn apply_native_bridge_release(
+        &mut self,
+        sender: Address,
+        message: &BridgeMessage,
+        config: &BridgeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !config.can_submit_incoming(sender) {
+            return Err(ChainError::UnauthorizedBridgeRelayer);
+        }
+        let NativeActionEffects { access, events } = effects;
+        let message_hash = self.process_incoming_bridge_message(
+            message,
+            IncomingBridgeAction::ReleaseNative,
+            access,
+        )?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Released {
+                message: message.clone(),
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Registers and funds one application fee-sponsor budget.
+    pub(crate) fn apply_native_register_app_sponsor(
+        &mut self,
+        context: NativeApplicationContext<'_>,
+        namespace: Hash256,
+        daily_budget_cap: Amount,
+        initial_funding: Amount,
+        config: &SponsorshipConfig,
+    ) -> Result<(), ChainError> {
+        let NativeApplicationContext {
+            sender,
+            authorization_lane,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+        if daily_budget_cap > config.max_app_daily_budget {
+            return Err(ChainError::AppSponsorDailyCapTooHigh);
+        }
+        if self.sponsors.contains_key(&namespace) {
+            return Err(ChainError::AppSponsorAlreadyExists);
+        }
+        self.debit_native(sender, initial_funding)?;
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_add(initial_funding)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let mut sponsor = AppSponsor::new(sender, daily_budget_cap);
+        sponsor.budget = initial_funding;
+        self.sponsors.insert(namespace, sponsor);
+        events.push(Event::AppSponsorRegistered {
+            application: namespace,
+            owner: sender,
+            daily_budget_cap,
+            funded: initial_funding,
+        });
+        Ok(())
+    }
+
+    /// Adds native units to an owner-controlled application sponsor budget.
+    pub(crate) fn apply_native_fund_app_sponsor(
+        &mut self,
+        context: NativeApplicationContext<'_>,
+        namespace: Hash256,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeApplicationContext {
+            sender,
+            authorization_lane,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+        let sponsor = self
+            .sponsors
+            .get(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        if sponsor.owner != sender {
+            return Err(ChainError::AppSponsorNotOwner);
+        }
+        self.debit_native(sender, amount)?;
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let sponsor = self
+            .sponsors
+            .get_mut(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        sponsor.budget = sponsor
+            .budget
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::AppSponsorFunded {
+            application: namespace,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Returns unspent application sponsor budget to its owner.
+    pub(crate) fn apply_native_withdraw_app_sponsor(
+        &mut self,
+        context: NativeApplicationContext<'_>,
+        namespace: Hash256,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeApplicationContext {
+            sender,
+            authorization_lane,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+        let sponsor = self
+            .sponsors
+            .get(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        if sponsor.owner != sender {
+            return Err(ChainError::AppSponsorNotOwner);
+        }
+        if sponsor.budget < amount {
+            return Err(ChainError::AppSponsorBudgetInsufficient {
+                needed: amount,
+                available: sponsor.budget,
+            });
+        }
+        let sponsor = self
+            .sponsors
+            .get_mut(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        sponsor.budget = sponsor
+            .budget
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.credit_native(sender, amount)?;
+        events.push(Event::AppSponsorWithdrawn {
+            application: namespace,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Claims an unregistered application namespace for the sender.
+    pub(crate) fn apply_native_register_namespace(
+        &mut self,
+        sender: Address,
+        namespace: Hash256,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::application(namespace, namespace_state_key_hash()))?;
+        if self.namespaces.contains_key(&namespace) {
+            return Err(ChainError::NamespaceAlreadyRegistered);
+        }
+        self.namespaces
+            .insert(namespace, NamespaceRecord::new(sender));
+        events.push(Event::NamespaceRegistered {
+            namespace,
+            owner: sender,
+        });
+        Ok(())
+    }
+
+    /// Transfers one registered namespace after checking its current owner.
+    pub(crate) fn apply_native_transfer_namespace(
+        &mut self,
+        sender: Address,
+        namespace: Hash256,
+        new_owner: Address,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::application(namespace, namespace_state_key_hash()))?;
+        let record = self
+            .namespaces
+            .get_mut(&namespace)
+            .ok_or(ChainError::NamespaceNotFound)?;
+        if record.owner != sender {
+            return Err(ChainError::NamespaceNotOwner);
+        }
+        record.owner = new_owner;
+        events.push(Event::NamespaceTransferred {
+            namespace,
+            from: sender,
+            to: new_owner,
         });
         Ok(())
     }
