@@ -24,14 +24,16 @@
 //! was, so memory and disk never disagree.
 
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 
 use webc_chain::{
-    apply_block, apply_block_v4, build_block, build_block_v4_with_derived_authority, Block,
-    BlockBuildInput, BlockBuildInputV1, BlockHeight, BlockV4, BlockV4ExecutionError, BuiltBlockV4,
-    ChainConfig, ChainError, ChainState, ConsensusWalRecord, ConsensusWalRecordV1, Epoch,
-    FinalityAuthoritySetErrorV1, FinalityAuthoritySetV1, FinalityCertificate, GenesisConfig,
-    SlashingEvidence, Transaction, TransactionId, TransactionV5, TransactionValidationErrorV1,
-    ValidatorSet, CURRENT_PROTOCOL_VERSION, TRANSACTION_V5_PROTOCOL_VERSION,
+    apply_block, build_block, build_block_v4_with_derived_authority_transition,
+    replay_block_v4_transition, Block, BlockBuildInput, BlockBuildInputV1, BlockHeight, BlockV4,
+    BlockV4ExecutionError, BuiltBlockV4, ChainConfig, ChainError, ChainState, ConsensusWalRecord,
+    ConsensusWalRecordV1, Epoch, FinalityAuthoritySetErrorV1, FinalityAuthoritySetV1,
+    FinalityCertificate, GenesisConfig, SlashingEvidence, Transaction, TransactionId,
+    TransactionV5, TransactionValidationErrorV1, ValidatorSet, CURRENT_PROTOCOL_VERSION,
+    TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Hash256};
 use webc_proof::{
@@ -40,6 +42,7 @@ use webc_proof::{
     FinalizedTransactionProofErrorV1, FinalizedTransactionProofRequirementsV1,
     FinalizedTransactionProofV1, AUTHORITY_SET_TRANSITION_V1, CHECKPOINT_V1,
     FINALIZED_TRANSACTION_PROOF_V1, MAX_AUTHORITY_TRANSITIONS_V1,
+    MAX_FINALIZED_TRANSACTION_PROOF_V1_JSON_BYTES,
 };
 use webc_storage::{BlockCommit, BlockV4Commit, ChainStore, KvStore, PendingSlotV1, StorageError};
 
@@ -80,6 +83,12 @@ pub enum NodeError {
     /// A requested checkpoint or its certified history is unavailable locally.
     #[error("protocol-2 finalized proof data is unavailable: {0}")]
     ProofDataUnavailable(&'static str),
+    /// Retaining or assembling the requested proof would exceed its fixed budget.
+    #[error("protocol-2 finalized proof material exceeds the {maximum_bytes}-byte limit")]
+    FinalizedProofMaterialTooLarge {
+        /// Maximum projected JSON bytes accepted for one proof snapshot.
+        maximum_bytes: usize,
+    },
     /// A requested checkpoint/target relationship cannot form a proof.
     #[error("protocol-2 finalized proof request is invalid: {0}")]
     InvalidProofRequest(&'static str),
@@ -118,6 +127,110 @@ pub struct FinalizedTransactionProofBundleV1 {
     pub proof: FinalizedTransactionProofV1,
 }
 
+/// Maximum projected JSON bytes retained or assembled for one finalized proof.
+///
+/// This matches the public proof envelope. The actor checks the same budget
+/// while loading, before cloning or pushing the next durable record, so a proof
+/// that cannot fit the envelope never accumulates a many-record snapshot.
+pub(crate) const MAX_FINALIZED_PROOF_MATERIAL_BYTES_V1: usize =
+    MAX_FINALIZED_TRANSACTION_PROOF_V1_JSON_BYTES;
+
+/// Minimal transition material retained by the actor before worker assembly.
+///
+/// Adjacent transitions share an authority set. Retaining only each incoming set
+/// once avoids keeping the previous transition's incoming set again as the next
+/// transition's outgoing set; the bounded worker creates the wire-owned copies.
+struct AuthoritySetTransitionMaterialV1 {
+    header: webc_chain::BlockHeaderV4,
+    certificate: FinalityCertificate,
+    incoming_authority_set: FinalityAuthoritySetV1,
+}
+
+/// Fail-closed cumulative projection for one proof snapshot and final envelope.
+struct FinalizedProofMaterialBudgetV1 {
+    used_bytes: usize,
+    maximum_bytes: usize,
+}
+
+impl FinalizedProofMaterialBudgetV1 {
+    fn new(maximum_bytes: usize) -> Self {
+        Self {
+            used_bytes: 0,
+            maximum_bytes,
+        }
+    }
+
+    fn measure<T: serde::Serialize + ?Sized>(&self, value: &T) -> Result<usize, NodeError> {
+        let mut writer = BoundedCountingWriterV1::new(self.maximum_bytes);
+        match serde_json::to_writer(&mut writer, value) {
+            Ok(()) => Ok(writer.written_bytes),
+            Err(_) if writer.limit_exceeded => Err(self.too_large()),
+            Err(_) => Err(NodeError::ProofDataUnavailable(
+                "finalized proof material cannot be sized",
+            )),
+        }
+    }
+
+    fn charge<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<usize, NodeError> {
+        let bytes = self.measure(value)?;
+        self.charge_bytes(bytes)?;
+        Ok(bytes)
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), NodeError> {
+        let Some(next) = self.used_bytes.checked_add(bytes) else {
+            return Err(self.too_large());
+        };
+        if next > self.maximum_bytes {
+            return Err(self.too_large());
+        }
+        self.used_bytes = next;
+        Ok(())
+    }
+
+    fn too_large(&self) -> NodeError {
+        NodeError::FinalizedProofMaterialTooLarge {
+            maximum_bytes: self.maximum_bytes,
+        }
+    }
+}
+
+/// Non-allocating JSON byte counter that aborts as soon as its limit is crossed.
+struct BoundedCountingWriterV1 {
+    written_bytes: usize,
+    maximum_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedCountingWriterV1 {
+    fn new(maximum_bytes: usize) -> Self {
+        Self {
+            written_bytes: 0,
+            maximum_bytes,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedCountingWriterV1 {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.written_bytes.checked_add(bytes.len()) else {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("proof material byte count overflowed"));
+        };
+        if next > self.maximum_bytes {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("proof material byte limit exceeded"));
+        }
+        self.written_bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Owned, bounded storage snapshot awaiting CPU-heavy proof construction.
 ///
 /// The single-owner runtime loads this snapshot in command order, then may move
@@ -139,12 +252,10 @@ pub(crate) struct FinalizedTransactionProofMaterialV1 {
     target_block: BlockV4,
     /// Durable zero-based position of the requested transaction in the block.
     transaction_index: usize,
-    /// Certificate authenticating the exact target header.
-    target_certificate: FinalityCertificate,
-    /// Authority snapshot that must verify the target certificate.
-    target_authority_set: FinalityAuthoritySetV1,
-    /// Ordered boundary certificates between checkpoint and target.
-    authority_transitions: Vec<AuthoritySetTransitionV1>,
+    /// Certificate authenticating a distinct target; `None` reuses checkpoint finality.
+    target_certificate: Option<FinalityCertificate>,
+    /// Ordered unique incoming-set material between checkpoint and target.
+    authority_transitions: Vec<AuthoritySetTransitionMaterialV1>,
 }
 
 impl FinalizedTransactionProofMaterialV1 {
@@ -222,12 +333,32 @@ impl FinalizedTransactionProofMaterialV1 {
         let receipt_proof = build_indexed_merkle_proof(&receipt_leaves, index)
             .map_err(|_| NodeError::ProofDataUnavailable("receipt path cannot be built"))?;
 
+        let target_certificate = self
+            .target_certificate
+            .unwrap_or_else(|| self.checkpoint_candidate.certificate.clone());
+        let mut outgoing_authority_set = self.checkpoint_candidate.authority_set.clone();
+        let mut authority_transitions = Vec::with_capacity(self.authority_transitions.len());
+        for transition in self.authority_transitions {
+            // The public proof owns both sides of every boundary. Keep the next
+            // outgoing copy only inside this bounded worker; the actor snapshot
+            // retained each incoming authority set exactly once.
+            let next_outgoing_authority_set = transition.incoming_authority_set.clone();
+            authority_transitions.push(AuthoritySetTransitionV1 {
+                version: AUTHORITY_SET_TRANSITION_V1,
+                header: transition.header,
+                certificate: transition.certificate,
+                outgoing_authority_set,
+                incoming_authority_set: transition.incoming_authority_set,
+            });
+            outgoing_authority_set = next_outgoing_authority_set;
+        }
+
         let proof = FinalizedTransactionProofV1 {
             version: FINALIZED_TRANSACTION_PROOF_V1,
-            authority_transitions: self.authority_transitions,
+            authority_transitions,
             target_header: self.target_block.header,
-            target_certificate: self.target_certificate,
-            target_authority_set: self.target_authority_set,
+            target_certificate,
+            target_authority_set: outgoing_authority_set,
             transaction,
             receipt,
             transaction_proof,
@@ -619,15 +750,15 @@ impl<K: KvStore> Node<K> {
             proposer,
             timestamp_ms: self.monotonic_timestamp(timestamp_ms),
         };
-        let mut candidate_state = self.state.clone();
-        Ok(build_block_v4_with_derived_authority(
-            &mut candidate_state,
+        Ok(build_block_v4_with_derived_authority_transition(
+            &self.state,
             &self.config,
             input,
             transactions,
             evidence,
             &current_authority_set,
-        )?)
+        )?
+        .built)
     }
 
     /// Replays one received V4 proposal against committed state without mutation.
@@ -645,9 +776,8 @@ impl<K: KvStore> Node<K> {
             return Err(NodeError::ChainIdMismatch);
         }
         let current_authority_set = self.current_finality_authority_set_v1()?;
-        let mut scratch = self.state.clone();
-        apply_block_v4(
-            &mut scratch,
+        let _validated_post_state = replay_block_v4_transition(
+            &self.state,
             &self.config,
             block,
             &current_authority_set,
@@ -733,7 +863,27 @@ impl<K: KvStore> Node<K> {
         transaction_id: TransactionId,
         checkpoint_height: BlockHeight,
     ) -> Result<Option<FinalizedTransactionProofMaterialV1>, NodeError> {
+        self.load_finalized_transaction_proof_with_budget_v1(
+            transaction_id,
+            checkpoint_height,
+            MAX_FINALIZED_PROOF_MATERIAL_BYTES_V1,
+        )
+    }
+
+    /// Loads proof material under an explicit cumulative byte budget.
+    ///
+    /// This seam is used by the runtime's fixed production limit and focused
+    /// tests with a tiny limit. Each durable value is measured without allocating
+    /// serialized bytes, and the budget is charged before that value is cloned or
+    /// pushed into the owned worker snapshot.
+    pub(crate) fn load_finalized_transaction_proof_with_budget_v1(
+        &self,
+        transaction_id: TransactionId,
+        checkpoint_height: BlockHeight,
+        maximum_material_bytes: usize,
+    ) -> Result<Option<FinalizedTransactionProofMaterialV1>, NodeError> {
         self.ensure_protocol_two_block_api()?;
+        let mut material_budget = FinalizedProofMaterialBudgetV1::new(maximum_material_bytes);
         let Some(index) = self.store.finalized_transaction_index_v1(transaction_id)? else {
             return Ok(None);
         };
@@ -758,6 +908,17 @@ impl<K: KvStore> Node<K> {
             .ok_or(NodeError::ProofDataUnavailable(
                 "checkpoint authority set is not retained",
             ))?;
+
+        // The common request anchors the target itself. Account for the full
+        // block before cloning its header, because the same decoded allocation
+        // will become the retained target block below.
+        let same_block = index.position.height == checkpoint_height;
+        if same_block {
+            material_budget.charge(&checkpoint_block)?;
+        }
+        material_budget.charge(&checkpoint_block.header)?;
+        let checkpoint_certificate_bytes = material_budget.charge(&checkpoint_certificate)?;
+        let checkpoint_authority_set_bytes = material_budget.charge(&checkpoint_authority_set)?;
         let checkpoint_candidate = CheckpointV1 {
             version: CHECKPOINT_V1,
             header: checkpoint_block.header.clone(),
@@ -765,33 +926,32 @@ impl<K: KvStore> Node<K> {
             authority_set: checkpoint_authority_set,
         };
 
-        // The common request anchors the target itself. Reuse its bounded decoded
-        // bytes rather than loading the same multi-megabyte record twice.
-        let same_block = index.position.height == checkpoint_height;
         let target_block = if same_block {
             checkpoint_block
         } else {
-            self.store
+            // Only its charged header survives in `checkpoint_candidate`.
+            // Release the potentially multi-megabyte block before the next read.
+            drop(checkpoint_block);
+            let block = self
+                .store
                 .block_v4_for_finalized_proof(index.position.height)?
                 .ok_or(NodeError::ProofDataUnavailable(
                     "target block is not retained",
-                ))?
+                ))?;
+            material_budget.charge(&block)?;
+            block
         };
         let target_certificate = if same_block {
-            checkpoint_candidate.certificate.clone()
+            // The public proof owns a second certificate even though the actor
+            // snapshot retains only the checkpoint copy.
+            material_budget.charge_bytes(checkpoint_certificate_bytes)?;
+            None
         } else {
-            self.store.certificate(index.position.height.get())?.ok_or(
+            let certificate = self.store.certificate(index.position.height.get())?.ok_or(
                 NodeError::ProofDataUnavailable("target certificate is not retained"),
-            )?
-        };
-        let target_authority_set = if same_block {
-            checkpoint_candidate.authority_set.clone()
-        } else {
-            self.store
-                .finality_authority_set_v1(target_block.header.epoch)?
-                .ok_or(NodeError::ProofDataUnavailable(
-                    "target authority set is not retained",
-                ))?
+            )?;
+            material_budget.charge(&certificate)?;
+            Some(certificate)
         };
 
         let transaction_index =
@@ -807,6 +967,7 @@ impl<K: KvStore> Node<K> {
         }
 
         let mut authority_transitions = Vec::new();
+        let mut current_authority_set_bytes = checkpoint_authority_set_bytes;
         let checkpoint_epoch = checkpoint_candidate.header.epoch.get();
         let target_epoch = target_block.header.epoch.get();
         let transition_span =
@@ -852,37 +1013,37 @@ impl<K: KvStore> Node<K> {
                     .ok_or(NodeError::ProofDataUnavailable(
                         "authority transition block is not retained",
                     ))?;
+                material_budget.charge(&transition_block.header)?;
+                let transition_header = transition_block.header.clone();
+                // Transition proofs retain only the header. Drop transactions
+                // and receipts before loading the certificate and authority set.
+                drop(transition_block);
                 let transition_certificate = self.store.certificate(boundary_height.get())?.ok_or(
                     NodeError::ProofDataUnavailable(
                         "authority transition certificate is not retained",
                     ),
                 )?;
-                let outgoing_epoch =
-                    next_epoch_value
-                        .checked_sub(1)
-                        .ok_or(NodeError::InvalidProofRequest(
-                            "outgoing authority epoch underflowed",
-                        ))?;
-                let outgoing_authority_set = self
-                    .store
-                    .finality_authority_set_v1(Epoch::new(outgoing_epoch))?
-                    .ok_or(NodeError::ProofDataUnavailable(
-                        "outgoing transition authority set is not retained",
-                    ))?;
                 let incoming_authority_set = self
                     .store
                     .finality_authority_set_v1(next_epoch)?
                     .ok_or(NodeError::ProofDataUnavailable(
                         "incoming transition authority set is not retained",
                     ))?;
-                let transition = AuthoritySetTransitionV1 {
-                    version: AUTHORITY_SET_TRANSITION_V1,
-                    header: transition_block.header,
+
+                // Charge every public-wire occurrence, but retain adjacent
+                // authority sets once. Reusing the measured outgoing size avoids
+                // repeatedly serializing a large set on the actor thread.
+                material_budget.charge_bytes(current_authority_set_bytes)?;
+                material_budget.charge(&transition_certificate)?;
+                let incoming_authority_set_bytes =
+                    material_budget.charge(&incoming_authority_set)?;
+                let transition = AuthoritySetTransitionMaterialV1 {
+                    header: transition_header,
                     certificate: transition_certificate,
-                    outgoing_authority_set,
                     incoming_authority_set,
                 };
                 authority_transitions.push(transition);
+                current_authority_set_bytes = incoming_authority_set_bytes;
             }
             if next_epoch_value == target_epoch {
                 break;
@@ -895,6 +1056,11 @@ impl<K: KvStore> Node<K> {
                     ))?;
         }
 
+        // Target-certificate verification carries its own authority-set field.
+        // It may reuse the checkpoint or last incoming set in memory, but its
+        // projected public bytes still count against the single proof envelope.
+        material_budget.charge_bytes(current_authority_set_bytes)?;
+
         Ok(Some(FinalizedTransactionProofMaterialV1 {
             chain_id: self.config.chain_id.clone(),
             blocks_per_epoch: self.config.staking.blocks_per_epoch,
@@ -903,7 +1069,6 @@ impl<K: KvStore> Node<K> {
             checkpoint_candidate,
             target_block,
             target_certificate,
-            target_authority_set,
             authority_transitions,
             transaction_index,
         }))
@@ -926,9 +1091,8 @@ impl<K: KvStore> Node<K> {
             return Err(NodeError::ChainIdMismatch);
         }
         let current_authority_set = self.current_finality_authority_set_v1()?;
-        let mut next_state = self.state.clone();
-        apply_block_v4(
-            &mut next_state,
+        let next_state = replay_block_v4_transition(
+            &self.state,
             &self.config,
             &block,
             &current_authority_set,
@@ -989,6 +1153,21 @@ mod tests {
     use webc_chain::{Amount, ChainConfig, FeeBid, GenesisAccount, GenesisConfig, Operation};
     use webc_crypto::Keypair;
     use webc_storage::{MemoryKvStore, RedbKvStore};
+
+    #[test]
+    fn proof_material_budget_rejects_the_next_record_atomically() {
+        let mut budget = FinalizedProofMaterialBudgetV1::new(4);
+        budget.charge_bytes(3).expect("first retained record fits");
+
+        assert!(matches!(
+            budget.charge_bytes(2),
+            Err(NodeError::FinalizedProofMaterialTooLarge { maximum_bytes: 4 })
+        ));
+        assert_eq!(
+            budget.used_bytes, 3,
+            "a rejected record must not become retained budget"
+        );
+    }
 
     /// Genesis with two funded accounts and no validators (enough to move value
     /// and produce blocks in a Phase 3 single-proposer node).

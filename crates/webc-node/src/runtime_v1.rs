@@ -20,6 +20,7 @@
 //! and a failed durable write leaves memory unchanged. Local time affects only
 //! retention and never enters consensus state.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
@@ -34,6 +35,8 @@ use webc_storage::{
     MAX_PENDING_TRANSACTION_SCAN_V1,
 };
 
+use crate::node::MAX_FINALIZED_PROOF_MATERIAL_BYTES_V1;
+use crate::pending_evidence_v1::MAX_PENDING_SLASHING_EVIDENCE_V1;
 use crate::{
     FinalizedTransactionProofBundleV1, Node, NodeError, V4FinalizationResult, V5InsertOutcome,
     V5Mempool, V5MempoolConfig, V5MempoolError,
@@ -118,6 +121,9 @@ pub enum NodeRuntimeError {
     /// A lifecycle snapshot request exceeded its fixed transaction-ID cap.
     #[error("protocol-2 lifecycle query exceeds the {MAX_V5_LIFECYCLE_QUERY_IDS}-ID limit")]
     TooManyLifecycleIds,
+    /// A consensus evidence-status request exceeded the driver's fixed pool cap.
+    #[error("protocol-2 evidence query exceeds the {MAX_PENDING_SLASHING_EVIDENCE_V1}-hash limit")]
+    TooManySlashingEvidenceHashes,
     /// Durable storage failed; the current in-memory mutation was not applied.
     #[error("protocol-2 runtime storage error: {0}")]
     Storage(#[from] StorageError),
@@ -335,6 +341,26 @@ impl NodeHandle {
         receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
     }
 
+    /// Returns the requested evidence hashes already present in durable chain state.
+    ///
+    /// The input is capped to the driver's complete fixed-capacity pool. This
+    /// avoids cloning the chain's monotonically growing processed-evidence set
+    /// into the consensus task on every height.
+    pub async fn processed_slashing_evidence_v1(
+        &self,
+        hashes: Vec<webc_crypto::Hash256>,
+    ) -> Result<BTreeSet<webc_crypto::Hash256>, NodeRuntimeError> {
+        if hashes.len() > MAX_PENDING_SLASHING_EVIDENCE_V1 {
+            return Err(NodeRuntimeError::TooManySlashingEvidenceHashes);
+        }
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ProcessedSlashingEvidenceV1 { hashes, response })
+            .await
+            .map_err(|_| NodeRuntimeError::Stopped)?;
+        receiver.await.map_err(|_| NodeRuntimeError::Stopped)?
+    }
+
     /// Replays a received authenticated V4 proposal without committing it.
     pub async fn validate_candidate_v4(
         &self,
@@ -482,6 +508,10 @@ enum Command {
     ConsensusContextV1 {
         response: oneshot::Sender<Result<ConsensusContextV1, NodeRuntimeError>>,
     },
+    ProcessedSlashingEvidenceV1 {
+        hashes: Vec<webc_crypto::Hash256>,
+        response: oneshot::Sender<Result<BTreeSet<webc_crypto::Hash256>, NodeRuntimeError>>,
+    },
     ValidateCandidateV4 {
         block: Box<BlockV4>,
         next_authority_set: Box<FinalityAuthoritySetV1>,
@@ -516,6 +546,8 @@ pub struct NodeRuntime<K: KvStore> {
     mempool: V5Mempool,
     lifecycle_events: broadcast::Sender<TransactionLifecycleV1>,
     proof_workers: Arc<Semaphore>,
+    /// Maximum projected JSON bytes loaded for one proof worker snapshot.
+    proof_material_budget_bytes: usize,
 }
 
 impl<K> NodeRuntime<K>
@@ -530,10 +562,33 @@ where
     /// handle becomes reachable. A tightened capacity policy selects survivors
     /// deterministically in stored transaction-ID order.
     pub fn spawn(
+        node: Node<K>,
+        mempool_config: V5MempoolConfig,
+        queue_capacity: usize,
+        recovery_now_ms: LocalTimestampMs,
+    ) -> Result<
+        (
+            NodeHandle,
+            tokio::task::JoinHandle<Result<(), NodeRuntimeError>>,
+        ),
+        NodeRuntimeError,
+    > {
+        Self::spawn_with_proof_material_budget(
+            node,
+            mempool_config,
+            queue_capacity,
+            recovery_now_ms,
+            MAX_FINALIZED_PROOF_MATERIAL_BYTES_V1,
+        )
+    }
+
+    /// Starts the actor with an injectable proof budget for boundary tests.
+    fn spawn_with_proof_material_budget(
         mut node: Node<K>,
         mempool_config: V5MempoolConfig,
         queue_capacity: usize,
         recovery_now_ms: LocalTimestampMs,
+        proof_material_budget_bytes: usize,
     ) -> Result<
         (
             NodeHandle,
@@ -553,6 +608,7 @@ where
             mempool,
             lifecycle_events: lifecycle_events.clone(),
             proof_workers: Arc::new(Semaphore::new(DEFAULT_FINALIZED_PROOF_WORKERS)),
+            proof_material_budget_bytes,
         };
         let task = tokio::spawn(runtime.run(receiver));
         Ok((
@@ -645,9 +701,10 @@ where
                                 response.send(Err(NodeRuntimeError::ProofWorkersBusy));
                         }
                         Ok(permit) => {
-                            match self.node.load_finalized_transaction_proof_v1(
+                            match self.node.load_finalized_transaction_proof_with_budget_v1(
                                 transaction_id,
                                 checkpoint_height,
+                                self.proof_material_budget_bytes,
                             ) {
                                 Err(error) => {
                                     drop(permit);
@@ -706,6 +763,14 @@ where
                 Command::ConsensusContextV1 { response } => {
                     let result = self.consensus_context_v1();
                     let _response_canceled = response.send(result);
+                }
+                Command::ProcessedSlashingEvidenceV1 { hashes, response } => {
+                    let processed = &self.node.state().processed_slashing_evidence;
+                    let result = hashes
+                        .into_iter()
+                        .filter(|hash| processed.contains(hash))
+                        .collect();
+                    let _response_canceled = response.send(Ok(result));
                 }
                 Command::ValidateCandidateV4 {
                     block,
@@ -1634,6 +1699,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_proof_material_releases_permit_and_actor_stays_responsive() {
+        let validator = Keypair::from_seed([0x27; 32]);
+        let recipient = Keypair::from_seed([0x28; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let mut node = Node::open(MemoryKvStore::new(), &genesis).expect("test node opens");
+        let transaction = transfer(&validator, &recipient, 0, 5);
+        let transaction_id = transaction
+            .transaction_id()
+            .expect("target transaction has an ID");
+        let candidate = node
+            .build_candidate_v4(vec![transaction], Vec::new(), validator.address(), NOW + 1)
+            .expect("proof fixture builds");
+        let certificate = certificate_for(&genesis, &validator, &candidate.block);
+        node.import_finalized_block_v4(
+            candidate.block,
+            &candidate.next_authority_set,
+            &certificate,
+        )
+        .expect("proof fixture finalizes");
+        let (handle, task) = NodeRuntime::spawn_with_proof_material_budget(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW + 1),
+            1,
+        )
+        .expect("runtime starts with a tiny injected proof budget");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    handle.finalized_proof(transaction_id, BlockHeight::new(1))
+                )
+                .await
+                .expect("actor answers the bounded request"),
+                Err(NodeRuntimeError::Node(
+                    NodeError::FinalizedProofMaterialTooLarge { maximum_bytes: 1 }
+                ))
+            ));
+            assert_eq!(
+                handle
+                    .stats()
+                    .await
+                    .expect("actor remains responsive after rejection")
+                    .active_finalized_proofs,
+                0,
+                "the fail-closed loader must release its proof permit"
+            );
+        }
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
     async fn submission_is_durable_idempotent_and_queryable() {
         let alice = Keypair::from_seed([31; 32]);
         let bob = Keypair::from_seed([32; 32]);
@@ -2170,6 +2293,22 @@ mod tests {
                 .submit(transfer(&alice, &bob, 1, 5), LocalTimestampMs::new(NOW + 1),)
                 .await,
             Err(NodeRuntimeError::QueueFull)
+        ));
+    }
+
+    #[tokio::test]
+    async fn processed_evidence_query_rejects_more_than_the_fixed_pool_bound() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (lifecycle_events, _) = broadcast::channel(1);
+        let handle = NodeHandle {
+            sender,
+            lifecycle_events,
+        };
+        let hashes = vec![webc_crypto::Hash256([0xA5; 32]); MAX_PENDING_SLASHING_EVIDENCE_V1 + 1];
+
+        assert!(matches!(
+            handle.processed_slashing_evidence_v1(hashes).await,
+            Err(NodeRuntimeError::TooManySlashingEvidenceHashes)
         ));
     }
 }

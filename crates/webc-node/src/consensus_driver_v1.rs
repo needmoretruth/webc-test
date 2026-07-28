@@ -21,15 +21,14 @@
 //! and a certified block rejected by deterministic replay stops as an explicit
 //! consensus emergency.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use webc_chain::{
     BlockHeight, BuiltBlockV4, ChainError, ConsensusActionV1, ConsensusEventV1, ConsensusMachineV1,
     ConsensusMessageV1, FinalityAuthoritySetV1, FinalityCertificate, SlashingEvidence, TimeoutKind,
-    ValidatorIdentity, MAX_BLOCK_SLASHING_EVIDENCE, MAX_FUTURE_ROUNDS,
-    TRANSACTION_V5_PROTOCOL_VERSION,
+    ValidatorIdentity, MAX_FUTURE_ROUNDS, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_crypto::{Address, Hash256, Keypair};
 use webc_net::{CertifiedBlockV4, InboundMessage, NetError, NetMessage, NetworkHandle};
@@ -40,6 +39,7 @@ use crate::consensus_driver::{
     timestamp_within_future_drift, CommitInfo, DriverTimeouts, SYNC_BATCH,
 };
 use crate::http::now_ms;
+use crate::pending_evidence_v1::PendingEvidencePoolV1;
 use crate::{NodeError, NodeHandle, NodeRuntimeError};
 
 /// Why the protocol-2 consensus driver stopped.
@@ -89,8 +89,10 @@ pub enum DriverExitV1 {
 ///
 /// The operator identity and consensus key are deliberately separate: genesis
 /// may register a dedicated consensus public key that is not the operator's
-/// account key. The seed is never exposed, logged, serialized, cloned, or
-/// debug-formatted and is erased when these credentials are dropped.
+/// account key. The retained seed is never exposed, logged, serialized, cloned,
+/// or debug-formatted and is erased when these credentials are dropped. Key
+/// construction necessarily creates dalek's owned signing state; protected file
+/// loading avoids an additional by-value seed copy on that path.
 pub struct ConsensusCredentialsV1 {
     operator: Address,
     consensus_seed: Zeroizing<[u8; 32]>,
@@ -105,13 +107,22 @@ impl ConsensusCredentialsV1 {
         }
     }
 
+    /// Takes ownership of an already-zeroizing loader buffer without requesting
+    /// another by-value seed at this API boundary.
+    pub(crate) fn from_zeroizing(operator: Address, consensus_seed: Zeroizing<[u8; 32]>) -> Self {
+        Self {
+            operator,
+            consensus_seed,
+        }
+    }
+
     /// Public operator address represented by these credentials.
     pub fn operator(&self) -> Address {
         self.operator
     }
 
     fn identity_for(&self, set: &webc_chain::ValidatorSet) -> Option<ValidatorIdentity> {
-        let consensus_key = Keypair::from_seed(*self.consensus_seed);
+        let consensus_key = Keypair::from_seed_ref(&self.consensus_seed);
         if set.consensus_key_of(self.operator)? != consensus_key.public_key() {
             return None;
         }
@@ -128,7 +139,7 @@ pub struct ConsensusDriverV1 {
     network: NetworkHandle,
     credentials: Option<ConsensusCredentialsV1>,
     timeouts: DriverTimeouts,
-    pending_evidence: BTreeMap<Hash256, SlashingEvidence>,
+    pending_evidence: PendingEvidencePoolV1,
     checked_proposal_rounds: BTreeSet<u32>,
 }
 
@@ -143,7 +154,7 @@ impl ConsensusDriverV1 {
         timeouts: DriverTimeouts,
     ) -> Self {
         let credentials = consensus_seed.map(|seed| {
-            let operator = Keypair::from_seed(seed).address();
+            let operator = Keypair::from_seed_ref(&seed).address();
             ConsensusCredentialsV1::new(operator, seed)
         });
         Self::new_with_credentials(runtime, network, credentials, timeouts)
@@ -165,7 +176,7 @@ impl ConsensusDriverV1 {
             network,
             credentials,
             timeouts,
-            pending_evidence: BTreeMap::new(),
+            pending_evidence: PendingEvidencePoolV1::default(),
             checked_proposal_rounds: BTreeSet::new(),
         }
     }
@@ -187,6 +198,9 @@ impl ConsensusDriverV1 {
             };
             let height = context.height.get();
             let authority_set = context.current_authority_set;
+            if let Err(exit) = self.prune_processed_evidence(context.height).await {
+                return exit;
+            }
             let validator_set = match authority_set.to_validator_set() {
                 Ok(set) => set,
                 Err(_) => {
@@ -533,14 +547,8 @@ impl ConsensusDriverV1 {
                 error: ChainError::ConsensusProtocol2ProposalInvalid,
             })?;
         let tx_count = built.block.transactions.len();
-        let included_evidence = built.block.evidence.clone();
         self.finalize_with_retry(built.block, built.next_authority_set, certificate.clone())
             .await?;
-        for evidence in included_evidence {
-            if let Ok(hash) = evidence.hash() {
-                self.pending_evidence.remove(&hash);
-            }
-        }
         self.network
             .broadcast(NetMessage::Certificate(Box::new(certificate)))?;
         self.report_commit(height, block_hash, tx_count, commit_tx)
@@ -549,13 +557,20 @@ impl ConsensusDriverV1 {
     }
 
     async fn finalize_with_retry(
-        &self,
+        &mut self,
         block: webc_chain::BlockV4,
         next_authority_set: FinalityAuthoritySetV1,
         certificate: FinalityCertificate,
     ) -> Result<(), DriverExitV1> {
         const RETRIES: u32 = 3;
         let height = block.header.height.get();
+        let finalized_evidence =
+            PendingEvidencePoolV1::finalized_hashes(&block.evidence).map_err(|error| {
+                DriverExitV1::CertifiedBlockInvalid {
+                    height,
+                    error: NodeRuntimeError::Node(NodeError::Chain(error)),
+                }
+            })?;
         let mut attempt = 0u32;
         let mut backoff = Duration::from_millis(50);
         loop {
@@ -568,7 +583,14 @@ impl ConsensusDriverV1 {
                 )
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    // Both locally decided and state-synchronized blocks pass
+                    // through this one durable-success boundary. Cleanup must
+                    // happen only after commit, never after a failed retry.
+                    self.pending_evidence
+                        .remove_hashes(finalized_evidence.iter().copied());
+                    return Ok(());
+                }
                 Err(NodeRuntimeError::Node(NodeError::Storage(StorageError::Io(_))))
                     if attempt < RETRIES =>
                 {
@@ -625,12 +647,7 @@ impl ConsensusDriverV1 {
                     else {
                         continue;
                     };
-                    let evidence = self
-                        .pending_evidence
-                        .values()
-                        .take(MAX_BLOCK_SLASHING_EVIDENCE)
-                        .cloned()
-                        .collect();
+                    let evidence = self.pending_evidence.candidate_evidence();
                     let built = self
                         .runtime
                         .build_candidate_v4(
@@ -657,9 +674,7 @@ impl ConsensusDriverV1 {
                 }
                 ConsensusActionV1::Equivocation(evidence) => {
                     let evidence = SlashingEvidence::DoubleVote(*evidence);
-                    if let Ok(hash) = evidence.hash() {
-                        self.pending_evidence.entry(hash).or_insert(evidence);
-                    }
+                    let _admitted = self.pending_evidence.insert(evidence);
                 }
             }
         }
@@ -668,6 +683,23 @@ impl ConsensusDriverV1 {
 
     fn identity_for(&self, set: &webc_chain::ValidatorSet) -> Option<ValidatorIdentity> {
         self.credentials.as_ref()?.identity_for(set)
+    }
+
+    async fn prune_processed_evidence(&mut self, height: BlockHeight) -> Result<(), DriverExitV1> {
+        let hashes = self.pending_evidence.hashes();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let processed = self
+            .runtime
+            .processed_slashing_evidence_v1(hashes)
+            .await
+            .map_err(|error| DriverExitV1::Runtime {
+                height: height.get(),
+                error,
+            })?;
+        self.pending_evidence.prune_processed(&processed);
+        Ok(())
     }
 
     async fn report_commit(

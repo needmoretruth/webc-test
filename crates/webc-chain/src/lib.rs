@@ -66,8 +66,9 @@ pub use block_builder::{
     MAX_BLOCK_SLASHING_EVIDENCE,
 };
 pub use block_builder_v1::{
-    apply_block_v4, build_block_v4, build_block_v4_with_derived_authority, BlockBuildInputV1,
-    BlockV4ExecutionError, BuiltBlockV4,
+    apply_block_v4, build_block_v4, build_block_v4_with_derived_authority,
+    build_block_v4_with_derived_authority_transition, replay_block_v4_transition,
+    BlockBuildInputV1, BlockV4ExecutionError, BuiltBlockV4, BuiltBlockV4Transition,
 };
 pub use block_v4::{
     BlockHeaderV4, BlockV4, BlockV4Error, BLOCK_HEADER_V4_DOMAIN, MAX_BLOCK_V4_CANONICAL_BYTES,
