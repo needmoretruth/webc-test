@@ -15,7 +15,10 @@
 //! everything as block errors.
 
 use crate::sponsor_grant_book::SponsorGrantBookError;
-use crate::state::{NativeActionEffects, NativeObjectMutation, NativeValidatorRegistration};
+use crate::state::{
+    NativeAccountControlContext, NativeActionEffects, NativeObjectMutation,
+    NativeValidatorRegistration,
+};
 use crate::state_key::StateAccessRecorder;
 use crate::unbonding::{
     UnbondingClaimJournalV1, UnbondingKind, UnbondingRequestId, UnbondingRequestJournalV1,
@@ -26,10 +29,11 @@ use crate::{
     BlockPositionV1, ChainConfig, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
     ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate,
     GasUnits, Nonce, ObjectId, Operation, PostQuantumRoot, ProtocolStateKey, ReceiptError,
-    ReceiptStatusV1, ReceiptV1, SessionKey, SessionKeyId, SponsorGrantId, SponsorGrantStateV1,
-    StakingActionV1, StakingConfig, StateKey, StateKeyKind, StoragePricing, TransactionKindV1,
-    TransactionV5, TransactionValidationErrorV1, EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION,
-    MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1, SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+    ReceiptStatusV1, ReceiptV1, SessionKey, SessionKeyConfig, SessionKeyId, SponsorGrantId,
+    SponsorGrantStateV1, StakingActionV1, StakingConfig, StateKey, StateKeyKind, StoragePricing,
+    TransactionKindV1, TransactionV5, TransactionValidationErrorV1, EVENT_V1,
+    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1,
+    SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
@@ -78,6 +82,12 @@ pub enum TransactionPreparationErrorV1 {
     /// A staking payload violates immutable protocol thresholds.
     #[error("V5 staking control violates the active staking thresholds")]
     StakingParametersInvalid,
+    /// A native recovery/session-control root signature or authority is invalid.
+    #[error("V5 native account control is not authorized by the current recovery root")]
+    NativeControlAuthorizationInvalid,
+    /// A native recovery/session-control payload violates active limits.
+    #[error("V5 native account control violates the active limits")]
+    NativeControlParametersInvalid,
     /// The signed sender nonce is not the next nonce in its lane.
     #[error("V5 sender nonce does not match current state")]
     SenderNonceMismatch,
@@ -127,6 +137,8 @@ pub enum TransactionPreparationErrorV1 {
 pub enum PreparedAuthorizationV1 {
     /// The account's active or legacy address-derived transaction key.
     AccountKey,
+    /// A replacement active key that may authorize only its own recovery action.
+    PostQuantumRootRecovery,
     /// An installed constrained session key whose budgets advance on inclusion.
     SessionKey(SessionKeyId),
 }
@@ -157,8 +169,10 @@ struct PreparationSnapshotV1 {
     effective_priority_fee_per_unit: FeeRate,
     authorization: PreparedAuthorizationV1,
     storage_pricing: StoragePricing,
-    /// Exact thresholds used by root-authorized staking, absent otherwise.
-    staking: Option<StakingConfig>,
+    /// Exact staking thresholds used by native compounding and staking controls.
+    staking: StakingConfig,
+    /// Exact session-key limits used by native key-management actions.
+    session_keys: SessionKeyConfig,
     /// Current installed root verified during preparation, absent otherwise.
     staking_root: Option<PostQuantumRoot>,
 }
@@ -830,7 +844,10 @@ impl ChainState {
 
         let authorization = prepare_sender_authorization(self, transaction, fee_reserve)?;
         let expected_access = match authorization {
-            PreparedAuthorizationV1::AccountKey => transaction.expected_access_list(),
+            PreparedAuthorizationV1::AccountKey
+            | PreparedAuthorizationV1::PostQuantumRootRecovery => {
+                transaction.expected_access_list()
+            }
             PreparedAuthorizationV1::SessionKey(_) => transaction.expected_session_access_list(),
         }
         .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
@@ -842,7 +859,13 @@ impl ChainState {
         if expected_nonce != transaction.authorization.nonce {
             return Err(TransactionPreparationErrorV1::SenderNonceMismatch);
         }
-        let (staking, staking_root) =
+        prepare_native_authorization_controls(
+            self,
+            transaction,
+            authorization,
+            &config.session_keys,
+        )?;
+        let (_staking_control, staking_root) =
             prepare_staking_controls(self, transaction, authorization, &config.staking)?;
         let fee_payer = match &transaction.fee_payment {
             FeePaymentV1::SenderLane => FeePayerV1 {
@@ -872,7 +895,8 @@ impl ChainState {
             ),
             authorization,
             storage_pricing: config.storage_pricing,
-            staking,
+            staking: config.staking.clone(),
+            session_keys: config.session_keys.clone(),
             staking_root,
         })
     }
@@ -894,16 +918,12 @@ impl ChainState {
         position: BlockPositionV1,
         config: &ChainConfig,
     ) -> Result<ExecutedTransactionV1, BlockExecutionErrorV1> {
-        if let Some(expected_staking) = prepared.snapshot.staking.as_ref() {
-            let expected_root = prepared
-                .snapshot
-                .staking_root
-                .ok_or(BlockExecutionErrorV1::InvalidState)?;
+        if let Some(expected_root) = prepared.snapshot.staking_root {
             let current_root = self
                 .authorization_policies
                 .get(&prepared.validated.transaction().sender)
                 .map(|policy| *policy.post_quantum_root());
-            if expected_staking != &config.staking || current_root != Some(expected_root) {
+            if prepared.snapshot.staking != config.staking || current_root != Some(expected_root) {
                 return Err(BlockExecutionErrorV1::StalePreparation);
             }
         }
@@ -977,7 +997,10 @@ impl ChainState {
                     program,
                     height: position.height,
                     storage_pricing: snapshot.storage_pricing,
-                    staking: snapshot.staking.as_ref(),
+                    chain_id: &transaction.chain_id,
+                    signed_nonce: transaction.authorization.nonce,
+                    staking: &snapshot.staking,
+                    session_keys: &snapshot.session_keys,
                 },
                 &mut access,
             )?,
@@ -1080,6 +1103,9 @@ fn unbonding_request_positions(
                 Operation::UnstakeValidator { .. } => {
                     Some((sender, sender, UnbondingKind::OperatorStake))
                 }
+                Operation::CompoundDelegatorRewards { validator } => {
+                    Some((*validator, *validator, UnbondingKind::OperatorStake))
+                }
                 _ => None,
             },
             ActionV1::StakingControl { action, .. } => match action.as_ref() {
@@ -1123,11 +1149,15 @@ enum NativeActionExecutionErrorV1 {
 /// This starts with sender and lane coordinates; later native groups add only
 /// the reviewed chain-config or authorization fields their V4 transition uses.
 #[derive(Clone, Copy)]
-struct NativeActionContextV1 {
+struct NativeActionContextV1<'a> {
     sender: Address,
     sender_public_key: PublicKeyBytes,
     authorization_lane: AuthorizationLaneId,
+    chain_id: &'a ChainId,
+    signed_nonce: Nonce,
     storage_pricing: StoragePricing,
+    staking: &'a StakingConfig,
+    session_keys: &'a SessionKeyConfig,
 }
 
 /// Executes one supported native action without owning fee or rollback policy.
@@ -1139,8 +1169,8 @@ struct NativeActionContextV1 {
 fn execute_native_action_v1(
     state: &mut ChainState,
     unbonding_claims: &mut UnbondingClaimJournalV1,
-    _unbonding_requests: &mut UnbondingRequestJournalV1,
-    context: NativeActionContextV1,
+    unbonding_requests: &mut UnbondingRequestJournalV1,
+    context: NativeActionContextV1<'_>,
     operation: &Operation,
     access: &mut StateAccessRecorder,
     events: &mut Vec<Event>,
@@ -1172,6 +1202,65 @@ fn execute_native_action_v1(
             *fee_deposit,
             effects,
         ),
+        Operation::InstallSessionKey {
+            session_public_key,
+            constraints,
+            post_quantum_root_reveal,
+        } => state.apply_native_install_session_key(
+            NativeAccountControlContext::new(
+                context.sender,
+                context.authorization_lane,
+                context.chain_id,
+                context.signed_nonce.get(),
+                effects,
+            ),
+            *session_public_key,
+            constraints,
+            post_quantum_root_reveal,
+            context.session_keys,
+        ),
+        Operation::RevokeSessionKey {
+            session_key,
+            post_quantum_root_reveal,
+        } => state.apply_native_revoke_session_key(
+            NativeAccountControlContext::new(
+                context.sender,
+                context.authorization_lane,
+                context.chain_id,
+                context.signed_nonce.get(),
+                effects,
+            ),
+            *session_key,
+            post_quantum_root_reveal,
+        ),
+        Operation::RotateActiveTransactionKey {
+            new_active_transaction_key,
+            post_quantum_root_reveal,
+        } => state.apply_native_rotate_active_transaction_key(
+            NativeAccountControlContext::new(
+                context.sender,
+                context.authorization_lane,
+                context.chain_id,
+                context.signed_nonce.get(),
+                effects,
+            ),
+            *new_active_transaction_key,
+            post_quantum_root_reveal,
+        ),
+        Operation::RotatePostQuantumRoot {
+            new_post_quantum_root,
+            post_quantum_root_reveal,
+        } => state.apply_native_rotate_post_quantum_root(
+            NativeAccountControlContext::new(
+                context.sender,
+                context.authorization_lane,
+                context.chain_id,
+                context.signed_nonce.get(),
+                effects,
+            ),
+            *new_post_quantum_root,
+            post_quantum_root_reveal,
+        ),
         Operation::ClaimValidatorRewards => {
             state.apply_native_claim_validator_rewards(context.sender, effects)
         }
@@ -1188,6 +1277,17 @@ fn execute_native_action_v1(
             unbonding_claims,
             effects,
         ),
+        Operation::CompoundValidatorRewards => {
+            state.apply_native_compound_validator_rewards(context.sender, context.staking, effects)
+        }
+        Operation::CompoundDelegatorRewards { validator } => state
+            .apply_native_compound_delegator_rewards(
+                context.sender,
+                *validator,
+                context.staking,
+                Some(unbonding_requests),
+                effects,
+            ),
         Operation::CreateObject {
             object_id,
             namespace,
@@ -1432,7 +1532,10 @@ struct ActionProgramContextV1<'a> {
     program: &'a crate::ActionProgramV1,
     height: BlockHeight,
     storage_pricing: StoragePricing,
-    staking: Option<&'a StakingConfig>,
+    chain_id: &'a ChainId,
+    signed_nonce: Nonce,
+    staking: &'a StakingConfig,
+    session_keys: &'a SessionKeyConfig,
 }
 
 /// Complete child-overlay result selected for fee and sparse-state commit.
@@ -1464,7 +1567,10 @@ fn execute_action_program_v1(
         program,
         height,
         storage_pricing,
+        chain_id,
+        signed_nonce,
         staking,
+        session_keys,
     } = context;
     let mut child = parent.clone();
     let mut child_unbonding_claims = parent_unbonding_claims.clone();
@@ -1493,7 +1599,11 @@ fn execute_action_program_v1(
                     sender: transaction.sender,
                     sender_public_key: transaction.sender_public_key,
                     authorization_lane: transaction.authorization.lane,
+                    chain_id,
+                    signed_nonce,
                     storage_pricing,
+                    staking,
+                    session_keys,
                 },
                 operation,
                 access,
@@ -1505,18 +1615,15 @@ fn execute_action_program_v1(
                 }
                 Err(NativeActionExecutionErrorV1::Transition(error)) => Err(error),
             },
-            ActionV1::StakingControl { action, .. } => {
-                let staking = staking.ok_or(BlockExecutionErrorV1::InvalidState)?;
-                execute_staking_action_v1(
-                    &mut child,
-                    &mut child_unbonding_requests,
-                    transaction.sender,
-                    staking,
-                    action,
-                    access,
-                    &mut action_events,
-                )
-            }
+            ActionV1::StakingControl { action, .. } => execute_staking_action_v1(
+                &mut child,
+                &mut child_unbonding_requests,
+                transaction.sender,
+                staking,
+                action,
+                access,
+                &mut action_events,
+            ),
             ActionV1::RevokeSponsorGrant { grant_id } => {
                 access
                     .write(StateKey::sponsor_grant(
@@ -1656,6 +1763,8 @@ fn classify_action_failure(
         | ChainError::AuthorizationPolicyAlreadyExists
         | ChainError::AuthorizationLaneExists
         | ChainError::AuthorizationLaneNotFound
+        | ChainError::SessionKeyAlreadyExists
+        | ChainError::SessionKeyNotFound
         | ChainError::ValidatorAlreadyExists(_)
         | ChainError::ValidatorNotFound(_)
         | ChainError::ValidatorNotActive(_)
@@ -1828,6 +1937,9 @@ fn prepare_sender_authorization(
     if &transaction.sender_public_key == policy.active_transaction_key() {
         return Ok(PreparedAuthorizationV1::AccountKey);
     }
+    if recovery_rotation_key(transaction) == Some(transaction.sender_public_key) {
+        return Ok(PreparedAuthorizationV1::PostQuantumRootRecovery);
+    }
     if transaction_contains_staking_control(transaction) {
         return Err(TransactionPreparationErrorV1::StakingAuthorizationInvalid);
     }
@@ -1841,12 +1953,181 @@ fn prepare_sender_authorization(
     Ok(PreparedAuthorizationV1::SessionKey(session_id))
 }
 
+/// Returns the replacement key only for the single-action recovery form.
+fn recovery_rotation_key(transaction: &TransactionV5) -> Option<PublicKeyBytes> {
+    let TransactionKindV1::Actions(program) = &transaction.kind else {
+        return None;
+    };
+    let [ActionV1::Native { operation }] = program.actions.as_slice() else {
+        return None;
+    };
+    let Operation::RotateActiveTransactionKey {
+        new_active_transaction_key,
+        ..
+    } = operation.as_ref()
+    else {
+        return None;
+    };
+    Some(*new_active_transaction_key)
+}
+
 fn transaction_contains_staking_control(transaction: &TransactionV5) -> bool {
     matches!(
         &transaction.kind,
         TransactionKindV1::Actions(program)
             if program.actions.iter().any(|action| matches!(action, ActionV1::StakingControl { .. }))
     )
+}
+
+/// Verifies legacy-domain recovery/session controls before any fee reservation.
+///
+/// V5 deliberately reuses these mature native operations, including their
+/// existing post-quantum signing domains. `ActionProgramV1::validate` therefore
+/// confines each such control to a single-action program, and this preparation
+/// step verifies the state-dependent policy/root/config before execution.
+fn prepare_native_authorization_controls(
+    state: &ChainState,
+    transaction: &TransactionV5,
+    authorization: PreparedAuthorizationV1,
+    config: &SessionKeyConfig,
+) -> Result<(), TransactionPreparationErrorV1> {
+    let TransactionKindV1::Actions(program) = &transaction.kind else {
+        return Ok(());
+    };
+    let [ActionV1::Native { operation }] = program.actions.as_slice() else {
+        return Ok(());
+    };
+    let is_control = matches!(
+        operation.as_ref(),
+        Operation::InstallSessionKey { .. }
+            | Operation::RevokeSessionKey { .. }
+            | Operation::RotateActiveTransactionKey { .. }
+            | Operation::RotatePostQuantumRoot { .. }
+    );
+    if !is_control {
+        return Ok(());
+    }
+    if !transaction.authorization.lane.is_default() {
+        return Err(TransactionPreparationErrorV1::NativeControlAuthorizationInvalid);
+    }
+    let policy = state
+        .authorization_policies
+        .get(&transaction.sender)
+        .ok_or(TransactionPreparationErrorV1::NativeControlAuthorizationInvalid)?;
+    policy
+        .validate()
+        .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+    let root = *policy.post_quantum_root();
+    let signed_nonce = transaction.authorization.nonce.get();
+
+    let verified = match operation.as_ref() {
+        Operation::InstallSessionKey {
+            session_public_key,
+            constraints,
+            post_quantum_root_reveal,
+        } => {
+            if authorization != PreparedAuthorizationV1::AccountKey {
+                return Err(TransactionPreparationErrorV1::NativeControlAuthorizationInvalid);
+            }
+            constraints
+                .validate()
+                .map_err(|_| TransactionPreparationErrorV1::NativeControlParametersInvalid)?;
+            if constraints.lifetime_epochs > config.max_lifetime_epochs {
+                return Err(TransactionPreparationErrorV1::NativeControlParametersInvalid);
+            }
+            let maximum = usize::try_from(config.max_session_keys_per_account)
+                .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+            let installed = state
+                .session_keys
+                .keys()
+                .filter(|(owner, _)| *owner == transaction.sender)
+                .take(maximum.saturating_add(1))
+                .count();
+            if installed >= maximum {
+                return Err(TransactionPreparationErrorV1::NativeControlParametersInvalid);
+            }
+            let action = crate::SessionKeyAuthorizationAction::Install {
+                session_public_key: *session_public_key,
+                constraints: constraints.clone(),
+            };
+            let message = crate::session_key_authorization_message(
+                &transaction.chain_id,
+                transaction.sender,
+                policy.revision(),
+                signed_nonce,
+                &action,
+            )
+            .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+            post_quantum_root_reveal.verify(&root, &message)
+        }
+        Operation::RevokeSessionKey {
+            session_key,
+            post_quantum_root_reveal,
+        } => {
+            if authorization != PreparedAuthorizationV1::AccountKey {
+                return Err(TransactionPreparationErrorV1::NativeControlAuthorizationInvalid);
+            }
+            let action = crate::SessionKeyAuthorizationAction::Revoke {
+                session_key: *session_key,
+            };
+            let message = crate::session_key_authorization_message(
+                &transaction.chain_id,
+                transaction.sender,
+                policy.revision(),
+                signed_nonce,
+                &action,
+            )
+            .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+            post_quantum_root_reveal.verify(&root, &message)
+        }
+        Operation::RotateActiveTransactionKey {
+            new_active_transaction_key,
+            post_quantum_root_reveal,
+        } => {
+            if !matches!(
+                authorization,
+                PreparedAuthorizationV1::AccountKey
+                    | PreparedAuthorizationV1::PostQuantumRootRecovery
+            ) || new_active_transaction_key == policy.active_transaction_key()
+            {
+                return Err(TransactionPreparationErrorV1::NativeControlAuthorizationInvalid);
+            }
+            let message = crate::active_key_rotation_message(
+                &transaction.chain_id,
+                transaction.sender,
+                policy.revision(),
+                signed_nonce,
+                new_active_transaction_key,
+            )
+            .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+            post_quantum_root_reveal.verify(&root, &message)
+        }
+        Operation::RotatePostQuantumRoot {
+            new_post_quantum_root,
+            post_quantum_root_reveal,
+        } => {
+            if authorization != PreparedAuthorizationV1::AccountKey
+                || new_post_quantum_root == policy.post_quantum_root()
+            {
+                return Err(TransactionPreparationErrorV1::NativeControlAuthorizationInvalid);
+            }
+            let message = crate::post_quantum_root_rotation_message(
+                &transaction.chain_id,
+                transaction.sender,
+                policy.revision(),
+                signed_nonce,
+                new_post_quantum_root,
+            )
+            .map_err(|_| TransactionPreparationErrorV1::InvalidState)?;
+            post_quantum_root_reveal.verify(&root, &message)
+        }
+        _ => return Ok(()),
+    }
+    .map_err(|_| TransactionPreparationErrorV1::NativeControlAuthorizationInvalid)?;
+    if !verified {
+        return Err(TransactionPreparationErrorV1::NativeControlAuthorizationInvalid);
+    }
+    Ok(())
 }
 
 /// Verifies every critical staking action against one current policy snapshot.
@@ -2189,14 +2470,15 @@ mod tests {
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
         AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainState, Delegation,
         Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectVersion, Operation, PostQuantumRoot,
-        PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
-        SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
-        StakingActionV1, TransactionAuthorizationV1, TransactionIndex, UnbondingKind,
-        UnbondingRequestId, Validator, ValidatorStatus, ValidityWindowV1,
-        INITIAL_AUTHORIZATION_POLICY_REVISION, MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1,
-        REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, TRANSACTION_V5_PROTOCOL_VERSION,
+        PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations,
+        SessionKeyAuthorizationAction, SessionKeyConstraints, SponsorGrantId, SponsorGrantV1,
+        SponsorUseCount, SponsorUseNonce, SponsorUseV1, StakingActionV1,
+        TransactionAuthorizationV1, TransactionIndex, UnbondingKind, UnbondingRequestId, Validator,
+        ValidatorStatus, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
+        MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1, REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
+        TRANSACTION_V5_PROTOCOL_VERSION,
     };
-    use webc_crypto::{Hash256, Keypair, MlDsa65PublicKey, MlDsa65SecretKey};
+    use webc_crypto::{ml_dsa65_keygen, Hash256, Keypair, MlDsa65PublicKey, MlDsa65SecretKey};
 
     fn sender_paid_fixture(sender: &Keypair, recipient: &Keypair) -> TransactionV5 {
         sender_actions_fixture(
@@ -2243,6 +2525,39 @@ mod tests {
         )
         .expect("bounded sender fixture");
         transaction.sign(sender).expect("sender fixture signs");
+        transaction
+    }
+
+    fn policy_native_transaction(
+        owner: Address,
+        signer: &Keypair,
+        policy_revision: AuthorizationPolicyRevision,
+        nonce: Nonce,
+        operation: Operation,
+    ) -> TransactionV5 {
+        let gas_limit = operation.required_units();
+        let mut transaction = TransactionV5::for_actions_unsigned(
+            ChainId::devnet(),
+            owner,
+            signer.public_key(),
+            TransactionAuthorizationV1 {
+                lane: AuthorizationLaneId::DEFAULT,
+                policy_revision,
+                nonce,
+            },
+            ValidityWindowV1::new(BlockHeight::new(10), BlockHeight::new(20)),
+            vec![ActionV1::native(operation)],
+            FeeBid {
+                gas_limit,
+                max_fee_per_unit: 5,
+                priority_fee_per_unit: 1,
+            },
+            FeePaymentV1::SenderLane,
+        )
+        .expect("policy-native transaction builds");
+        transaction
+            .sign_with_policy_key(signer)
+            .expect("policy-native transaction signs");
         transaction
     }
 
@@ -3551,6 +3866,210 @@ mod tests {
     }
 
     #[test]
+    fn native_account_controls_execute_recovery_lifecycle_and_restart_stably() {
+        let owner = Keypair::from_seed([1; 32]);
+        let session = Keypair::from_seed([2; 32]);
+        let replacement = Keypair::from_seed([3; 32]);
+        let (root_public, root_secret) = ml_dsa65_keygen().expect("test recovery keygen");
+        let root =
+            PostQuantumRoot::from_public_key(PostQuantumScheme::MlDsa65, root_public.as_bytes())
+                .expect("test recovery root");
+        let mut state = funded_state(&owner, None);
+        state
+            .accounts
+            .get_mut(&owner.address())
+            .expect("owner account")
+            .balance = Amount::from_units(1_000_000);
+        state.minted_supply = Amount::from_units(1_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+        state.authorization_policies.insert(
+            owner.address(),
+            AccountAuthorizationPolicy::new_v1(owner.public_key(), root).expect("test policy"),
+        );
+        let constraints = SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_units(10),
+            total_amount_budget: Amount::from_units(100),
+            max_fee_per_use: Amount::from_units(100_000),
+            total_fee_budget: Amount::from_units(200_000),
+            lifetime_epochs: 10,
+        };
+        let install_action = SessionKeyAuthorizationAction::Install {
+            session_public_key: session.public_key(),
+            constraints: constraints.clone(),
+        };
+        let install_message = crate::session_key_authorization_message(
+            &ChainId::devnet(),
+            owner.address(),
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            0,
+            &install_action,
+        )
+        .expect("session install message");
+        let install = policy_native_transaction(
+            owner.address(),
+            &owner,
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            Nonce::new(0),
+            Operation::InstallSessionKey {
+                session_public_key: session.public_key(),
+                constraints,
+                post_quantum_root_reveal: PostQuantumRootReveal {
+                    scheme: PostQuantumScheme::MlDsa65,
+                    public_key: root_public.to_bytes(),
+                    signature: root_secret
+                        .sign(&install_message, b"")
+                        .expect("session install root signature"),
+                },
+            },
+        );
+        state
+            .execute_prepared_transaction_v1(
+                prepared(&state, install),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
+            )
+            .expect("session installation executes");
+        let session_id = SessionKeyId::derive(&session.public_key());
+        assert!(state
+            .session_keys
+            .contains_key(&(owner.address(), session_id)));
+
+        let revoke_action = SessionKeyAuthorizationAction::Revoke {
+            session_key: session_id,
+        };
+        let revoke_message = crate::session_key_authorization_message(
+            &ChainId::devnet(),
+            owner.address(),
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            1,
+            &revoke_action,
+        )
+        .expect("session revoke message");
+        let revoke = policy_native_transaction(
+            owner.address(),
+            &owner,
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            Nonce::new(1),
+            Operation::RevokeSessionKey {
+                session_key: session_id,
+                post_quantum_root_reveal: PostQuantumRootReveal {
+                    scheme: PostQuantumScheme::MlDsa65,
+                    public_key: root_public.to_bytes(),
+                    signature: root_secret
+                        .sign(&revoke_message, b"")
+                        .expect("session revoke root signature"),
+                },
+            },
+        );
+        state
+            .execute_prepared_transaction_v1(
+                prepared(&state, revoke),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(1)),
+                &v5_config(),
+            )
+            .expect("session revocation executes");
+        assert!(!state
+            .session_keys
+            .contains_key(&(owner.address(), session_id)));
+
+        let rotation_message = crate::active_key_rotation_message(
+            &ChainId::devnet(),
+            owner.address(),
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            2,
+            &replacement.public_key(),
+        )
+        .expect("active-key rotation message");
+        let recovery = policy_native_transaction(
+            owner.address(),
+            &replacement,
+            INITIAL_AUTHORIZATION_POLICY_REVISION,
+            Nonce::new(2),
+            Operation::RotateActiveTransactionKey {
+                new_active_transaction_key: replacement.public_key(),
+                post_quantum_root_reveal: PostQuantumRootReveal {
+                    scheme: PostQuantumScheme::MlDsa65,
+                    public_key: root_public.to_bytes(),
+                    signature: root_secret
+                        .sign(&rotation_message, b"")
+                        .expect("active-key root signature"),
+                },
+            },
+        );
+        state
+            .execute_prepared_transaction_v1(
+                prepared(&state, recovery),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(2)),
+                &v5_config(),
+            )
+            .expect("new-key-signed recovery executes");
+        let rotated_revision = AuthorizationPolicyRevision::new(2);
+        assert_eq!(
+            state.authorization_policies[&owner.address()].active_transaction_key(),
+            &replacement.public_key()
+        );
+
+        let new_root = PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([0x55; 32]))
+            .expect("replacement root");
+        let root_rotation_message = crate::post_quantum_root_rotation_message(
+            &ChainId::devnet(),
+            owner.address(),
+            rotated_revision,
+            3,
+            &new_root,
+        )
+        .expect("root rotation message");
+        let rotate_root = policy_native_transaction(
+            owner.address(),
+            &replacement,
+            rotated_revision,
+            Nonce::new(3),
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root: new_root,
+                post_quantum_root_reveal: PostQuantumRootReveal {
+                    scheme: PostQuantumScheme::MlDsa65,
+                    public_key: root_public.to_bytes(),
+                    signature: root_secret
+                        .sign(&root_rotation_message, b"")
+                        .expect("root rotation signature"),
+                },
+            },
+        );
+        state
+            .execute_prepared_transaction_v1(
+                prepared(&state, rotate_root),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(3)),
+                &v5_config(),
+            )
+            .expect("root rotation executes");
+        assert_eq!(
+            state.authorization_policies[&owner.address()].post_quantum_root(),
+            &new_root
+        );
+        assert_eq!(
+            state.authorization_policies[&owner.address()].revision(),
+            AuthorizationPolicyRevision::new(3)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("account-control supply report")
+                .balanced
+        );
+        let restored: ChainState = bincode::deserialize(
+            &bincode::serialize(&state).expect("serialize account-control state"),
+        )
+        .expect("restore account-control state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("live root")
+        );
+    }
+
+    #[test]
     fn duplicate_policy_install_discards_first_child_policy() {
         let sender = Keypair::from_seed([1; 32]);
         let root = PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([0x98; 32]))
@@ -3675,6 +4194,108 @@ mod tests {
                 .supply_invariant_report()
                 .expect("reward claim supply report")
                 .balanced
+        );
+    }
+
+    #[test]
+    fn native_reward_compounding_conserves_supply_and_restart_root() {
+        let sender = Keypair::from_seed([1; 32]);
+        let target = Keypair::from_seed([2; 32]);
+        let actions = vec![
+            ActionV1::native(Operation::CompoundValidatorRewards),
+            ActionV1::native(Operation::CompoundDelegatorRewards {
+                validator: target.address(),
+            }),
+        ];
+        let gas_limit = actions.iter().map(ActionV1::required_units).sum::<u64>();
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut state = funded_state(&sender, None);
+        let sender_account = state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account");
+        sender_account.balance = Amount::from_units(500_000);
+        sender_account.staked = Amount::from_units(1_000);
+        sender_account.delegated = Amount::from_units(100);
+        let target_account = Account {
+            staked: Amount::from_units(1_000),
+            ..Account::default()
+        };
+        state.accounts.insert(target.address(), target_account);
+        state.validators.insert(
+            sender.address(),
+            Validator {
+                operator: sender.address(),
+                consensus_key: sender.public_key(),
+                self_stake: Amount::from_units(1_000),
+                delegated_stake: Amount::ZERO,
+                commission_bps: 0,
+                status: ValidatorStatus::PendingActivation,
+                bootstrap: false,
+                accumulated_rewards: Amount::from_units(30),
+            },
+        );
+        state.validators.insert(
+            target.address(),
+            Validator {
+                operator: target.address(),
+                consensus_key: target.public_key(),
+                self_stake: Amount::from_units(1_000),
+                delegated_stake: Amount::from_units(100),
+                commission_bps: 0,
+                status: ValidatorStatus::PendingActivation,
+                bootstrap: false,
+                accumulated_rewards: Amount::ZERO,
+            },
+        );
+        state.delegations.insert(
+            (sender.address(), target.address()),
+            Delegation {
+                delegator: sender.address(),
+                validator: target.address(),
+                amount: Amount::from_units(100),
+                accumulated_rewards: Amount::from_units(50),
+            },
+        );
+        state.minted_supply = Amount::from_units(502_180);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared(&state, transaction),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &v5_config(),
+            )
+            .expect("both native compounding actions execute")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 2);
+        assert_eq!(
+            state.validators[&sender.address()].self_stake,
+            Amount::from_units(1_030)
+        );
+        assert_eq!(
+            state.validators[&target.address()].delegated_stake,
+            Amount::from_units(150)
+        );
+        assert_eq!(
+            state.delegations[&(sender.address(), target.address())].amount,
+            Amount::from_units(150)
+        );
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("compounding supply report")
+                .balanced
+        );
+        let restored: ChainState =
+            bincode::deserialize(&bincode::serialize(&state).expect("serialize compounded state"))
+                .expect("restore compounded state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("live root")
         );
     }
 

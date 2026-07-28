@@ -616,8 +616,14 @@ impl ActionV1 {
                         | Operation::InstallAuthorizationPolicy { .. }
                         | Operation::OpenAuthorizationLane { .. }
                         | Operation::FundAuthorizationLane { .. }
+                        | Operation::InstallSessionKey { .. }
+                        | Operation::RevokeSessionKey { .. }
+                        | Operation::RotateActiveTransactionKey { .. }
+                        | Operation::RotatePostQuantumRoot { .. }
                         | Operation::ClaimValidatorRewards
                         | Operation::ClaimDelegatorRewards { .. }
+                        | Operation::CompoundValidatorRewards
+                        | Operation::CompoundDelegatorRewards { .. }
                         | Operation::ClaimUnbonded { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
@@ -679,6 +685,39 @@ impl ActionV1 {
                 if lane.is_default() || fee_deposit.is_zero() =>
             {
                 Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::InstallSessionKey {
+                constraints,
+                post_quantum_root_reveal,
+                ..
+            } => {
+                constraints
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)?;
+                post_quantum_root_reveal
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::RevokeSessionKey {
+                post_quantum_root_reveal,
+                ..
+            }
+            | Operation::RotateActiveTransactionKey {
+                post_quantum_root_reveal,
+                ..
+            } => post_quantum_root_reveal
+                .validate()
+                .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction),
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root,
+                post_quantum_root_reveal,
+            } => {
+                new_post_quantum_root
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)?;
+                post_quantum_root_reveal
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)
             }
             Operation::CreateObject { data, .. } | Operation::MutateObject { data, .. }
                 if data.len() > MAX_OBJECT_DATA_BYTES =>
@@ -745,6 +784,29 @@ impl ActionProgramV1 {
         }
         for action in &self.actions {
             action.validate_structure()?;
+        }
+        // Recovery-root signatures use the legacy native-operation message
+        // domains, which bind the exact operation and envelope nonce but do not
+        // carry an action ordinal. Keep these critical controls single-action
+        // until a future version introduces an ordinal-bound authorization
+        // format; this prevents an otherwise valid root proof from authorizing
+        // surprising sibling actions in the same atomic program.
+        if self.actions.len() != 1
+            && self.actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ActionV1::Native { operation }
+                        if matches!(
+                            operation.as_ref(),
+                            Operation::InstallSessionKey { .. }
+                                | Operation::RevokeSessionKey { .. }
+                                | Operation::RotateActiveTransactionKey { .. }
+                                | Operation::RotatePostQuantumRoot { .. }
+                        )
+                )
+            })
+        {
+            return Err(TransactionValidationErrorV1::InvalidNativeAction);
         }
         self.required_units()?;
         Ok(())
@@ -1823,7 +1885,58 @@ mod fee_bid_decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectId, ObjectVersion, Operation};
+    use crate::{
+        ObjectId, ObjectVersion, Operation, PostQuantumRoot, PostQuantumRootReveal,
+        PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
+    };
+
+    #[test]
+    fn protocol_two_supports_native_account_controls_and_reward_compounding() {
+        let replacement = Keypair::from_seed([41; 32]).public_key();
+        let reveal = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: vec![1],
+            signature: vec![2],
+        };
+        let constraints = SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_units(1),
+            total_amount_budget: Amount::from_units(1),
+            max_fee_per_use: Amount::from_units(1),
+            total_fee_budget: Amount::from_units(1),
+            lifetime_epochs: 1,
+        };
+        let root = PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([3; 32]))
+            .expect("non-zero root commitment");
+        let operations = [
+            Operation::InstallSessionKey {
+                session_public_key: replacement,
+                constraints,
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RevokeSessionKey {
+                session_key: SessionKeyId::derive(&replacement),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotateActiveTransactionKey {
+                new_active_transaction_key: replacement,
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root: root,
+                post_quantum_root_reveal: reveal,
+            },
+            Operation::CompoundValidatorRewards,
+            Operation::CompoundDelegatorRewards {
+                validator: Keypair::from_seed([42; 32]).address(),
+            },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
 
     #[test]
     fn staking_control_authorization_message_is_bounded_and_cross_language_stable() {
