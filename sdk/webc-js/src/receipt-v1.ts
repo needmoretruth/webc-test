@@ -29,6 +29,10 @@ export const MERKLE_V1_DOMAIN = "WEBC_MERKLE_V1";
 export const MAX_RECEIPT_EVENTS_V1 = 256;
 /** Maximum UTF-8 JSON bytes accepted for one untrusted V1 receipt. */
 export const MAX_RECEIPT_V1_JSON_BYTES = 256 * 1024;
+/** Maximum object nesting beneath one native event body. */
+export const MAX_NATIVE_EVENT_JSON_DEPTH_V1 = 8;
+/** Maximum primitive and object nodes traversed beneath one native event body. */
+export const MAX_NATIVE_EVENT_JSON_NODES_V1 = 64;
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
@@ -99,9 +103,7 @@ export function validateEventV1(value: unknown): asserts value is EventV1Json {
   hash256(event.transaction_id, "event transaction ID");
   u32(event.action_index, "event action index");
   u32(event.event_index, "event index");
-  const body = record(event.body, "native event body");
-  if (Object.keys(body).length !== 1) throw new Error("native event body must have one variant");
-  validateCanonicalValue(body, "native event body");
+  validateNativeEventBody(event.body);
 }
 
 export function validateFeeSummaryV1(value: unknown): asserts value is FeeSummaryV1Json {
@@ -328,7 +330,7 @@ function record(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function exactKeys(value: Record<string, unknown>, expected: string[], label: string): void {
+function exactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
   if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
@@ -369,22 +371,479 @@ function decimal(value: unknown, label: string, maxLength: number, maximum: bigi
   return parsed;
 }
 
-function validateCanonicalValue(value: unknown, label: string): void {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return;
-  if (typeof value === "number") {
-    if (!Number.isSafeInteger(value)) throw new Error(`${label} contains an unsafe JSON number`);
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) validateCanonicalValue(item, label);
-    return;
-  }
-  if (typeof value === "object") {
-    for (const item of Object.values(value as Record<string, unknown>)) validateCanonicalValue(item, label);
-    return;
-  }
-  throw new Error(`${label} contains a non-JSON value`);
+type JsonFieldValidator = (value: unknown, label: string) => void;
+type NativeEventSchema = Readonly<Record<string, JsonFieldValidator>>;
+
+/**
+ * Validates the exact externally-tagged JSON schema of Rust `state::Event`.
+ *
+ * The bounded, iterative pass runs before variant dispatch. This matters even
+ * though every current variant is shallow: a hostile node can otherwise place
+ * a deeply nested value behind a known field and exhaust the JavaScript stack
+ * before the fail-closed field/type check gets a chance to reject it.
+ */
+function validateNativeEventBody(value: unknown): asserts value is NativeEventJson {
+  const body = record(value, "native event body");
+  validateBoundedNativeEventJson(body, "native event body");
+  const variants = Object.keys(body);
+  if (variants.length !== 1) throw new Error("native event body must have one variant");
+  const variant = variants[0];
+  const schema = NATIVE_EVENT_SCHEMAS.get(variant);
+  if (schema === undefined) throw new Error(`unknown native event variant: ${variant}`);
+  validateFields(body[variant], schema, `native event ${variant}`);
 }
+
+/** Traverses hostile JSON iteratively under explicit depth and node budgets. */
+function validateBoundedNativeEventJson(value: unknown, label: string): void {
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  let discoveredNodes = 1;
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === undefined) break;
+    if (current.depth > MAX_NATIVE_EVENT_JSON_DEPTH_V1) {
+      throw new Error(`${label} exceeds the V1 depth limit`);
+    }
+    if (current.value === null || typeof current.value === "string" || typeof current.value === "boolean") {
+      continue;
+    }
+    if (typeof current.value === "number") {
+      if (!Number.isSafeInteger(current.value)) throw new Error(`${label} contains an unsafe JSON number`);
+      continue;
+    }
+    if (Array.isArray(current.value)) {
+      // No current Rust Event/BridgeEvent variant contains a sequence. Rejecting
+      // it here also avoids walking an attacker-controlled sparse array length.
+      throw new Error(`${label} contains an array outside the V1 schema`);
+    }
+    if (typeof current.value !== "object") throw new Error(`${label} contains a non-JSON value`);
+
+    const object = current.value as Record<string, unknown>;
+    for (const key in object) {
+      if (!Object.prototype.hasOwnProperty.call(object, key)) continue;
+      discoveredNodes += 1;
+      if (discoveredNodes > MAX_NATIVE_EVENT_JSON_NODES_V1) {
+        throw new Error(`${label} exceeds the V1 node budget`);
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(object, key);
+      if (descriptor === undefined || !("value" in descriptor)) {
+        throw new Error(`${label} contains an accessor property`);
+      }
+      const childDepth = current.depth + 1;
+      if (childDepth > MAX_NATIVE_EVENT_JSON_DEPTH_V1) {
+        throw new Error(`${label} exceeds the V1 depth limit`);
+      }
+      stack.push({ value: descriptor.value, depth: childDepth });
+    }
+  }
+}
+
+function validateFields(value: unknown, schema: NativeEventSchema, label: string): void {
+  const object = record(value, label);
+  const fields = Object.keys(schema);
+  exactKeys(object, fields, label);
+  for (const field of fields) schema[field](object[field], `${label}.${field}`);
+}
+
+function jsonString(value: unknown, label: string): void {
+  if (typeof value !== "string") throw new Error(`${label} must be a string`);
+}
+
+function jsonBoolean(value: unknown, label: string): void {
+  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
+}
+
+function safeU64Number(value: unknown, label: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe JSON integer`);
+  }
+}
+
+function signedI128(value: unknown, label: string): void {
+  if (typeof value !== "string" || value.length === 0 || value.length > 40 || !/^(0|-?[1-9][0-9]*)$/u.test(value)) {
+    throw new Error(`${label} must be a canonical signed decimal string`);
+  }
+  const parsed = BigInt(value);
+  const minimum = -(1n << 127n);
+  const maximum = (1n << 127n) - 1n;
+  if (parsed < minimum || parsed > maximum) throw new Error(`${label} is out of range`);
+}
+
+function oneOfStrings(value: unknown, choices: readonly string[], label: string): void {
+  if (typeof value !== "string" || !choices.includes(value)) throw new Error(`${label} has an unknown enum value`);
+}
+
+function nullable(validator: JsonFieldValidator): JsonFieldValidator {
+  return (value, label) => {
+    if (value !== null) validator(value, label);
+  };
+}
+
+function validateFeeBreakdown(value: unknown, label: string): void {
+  validateFields(value, {
+    total: AMOUNT_FIELD,
+    burned: AMOUNT_FIELD,
+    validator_reward: AMOUNT_FIELD,
+  }, label);
+}
+
+function validatePostQuantumRoot(value: unknown, label: string): void {
+  validateFields(value, {
+    scheme: POST_QUANTUM_SCHEME_FIELD,
+    public_key_hash: HASH_FIELD,
+  }, label);
+}
+
+function validateTradingPair(value: unknown, label: string): void {
+  validateFields(value, { base: validateAssetId, quote: validateAssetId }, label);
+}
+
+function validateNftId(value: unknown, label: string): void {
+  validateFields(value, { collection: HASH_FIELD, serial: SAFE_U64_NUMBER_FIELD }, label);
+}
+
+function validateSlashingOutcome(value: unknown, label: string): void {
+  validateFields(value, {
+    validator: ADDRESS_FIELD,
+    self_slashed: AMOUNT_FIELD,
+    delegated_slashed: AMOUNT_FIELD,
+    jailed: BOOLEAN_FIELD,
+    tombstoned: BOOLEAN_FIELD,
+    reason: STRING_FIELD,
+  }, label);
+}
+
+function validateAssetId(value: unknown, label: string): void {
+  if (value === "NativeWebc") return;
+  const tagged = record(value, label);
+  const variants = Object.keys(tagged);
+  if (variants.length !== 1) throw new Error(`${label} must have one asset variant`);
+  switch (variants[0]) {
+    case "WrappedWebc":
+      validateFields(tagged.WrappedWebc, { origin_chain: EXTERNAL_CHAIN_FIELD }, `${label}.WrappedWebc`);
+      return;
+    case "External":
+      validateFields(tagged.External, {
+        origin_chain: EXTERNAL_CHAIN_FIELD,
+        symbol: STRING_FIELD,
+        contract_or_mint: STRING_FIELD,
+      }, `${label}.External`);
+      return;
+    default:
+      throw new Error(`${label} has an unknown asset variant`);
+  }
+}
+
+function validateBridgeMessage(value: unknown, label: string): void {
+  validateFields(value, {
+    source_chain: EXTERNAL_CHAIN_FIELD,
+    destination_chain: EXTERNAL_CHAIN_FIELD,
+    nonce: SAFE_U64_NUMBER_FIELD,
+    asset: validateAssetId,
+    sender: BRIDGE_ADDRESS_FIELD,
+    recipient: BRIDGE_ADDRESS_FIELD,
+    amount: AMOUNT_FIELD,
+    source_tx: HASH_FIELD,
+  }, label);
+}
+
+function validateBridgeEvent(value: unknown, label: string): void {
+  const tagged = record(value, label);
+  const variants = Object.keys(tagged);
+  if (variants.length !== 1) throw new Error(`${label} must have one bridge-event variant`);
+  const variant = variants[0];
+  if (!["Locked", "Minted", "Burned", "Released"].includes(variant)) {
+    throw new Error(`${label} has an unknown bridge-event variant`);
+  }
+  validateFields(tagged[variant], {
+    message: validateBridgeMessage,
+    message_hash: HASH_FIELD,
+  }, `${label}.${variant}`);
+}
+
+function boundedBridgeAddress(value: unknown, label: string): void {
+  if (typeof value !== "string"
+    || value.length > 256
+    || value.length % 2 !== 0
+    || value !== value.toLowerCase()
+    || !/^[0-9a-f]*$/u.test(value)) {
+    throw new Error(`${label} must be at most 128 bytes of lowercase hex`);
+  }
+}
+
+const ADDRESS_FIELD: JsonFieldValidator = (value, label) => { address(value, label); };
+const HASH_FIELD: JsonFieldValidator = (value, label) => { hash256(value, label); };
+const AMOUNT_FIELD: JsonFieldValidator = (value, label) => { u128(value, label); };
+const SAFE_U64_NUMBER_FIELD: JsonFieldValidator = safeU64Number;
+const STRING_FIELD: JsonFieldValidator = jsonString;
+const BOOLEAN_FIELD: JsonFieldValidator = jsonBoolean;
+const BRIDGE_ADDRESS_FIELD: JsonFieldValidator = boundedBridgeAddress;
+const FEED_VALUE_FIELD: JsonFieldValidator = signedI128;
+const PRICE_FIELD: JsonFieldValidator = AMOUNT_FIELD;
+const EXTERNAL_CHAIN_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["Webc", "Ethereum", "Solana"], label);
+};
+const ORDER_SIDE_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["Buy", "Sell"], label);
+};
+const ORDER_CLOSE_REASON_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["Cancelled", "FillOrCancel", "Expired"], label);
+};
+const BUILTIN_CONTRACT_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["KeyValue"], label);
+};
+const UNBONDING_KIND_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["OperatorStake", "Delegation"], label);
+};
+const POST_QUANTUM_SCHEME_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["MlDsa65"], label);
+};
+const SERVICE_STATUS_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["Active", "Paused", "Retired"], label);
+};
+const TOKEN_AUTHORITY_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["Mint", "Freeze"], label);
+};
+const NFT_AUTHORITY_FIELD: JsonFieldValidator = TOKEN_AUTHORITY_FIELD;
+const GOVERNANCE_STATUS_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["Active", "Defeated", "Passed", "Executed", "Expired"], label);
+};
+const VOTE_CHOICE_FIELD: JsonFieldValidator = (value, label) => {
+  oneOfStrings(value, ["Yes", "No", "Abstain"], label);
+};
+const NULLABLE_ADDRESS_FIELD = nullable(ADDRESS_FIELD);
+const NULLABLE_FEED_VALUE_FIELD = nullable(FEED_VALUE_FIELD);
+const NULLABLE_SAFE_U64_NUMBER_FIELD = nullable(SAFE_U64_NUMBER_FIELD);
+
+/**
+ * Exact field/type schemas for every current Rust `webc_chain::state::Event`
+ * variant. Adding a Rust event without adding its schema here intentionally
+ * makes old SDKs reject it until the wire boundary is reviewed and versioned.
+ */
+const NATIVE_EVENT_SCHEMAS: ReadonlyMap<string, NativeEventSchema> = new Map<string, NativeEventSchema>([
+  ["Transfer", { from: ADDRESS_FIELD, to: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["FeePaid", { payer: ADDRESS_FIELD, breakdown: validateFeeBreakdown }],
+  ["FeeSponsored", { application: HASH_FIELD, beneficiary: ADDRESS_FIELD, breakdown: validateFeeBreakdown }],
+  ["AppSponsorRegistered", {
+    application: HASH_FIELD, owner: ADDRESS_FIELD, daily_budget_cap: AMOUNT_FIELD, funded: AMOUNT_FIELD,
+  }],
+  ["AppSponsorFunded", { application: HASH_FIELD, amount: AMOUNT_FIELD }],
+  ["AppSponsorWithdrawn", { application: HASH_FIELD, amount: AMOUNT_FIELD }],
+  ["NamespaceRegistered", { namespace: HASH_FIELD, owner: ADDRESS_FIELD }],
+  ["NamespaceTransferred", { namespace: HASH_FIELD, from: ADDRESS_FIELD, to: ADDRESS_FIELD }],
+  ["FeedCreated", { feed_id: HASH_FIELD, creator: ADDRESS_FIELD, bond: AMOUNT_FIELD, fee_burned: AMOUNT_FIELD }],
+  ["ReporterRegistered", { feed_id: HASH_FIELD, reporter: ADDRESS_FIELD, bond: AMOUNT_FIELD }],
+  ["ReporterDeregistered", { feed_id: HASH_FIELD, reporter: ADDRESS_FIELD, bond: AMOUNT_FIELD }],
+  ["ReportSubmitted", {
+    feed_id: HASH_FIELD, reporter: ADDRESS_FIELD, value: FEED_VALUE_FIELD, epoch: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["FeedReadPaid", { feed_id: HASH_FIELD, payer: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["FeedRevenueSettled", {
+    feed_id: HASH_FIELD,
+    epoch: SAFE_U64_NUMBER_FIELD,
+    median: NULLABLE_FEED_VALUE_FIELD,
+    distributed: AMOUNT_FIELD,
+    carried: AMOUNT_FIELD,
+  }],
+  ["OrderSubmitted", {
+    order_id: HASH_FIELD,
+    owner: ADDRESS_FIELD,
+    pair: validateTradingPair,
+    side: ORDER_SIDE_FIELD,
+    amount: AMOUNT_FIELD,
+    limit_price: PRICE_FIELD,
+    deadline_height: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["OrderFilled", {
+    order_id: HASH_FIELD,
+    pair: validateTradingPair,
+    side: ORDER_SIDE_FIELD,
+    clearing_price: PRICE_FIELD,
+    filled: AMOUNT_FIELD,
+    remaining: AMOUNT_FIELD,
+    quote: AMOUNT_FIELD,
+  }],
+  ["OrderClosed", {
+    order_id: HASH_FIELD, owner: ADDRESS_FIELD, reason: ORDER_CLOSE_REASON_FIELD, unfilled: AMOUNT_FIELD,
+  }],
+  ["ContractRegistered", {
+    code_id: HASH_FIELD,
+    namespace: HASH_FIELD,
+    owner: ADDRESS_FIELD,
+    builtin: BUILTIN_CONTRACT_FIELD,
+    fee_burned: AMOUNT_FIELD,
+  }],
+  ["ContractInvoked", {
+    code_id: HASH_FIELD,
+    namespace: HASH_FIELD,
+    caller: ADDRESS_FIELD,
+    gas_consumed: SAFE_U64_NUMBER_FIELD,
+    output_len: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["WasmContractRegistered", {
+    code_id: HASH_FIELD,
+    namespace: HASH_FIELD,
+    owner: ADDRESS_FIELD,
+    code_hash: HASH_FIELD,
+    code_len: SAFE_U64_NUMBER_FIELD,
+    fee_burned: AMOUNT_FIELD,
+  }],
+  ["WasmContractInvoked", {
+    code_id: HASH_FIELD,
+    namespace: HASH_FIELD,
+    caller: ADDRESS_FIELD,
+    gas_consumed: SAFE_U64_NUMBER_FIELD,
+    output_len: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["ValidatorRegistered", { operator: ADDRESS_FIELD, bootstrap: BOOLEAN_FIELD }],
+  ["Delegated", { delegator: ADDRESS_FIELD, validator: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["UnbondingRequested", {
+    request_id: SAFE_U64_NUMBER_FIELD,
+    delegator: ADDRESS_FIELD,
+    validator: ADDRESS_FIELD,
+    kind: UNBONDING_KIND_FIELD,
+    amount: AMOUNT_FIELD,
+  }],
+  ["UnbondingAdmitted", {
+    request_id: SAFE_U64_NUMBER_FIELD,
+    delegator: ADDRESS_FIELD,
+    validator: ADDRESS_FIELD,
+    kind: UNBONDING_KIND_FIELD,
+    amount: AMOUNT_FIELD,
+  }],
+  ["UnbondingMatured", {
+    request_id: SAFE_U64_NUMBER_FIELD,
+    delegator: ADDRESS_FIELD,
+    validator: ADDRESS_FIELD,
+    kind: UNBONDING_KIND_FIELD,
+    amount: AMOUNT_FIELD,
+  }],
+  ["UnbondingClaimed", {
+    request_id: SAFE_U64_NUMBER_FIELD, delegator: ADDRESS_FIELD, kind: UNBONDING_KIND_FIELD, amount: AMOUNT_FIELD,
+  }],
+  ["ValidatorRewardsClaimed", { validator: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["DelegatorRewardsClaimed", { delegator: ADDRESS_FIELD, validator: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["ValidatorRewardsCompounded", { validator: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["DelegatorRewardsCompounded", { delegator: ADDRESS_FIELD, validator: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["Slashed", { outcome: validateSlashingOutcome }],
+  ["Bridge", { event: validateBridgeEvent }],
+  ["EpochRewardsDistributed", { epoch: SAFE_U64_NUMBER_FIELD, total: AMOUNT_FIELD }],
+  ["AuthorizationLaneOpened", { owner: ADDRESS_FIELD, lane: HASH_FIELD, fee_deposit: AMOUNT_FIELD }],
+  ["AuthorizationLaneFunded", { owner: ADDRESS_FIELD, lane: HASH_FIELD, fee_deposit: AMOUNT_FIELD }],
+  ["AuthorizationPolicyInstalled", {
+    owner: ADDRESS_FIELD, revision: SAFE_U64_NUMBER_FIELD, post_quantum_root: validatePostQuantumRoot,
+  }],
+  ["SessionKeyInstalled", {
+    owner: ADDRESS_FIELD, session_key: HASH_FIELD, expires_after_epoch: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["SessionKeyRevoked", { owner: ADDRESS_FIELD, session_key: HASH_FIELD }],
+  ["SessionKeyExpired", { owner: ADDRESS_FIELD, session_key: HASH_FIELD }],
+  ["ActiveTransactionKeyRotated", {
+    owner: ADDRESS_FIELD, new_revision: SAFE_U64_NUMBER_FIELD, new_active_transaction_key: HASH_FIELD,
+  }],
+  ["PostQuantumRootRotated", {
+    owner: ADDRESS_FIELD, new_revision: SAFE_U64_NUMBER_FIELD, new_post_quantum_root: validatePostQuantumRoot,
+  }],
+  ["SessionKeyUsed", { owner: ADDRESS_FIELD, session_key: HASH_FIELD, amount: AMOUNT_FIELD }],
+  ["ObjectCreated", {
+    object_id: HASH_FIELD,
+    namespace: HASH_FIELD,
+    owner: ADDRESS_FIELD,
+    version: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["ObjectMutated", { object_id: HASH_FIELD, version: SAFE_U64_NUMBER_FIELD }],
+  ["ObjectTransferred", {
+    object_id: HASH_FIELD,
+    from: ADDRESS_FIELD,
+    to: ADDRESS_FIELD,
+    version: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["ObjectDeleted", { object_id: HASH_FIELD, owner: ADDRESS_FIELD, refund: AMOUNT_FIELD, burned: AMOUNT_FIELD }],
+  ["MandateGranted", {
+    mandate_id: HASH_FIELD,
+    principal: ADDRESS_FIELD,
+    agent_key: HASH_FIELD,
+    budget_total: AMOUNT_FIELD,
+    expiry_epoch: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["MandateToppedUp", { mandate_id: HASH_FIELD, amount: AMOUNT_FIELD, budget_total: AMOUNT_FIELD }],
+  ["MandateSpent", {
+    mandate_id: HASH_FIELD,
+    agent_key: HASH_FIELD,
+    recipient: ADDRESS_FIELD,
+    amount: AMOUNT_FIELD,
+    fee: AMOUNT_FIELD,
+  }],
+  ["MandateRevoked", { mandate_id: HASH_FIELD, principal: ADDRESS_FIELD, refunded: AMOUNT_FIELD }],
+  ["ServiceRegistered", { service_id: HASH_FIELD, owner: ADDRESS_FIELD, namespace: HASH_FIELD }],
+  ["ServiceUpdated", { service_id: HASH_FIELD, revision: SAFE_U64_NUMBER_FIELD }],
+  ["ServiceStatusChanged", {
+    service_id: HASH_FIELD, status: SERVICE_STATUS_FIELD, revision: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["MandateSpentToService", {
+    mandate_id: HASH_FIELD,
+    service_id: HASH_FIELD,
+    agent_key: HASH_FIELD,
+    recipient: ADDRESS_FIELD,
+    amount: AMOUNT_FIELD,
+    fee: AMOUNT_FIELD,
+  }],
+  ["TokenCreated", {
+    token_id: HASH_FIELD,
+    creator: ADDRESS_FIELD,
+    namespace: HASH_FIELD,
+    deposit: AMOUNT_FIELD,
+    initial_supply: AMOUNT_FIELD,
+  }],
+  ["TokenMinted", {
+    token_id: HASH_FIELD, recipient: ADDRESS_FIELD, amount: AMOUNT_FIELD, issued_supply: AMOUNT_FIELD,
+  }],
+  ["TokenBurned", {
+    token_id: HASH_FIELD, holder: ADDRESS_FIELD, amount: AMOUNT_FIELD, issued_supply: AMOUNT_FIELD,
+  }],
+  ["TokenTransferred", { token_id: HASH_FIELD, from: ADDRESS_FIELD, to: ADDRESS_FIELD, amount: AMOUNT_FIELD }],
+  ["TokenPausedChanged", { token_id: HASH_FIELD, paused: BOOLEAN_FIELD }],
+  ["TokenFreezeChanged", { token_id: HASH_FIELD, account: ADDRESS_FIELD, frozen: BOOLEAN_FIELD }],
+  ["TokenAuthorityChanged", {
+    token_id: HASH_FIELD, authority_kind: TOKEN_AUTHORITY_FIELD, new_authority: NULLABLE_ADDRESS_FIELD,
+  }],
+  ["NftCollectionCreated", {
+    collection_id: HASH_FIELD, creator: ADDRESS_FIELD, namespace: HASH_FIELD, deposit: AMOUNT_FIELD,
+  }],
+  ["NftMinted", { nft_id: validateNftId, recipient: ADDRESS_FIELD, item_metadata_hash: HASH_FIELD }],
+  ["NftTransferred", { nft_id: validateNftId, from: ADDRESS_FIELD, to: ADDRESS_FIELD }],
+  ["NftBurned", { nft_id: validateNftId, owner: ADDRESS_FIELD }],
+  ["NftCollectionPausedChanged", { collection_id: HASH_FIELD, paused: BOOLEAN_FIELD }],
+  ["NftItemFreezeChanged", { nft_id: validateNftId, frozen: BOOLEAN_FIELD }],
+  ["NftAuthorityChanged", {
+    collection_id: HASH_FIELD, authority_kind: NFT_AUTHORITY_FIELD, new_authority: NULLABLE_ADDRESS_FIELD,
+  }],
+  ["GovernanceInstanceCreated", {
+    instance_id: HASH_FIELD,
+    creator: ADDRESS_FIELD,
+    namespace: HASH_FIELD,
+    weight_token: HASH_FIELD,
+    deposit: AMOUNT_FIELD,
+  }],
+  ["GovernanceTreasuryFunded", {
+    instance_id: HASH_FIELD, funder: ADDRESS_FIELD, amount: AMOUNT_FIELD, treasury: AMOUNT_FIELD,
+  }],
+  ["GovernanceProposalOpened", {
+    proposal_id: HASH_FIELD,
+    instance_id: HASH_FIELD,
+    proposer: ADDRESS_FIELD,
+    voting_ends_epoch: SAFE_U64_NUMBER_FIELD,
+  }],
+  ["GovernanceVoteCast", {
+    proposal_id: HASH_FIELD, voter: ADDRESS_FIELD, choice: VOTE_CHOICE_FIELD, weight: AMOUNT_FIELD,
+  }],
+  ["GovernanceProposalResolved", {
+    proposal_id: HASH_FIELD, status: GOVERNANCE_STATUS_FIELD, eta_epoch: NULLABLE_SAFE_U64_NUMBER_FIELD,
+  }],
+  ["GovernanceProposalExecuted", { proposal_id: HASH_FIELD, instance_id: HASH_FIELD }],
+  ["GovernanceProposalExpired", { proposal_id: HASH_FIELD }],
+  ["GovernanceVoteReclaimed", { proposal_id: HASH_FIELD, voter: ADDRESS_FIELD, weight: AMOUNT_FIELD }],
+  ["SponsorGrantRevoked", { sponsor: ADDRESS_FIELD, grant_id: HASH_FIELD }],
+]);
 
 function min(left: bigint, right: bigint): bigint {
   return left < right ? left : right;

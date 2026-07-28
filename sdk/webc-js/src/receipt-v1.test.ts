@@ -1,3 +1,11 @@
+/**
+ * Adversarial and cross-language tests for protocol-version-2 receipts.
+ *
+ * These tests freeze Rust/TypeScript commitment parity and exercise the SDK's
+ * hostile-network-data boundary. They do not execute transactions or establish
+ * finality; those responsibilities stay with the chain and proof layers.
+ */
+
 import { describe, expect, it } from "vitest";
 import { canonicalJson } from "./canonical";
 import {
@@ -149,6 +157,88 @@ describe("V1 receipts and ordered roots", () => {
     const value = await receipt(transaction());
     value.events[0].body = { EpochRewardsDistributed: { epoch: Number.MAX_SAFE_INTEGER + 1, total: "1" } };
     expect(() => validateReceiptV1(value)).toThrow(/unsafe JSON number/u);
+  });
+
+  it("rejects unknown native event variants", async () => {
+    const value = await receipt(transaction());
+    value.events[0].body = { InventedEvent: {} };
+    expect(() => validateReceiptV1(value)).toThrow(/unknown native event variant/u);
+  });
+
+  it("rejects unknown native event fields", async () => {
+    const value = await receipt(transaction());
+    value.events[0].body = {
+      Transfer: { from: SENDER, to: RECIPIENT, amount: "123456", memo: "not on the Rust wire" },
+    };
+    expect(() => validateReceiptV1(value)).toThrow(/unexpected field set/u);
+  });
+
+  it("rejects native event fields with the wrong wire type", async () => {
+    const value = await receipt(transaction());
+    value.events[0].body = { Transfer: { from: SENDER, to: RECIPIENT, amount: true } };
+    expect(() => validateReceiptV1(value)).toThrow(/canonical decimal string/u);
+  });
+
+  it("accepts the deepest current Rust BridgeEvent shape and rejects nested drift", async () => {
+    const value = await receipt(transaction());
+    value.events[0].body = {
+      Bridge: {
+        event: {
+          Locked: {
+            message: {
+              source_chain: "Ethereum",
+              destination_chain: "Webc",
+              nonce: 9,
+              asset: {
+                External: {
+                  origin_chain: "Ethereum",
+                  symbol: "USDC",
+                  contract_or_mint: "0x1234",
+                },
+              },
+              sender: "abcd",
+              recipient: "12".repeat(32),
+              amount: "77",
+              source_tx: "77".repeat(32),
+            },
+            message_hash: "88".repeat(32),
+          },
+        },
+      },
+    };
+    expect(() => validateReceiptV1(value)).not.toThrow();
+
+    const unknownField = structuredClone(value);
+    const bridge = unknownField.events[0].body.Bridge as Record<string, unknown>;
+    const event = bridge.event as Record<string, unknown>;
+    const locked = event.Locked as Record<string, unknown>;
+    const message = locked.message as Record<string, unknown>;
+    message.proof = "not part of BridgeMessage";
+    expect(() => validateReceiptV1(unknownField)).toThrow(/unexpected field set/u);
+
+    const oversizedAddress = structuredClone(value);
+    const oversizedBridge = oversizedAddress.events[0].body.Bridge as Record<string, unknown>;
+    const oversizedEvent = oversizedBridge.event as Record<string, unknown>;
+    const oversizedLocked = oversizedEvent.Locked as Record<string, unknown>;
+    const oversizedMessage = oversizedLocked.message as Record<string, unknown>;
+    oversizedMessage.recipient = "aa".repeat(129);
+    expect(() => validateReceiptV1(oversizedAddress)).toThrow(/128 bytes/u);
+  });
+
+  it("rejects deeply nested native event JSON without recursive descent", async () => {
+    const value = await receipt(transaction());
+    let nested: unknown = null;
+    for (let depth = 0; depth < 64; depth += 1) nested = { child: nested };
+    value.events[0].body = { Transfer: nested };
+    expect(() => validateReceiptV1(value)).toThrow(/depth limit/u);
+  });
+
+  it("rejects native event JSON that exceeds the structural node budget", async () => {
+    const value = await receipt(transaction());
+    value.events[0].body = {
+      Transfer: Object.fromEntries(Array.from({ length: 512 }, (_, index) => [`field_${index}`, null])),
+    };
+    expect(() => validateReceiptV1(value)).toThrow(/node budget/u);
   });
 
   it("rejects an oversized hostile event array before hashing", async () => {
