@@ -52,6 +52,9 @@ export const NODE_API_VERSION = "v1";
 /** Upper bound on a single API response body, to cap hostile payloads. */
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
+/** Maximum transport fragments retained or processed for one HTTP response. */
+const MAX_RESPONSE_STREAM_CHUNKS = 4_096;
+
 /** Largest unsigned 64-bit checkpoint height accepted by the node protocol. */
 const MAX_U64 = 18_446_744_073_709_551_615n;
 
@@ -764,28 +767,37 @@ export class WebcNodeClient {
 
   async #readStreamCapped(body: ByteStream, maximumBytes: number): Promise<string> {
     const reader = body.getReader();
-    // Decode each network chunk immediately instead of retaining every backing
-    // ArrayBuffer and then allocating a second concatenated byte buffer. Fatal
-    // mode keeps the browser boundary aligned with Rust JSON decoding: malformed
-    // UTF-8 is hostile input, not text that may be silently repaired.
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    const decodedChunks: string[] = [];
+    // Coalesce into one geometrically-grown byte buffer. Retaining one decoded
+    // string per attacker-controlled network fragment lets a response stay under
+    // the byte cap while consuming unbounded object metadata. A separate chunk
+    // cap also bounds CPU spent on pathological one-byte fragmentation.
+    let bytes = new Uint8Array(Math.min(maximumBytes, 64 * 1024));
     let total = 0;
+    let chunks = 0;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         if (value && value.byteLength > 0) {
-          total += value.byteLength;
-          if (total > maximumBytes) {
+          chunks += 1;
+          if (chunks > MAX_RESPONSE_STREAM_CHUNKS) {
+            throw new Error("node response is excessively fragmented");
+          }
+          const nextTotal = total + value.byteLength;
+          if (nextTotal > maximumBytes) {
             throw new Error("node response exceeds the maximum allowed size");
           }
-          const decoded = decodeUtf8Chunk(decoder, value, true);
-          if (decoded.length > 0) decodedChunks.push(decoded);
+          if (nextTotal > bytes.byteLength) {
+            const doubled = Math.max(1, bytes.byteLength * 2);
+            const capacity = Math.min(maximumBytes, Math.max(nextTotal, doubled));
+            const grown = new Uint8Array(capacity);
+            grown.set(bytes.subarray(0, total));
+            bytes = grown;
+          }
+          bytes.set(value, total);
+          total = nextTotal;
         }
       }
-      const tail = decodeUtf8Chunk(decoder, undefined, false);
-      if (tail.length > 0) decodedChunks.push(tail);
     } finally {
       // Abort any remaining body (early exit on the cap) and release resources.
       try {
@@ -794,7 +806,7 @@ export class WebcNodeClient {
         // The stream may already be closed/errored; nothing to release.
       }
     }
-    return decodedChunks.join("");
+    return decodeUtf8(bytes.subarray(0, total));
   }
 }
 
@@ -803,14 +815,10 @@ function utf8ByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
 }
 
-/** Strictly decodes one UTF-8 stream chunk without leaking engine-specific errors. */
-function decodeUtf8Chunk(
-  decoder: TextDecoder,
-  bytes: Uint8Array | undefined,
-  stream: boolean,
-): string {
+/** Strictly decodes bounded UTF-8 bytes without leaking engine-specific errors. */
+function decodeUtf8(bytes: Uint8Array): string {
   try {
-    return decoder.decode(bytes, { stream });
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     throw new Error("node returned invalid UTF-8");
   }

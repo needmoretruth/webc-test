@@ -1,3 +1,13 @@
+/**
+ * Adversarial and contract tests for the browser-safe node client.
+ *
+ * Responsibilities: pin HTTP/WebSocket routes, strict response parsing, byte
+ * and chunk bounds, and stable public projections. Non-responsibilities:
+ * cryptographic verification and wallet signing are exercised by their owning
+ * modules. Security boundary: every fake node response is hostile input and
+ * must fail closed without retaining attacker-controlled backing buffers.
+ */
+
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
@@ -432,6 +442,42 @@ describe("WebcNodeClient HTTP", () => {
     await expect(client.health()).rejects.toThrow(/maximum allowed size/u);
     // 256-byte cap / 64-byte chunks: aborted after a few reads, not unbounded.
     expect(reads).toBeLessThanOrEqual(6);
+    expect(canceled).toBe(true);
+  });
+
+  it("rejects excessive streamed chunk fragmentation under the byte cap", async () => {
+    // A hostile peer can keep the byte count small while forcing one retained
+    // string/array entry per chunk. The transport must bound fragmentation as
+    // well as bytes so millions of one-byte chunks cannot exhaust memory.
+    let reads = 0;
+    let canceled = false;
+    const fetchImpl: FetchLike = async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              reads += 1;
+              return { done: false, value: Uint8Array.of(0x20) };
+            },
+            async cancel() {
+              canceled = true;
+            },
+          };
+        },
+      },
+      text: async () => {
+        throw new Error("text() must not be used when a stream body exists");
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", {
+      fetchImpl,
+      maxResponseBytes: 16 * 1024,
+    });
+
+    await expect(client.health()).rejects.toThrow(/fragmented/u);
+    expect(reads).toBeLessThanOrEqual(4_098);
     expect(canceled).toBe(true);
   });
 
