@@ -651,7 +651,7 @@ export class WebcNodeClient {
     validateTransactionIdV2(transactionId);
     const value = await this.#get(
       `/v2/transactions/${transactionId}`,
-      MAX_TRANSACTION_API_RESPONSE_BYTES_V2,
+      Math.min(this.#maxResponseBytes, MAX_TRANSACTION_API_RESPONSE_BYTES_V2),
     );
     return parseTransactionLifecycleV2(value, transactionId);
   }
@@ -666,7 +666,7 @@ export class WebcNodeClient {
     validateTransactionIdV2(transactionId);
     const value = await this.#get(
       `/v2/transactions/${transactionId}/receipt`,
-      MAX_TRANSACTION_RECEIPT_RESPONSE_BYTES_V2,
+      Math.min(this.#maxResponseBytes, MAX_TRANSACTION_RECEIPT_RESPONSE_BYTES_V2),
     );
     return parseFinalizedTransactionReceiptV2(value, transactionId);
   }
@@ -722,7 +722,7 @@ export class WebcNodeClient {
     const value = await this.#post(
       "/v2/transactions",
       transaction,
-      MAX_TRANSACTION_API_RESPONSE_BYTES_V2,
+      Math.min(this.#maxResponseBytes, MAX_TRANSACTION_API_RESPONSE_BYTES_V2),
     );
     return parseTransactionSubmitResponseV2(value, expectedTransactionId);
   }

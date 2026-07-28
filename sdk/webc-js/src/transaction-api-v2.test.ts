@@ -22,6 +22,7 @@ import {
   MAX_TRANSACTION_LIFECYCLE_IDS_V2,
   MAX_TRANSACTION_LIFECYCLE_WS_MESSAGE_BYTES_V2,
   TransactionLifecycleSubscriptionError,
+  parseTransactionSubmitResponseV2,
   parseTransactionLifecycleV2,
 } from "./transaction-api-v2.js";
 import type { ReceiptV1Json } from "./receipt-v1.js";
@@ -262,6 +263,80 @@ describe("WebcNodeClient protocol-2 HTTP", () => {
       requestId: "v2-0000000000000001",
     });
   });
+
+  it("honors a caller response cap below every protocol-2 endpoint cap", async () => {
+    const { fetchImpl } = fakeFetch({
+      [`GET /v2/transactions/${TRANSACTION_ID}`]: {
+        ok: true,
+        status: 200,
+        body: queuedLifecycle(),
+      },
+      [`GET /v2/transactions/${TRANSACTION_ID}/receipt`]: {
+        ok: true,
+        status: 200,
+        body: fixture.proof.receipt,
+      },
+      "POST /v2/transactions": {
+        ok: true,
+        status: 200,
+        body: {
+          api_version: "v2",
+          transaction_id: TRANSACTION_ID,
+          outcome: { kind: "added" },
+          lifecycle: queuedLifecycle(),
+          mempool_size: 1,
+        },
+      },
+    });
+    const client = new WebcNodeClient("http://node.test", {
+      fetchImpl,
+      maxResponseBytes: 1,
+    });
+
+    await expect(client.transactionLifecycleV2(TRANSACTION_ID))
+      .rejects.toThrow(/maximum allowed size/u);
+    await expect(client.finalizedTransactionReceiptV2(TRANSACTION_ID))
+      .rejects.toThrow(/maximum allowed size/u);
+    await expect(client.submitTransactionV2(fixture.proof.transaction))
+      .rejects.toThrow(/maximum allowed size/u);
+  });
+
+  it("rejects internally contradictory durable submission responses", () => {
+    const valid = {
+      api_version: "v2",
+      transaction_id: TRANSACTION_ID,
+      outcome: { kind: "added" },
+      lifecycle: queuedLifecycle(),
+      mempool_size: 1,
+    };
+    expect(() => parseTransactionSubmitResponseV2({
+      ...valid,
+      lifecycle: {
+        api_version: "v2",
+        transaction_id: TRANSACTION_ID,
+        sequence: null,
+        status: { kind: "unknown" },
+      },
+    }, TRANSACTION_ID)).toThrow(/durable lifecycle/u);
+    expect(() => parseTransactionSubmitResponseV2({
+      ...valid,
+      outcome: { kind: "replaced", old_id: TRANSACTION_ID },
+    }, TRANSACTION_ID)).toThrow(/old transaction ID/u);
+    expect(() => parseTransactionSubmitResponseV2({
+      ...valid,
+      mempool_size: 0,
+    }, TRANSACTION_ID)).toThrow(/mempool/u);
+    expect(() => parseTransactionSubmitResponseV2({
+      ...valid,
+      lifecycle: {
+        ...queuedLifecycle(),
+        status: {
+          kind: "included",
+          position: { height: "1", transaction_index: 0 },
+        },
+      },
+    }, TRANSACTION_ID)).toThrow(/queued lifecycle/u);
+  });
 });
 
 class FakeWebSocket {
@@ -385,12 +460,16 @@ describe("WebcNodeClient protocol-2 lifecycle WebSocket", () => {
   it("exposes the server resync marker and reconnects from that sequence", () => {
     const client = websocketClient();
     const resyncs: bigint[] = [];
+    const snapshots: bigint[] = [];
     const subscription = client.subscribeTransactionLifecyclesV2([TRANSACTION_ID], {
-      onLifecycle: () => undefined,
+      onLifecycle: (lifecycle) => snapshots.push(lifecycle.sequence ?? -1n),
       onResyncRequired: (notice) => resyncs.push(notice.lastSequence),
     });
     const first = FakeWebSocket.instances[0];
     first.emit("open");
+    first.emit("message", {
+      data: JSON.stringify({ type: "snapshot", lifecycle: queuedLifecycle("7") }),
+    });
     first.emit("message", {
       data: JSON.stringify({
         type: "resync_required",
@@ -400,6 +479,15 @@ describe("WebcNodeClient protocol-2 lifecycle WebSocket", () => {
     });
     expect(first.closed).toBe(true);
     expect(resyncs).toEqual([7n]);
+    expect(snapshots).toEqual([7n]);
+    expect(subscription.lastSequence).toBe(7n);
+
+    // A hostile/custom transport may still deliver queued events after close().
+    // A terminal resync must retire the old generation before those callbacks.
+    first.emit("message", {
+      data: JSON.stringify({ type: "snapshot", lifecycle: queuedLifecycle("8") }),
+    });
+    expect(snapshots).toEqual([7n]);
     expect(subscription.lastSequence).toBe(7n);
 
     subscription.reconnect();
@@ -410,6 +498,92 @@ describe("WebcNodeClient protocol-2 lifecycle WebSocket", () => {
       transaction_ids: [TRANSACTION_ID],
       after_sequence: "7",
     });
+  });
+
+  it("advances the reconnect cursor only after a snapshot callback succeeds", () => {
+    const client = websocketClient();
+    const errors: unknown[] = [];
+    const subscription = client.subscribeTransactionLifecyclesV2(
+      [TRANSACTION_ID],
+      {
+        onLifecycle: () => {
+          throw new Error("application did not apply the snapshot");
+        },
+        onResyncRequired: () => undefined,
+        onError: (error) => errors.push(error),
+      },
+      { afterSequence: 4n },
+    );
+    const first = FakeWebSocket.instances[0];
+    first.emit("open");
+    first.emit("message", {
+      data: JSON.stringify({ type: "snapshot", lifecycle: queuedLifecycle("5") }),
+    });
+
+    expect(first.closed).toBe(true);
+    expect(errors).toHaveLength(1);
+    expect(subscription.lastSequence).toBe(4n);
+
+    subscription.reconnect();
+    const second = FakeWebSocket.instances[1];
+    second.emit("open");
+    expect(JSON.parse(second.sent[0]) as unknown).toEqual({
+      version: 1,
+      transaction_ids: [TRANSACTION_ID],
+      after_sequence: "4",
+    });
+  });
+
+  it("rejects asynchronous snapshot callbacks without claiming safe application", () => {
+    const client = websocketClient();
+    const errors: unknown[] = [];
+    const subscription = client.subscribeTransactionLifecyclesV2(
+      [TRANSACTION_ID],
+      {
+        onLifecycle: async () => undefined,
+        onResyncRequired: () => undefined,
+        onError: (error) => errors.push(error),
+      },
+      { afterSequence: 4n },
+    );
+    const socket = FakeWebSocket.instances[0];
+    socket.emit("open");
+    socket.emit("message", {
+      data: JSON.stringify({ type: "snapshot", lifecycle: queuedLifecycle("5") }),
+    });
+
+    expect(socket.closed).toBe(true);
+    expect(subscription.lastSequence).toBe(4n);
+    expect(errors).toHaveLength(1);
+  });
+
+  it("rejects a resync marker that skips a snapshot the client never applied", () => {
+    const client = websocketClient();
+    const errors: unknown[] = [];
+    const subscription = client.subscribeTransactionLifecyclesV2(
+      [TRANSACTION_ID],
+      {
+        onLifecycle: () => undefined,
+        onResyncRequired: () => {
+          throw new Error("must not accept a forward marker");
+        },
+        onError: (error) => errors.push(error),
+      },
+      { afterSequence: 4n },
+    );
+    const socket = FakeWebSocket.instances[0];
+    socket.emit("open");
+    socket.emit("message", {
+      data: JSON.stringify({
+        type: "resync_required",
+        last_sequence: "7",
+        request_id: "v2-0000000000000009",
+      }),
+    });
+
+    expect(socket.closed).toBe(true);
+    expect(subscription.lastSequence).toBe(4n);
+    expect(errors).toHaveLength(1);
   });
 
   it("turns a bounded server error into a typed subscription error", () => {

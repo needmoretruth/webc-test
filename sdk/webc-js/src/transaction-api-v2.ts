@@ -237,12 +237,27 @@ export function parseTransactionSubmitResponseV2(
     throw new Error("V2 submission transaction ID does not match the signed request");
   }
   const lifecycle = parseTransactionLifecycleV2(value.lifecycle, expected);
+  const outcome = parseInsertOutcomeV2(value.outcome);
+  const mempoolSize = safeCount(value.mempool_size, "mempool size");
+  if (lifecycle.status.kind === "unknown") {
+    throw new Error("V2 successful submission must include a durable lifecycle");
+  }
+  if (outcome.kind !== "duplicate_known" && lifecycle.status.kind !== "queued") {
+    throw new Error("V2 mutating submission must return its queued lifecycle");
+  }
+  if ((outcome.kind === "replaced" || outcome.kind === "evicted")
+    && outcome.oldId === transactionId) {
+    throw new Error("V2 insertion outcome old transaction ID must differ from the submitted ID");
+  }
+  if (mempoolSize === 0) {
+    throw new Error("V2 successful submission must retain a non-empty mempool");
+  }
   return Object.freeze({
     apiVersion: TRANSACTION_API_VERSION_V2,
     transactionId,
-    outcome: parseInsertOutcomeV2(value.outcome),
+    outcome,
     lifecycle,
-    mempoolSize: safeCount(value.mempool_size, "mempool size"),
+    mempoolSize,
   });
 }
 
@@ -353,6 +368,25 @@ export function openTransactionLifecycleSubscriptionV2(
 
     const isCurrent = (): boolean =>
       !permanentlyClosed && generation === ownGeneration && socket === next;
+    let acceptingMessages = true;
+    let closeReported = false;
+
+    // `WebSocket.close()` is advisory for injected/custom transports. Retire
+    // the socket locally before requesting close so queued hostile callbacks
+    // cannot move the durable cursor after a terminal message or parse error.
+    const stopReceiving = (): void => {
+      if (!acceptingMessages) return;
+      acceptingMessages = false;
+      next.close();
+    };
+
+    const requireSynchronousCallback = (result: unknown, label: string): void => {
+      if (!isThenable(result)) return;
+      // Observe a rejected Promise so a mistakenly async application callback
+      // cannot create an unhandled rejection after this socket fails closed.
+      void Promise.resolve(result).catch(reportError);
+      throw new Error(`${label} must complete synchronously`);
+    };
 
     next.addEventListener("open", () => {
       if (!isCurrent() || subscriptionSent) return;
@@ -371,13 +405,13 @@ export function openTransactionLifecycleSubscriptionV2(
         }
         next.send?.(text);
       } catch (error) {
+        stopReceiving();
         reportError(error);
-        next.close();
       }
     });
 
     next.addEventListener("message", (event) => {
-      if (!isCurrent()) return;
+      if (!isCurrent() || !acceptingMessages) return;
       try {
         const message = parseTransactionLifecycleWsMessageV2(
           decodeBoundedWsJson(event.data),
@@ -390,38 +424,50 @@ export function openTransactionLifecycleSubscriptionV2(
           if (sequence !== null && lastSequence !== null && sequence <= lastSequence) {
             return;
           }
-          if (sequence !== null) lastSequence = sequence;
-          handlers.onLifecycle(message.lifecycle);
+          const callbackResult = handlers.onLifecycle(message.lifecycle) as unknown;
+          requireSynchronousCallback(callbackResult, "V2 lifecycle callback");
+          // The callback may synchronously reconnect and re-enter through an
+          // injected transport. Preserve a newer nested cursor rather than
+          // moving it backwards when this callback returns.
+          if (sequence !== null && (lastSequence === null || sequence > lastSequence)) {
+            lastSequence = sequence;
+          }
           return;
         }
         if (message.type === "resync_required") {
-          if (lastSequence !== null && message.lastSequence < lastSequence) {
-            throw new Error("V2 lifecycle resync marker moves backwards");
+          const safelyApplied = lastSequence ?? 0n;
+          if (message.lastSequence !== safelyApplied) {
+            throw new Error("V2 lifecycle resync marker does not match the safely applied cursor");
           }
-          lastSequence = message.lastSequence;
-          next.close();
-          handlers.onResyncRequired(Object.freeze({
+          stopReceiving();
+          const callbackResult = handlers.onResyncRequired(Object.freeze({
             lastSequence: message.lastSequence,
             requestId: message.requestId,
-          }));
+          })) as unknown;
+          requireSynchronousCallback(callbackResult, "V2 lifecycle resync callback");
+          if (lastSequence === null || message.lastSequence > lastSequence) {
+            lastSequence = message.lastSequence;
+          }
           return;
         }
+        stopReceiving();
         reportError(new TransactionLifecycleSubscriptionError(
           message.code,
           message.message,
           message.requestId,
         ));
-        next.close();
       } catch (error) {
+        stopReceiving();
         reportError(error);
-        next.close();
       }
     });
     next.addEventListener("error", (event) => {
       if (isCurrent()) reportError(event);
     });
     next.addEventListener("close", () => {
-      if (!isCurrent()) return;
+      if (!isCurrent() || closeReported) return;
+      acceptingMessages = false;
+      closeReported = true;
       try {
         handlers.onClose?.();
       } catch (error) {
@@ -571,6 +617,13 @@ function decodeBoundedWsJson(input: unknown): unknown {
 
 function utf8ByteLength(input: string): number {
   return new TextEncoder().encode(input).byteLength;
+}
+
+function isThenable(input: unknown): input is PromiseLike<unknown> {
+  if ((typeof input !== "object" && typeof input !== "function") || input === null) {
+    return false;
+  }
+  return typeof Reflect.get(input, "then") === "function";
 }
 
 function transactionIdV2(input: unknown, label: string): string {
