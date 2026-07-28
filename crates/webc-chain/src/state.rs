@@ -1658,6 +1658,45 @@ impl<'effects> NativeApplicationContext<'effects> {
     }
 }
 
+/// Borrowed, authenticated intent for one native DEX order submission.
+///
+/// Grouping all price, deadline, and fill-policy fields keeps V4 and V5 callers
+/// on one transition and prevents positional arguments from drifting. This is
+/// an internal descriptor; the signed [`Operation::SubmitOrder`] remains the
+/// consensus wire value.
+pub(crate) struct NativeDexOrderSubmission<'a> {
+    order_id: OrderId,
+    pair: &'a TradingPair,
+    side: OrderSide,
+    amount: Amount,
+    limit_price: Price,
+    deadline_height: u64,
+    fill_or_cancel: bool,
+}
+
+impl<'a> NativeDexOrderSubmission<'a> {
+    /// Constructs one submission from already bounded signed action fields.
+    pub(crate) const fn new(
+        order_id: OrderId,
+        pair: &'a TradingPair,
+        side: OrderSide,
+        amount: Amount,
+        limit_price: Price,
+        deadline_height: u64,
+        fill_or_cancel: bool,
+    ) -> Self {
+        Self {
+            order_id,
+            pair,
+            side,
+            amount,
+            limit_price,
+            deadline_height,
+            fill_or_cancel,
+        }
+    }
+}
+
 /// Borrowed coordinates and replacement bytes for one owned-object mutation.
 ///
 /// Grouping the namespace/version preconditions with the target prevents V4 and
@@ -3648,93 +3687,29 @@ impl ChainState {
                 deadline_height,
                 fill_or_cancel,
             } => {
-                // Default lane only: the order's input is locked from the sender's
-                // liquid balance (native leg -> dex_escrow) or asset balance
-                // (non-native leg). The block-level batch pass later settles/refunds
-                // it; that pass is not access-list-bound (like epoch settlement).
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::DexRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::dex_order(*order_id))?;
-                // Validate the hostile order intent before touching any supply.
-                pair.validate()?;
-                if amount.is_zero() || *amount < config.dex.min_order_amount {
-                    return Err(ChainError::DexOrderAmountTooSmall);
-                }
-                if limit_price.is_zero() {
-                    return Err(ChainError::DexOrderPriceZero);
-                }
-                if self.dex_orders.contains_key(order_id) {
-                    return Err(ChainError::DexOrderAlreadyExists);
-                }
-                // Resolve the effective deadline: 0 is the "use the default window"
-                // sentinel; an explicit deadline must not already be in the past.
-                let effective_deadline = if *deadline_height == 0 {
-                    self.current_height
-                        .checked_add(config.dex.default_deadline_blocks)
-                        .ok_or(ChainError::ArithmeticOverflow)?
-                } else {
-                    if *deadline_height < self.current_height {
-                        return Err(ChainError::DexOrderDeadlineInPast);
-                    }
-                    *deadline_height
-                };
-                // The locked leg and its asset: a buy locks quote = amount*price, a
-                // sell locks base = amount. Compute the quote lock overflow-safely.
-                let (locked_asset, locked_amount) = match side {
-                    OrderSide::Buy => (
-                        pair.quote.clone(),
-                        limit_price
-                            .quote_for(*amount)
-                            .ok_or(ChainError::ArithmeticOverflow)?,
+                self.apply_native_submit_order(
+                    tx.sender,
+                    tx.authorization_lane,
+                    NativeDexOrderSubmission::new(
+                        *order_id,
+                        pair,
+                        *side,
+                        *amount,
+                        *limit_price,
+                        *deadline_height,
+                        *fill_or_cancel,
                     ),
-                    OrderSide::Sell => (pair.base.clone(), *amount),
-                };
-                if locked_asset != AssetId::NativeWebc {
-                    access.write(StateKey::asset_balance(locked_asset.clone(), tx.sender))?;
-                }
-                self.dex_lock(tx.sender, &locked_asset, locked_amount)?;
-                let order = Order {
-                    owner: tx.sender,
-                    pair: pair.clone(),
-                    side: *side,
-                    amount: *amount,
-                    remaining: *amount,
-                    limit_price: *limit_price,
-                    deadline_height: effective_deadline,
-                    fill_or_cancel: *fill_or_cancel,
-                    cancel_requested: false,
-                };
-                self.dex_orders.insert(*order_id, order);
-                events.push(Event::OrderSubmitted {
-                    order_id: *order_id,
-                    owner: tx.sender,
-                    pair: pair.clone(),
-                    side: *side,
-                    amount: *amount,
-                    limit_price: *limit_price,
-                    deadline_height: effective_deadline,
-                });
+                    &config.dex,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::CancelOrder { order_id } => {
-                // Default lane only. Only marks the order for the block-level batch
-                // pass, which performs the refund (possibly a non-native asset the
-                // access list cannot name) and removal. Marking is a write to the
-                // order's own state key; the fee already touches the account.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::DexRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::dex_order(*order_id))?;
-                let order = self
-                    .dex_orders
-                    .get_mut(order_id)
-                    .ok_or(ChainError::DexOrderNotFound)?;
-                if order.owner != tx.sender {
-                    return Err(ChainError::DexOrderNotOwner);
-                }
-                order.cancel_requested = true;
+                self.apply_native_cancel_order(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *order_id,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::GrantMandate {
                 agent_key,
@@ -6756,6 +6731,106 @@ impl ChainState {
             payer: sender,
             amount,
         });
+        Ok(())
+    }
+
+    /// Validates and escrows one order for deterministic block-level settlement.
+    pub(crate) fn apply_native_submit_order(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        submission: NativeDexOrderSubmission<'_>,
+        config: &DexConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::DexRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::dex_order(submission.order_id))?;
+        submission.pair.validate()?;
+        if submission.amount.is_zero() || submission.amount < config.min_order_amount {
+            return Err(ChainError::DexOrderAmountTooSmall);
+        }
+        if submission.limit_price.is_zero() {
+            return Err(ChainError::DexOrderPriceZero);
+        }
+        if self.dex_orders.contains_key(&submission.order_id) {
+            return Err(ChainError::DexOrderAlreadyExists);
+        }
+        let effective_deadline = if submission.deadline_height == 0 {
+            self.current_height
+                .checked_add(config.default_deadline_blocks)
+                .ok_or(ChainError::ArithmeticOverflow)?
+        } else {
+            if submission.deadline_height < self.current_height {
+                return Err(ChainError::DexOrderDeadlineInPast);
+            }
+            submission.deadline_height
+        };
+        let (locked_asset, locked_amount) = match submission.side {
+            OrderSide::Buy => (
+                submission.pair.quote.clone(),
+                submission
+                    .limit_price
+                    .quote_for(submission.amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?,
+            ),
+            OrderSide::Sell => (submission.pair.base.clone(), submission.amount),
+        };
+        if locked_asset != AssetId::NativeWebc {
+            access.write(StateKey::asset_balance(locked_asset.clone(), sender))?;
+        }
+        self.dex_lock(sender, &locked_asset, locked_amount)?;
+        self.dex_orders.insert(
+            submission.order_id,
+            Order {
+                owner: sender,
+                pair: submission.pair.clone(),
+                side: submission.side,
+                amount: submission.amount,
+                remaining: submission.amount,
+                limit_price: submission.limit_price,
+                deadline_height: effective_deadline,
+                fill_or_cancel: submission.fill_or_cancel,
+                cancel_requested: false,
+            },
+        );
+        events.push(Event::OrderSubmitted {
+            order_id: submission.order_id,
+            owner: sender,
+            pair: submission.pair.clone(),
+            side: submission.side,
+            amount: submission.amount,
+            limit_price: submission.limit_price,
+            deadline_height: effective_deadline,
+        });
+        Ok(())
+    }
+
+    /// Marks an owned live order for refund/removal by the block batch pass.
+    pub(crate) fn apply_native_cancel_order(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        order_id: OrderId,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::DexRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, .. } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::dex_order(order_id))?;
+        let order = self
+            .dex_orders
+            .get_mut(&order_id)
+            .ok_or(ChainError::DexOrderNotFound)?;
+        if order.owner != sender {
+            return Err(ChainError::DexOrderNotOwner);
+        }
+        order.cancel_requested = true;
         Ok(())
     }
 
