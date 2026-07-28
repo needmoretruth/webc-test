@@ -30,11 +30,12 @@ use crate::{
     ActionProgramIndexV1, ActionV1, Amount, AssetId, AuthorizationLaneId, BlockHeight,
     BlockPositionV1, ChainConfig, ChainError, ChainId, ChainState, Event, EventIndex, EventV1,
     ExecutionFailureCodeV1, ExternalChain, FeeComputationError, FeePayerV1, FeePaymentV1, FeeRate,
-    GasUnits, Nonce, ObjectId, Operation, PostQuantumRoot, ProtocolStateKey, ReceiptError,
-    ReceiptStatusV1, ReceiptV1, SessionKey, SessionKeyConfig, SessionKeyId, SponsorGrantId,
-    SponsorGrantStateV1, StakingActionV1, StakingConfig, StateKey, StateKeyKind, TransactionKindV1,
-    TransactionV5, TransactionValidationErrorV1, EVENT_V1, LEGACY_AUTHORIZATION_POLICY_REVISION,
-    MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1, SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
+    FeedId, GasUnits, Nonce, ObjectId, Operation, OrderId, PostQuantumRoot, ProtocolStateKey,
+    ReceiptError, ReceiptStatusV1, ReceiptV1, SessionKey, SessionKeyConfig, SessionKeyId,
+    SponsorGrantId, SponsorGrantStateV1, StakingActionV1, StakingConfig, StateKey, StateKeyKind,
+    TransactionKindV1, TransactionV5, TransactionValidationErrorV1, EVENT_V1,
+    LEGACY_AUTHORIZATION_POLICY_REVISION, MAX_TRANSACTION_VALIDITY_BLOCKS, RECEIPT_V1,
+    SPONSOR_GRANT_USE_V1_REQUIRED_UNITS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use webc_crypto::{Address, Hash256, PublicKeyBytes};
@@ -246,6 +247,10 @@ enum ExecutionWriteKeyV1 {
     UnbondingQueue,
     Object(ObjectId),
     Application(Hash256, Hash256),
+    OracleFeed(FeedId),
+    OracleReporter(FeedId, Address),
+    DexOrder(OrderId),
+    Module(Hash256),
     ProtocolBridgeNonce,
     SponsorGrant(Address, SponsorGrantId),
 }
@@ -268,6 +273,9 @@ struct SparseExecutionStateV1 {
     captured_validator_fee_pool: Amount,
     captured_storage_deposits: Amount,
     captured_sponsor_budgets: Amount,
+    captured_oracle_bonds: Amount,
+    captured_oracle_revenue: Amount,
+    captured_dex_escrow: Amount,
 }
 
 impl SparseExecutionStateV1 {
@@ -287,10 +295,14 @@ impl SparseExecutionStateV1 {
             validator_fee_pool: base.validator_fee_pool,
             storage_deposits: base.storage_deposits,
             sponsor_budgets: base.sponsor_budgets,
+            oracle_bonds: base.oracle_bonds,
+            oracle_revenue: base.oracle_revenue,
+            dex_escrow: base.dex_escrow,
             minted_supply: base.minted_supply,
             inflation_year_start_supply: base.inflation_year_start_supply,
             current_base_fee_per_unit: base.current_base_fee_per_unit,
             current_epoch: base.current_epoch,
+            current_height: base.current_height,
             bridge_nonce: base.bridge_nonce,
             last_block_timestamp_ms: base.last_block_timestamp_ms,
             ..ChainState::default()
@@ -318,6 +330,9 @@ impl SparseExecutionStateV1 {
             captured_validator_fee_pool: base.validator_fee_pool,
             captured_storage_deposits: base.storage_deposits,
             captured_sponsor_budgets: base.sponsor_budgets,
+            captured_oracle_bonds: base.oracle_bonds,
+            captured_oracle_revenue: base.oracle_revenue,
+            captured_dex_escrow: base.dex_escrow,
         })
     }
 
@@ -347,6 +362,15 @@ impl SparseExecutionStateV1 {
         let sponsor_budget_delta =
             AmountDeltaV1::between(self.state.sponsor_budgets, self.captured_sponsor_budgets)?;
         let merged_sponsor_budgets = sponsor_budget_delta.apply(base.sponsor_budgets)?;
+        let oracle_bond_delta =
+            AmountDeltaV1::between(self.state.oracle_bonds, self.captured_oracle_bonds)?;
+        let merged_oracle_bonds = oracle_bond_delta.apply(base.oracle_bonds)?;
+        let oracle_revenue_delta =
+            AmountDeltaV1::between(self.state.oracle_revenue, self.captured_oracle_revenue)?;
+        let merged_oracle_revenue = oracle_revenue_delta.apply(base.oracle_revenue)?;
+        let dex_escrow_delta =
+            AmountDeltaV1::between(self.state.dex_escrow, self.captured_dex_escrow)?;
+        let merged_dex_escrow = dex_escrow_delta.apply(base.dex_escrow)?;
         let sponsor_keys = self
             .writes
             .iter()
@@ -431,6 +455,28 @@ impl SparseExecutionStateV1 {
                 ExecutionWriteKeyV1::Application(namespace, key_hash) => {
                     commit_application_entry(base, &mut self.state, namespace, key_hash);
                 }
+                ExecutionWriteKeyV1::OracleFeed(feed_id) => commit_map_entry(
+                    &mut base.oracle_feeds,
+                    &mut self.state.oracle_feeds,
+                    feed_id,
+                ),
+                ExecutionWriteKeyV1::OracleReporter(feed_id, reporter) => commit_map_entry(
+                    &mut base.oracle_reporters,
+                    &mut self.state.oracle_reporters,
+                    (feed_id, reporter),
+                ),
+                ExecutionWriteKeyV1::DexOrder(order_id) => {
+                    commit_map_entry(&mut base.dex_orders, &mut self.state.dex_orders, order_id)
+                }
+                ExecutionWriteKeyV1::Module(code_id) => {
+                    commit_map_entry(&mut base.contracts, &mut self.state.contracts, code_id);
+                    commit_map_entry(
+                        &mut base.wasm_contracts,
+                        &mut self.state.wasm_contracts,
+                        code_id,
+                    );
+                    commit_map_entry(&mut base.wasm_code, &mut self.state.wasm_code, code_id);
+                }
                 ExecutionWriteKeyV1::ProtocolBridgeNonce => {
                     base.bridge_nonce = self.state.bridge_nonce;
                 }
@@ -441,6 +487,9 @@ impl SparseExecutionStateV1 {
         base.validator_fee_pool = merged_validator_fee_pool;
         base.storage_deposits = merged_storage_deposits;
         base.sponsor_budgets = merged_sponsor_budgets;
+        base.oracle_bonds = merged_oracle_bonds;
+        base.oracle_revenue = merged_oracle_revenue;
+        base.dex_escrow = merged_dex_escrow;
         Ok(())
     }
 }
@@ -522,10 +571,23 @@ fn capture_state_key(
             namespace,
             key_hash,
         } => capture_application_entry(base, target, *namespace, *key_hash),
-        StateKeyKind::OracleFeed { .. }
-        | StateKeyKind::OracleReporter { .. }
-        | StateKeyKind::DexOrder { .. }
-        | StateKeyKind::Mandate { .. }
+        StateKeyKind::OracleFeed { feed_id } => {
+            capture_map_entry(&base.oracle_feeds, &mut target.oracle_feeds, feed_id);
+        }
+        StateKeyKind::OracleReporter { feed_id, reporter } => capture_map_entry(
+            &base.oracle_reporters,
+            &mut target.oracle_reporters,
+            &(*feed_id, *reporter),
+        ),
+        StateKeyKind::DexOrder { order_id } => {
+            capture_map_entry(&base.dex_orders, &mut target.dex_orders, order_id);
+        }
+        StateKeyKind::Module { module_id } => {
+            capture_map_entry(&base.contracts, &mut target.contracts, module_id);
+            capture_map_entry(&base.wasm_contracts, &mut target.wasm_contracts, module_id);
+            capture_map_entry(&base.wasm_code, &mut target.wasm_code, module_id);
+        }
+        StateKeyKind::Mandate { .. }
         | StateKeyKind::Service { .. }
         | StateKeyKind::Token { .. }
         | StateKeyKind::TokenBalance { .. }
@@ -534,8 +596,7 @@ fn capture_state_key(
         | StateKeyKind::NftItem { .. }
         | StateKeyKind::GovernanceInstance { .. }
         | StateKeyKind::GovernanceProposal { .. }
-        | StateKeyKind::GovernanceVote { .. }
-        | StateKeyKind::Module { .. } => {
+        | StateKeyKind::GovernanceVote { .. } => {
             return Err(BlockExecutionErrorV1::StateAccessInvariant);
         }
     }
@@ -587,12 +648,15 @@ fn execution_write_key(key: &StateKey) -> Result<ExecutionWriteKeyV1, BlockExecu
             *sponsor,
             SponsorGrantId::new(*grant_id),
         )),
+        StateKeyKind::OracleFeed { feed_id } => Ok(ExecutionWriteKeyV1::OracleFeed(*feed_id)),
+        StateKeyKind::OracleReporter { feed_id, reporter } => {
+            Ok(ExecutionWriteKeyV1::OracleReporter(*feed_id, *reporter))
+        }
+        StateKeyKind::DexOrder { order_id } => Ok(ExecutionWriteKeyV1::DexOrder(*order_id)),
+        StateKeyKind::Module { module_id } => Ok(ExecutionWriteKeyV1::Module(*module_id)),
         StateKeyKind::Protocol {
             field: ProtocolStateKey::BaseFee,
         }
-        | StateKeyKind::OracleFeed { .. }
-        | StateKeyKind::OracleReporter { .. }
-        | StateKeyKind::DexOrder { .. }
         | StateKeyKind::Mandate { .. }
         | StateKeyKind::Service { .. }
         | StateKeyKind::Token { .. }
@@ -602,8 +666,7 @@ fn execution_write_key(key: &StateKey) -> Result<ExecutionWriteKeyV1, BlockExecu
         | StateKeyKind::NftItem { .. }
         | StateKeyKind::GovernanceInstance { .. }
         | StateKeyKind::GovernanceProposal { .. }
-        | StateKeyKind::GovernanceVote { .. }
-        | StateKeyKind::Module { .. } => Err(BlockExecutionErrorV1::StateAccessInvariant),
+        | StateKeyKind::GovernanceVote { .. } => Err(BlockExecutionErrorV1::StateAccessInvariant),
     }
 }
 
@@ -1018,6 +1081,9 @@ impl ChainState {
             captured_validator_fee_pool,
             captured_storage_deposits,
             captured_sponsor_budgets,
+            captured_oracle_bonds,
+            captured_oracle_revenue,
+            captured_dex_escrow,
         } = SparseExecutionStateV1::capture(
             self,
             &transaction.access_list.read_only,
@@ -1113,6 +1179,9 @@ impl ChainState {
             captured_validator_fee_pool,
             captured_storage_deposits,
             captured_sponsor_budgets,
+            captured_oracle_bonds,
+            captured_oracle_revenue,
+            captured_dex_escrow,
         }
         .commit(self)?;
         Ok(ExecutedTransactionV1 { receipt })
@@ -1407,6 +1476,35 @@ fn execute_native_action_v1(
             namespace,
             new_owner,
         } => state.apply_native_transfer_namespace(context.sender, *namespace, *new_owner, effects),
+        Operation::CreateFeed { feed_id } => state.apply_native_create_feed(
+            context.sender,
+            context.authorization_lane,
+            *feed_id,
+            &context.config.oracle,
+            effects,
+        ),
+        Operation::RegisterReporter { feed_id } => state.apply_native_register_reporter(
+            context.sender,
+            context.authorization_lane,
+            *feed_id,
+            effects,
+        ),
+        Operation::DeregisterReporter { feed_id } => state.apply_native_deregister_reporter(
+            context.sender,
+            context.authorization_lane,
+            *feed_id,
+            effects,
+        ),
+        Operation::SubmitReport { feed_id, value } => {
+            state.apply_native_submit_report(context.sender, *feed_id, *value, effects)
+        }
+        Operation::PayFeedRead { feed_id, amount } => state.apply_native_pay_feed_read(
+            context.sender,
+            context.authorization_lane,
+            *feed_id,
+            *amount,
+            effects,
+        ),
         Operation::CreateObject {
             object_id,
             namespace,
@@ -1896,6 +1994,12 @@ fn classify_action_failure(
         | ChainError::NamespaceAlreadyRegistered
         | ChainError::NamespaceNotFound
         | ChainError::NamespaceNotOwner
+        | ChainError::OracleFeedAlreadyExists
+        | ChainError::OracleFeedNotFound
+        | ChainError::OracleReporterAlreadyRegistered
+        | ChainError::OracleReporterNotFound
+        | ChainError::OracleRequiresDefaultLane
+        | ChainError::OracleReadAmountZero
         | ChainError::ValidatorAlreadyExists(_)
         | ChainError::ValidatorNotFound(_)
         | ChainError::ValidatorNotActive(_)
@@ -2600,14 +2704,14 @@ mod tests {
     use crate::{
         Account, AccountAuthorizationPolicy, ActionScopeV1, ActionV1, Amount, AuthorizationLane,
         AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, BridgeMessage, ChainState,
-        Delegation, Epoch, FeeBid, FeePaymentV1, Nonce, ObjectId, ObjectVersion, Operation,
-        PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations,
-        SessionKeyAuthorizationAction, SessionKeyConstraints, SponsorGrantId, SponsorGrantV1,
-        SponsorUseCount, SponsorUseNonce, SponsorUseV1, StakingActionV1, StoragePricing,
-        TransactionAuthorizationV1, TransactionIndex, UnbondingKind, UnbondingRequestId, Validator,
-        ValidatorStatus, ValidityWindowV1, INITIAL_AUTHORIZATION_POLICY_REVISION,
-        MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1, REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS,
-        TRANSACTION_V5_PROTOCOL_VERSION,
+        Delegation, Epoch, FeeBid, FeePaymentV1, FeedValue, Nonce, ObjectId, ObjectVersion,
+        Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+        SessionAllowedOperations, SessionKeyAuthorizationAction, SessionKeyConstraints,
+        SponsorGrantId, SponsorGrantV1, SponsorUseCount, SponsorUseNonce, SponsorUseV1,
+        StakingActionV1, StoragePricing, TransactionAuthorizationV1, TransactionIndex,
+        UnbondingKind, UnbondingRequestId, Validator, ValidatorStatus, ValidityWindowV1,
+        INITIAL_AUTHORIZATION_POLICY_REVISION, MAX_SPONSOR_GRANT_PRUNES_PER_BLOCK_V1,
+        REVOKE_SIGNED_SPONSOR_GRANT_V1_REQUIRED_UNITS, TRANSACTION_V5_PROTOCOL_VERSION,
     };
     use webc_crypto::{ml_dsa65_keygen, Hash256, Keypair, MlDsa65PublicKey, MlDsa65SecretKey};
 
@@ -4494,6 +4598,128 @@ mod tests {
         assert_eq!(
             restored.state_root().expect("restored root"),
             state.state_root().expect("live root")
+        );
+    }
+
+    #[test]
+    fn native_oracle_lifecycle_conserves_supply_and_restart_root() {
+        let sender = Keypair::from_seed([1; 32]);
+        let feed_id = FeedId::new(Hash256([0x71; 32]));
+        let actions = vec![
+            ActionV1::native(Operation::CreateFeed { feed_id }),
+            ActionV1::native(Operation::RegisterReporter { feed_id }),
+            ActionV1::native(Operation::SubmitReport {
+                feed_id,
+                value: FeedValue::new(42_000),
+            }),
+            ActionV1::native(Operation::PayFeedRead {
+                feed_id,
+                amount: Amount::from_units(30),
+            }),
+            ActionV1::native(Operation::DeregisterReporter { feed_id }),
+        ];
+        let gas_limit = actions.iter().map(ActionV1::required_units).sum::<u64>();
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut config = v5_config();
+        config.oracle.feed_creation_fee = Amount::from_units(100);
+        config.oracle.min_reporter_bond = Amount::from_units(200);
+        let mut state = funded_state(&sender, None);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = Amount::from_units(1_000_000);
+        state.minted_supply = Amount::from_units(1_000_000);
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, transaction, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("oracle lifecycle executes")
+            .into_receipt();
+
+        assert_eq!(receipt.status, ReceiptStatusV1::Succeeded);
+        assert_eq!(receipt.events.len(), 5);
+        assert_eq!(state.oracle_bonds, Amount::ZERO);
+        assert_eq!(state.oracle_revenue, Amount::from_units(30));
+        assert!(!state
+            .oracle_reporters
+            .contains_key(&(feed_id, sender.address())));
+        assert_eq!(state.oracle_feeds[&feed_id].revenue, Amount::from_units(30));
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("oracle lifecycle supply report")
+                .balanced
+        );
+        let restored: ChainState = bincode::deserialize(
+            &bincode::serialize(&state).expect("serialize oracle lifecycle state"),
+        )
+        .expect("restore oracle lifecycle state");
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.state_root().expect("restored root"),
+            state.state_root().expect("live root")
+        );
+    }
+
+    #[test]
+    fn native_oracle_failure_rolls_back_child_but_charges_parent() {
+        let sender = Keypair::from_seed([1; 32]);
+        let feed_id = FeedId::new(Hash256([0x72; 32]));
+        let actions = vec![
+            ActionV1::native(Operation::CreateFeed { feed_id }),
+            ActionV1::native(Operation::CreateFeed { feed_id }),
+        ];
+        let gas_limit = actions.iter().map(ActionV1::required_units).sum::<u64>();
+        let transaction = sender_actions_fixture(&sender, actions, gas_limit);
+        let mut config = v5_config();
+        config.oracle.feed_creation_fee = Amount::from_units(100);
+        config.oracle.min_reporter_bond = Amount::from_units(200);
+        let mut state = funded_state(&sender, None);
+        let initial_balance = Amount::from_units(1_000_000);
+        state
+            .accounts
+            .get_mut(&sender.address())
+            .expect("sender account")
+            .balance = initial_balance;
+        state.minted_supply = initial_balance;
+        state.inflation_year_start_supply = state.minted_supply;
+
+        let receipt = state
+            .execute_prepared_transaction_v1(
+                prepared_with_config(&state, transaction, &config),
+                BlockPositionV1::new(BlockHeight::new(10), TransactionIndex::new(0)),
+                &config,
+            )
+            .expect("duplicate feed is a chargeable action failure")
+            .into_receipt();
+
+        assert_eq!(
+            receipt.status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::Precondition,
+                failed_action_index: Some(ActionIndex::new(1)),
+            }
+        );
+        assert_eq!(state.accounts[&sender.address()].nonce, 1);
+        assert_eq!(
+            state.accounts[&sender.address()].balance,
+            initial_balance
+                .checked_sub(receipt.fee_summary.charged)
+                .expect("fee is below fixture balance")
+        );
+        assert!(!state.oracle_feeds.contains_key(&feed_id));
+        assert_eq!(state.oracle_bonds, Amount::ZERO);
+        assert_eq!(state.oracle_revenue, Amount::ZERO);
+        assert!(
+            state
+                .supply_invariant_report()
+                .expect("failed oracle supply report")
+                .balanced
         );
     }
 

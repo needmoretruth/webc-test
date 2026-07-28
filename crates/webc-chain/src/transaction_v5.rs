@@ -633,6 +633,11 @@ impl ActionV1 {
                         | Operation::WithdrawAppSponsor { .. }
                         | Operation::RegisterNamespace { .. }
                         | Operation::TransferNamespace { .. }
+                        | Operation::CreateFeed { .. }
+                        | Operation::RegisterReporter { .. }
+                        | Operation::DeregisterReporter { .. }
+                        | Operation::SubmitReport { .. }
+                        | Operation::PayFeedRead { .. }
                         | Operation::ClaimUnbonded { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
@@ -1895,8 +1900,9 @@ mod fee_bid_decimal {
 mod tests {
     use super::*;
     use crate::{
-        AssetId, BridgeMessage, ExternalChain, ObjectId, ObjectVersion, Operation, PostQuantumRoot,
-        PostQuantumRootReveal, PostQuantumScheme, SessionAllowedOperations, SessionKeyConstraints,
+        AssetId, BridgeMessage, ExternalChain, FeedId, FeedValue, ObjectId, ObjectVersion,
+        Operation, PostQuantumRoot, PostQuantumRootReveal, PostQuantumScheme,
+        SessionAllowedOperations, SessionKeyConstraints,
     };
 
     #[test]
@@ -1999,6 +2005,28 @@ mod tests {
             Operation::TransferNamespace {
                 namespace,
                 new_owner: Keypair::from_seed([43; 32]).address(),
+            },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_oracle_operations() {
+        let feed_id = FeedId::new(Hash256([6; 32]));
+        let operations = [
+            Operation::CreateFeed { feed_id },
+            Operation::RegisterReporter { feed_id },
+            Operation::DeregisterReporter { feed_id },
+            Operation::SubmitReport {
+                feed_id,
+                value: FeedValue::new(42),
+            },
+            Operation::PayFeedRead {
+                feed_id,
+                amount: Amount::from_units(1),
             },
         ];
 
