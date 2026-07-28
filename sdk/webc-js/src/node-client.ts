@@ -1,5 +1,5 @@
 /**
- * Browser-safe client for the WEBC node developer API (`/v1`).
+ * Browser-safe client for the WEBC node developer and transaction APIs.
  *
  * Purpose: give a web application a small, typed, defensively-validated way to
  * talk to a `webc-node` HTTP/WebSocket endpoint — read health/fees, query
@@ -25,6 +25,26 @@ import {
   type FinalizedTransactionProofBundleV1Json,
 } from "./finalized-proof-v1.js";
 import type { ServiceEntry } from "./http402.js";
+import {
+  MAX_TRANSACTION_API_RESPONSE_BYTES_V2,
+  MAX_TRANSACTION_RECEIPT_RESPONSE_BYTES_V2,
+  openTransactionLifecycleSubscriptionV2,
+  parseFinalizedTransactionReceiptV2,
+  parseTransactionLifecycleV2,
+  parseTransactionSubmitResponseV2,
+  validateTransactionIdV2,
+  type TransactionLifecycleSubscriptionHandlersV2,
+  type TransactionLifecycleSubscriptionOptionsV2,
+  type TransactionLifecycleSubscriptionV2,
+  type TransactionLifecycleV2,
+  type TransactionSubmitResponseV2,
+} from "./transaction-api-v2.js";
+import {
+  transactionV5IdHex,
+  validateTransactionV5Structure,
+  type SignedTransactionV5Json,
+} from "./transaction-v5.js";
+import type { ReceiptV1Json } from "./receipt-v1.js";
 import type {
   GovernanceActionJson,
   GovernanceConfigJson,
@@ -99,6 +119,8 @@ export interface WebSocketLike {
   addEventListener(type: "open", listener: () => void): void;
   addEventListener(type: "close", listener: () => void): void;
   addEventListener(type: "error", listener: (event: unknown) => void): void;
+  /** Sends a text frame; optional so existing receive-only V1 test adapters remain valid. */
+  send?(data: string): void;
   close(): void;
 }
 
@@ -109,12 +131,15 @@ export type WebSocketConstructor = new (url: string) => WebSocketLike;
 export class NodeApiError extends Error {
   readonly status: number;
   readonly kind: string;
+  /** V2 node-local correlation ID, when the response carried a valid one. */
+  readonly requestId: string | undefined;
 
-  constructor(status: number, kind: string, message: string) {
+  constructor(status: number, kind: string, message: string, requestId?: string) {
     super(message);
     this.name = "NodeApiError";
     this.status = status;
     this.kind = kind;
+    this.requestId = requestId;
   }
 }
 
@@ -619,6 +644,34 @@ export class WebcNodeClient {
   }
 
   /**
+   * Returns the durable protocol-2 lifecycle for one canonical transaction ID.
+   * The response identity is required to match the requested ID exactly.
+   */
+  async transactionLifecycleV2(transactionId: string): Promise<TransactionLifecycleV2> {
+    validateTransactionIdV2(transactionId);
+    const value = await this.#get(
+      `/v2/transactions/${transactionId}`,
+      MAX_TRANSACTION_API_RESPONSE_BYTES_V2,
+    );
+    return parseTransactionLifecycleV2(value, transactionId);
+  }
+
+  /**
+   * Returns a finalized V1 receipt for one protocol-2 transaction.
+   *
+   * The existing receipt validator reconciles every fee field and event bound;
+   * this method additionally binds the receipt ID to the requested path.
+   */
+  async finalizedTransactionReceiptV2(transactionId: string): Promise<ReceiptV1Json> {
+    validateTransactionIdV2(transactionId);
+    const value = await this.#get(
+      `/v2/transactions/${transactionId}/receipt`,
+      MAX_TRANSACTION_RECEIPT_RESPONSE_BYTES_V2,
+    );
+    return parseFinalizedTransactionReceiptV2(value, transactionId);
+  }
+
+  /**
    * Fetches a checkpoint-relative finalized transaction proof from the V2 API.
    *
    * `transactionId` is an exact lowercase 32-byte hex transaction identity and
@@ -649,6 +702,29 @@ export class WebcNodeClient {
    */
   async submitTransaction(transaction: unknown): Promise<SubmitReceipt> {
     return parseSubmitReceipt(await this.#post("/v1/transactions", transaction));
+  }
+
+  /**
+   * Durably submits one complete signed V5 transaction to the protocol-2 actor.
+   *
+   * The SDK validates the bounded V5 shape before network I/O, computes the
+   * canonical transaction ID locally, and rejects any response whose top-level
+   * or nested lifecycle identity disagrees with that signed request.
+   */
+  async submitTransactionV2(
+    transaction: SignedTransactionV5Json,
+  ): Promise<TransactionSubmitResponseV2> {
+    validateTransactionV5Structure(transaction);
+    if (transaction.sender_signature === null) {
+      throw new Error("V2 submission requires a signed V5 transaction signature");
+    }
+    const expectedTransactionId = await transactionV5IdHex(transaction);
+    const value = await this.#post(
+      "/v2/transactions",
+      transaction,
+      MAX_TRANSACTION_API_RESPONSE_BYTES_V2,
+    );
+    return parseTransactionSubmitResponseV2(value, expectedTransactionId);
   }
 
   /** Requests a devnet faucet drip to `address`. Devnet only; funds are valueless. */
@@ -684,6 +760,30 @@ export class WebcNodeClient {
     };
   }
 
+  /**
+   * Subscribes to durable lifecycle snapshots for one through 64 explicit IDs.
+   *
+   * The returned handle never reconnects in a hidden loop. On
+   * `resync_required`, the handler receives the safe sequence marker and may
+   * call `reconnect()` to request an actor-consistent snapshot after it.
+   */
+  subscribeTransactionLifecyclesV2(
+    transactionIds: readonly string[],
+    handlers: TransactionLifecycleSubscriptionHandlersV2,
+    options: TransactionLifecycleSubscriptionOptionsV2 = {},
+  ): TransactionLifecycleSubscriptionV2 {
+    if (!this.#webSocket) {
+      throw new Error("no WebSocket implementation available; pass options.webSocketImpl");
+    }
+    return openTransactionLifecycleSubscriptionV2(
+      `${this.#toWebSocketUrl()}/v2/transactions/ws`,
+      this.#webSocket,
+      transactionIds,
+      handlers,
+      options,
+    );
+  }
+
   /** Converts the http(s) base URL to a ws(s) URL for the subscription. */
   #toWebSocketUrl(): string {
     if (this.#baseUrl.startsWith("https://")) {
@@ -701,13 +801,17 @@ export class WebcNodeClient {
     return this.#handle(response, successBodyLimit);
   }
 
-  async #post(path: string, body: unknown): Promise<unknown> {
+  async #post(
+    path: string,
+    body: unknown,
+    successBodyLimit = this.#maxResponseBytes,
+  ): Promise<unknown> {
     const response = await this.#fetch(`${this.#baseUrl}${path}`, {
       method: "POST",
       headers: body === undefined ? {} : { "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    return this.#handle(response, this.#maxResponseBytes);
+    return this.#handle(response, successBodyLimit);
   }
 
   async #handle(response: {
@@ -724,6 +828,15 @@ export class WebcNodeClient {
     );
     const value = text.length > 0 ? decodeJson(text) : null;
     if (!response.ok) {
+      const v2Error = parseV2NodeApiError(value);
+      if (v2Error !== null) {
+        throw new NodeApiError(
+          response.status,
+          v2Error.code,
+          v2Error.message,
+          v2Error.requestId,
+        );
+      }
       // The node returns { error, kind } on failure; surface both, but truncate
       // so a hostile node cannot push megabytes of controlled text into host UI.
       const kind =
@@ -847,6 +960,40 @@ function asString(data: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Strictly recognizes the stable redacted `/v2` error envelope. */
+function parseV2NodeApiError(value: unknown): {
+  code: string;
+  message: string;
+  requestId: string;
+} | null {
+  if (!isRecord(value) || value.api_version !== "v2") return null;
+  const keys = Object.keys(value).sort();
+  const expected = ["api_version", "code", "message", "request_id"];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    return null;
+  }
+  if (
+    typeof value.code !== "string"
+    || value.code.length === 0
+    || value.code.length > 64
+    || !/^[a-z][a-z0-9_]*$/.test(value.code)
+    || typeof value.message !== "string"
+    || value.message.length === 0
+    || value.message.length > MAX_ERROR_STRING_CHARS
+    || typeof value.request_id !== "string"
+    || value.request_id.length === 0
+    || value.request_id.length > 128
+    || !/^[A-Za-z0-9_-]+$/.test(value.request_id)
+  ) {
+    return null;
+  }
+  return {
+    code: value.code,
+    message: value.message,
+    requestId: value.request_id,
+  };
 }
 
 /** Requires a finite, non-negative safe integer. */
