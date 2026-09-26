@@ -2,6 +2,7 @@
   "name": "@webc/widget",
   "version": "0.1.0",
   "description": "Embeddable WEBC wallet/payment widget skeleton.",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
