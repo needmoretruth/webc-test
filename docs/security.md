@@ -44,10 +44,11 @@ state root and supply invariant. Only a default-lane transaction can open or
 fund a lane. Missing lanes, nonce reuse, insufficient prepaid fees, duplicate
 creation, and attempts to manage lanes from another lane fail atomically.
 
-Transaction wire V3 binds every Ed25519 signature to protocol version and chain
-ID under `WEBC_SIGNED_TRANSACTION_V3`. A correctly signed transaction for a
-different WEBC network or unsupported protocol version is rejected before fees
-or state change, closing the remaining cross-network transaction replay path.
+Transaction wires V4 (`WEBC_SIGNED_TRANSACTION_V4`, protocol 1) and V5
+(`WEBC_SIGNED_TRANSACTION_V5`, protocol 2) bind every Ed25519 signature to
+protocol version and chain ID. A correctly signed transaction for a different
+WEBC network or unsupported protocol version is rejected before fees or state
+change, closing the remaining cross-network transaction replay path.
 
 Objects add a second replay boundary: every mutation or ownership transfer must
 name the stored namespace and exact current version. Only the current address
@@ -71,8 +72,8 @@ bounded and invalid checksums fail before derivation. The public wallet object
 does not expose a `CryptoKey`; its signing handle remains non-extractable and
 module-private. JavaScript cannot guarantee erasure of immutable strings, so
 the phrase and optional passphrase must exist only inside the trusted wallet
-origin. Encrypted persistence and the host-facing request boundary are still
-incomplete.
+origin. Encrypted persistence and the host-facing request boundary are covered
+below.
 
 Encrypted recovery export now has a strict v1 envelope. Argon2id uses the fixed
 OWASP 19 MiB/t=2/p=1 profile with a fresh 16-byte salt, then AES-256-GCM uses a
@@ -94,8 +95,12 @@ origin-specific lanes prevent one site selecting another site's lane. Exact
 per-transaction/cumulative principal and fee limits are race-free because
 requests execute serially. Every transfer still shows origin, recipient, amount,
 asset, maximum fee, chain, and lane in the trusted popup and requires a click.
-Permissions are not yet durably persisted, and this browser boundary still
-requires independent security review and real-browser adversarial testing.
+Per-origin grants (lane, limits, cumulative spend) can persist in the encrypted
+permission store v1 (Argon2id, AES-256-GCM, bound to the wallet identity)
+through a caller-supplied storage backend. It has no anti-rollback counter, so
+an attacker who can overwrite the wallet origin's own storage could restore an
+older snapshot and reset a spend budget. This browser boundary still requires
+independent security review and real-browser adversarial testing.
 
 ## Post-quantum readiness
 
@@ -115,40 +120,69 @@ Bridges are a separate high-risk system. Required controls include exact asset i
 
 Generic token support does not make malicious or unusual tokens safe. Real bridge funds remain disabled until the production trust/proof model is approved.
 
-## Known gaps from the 2026-07-16 plan review
+## Review status
 
-A read-only review reported gaps that are not yet fixed. These are recorded here
-so the security model does not read as stronger than the code. Full detail and
-line references are in `docs/review/findings.md`; the prioritized fix order is in
-`docs/review/2026-07-16-plan-review.md` §6. Each finding must be reproduced with a
-test before it is fixed.
+The 2026-07-16 read-only plan review reported the gaps tracked here. A resolved
+finding is not an audit result, and the posture above still applies.
 
-- **Consensus is not yet safe (HIGH).** A proposed block is prevoted, locked, and
-  finalized without re-executing it, so a Byzantine leader can obtain a valid
-  finality certificate for an unimportable block (findings C1). A failed
-  finalized-block import silently halts the node (C2). Per-height consensus memory
-  is keyed by an attacker-chosen round with no bound (C3, OOM). There is no durable
-  write-ahead log of a validator's own votes/locks, so a crash-restart can make an
-  honest validator self-equivocate (C4) — this must be fixed before equivocation is
-  wired to a slash.
-- **Slashing is now applied, which makes the C4 WAL gap dangerous.** Commit
-  `a6197ac` wired equivocation-to-slash end to end (header `evidence_root` + block
-  evidence executed atomically; the driver auto-includes machine-detected
-  equivocation). Because that loop is live, finding C4 (no durable vote/lock WAL)
-  means an honest validator that crashes and restarts mid-height can self-
-  equivocate and be slashed — the WAL must land before this runs on a network. The
-  a6197ac evidence path also still needs an independent adversarial review.
-- **The finality "committee" is the whole validator set.** The confirmed rotating
-  stake-weighted sub-committee is unbuilt; whole-set voting does not scale to an
-  uncapped validator set and is a first-step approximation only.
-- **Node/network hardening gaps (devnet surface).** No handshake timeout, unbounded
-  inbound connections and peer table, faucet drainable via unlimited fresh
-  addresses, and unbounded WebSocket subscriptions (findings N1–N3, H1, H3).
-- **No production validator-key provisioning yet.** Devnet uses fresh per-process
-  and hardcoded devnet keys; a permissioned keystore path (no key material in
-  argv) must exist before mainnet.
-- **No automated supply-chain gate.** `cargo-deny` (advisories/licenses/bans) and a
-  JS advisory scan are not yet in CI.
+Resolved in the current code (tests and fix commits per finding are in
+`docs/review/findings.md`; the original fix order is in
+`docs/review/2026-07-16-plan-review.md` §6):
+
+- **Consensus C1–C4.** A proposal is fully re-executed before it can be
+  prevoted (C1, `45f7396`). A failed finalized-block import stops the driver
+  with a typed reason instead of halting silently; only transient storage
+  errors are retried, a bounded number of times (C2, `5ca197d`). Per-height
+  consensus storage is limited to a sliding round window (C3, `bc3869b`). A
+  validator durably journals its own proposals, votes, and lock before
+  broadcasting and replays them on restart (C4, `90c28ac`). Both consensus
+  drivers (legacy and protocol-2) implement these protections, so a
+  crash-restart with intact storage no longer makes an honest validator
+  self-equivocate into the live slash path (`a6197ac`). The open note from the
+  follow-up trace of that evidence path (`23387f5`) is listed under H5 below.
+- **Network and node.** N1 handshake timeout (`52b87a4`), N2 inbound-connection
+  and per-IP caps (`478ebed`), N3 peer-table cap (`5b0955f`), H1 global faucet
+  rate limit and H3 WebSocket subscription cap (`ec327c7`).
+- **Supply chain D1–D2** (`91760e2`, extended in `ecfeebe` and `0e04306`). CI
+  runs `cargo-deny` (advisories, bans, licenses, sources) on the root and fuzz
+  dependency graphs, `pnpm audit --audit-level=moderate` over all JavaScript
+  dependencies including development tooling, `pnpm licenses:check`, and a
+  `fuzz-smoke` pass over every `fuzz/` target.
+
+Still open (a code finding must be reproduced with a failing test before it is
+fixed):
+
+- **Whole-set finality.** The finality committee is the whole active validator
+  set; the stake-weighted sub-committee of ADR-0010 is unbuilt, and whole-set
+  voting does not scale to an uncapped validator set.
+- **Validator keys (H5).** The protocol-2 node reads the validator seed only
+  from a bounded key file (never argv or environment), rejects files accessible
+  by group or other users on Unix, checks the key against a genesis authority,
+  and zeroizes the retained seed. Still missing: the encrypted,
+  passphrase-unlocked keystore of ADR-0009 (the file is plaintext), Windows ACL
+  enforcement, and consensus-key rotation. Slashing evidence is verified against
+  the validator's current key, so rotation must first switch that check to the
+  offense-height snapshot.
+- **Long-range sync (E4).** `webc-proof` verifies weak-subjectivity checkpoints
+  and authority-set transitions for proof clients, but a node still bootstraps
+  from genesis with no checkpoint input.
+- **Eclipse resistance (E5).** Peer scoring, eviction, and anti-eclipse peer
+  selection are later work; the peer channel is authenticated but not
+  encrypted.
+- **Contract runtime (E7).** The WASM runtime (`webc-vm`) has landed, but the
+  E7 reentrancy/metering checklist has not been recorded as run against it.
+  Admission carries no compute term, and each call runs under a fixed fuel
+  budget not derived from `gas_limit`; consumed fuel is reconciled against
+  `gas_limit` only after the run (owner decision pending, ADR-0014).
+- **Weft compiler.** The off-chain skeleton compiler (`webc-weft`) has not had
+  its adversarial review, and its recursive-descent parser has no nesting-depth
+  guard, so deeply nested input could overflow the stack.
+- **Dependencies (D4).** `fips204 0.4.6` is pre-1.0 and on the ML-DSA
+  recovery-root verify path; `bincode 1.3.3` is unmaintained and its advisory is
+  ignored in `deny.toml` until the 2.x migration.
+- **External assurance.** The Phase 5.5 independent security review, redb
+  crash-atomicity fault injection, and long external fuzz campaigns are still
+  owed. Lower-severity residuals (E3, S8, X5) are in `findings.md`.
 
 ## Test strategy
 
