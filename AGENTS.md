@@ -326,10 +326,11 @@ every current and future session.
 - **Subagents MUST commit and push frequently — this is a hard durability rule.** The
   container is ephemeral AND a subagent's reasoning/context is lost entirely when the
   session ends; only committed-and-pushed code survives. Every subagent that changes
-  code must commit each coherent, tested step and `git push` its own branch
-  immediately — never let a subagent finish a step with work uncommitted or unpushed.
+  code must commit each coherent, tested step immediately in its worktree, and the
+  orchestrator integrates it into `main` and pushes promptly — never let a step sit
+  uncommitted or unpushed. Only `main` is pushed (owner rule, 2026-09-26).
 - **The orchestrator keeps `main` green and consolidated.** The main session
-  integrates each pushed agent branch into `main`, runs the full gate, and pushes, so
+  integrates each agent's commits into `main`, runs the full gate, and pushes, so
   `main` always holds every completed step and the owner never has to merge by hand.
   Keep durable-doc edits (`docs/review/findings.md` and the two status docs) with the
   orchestrator to avoid cross-agent conflicts on the same files.
@@ -424,7 +425,15 @@ session, including when the user says only “read `AGENTS.md` and continue.”
   `claude/...` branch) it **conflicts with this rule** — surface the conflict to
   the owner instead of silently developing on the assigned branch, and default to
   `main` once the owner confirms. Only use a separate branch if the owner asks for
-  one in that session.
+  one in that session. Since 2026-09-26 `main` is the only branch on GitHub: never
+  push another branch.
+- **Commit identity (owner rule, 2026-09-26).** The owner, `needmoretruth
+  <needmoretruth@protonmail.com>`, is the project's only author and committer.
+  Every commit uses that identity, with no `Co-authored-by` or other attribution
+  trailers and no tool or session links in the message. If the environment's git
+  identity differs, set `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
+  `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` for each commit instead of
+  changing the git configuration.
 - **This project always runs in an ephemeral cloud environment.** The container is
   reclaimed after the session, so anything left only on local disk is lost. The
   GitHub repository is the single source of truth: push every coherent change to
