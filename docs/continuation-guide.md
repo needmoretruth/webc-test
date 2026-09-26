@@ -1,5 +1,13 @@
 # WEBC continuation guide
 
+**2026-09-26 update:** the transaction system (`codex/transaction-system` with
+its native-completion and lifecycle-outcomes lanes) is integrated into `main`
+(merges `b91f909`, `0f4d4a6`), followed by CI fixes, an exact 256-bit
+`checked_mul_ratio` (`aaf87b8`), and a refreshed `docs/security.md` review
+status. Every other branch was retired; all work continues on `main` only. The
+open transaction-system work is merge blockers 5–7 in
+`docs/transaction-system-plan.md` ("Main integration checkpoint").
+
 Last updated: 2026-07-18 (Phases 5–13 done on `main`; owner direction is
 "practical L1 완성" plus an owner-approved **earliest-skeleton Weft** front end.
 Owner is **pausing here to resume later** — this session wrapped up at a clean,
@@ -9,8 +17,9 @@ it has the live state: the WASM contract runtime is **wired end-to-end**
 (`webc-vm` bridged into `webc-chain`, `4ca3483`) and **adversarially reviewed** (one
 HIGH finding fixed in `a162bfe`); the **Weft skeleton compiler** (`webc-weft`) is
 **built and runs on-chain end-to-end** (its own review is an open follow-up). The
-Codex decision and swappable-engine design still apply.) Separately assigned
-feature goals use their own branches and do not replace this pointer until merged.
+swappable-engine design still applies; the Codex pause decision below was
+superseded on 2026-09-26.) All work, including separately assigned feature
+goals, happens on `main`.
 This file is the live pointer to the **exact next task**. Detailed "what the code
 implements" facts live in `implementation-status.md`; do not duplicate them
 here.
@@ -117,15 +126,14 @@ audit remain. **Weft language is EXCLUDED** (later separate project). Work on
 **Landed on `main` since Phase 13 (this session):** node read + discovery/list
 endpoints; the full SDK high-level client layer (Agent-commerce / Governance /
 Token / Nft clients); and the **`webc-proof` crate** (transparent indexed Merkle
-proofs — the **Phase 10** foundation), adopted from the paused
-`codex/transaction-system` branch (commit `b21a525`).
+proofs — the **Phase 10** foundation), adopted early from
+`codex/transaction-system` (commit `b21a525`).
 
-**Codex decision (owner-delegated):** `codex/transaction-system` is PAUSED and
-self-declared incomplete. Adopted ONLY its clean, complete `webc-proof` crate.
-Its centerpiece **V5 transaction wire** was SKIPPED — it is an unintegrated
-parallel foundation (2000+ lines) that would need real completion (not a light
-fix) + conflicts (fees.rs, an ADR-0012 number collision). Owner MAY later ask to
-complete V5 as a formal task; do not merge it wholesale.
+**Codex decision (owner-delegated, 2026-07-18) — superseded 2026-09-26:** the
+branch was paused then and only its `webc-proof` crate was adopted. It was later
+completed through merge blockers 1–4 and integrated into `main` with its
+native-completion and lifecycle-outcomes lanes (`b91f909`, `0f4d4a6`); blockers
+5–7 remain (`docs/transaction-system-plan.md`, "Remaining merge blockers").
 
 **DONE — Phase 7b: real WASM contract runtime, wired end-to-end.** Owner-endorsed
 principle held throughout: **SWAPPABLE / MODULAR ENGINE.** `webc-vm` (deterministic
@@ -334,11 +342,10 @@ absence of the vector.
 The Phase 5–13 work (economics, localized fees, sponsorship, namespaces, oracle,
 interim contract runtime, DEX, agent mandate + service registry, tokens, NFTs,
 application governance) was developed on **`claude/agent-md-review-6a392q`** and
-**integrated into `main`** on 2026-07-17. A separately assigned **transaction-system**
-goal develops independently on its own `codex/transaction-system` branch and is
-**not** merged here (per the branch-isolation workflow in `AGENTS.md`); the three
-Codex commits already on `main` (repo restore + workflow docs) are preserved by
-this integration. Further work continues on `main`.
+**integrated into `main`** on 2026-07-17. The separately developed
+**transaction-system** goal (`codex/transaction-system`) was integrated into
+`main` on 2026-09-26; the three Codex commits already on `main` (repo restore +
+workflow docs) are preserved. Further work continues on `main`.
 
 ### Exact next work
 
@@ -646,8 +653,9 @@ flows, Phase 10 succinct proofs / PQ, Phase 11 fast-path + real-hardware
 benchmarks, Phase 12 web platform, Phase 14/18 bridges, Phase 16 testnet, Phase
 17 mainnet gates — remains owner-gated (trust anchors, slashing numbers, bridge
 trust model, mainnet governance) or needs external resources (benchmarks, audits,
-live bridges). Surface those to the owner rather than deciding alone. A separate
-**transaction-system** goal runs independently on `codex/transaction-system`.
+live bridges). Surface those to the owner rather than deciding alone. The
+**transaction-system** goal is integrated into `main`; its open blockers 5–7 are
+in `docs/transaction-system-plan.md`.
 
 ### SDK native-operation coverage — DONE (Phase 12 sliver)
 
@@ -704,7 +712,8 @@ Phase 17 mainnet launch gates; and an independent security audit before any real
 funds. Optional low-value autonomous polish that could still be picked up: SDK
 node-client read-method parsers + high-level client wrappers, node list/pagination
 endpoints, and the DEX delegated mechanics (AMM/multi-hop, a design-within-scope
-refinement). A separate transaction-system goal runs on `codex/transaction-system`.
+refinement). The transaction-system goal is integrated into `main` (open
+blockers 5–7 in `docs/transaction-system-plan.md`).
 
 ### Original Phase 13 rationale — native tokens / NFTs / app governance
 

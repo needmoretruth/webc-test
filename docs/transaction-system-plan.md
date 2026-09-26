@@ -5,6 +5,10 @@ specification, not a completion claim. Branch-local recovery state lives in the
 goal progress section below. Global code reality and continuation documents are
 reconciled only when the completed branch is integrated.
 
+Integrated into `main` on 2026-09-26 by owner decision, with merge blockers 1–4
+done and 5–7 still open; see "Main integration checkpoint (2026-09-26)". Work
+continues on `main` only.
+
 This plan is activated only by an explicit transaction-system goal. It is not
 the global `main` continuation pointer and must not redirect unrelated agents.
 
@@ -1417,17 +1421,20 @@ Remaining merge blockers, in execution order:
 
 1. integrate every current non-legacy-staking native `Operation` through the V5
    shared action executor, retaining the dedicated post-quantum staking-control
-   path and free rejection of the four legacy direct-staking operations;
+   path and free rejection of the four legacy direct-staking operations —
+   **done:** merged in `b91f909` (lane head `cd9cdb3`);
 2. bound/prune consensus evidence on both local finality and state sync; bound
    proof-material retention before cloning; harden malformed key JSON
    zeroization; remove redundant whole-state clones without changing V4/V5
-   roots or receipts;
+   roots or receipts — **done:** merged in `de9b996`;
 3. complete strict browser SDK V2 submit/lifecycle/receipt/WebSocket APIs and
-   hostile-input bounds;
+   hostile-input bounds — **done:** merged in `69f750e` and `37f366d`;
 4. expose included/finalized success versus typed chargeable failure, wire
    candidate inclusion as a real production lifecycle observation, periodically
    expire local pending entries, and re-gossip valid recovered pending bytes
-   only after restart validation;
+   only after restart validation — **done:** merged in `0f4d4a6` (lane head
+   `969e302`) plus `751fbce`; its restart/expiry acceptance proof is part of
+   blocker 5;
 5. add the required three-validator public HTTP-to-gossip-to-consensus-to-
    finalized-query acceptance coverage across restart, duplicate submission,
    replacement, cancellation, and expiry;
@@ -1438,15 +1445,42 @@ Remaining merge blockers, in execution order:
    test/doc/demo/SDK/audit/deny gate, open a ready integration PR, and require
    Linux fuzz-smoke and every other GitHub check green before calling the branch
    mergeable. No force push and no merge are authorized by this checkpoint.
+   (Superseded 2026-09-26: the owner integrated the branch into `main` before
+   blockers 5–7; this blocker now means every GitHub check green on `main`.)
 
 The real STARK/ZK backend, production bridge funds, Windows deployment ACL
 enforcement, anti-eclipse work, long external fuzz campaigns, and independent
 mainnet audits remain explicitly gated follow-ups; they do not justify claiming
 those systems production-ready, but they do not replace any blocker above.
 
-Exact next item: finish and integrate blockers 1 through 3 one tested branch at
-a time, then implement lifecycle/restart/expiry acceptance blockers 4 and 5
-against the consolidated code before running the final gates.
+Exact next item (updated 2026-09-26): blocker 5 on `main`, then blockers 6
+and 7.
+
+### Main integration checkpoint (2026-09-26)
+
+By owner decision this branch was merged into `main` before blockers 5–7 were
+finished; the remaining work continues on `main`, and every other branch was
+retired.
+
+- `b91f909` merges the native-completion lane (`cd9cdb3`, blocker 1).
+- `0f4d4a6` merges the lifecycle-outcomes lane (`969e302`, blocker 4).
+- `82b5bc5` refreshes `fuzz/Cargo.lock` (webc-crypto's `zeroize`), which the
+  fuzz-smoke `cargo metadata --locked` step rejected.
+- `1a880e0` replaces `fetch_update`, deprecated on the pinned fuzz nightly and
+  fatal under `warnings = "deny"`, with the identical `try_update`.
+- `0557e68` updates vitest to 4.1.11 and the postcss override to 8.5.28 for new
+  development-dependency advisories reported by `pnpm audit`.
+- `aaf87b8` makes `Amount::checked_mul_ratio` an exact floor over a 256-bit
+  intermediate; the old whole/remainder split returned a spurious overflow
+  whenever `remainder * numerator` exceeded `u128` (reward splits, DEX pro-rata
+  fills).
+- `d4471e0` and `ad7946f` refresh the `docs/security.md` review status and
+  declare Apache-2.0 as the only license.
+
+Local gates on the integrated tree before the push: format, both clippy
+passes, workspace tests, rustdoc, demo, cargo-deny on the root and fuzz graphs,
+fuzz smoke over every target (30 s each), `pnpm check`,
+`pnpm audit --audit-level=moderate`, and `pnpm licenses:check`.
 
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
