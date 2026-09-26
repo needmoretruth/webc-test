@@ -49,7 +49,7 @@ use crate::service_registry::{
 };
 use crate::session_key::{
     session_key_authorization_message, SessionAllowedOperations, SessionKey,
-    SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyId,
+    SessionKeyAuthorizationAction, SessionKeyConfig, SessionKeyConstraints, SessionKeyId,
 };
 use crate::slashing::{
     slash_validator_with_delegation_loss, slashing_bps, SlashingOutcome, SlashingPolicy,
@@ -1580,6 +1580,155 @@ impl<'a> NativeActionEffects<'a> {
         events: &'a mut Vec<Event>,
     ) -> Self {
         Self { access, events }
+    }
+}
+
+/// Envelope coordinates shared by recovery-root-authorized native controls.
+///
+/// Grouping these values prevents V4/V5 call sites from accidentally mixing a
+/// live account with another transaction's chain domain or pre-advance nonce.
+pub(crate) struct NativeAccountControlContext<'chain, 'effects> {
+    sender: Address,
+    authorization_lane: AuthorizationLaneId,
+    chain_id: &'chain ChainId,
+    signed_nonce: u64,
+    effects: NativeActionEffects<'effects>,
+}
+
+impl<'chain, 'effects> NativeAccountControlContext<'chain, 'effects> {
+    /// Creates context from an already authenticated transaction envelope.
+    pub(crate) const fn new(
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        chain_id: &'chain ChainId,
+        signed_nonce: u64,
+        effects: NativeActionEffects<'effects>,
+    ) -> Self {
+        Self {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        }
+    }
+}
+
+/// Envelope coordinates shared by the four bridge transitions.
+pub(crate) struct NativeBridgeContext<'effects> {
+    sender: Address,
+    source_transaction: Hash256,
+    effects: NativeActionEffects<'effects>,
+}
+
+impl<'effects> NativeBridgeContext<'effects> {
+    /// Creates bridge context from an already authenticated envelope.
+    pub(crate) const fn new(
+        sender: Address,
+        source_transaction: Hash256,
+        effects: NativeActionEffects<'effects>,
+    ) -> Self {
+        Self {
+            sender,
+            source_transaction,
+            effects,
+        }
+    }
+}
+
+/// Sender and lane coordinates shared by application-registry transitions.
+pub(crate) struct NativeApplicationContext<'effects> {
+    sender: Address,
+    authorization_lane: AuthorizationLaneId,
+    effects: NativeActionEffects<'effects>,
+}
+
+impl<'effects> NativeApplicationContext<'effects> {
+    /// Creates application context from an authenticated transaction envelope.
+    pub(crate) const fn new(
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        effects: NativeActionEffects<'effects>,
+    ) -> Self {
+        Self {
+            sender,
+            authorization_lane,
+            effects,
+        }
+    }
+}
+
+/// Borrowed, authenticated intent for one native DEX order submission.
+///
+/// Grouping all price, deadline, and fill-policy fields keeps V4 and V5 callers
+/// on one transition and prevents positional arguments from drifting. This is
+/// an internal descriptor; the signed [`Operation::SubmitOrder`] remains the
+/// consensus wire value.
+pub(crate) struct NativeDexOrderSubmission<'a> {
+    order_id: OrderId,
+    pair: &'a TradingPair,
+    side: OrderSide,
+    amount: Amount,
+    limit_price: Price,
+    deadline_height: u64,
+    fill_or_cancel: bool,
+}
+
+impl<'a> NativeDexOrderSubmission<'a> {
+    /// Constructs one submission from already bounded signed action fields.
+    pub(crate) const fn new(
+        order_id: OrderId,
+        pair: &'a TradingPair,
+        side: OrderSide,
+        amount: Amount,
+        limit_price: Price,
+        deadline_height: u64,
+        fill_or_cancel: bool,
+    ) -> Self {
+        Self {
+            order_id,
+            pair,
+            side,
+            amount,
+            limit_price,
+            deadline_height,
+            fill_or_cancel,
+        }
+    }
+}
+
+/// Borrowed specification for one native or WASM contract invocation.
+///
+/// The descriptor binds the signed module identity, namespace, footprint,
+/// input, admission units, and envelope gas cap as one value so V4 and V5 use
+/// the same manifest checks and runtime boundary.
+pub(crate) struct NativeContractInvocation<'a> {
+    code_id: Hash256,
+    namespace: Hash256,
+    declared_keys: &'a [Hash256],
+    input: &'a [u8],
+    admission_units: u64,
+    gas_limit: u64,
+}
+
+impl<'a> NativeContractInvocation<'a> {
+    /// Constructs one invocation from an authenticated transaction action.
+    pub(crate) const fn new(
+        code_id: Hash256,
+        namespace: Hash256,
+        declared_keys: &'a [Hash256],
+        input: &'a [u8],
+        admission_units: u64,
+        gas_limit: u64,
+    ) -> Self {
+        Self {
+            code_id,
+            namespace,
+            declared_keys,
+            input,
+            admission_units,
+            gas_limit,
+        }
     }
 }
 
@@ -3182,235 +3331,67 @@ impl ChainState {
                 constraints,
                 post_quantum_root_reveal,
             } => {
-                // Installing a session key is a critical action: it must use the
-                // default lane and prove knowledge of the account's committed
-                // post-quantum root. A legacy account without a policy has no
-                // root to gate the action and therefore cannot own session keys.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
-                }
-                let (policy_revision, root) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (policy.revision(), *policy.post_quantum_root())
-                };
-                // The root must sign this exact install (its lane-bound
-                // constraints and session key) under the current policy revision
-                // and account nonce, not merely prove knowledge of the public
-                // root key. A signature captured for any other action, nonce, or
-                // policy revision rebuilds a different message and fails here.
-                let authorization = SessionKeyAuthorizationAction::Install {
-                    session_public_key: *session_public_key,
-                    constraints: constraints.clone(),
-                };
-                let message = session_key_authorization_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    &authorization,
-                )?;
-                if !post_quantum_root_reveal.verify(&root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                constraints.validate()?;
-                if constraints.lifetime_epochs > config.session_keys.max_lifetime_epochs {
-                    return Err(ChainError::SessionKeyLifetimeTooLong);
-                }
-                // Expiry is an absolute epoch derived from the install epoch, so
-                // the deadline never depends on a wall clock.
-                let expires_after_epoch = Epoch::new(
-                    self.current_epoch
-                        .checked_add(constraints.lifetime_epochs)
-                        .ok_or(ChainError::ArithmeticOverflow)?,
-                );
-                let id = SessionKeyId::derive(session_public_key);
-                access.write(StateKey::session_key(tx.sender, id))?;
-                if self.session_keys.contains_key(&(tx.sender, id)) {
-                    return Err(ChainError::SessionKeyAlreadyExists);
-                }
-                let installed = self
-                    .session_keys
-                    .keys()
-                    .filter(|(owner, _)| *owner == tx.sender)
-                    .count();
-                if installed >= config.session_keys.max_session_keys_per_account as usize {
-                    return Err(ChainError::SessionKeyLimitExceeded);
-                }
-                let record = SessionKey::new(
-                    tx.sender,
+                self.apply_native_install_session_key(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
                     *session_public_key,
-                    policy_revision,
-                    constraints.clone(),
-                    expires_after_epoch,
+                    constraints,
+                    post_quantum_root_reveal,
+                    &config.session_keys,
                 )?;
-                self.session_keys.insert((tx.sender, id), record);
-                events.push(Event::SessionKeyInstalled {
-                    owner: tx.sender,
-                    session_key: id,
-                    expires_after_epoch,
-                });
             }
             Operation::RevokeSessionKey {
                 session_key,
                 post_quantum_root_reveal,
             } => {
-                // Revocation is immediate and unconditional so a compromised key
-                // can be killed at once. It is a critical action under the same
-                // default-lane and post-quantum-root gate as installation.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
-                }
-                let (policy_revision, root) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (policy.revision(), *policy.post_quantum_root())
-                };
-                // Revocation is gated by the same root signature as installation,
-                // bound to this exact session-key id, policy revision, and nonce.
-                let authorization = SessionKeyAuthorizationAction::Revoke {
-                    session_key: *session_key,
-                };
-                let message = session_key_authorization_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    &authorization,
+                self.apply_native_revoke_session_key(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *session_key,
+                    post_quantum_root_reveal,
                 )?;
-                if !post_quantum_root_reveal.verify(&root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                access.write(StateKey::session_key(tx.sender, *session_key))?;
-                if self
-                    .session_keys
-                    .remove(&(tx.sender, *session_key))
-                    .is_none()
-                {
-                    return Err(ChainError::SessionKeyNotFound);
-                }
-                events.push(Event::SessionKeyRevoked {
-                    owner: tx.sender,
-                    session_key: *session_key,
-                });
             }
             Operation::RotateActiveTransactionKey {
                 new_active_transaction_key,
                 post_quantum_root_reveal,
             } => {
-                // Rotating the sole active key is the account recovery path and a
-                // critical action: default lane, an installed policy with a
-                // post-quantum root, and a real root signature over this exact
-                // rotation. A legacy account without a policy has no root to gate
-                // the change and therefore cannot rotate this way.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::ActiveKeyRotationRequiresDefaultLane);
-                }
-                let (policy_revision, root, current_active) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (
-                        policy.revision(),
-                        *policy.post_quantum_root(),
-                        *policy.active_transaction_key(),
-                    )
-                };
-                // A no-op rotation would waste a revision and could be used to
-                // grief outstanding session keys without any real key change.
-                if *new_active_transaction_key == current_active {
-                    return Err(ChainError::ActiveKeyRotationToSameKey);
-                }
-                // The root must sign this exact new key under the current policy
-                // revision and account nonce. A signature captured for any other
-                // key, nonce, or revision rebuilds a different message and fails,
-                // so it cannot be replayed after this rotation bumps the revision.
-                let message = active_key_rotation_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    new_active_transaction_key,
+                self.apply_native_rotate_active_transaction_key(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *new_active_transaction_key,
+                    post_quantum_root_reveal,
                 )?;
-                if !post_quantum_root_reveal.verify(&root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                // The policy state key was already recorded as a write at the top
-                // of apply, so the rotation conflicts with concurrent spends.
-                let rotated = self
-                    .authorization_policies
-                    .get(&tx.sender)
-                    .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?
-                    .rotate_active_key(*new_active_transaction_key)?;
-                let new_revision = rotated.revision();
-                self.authorization_policies.insert(tx.sender, rotated);
-                events.push(Event::ActiveTransactionKeyRotated {
-                    owner: tx.sender,
-                    new_revision,
-                    new_active_transaction_key: *new_active_transaction_key,
-                });
             }
             Operation::RotatePostQuantumRoot {
                 new_post_quantum_root,
                 post_quantum_root_reveal,
             } => {
-                // Replacing the recovery root is a critical action gated on a
-                // signature by the CURRENT root, so only the present recovery-root
-                // holder can change it. The envelope is signed by the active key
-                // (the AccountKey path), so a stolen root alone cannot rotate the
-                // root without also holding the active key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::PostQuantumRootRotationRequiresDefaultLane);
-                }
-                let (policy_revision, current_root) = {
-                    let policy = self
-                        .authorization_policies
-                        .get(&tx.sender)
-                        .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?;
-                    policy.validate()?;
-                    (policy.revision(), *policy.post_quantum_root())
-                };
-                new_post_quantum_root.validate()?;
-                // A no-op rotation would waste a revision and needlessly grief
-                // outstanding session keys without changing the root.
-                if *new_post_quantum_root == current_root {
-                    return Err(ChainError::PostQuantumRootRotationToSameRoot);
-                }
-                // The CURRENT root must sign this exact new commitment under the
-                // current revision and nonce. A signature captured for any other
-                // root, nonce, or revision rebuilds a different message and fails.
-                let message = post_quantum_root_rotation_message(
-                    &config.chain_id,
-                    tx.sender,
-                    policy_revision,
-                    tx.nonce,
-                    new_post_quantum_root,
+                self.apply_native_rotate_post_quantum_root(
+                    NativeAccountControlContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        &config.chain_id,
+                        tx.nonce,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *new_post_quantum_root,
+                    post_quantum_root_reveal,
                 )?;
-                if !post_quantum_root_reveal.verify(&current_root, &message)? {
-                    return Err(ChainError::InvalidPostQuantumRootReveal);
-                }
-                // The policy state key was already recorded as a write at the top
-                // of apply, so the rotation conflicts with concurrent spends.
-                let rotated = self
-                    .authorization_policies
-                    .get(&tx.sender)
-                    .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?
-                    .rotate_post_quantum_root(*new_post_quantum_root)?;
-                let new_revision = rotated.revision();
-                self.authorization_policies.insert(tx.sender, rotated);
-                events.push(Event::PostQuantumRootRotated {
-                    owner: tx.sender,
-                    new_revision,
-                    new_post_quantum_root: *new_post_quantum_root,
-                });
             }
             Operation::CreateObject {
                 object_id,
@@ -3548,108 +3529,20 @@ impl ChainState {
                 )?;
             }
             Operation::CompoundValidatorRewards => {
-                access.write(StateKey::validator(tx.sender))?;
-                access.write(StateKey::account(tx.sender))?;
-                // Move accumulated operator rewards straight into self-stake. This
-                // shifts units from the pending-rewards bucket to the staked
-                // bucket (supply-neutral) without a claim-then-restake round trip.
-                let reward = {
-                    let validator = self
-                        .validators
-                        .get_mut(&tx.sender)
-                        .ok_or(ChainError::ValidatorNotFound(tx.sender))?;
-                    let reward = validator.accumulated_rewards;
-                    validator.accumulated_rewards = Amount::ZERO;
-                    validator.self_stake = validator
-                        .self_stake
-                        .checked_add(reward)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                    validator.refresh_stake_status(&config.staking)?;
-                    reward
-                };
-                let account = self.account_mut(tx.sender)?;
-                account.staked = account
-                    .staked
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::ValidatorRewardsCompounded {
-                    validator: tx.sender,
-                    amount: reward,
-                });
+                self.apply_native_compound_validator_rewards(
+                    tx.sender,
+                    &config.staking,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::CompoundDelegatorRewards { validator } => {
-                access.write(StateKey::validator(*validator))?;
-                access.write(StateKey::delegation(tx.sender, *validator))?;
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::unbonding_queue(*validator))?;
-                let target = self
-                    .validators
-                    .get(validator)
-                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
-                if matches!(
-                    target.status,
-                    ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
-                ) {
-                    return Err(ChainError::ValidatorNotActive(*validator));
-                }
-                let reward = self
-                    .delegations
-                    .get(&(tx.sender, *validator))
-                    .ok_or(ChainError::DelegationNotFound)?
-                    .accumulated_rewards;
-                // Adding the reward to the position must respect the operator/
-                // delegator ratio, exactly as a fresh delegation would (a queued
-                // operator exit still cannot back new delegated stake).
-                let queued_operator_stake = self.unbonding.queued_for(
+                self.apply_native_compound_delegator_rewards(
+                    tx.sender,
                     *validator,
-                    *validator,
-                    UnbondingKind::OperatorStake,
+                    &config.staking,
+                    None,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                let available_operator_stake = target
-                    .self_stake
-                    .checked_sub(queued_operator_stake)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let maximum_delegated = available_operator_stake
-                    .checked_mul_u64(4)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let proposed_delegated = target
-                    .delegated_stake
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                if proposed_delegated > maximum_delegated {
-                    return Err(ChainError::DelegationRatioExceeded);
-                }
-
-                {
-                    let delegation = self
-                        .delegations
-                        .get_mut(&(tx.sender, *validator))
-                        .ok_or(ChainError::DelegationNotFound)?;
-                    delegation.accumulated_rewards = Amount::ZERO;
-                    delegation.amount = delegation
-                        .amount
-                        .checked_add(reward)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                let validator_state = self
-                    .validators
-                    .get_mut(validator)
-                    .ok_or(ChainError::ValidatorNotFound(*validator))?;
-                validator_state.delegated_stake = validator_state
-                    .delegated_stake
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                validator_state.refresh_stake_status(&config.staking)?;
-                let account = self.account_mut(tx.sender)?;
-                account.delegated = account
-                    .delegated
-                    .checked_add(reward)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::DelegatorRewardsCompounded {
-                    delegator: tx.sender,
-                    validator: *validator,
-                    amount: reward,
-                });
             }
             Operation::SubmitSlashingEvidence { evidence } => {
                 let outcome = self.apply_slashing_evidence(evidence, config, Some(&mut access))?;
@@ -3661,34 +3554,17 @@ impl ChainState {
                 recipient,
                 amount,
             } => {
-                if amount.is_zero() {
-                    return Err(ChainError::BridgeAmountZero);
-                }
-                if *asset != AssetId::NativeWebc || *destination_chain == ExternalChain::Webc {
-                    return Err(ChainError::InvalidBridgeAssetFlow);
-                }
-                access.write(StateKey::bridge_escrow(destination_chain.clone()))?;
-                self.debit_asset_or_native(tx.sender, asset, *amount)?;
-                self.credit_native_bridge_escrow(destination_chain.clone(), *amount)?;
-                let message = self.next_bridge_message(
-                    OutgoingBridgeMessage {
-                        source_chain: ExternalChain::Webc,
-                        destination_chain: destination_chain.clone(),
-                        asset: asset.clone(),
-                        sender: tx.sender.as_bytes().to_vec(),
-                        recipient: recipient.clone(),
-                        amount: *amount,
-                        source_tx: tx_hash,
-                    },
-                    &mut access,
+                self.apply_native_bridge_lock(
+                    NativeBridgeContext::new(
+                        tx.sender,
+                        tx_hash,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    asset,
+                    destination_chain,
+                    recipient,
+                    *amount,
                 )?;
-                let message_hash = message.hash()?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Locked {
-                        message,
-                        message_hash,
-                    },
-                });
             }
             Operation::BridgeBurn {
                 asset,
@@ -3696,69 +3572,33 @@ impl ChainState {
                 recipient,
                 amount,
             } => {
-                if amount.is_zero() {
-                    return Err(ChainError::BridgeAmountZero);
-                }
-                let AssetId::External { origin_chain, .. } = asset else {
-                    return Err(ChainError::InvalidBridgeAssetFlow);
-                };
-                if *origin_chain != *destination_chain || *destination_chain == ExternalChain::Webc
-                {
-                    return Err(ChainError::BridgeSourceMismatch);
-                }
-                access.write(StateKey::asset_balance(asset.clone(), tx.sender))?;
-                self.debit_asset_or_native(tx.sender, asset, *amount)?;
-                let message = self.next_bridge_message(
-                    OutgoingBridgeMessage {
-                        source_chain: ExternalChain::Webc,
-                        destination_chain: destination_chain.clone(),
-                        asset: asset.clone(),
-                        sender: tx.sender.as_bytes().to_vec(),
-                        recipient: recipient.clone(),
-                        amount: *amount,
-                        source_tx: tx_hash,
-                    },
-                    &mut access,
+                self.apply_native_bridge_burn(
+                    NativeBridgeContext::new(
+                        tx.sender,
+                        tx_hash,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    asset,
+                    destination_chain,
+                    recipient,
+                    *amount,
                 )?;
-                let message_hash = message.hash()?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Burned {
-                        message,
-                        message_hash,
-                    },
-                });
             }
             Operation::BridgeMint { message } => {
-                if !config.bridge.can_submit_incoming(tx.sender) {
-                    return Err(ChainError::UnauthorizedBridgeRelayer);
-                }
-                let message_hash = self.process_incoming_bridge_message(
+                self.apply_native_bridge_mint(
+                    tx.sender,
                     message,
-                    IncomingBridgeAction::MintRepresentation,
-                    &mut access,
+                    &config.bridge,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Minted {
-                        message: message.clone(),
-                        message_hash,
-                    },
-                });
             }
             Operation::BridgeRelease { message } => {
-                if !config.bridge.can_submit_incoming(tx.sender) {
-                    return Err(ChainError::UnauthorizedBridgeRelayer);
-                }
-                let message_hash = self.process_incoming_bridge_message(
+                self.apply_native_bridge_release(
+                    tx.sender,
                     message,
-                    IncomingBridgeAction::ReleaseNative,
-                    &mut access,
+                    &config.bridge,
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::Bridge {
-                    event: BridgeEvent::Released {
-                        message: message.clone(),
-                        message_hash,
-                    },
-                });
             }
             Operation::RegisterAppSponsor {
                 namespace,
@@ -3768,305 +3608,110 @@ impl ChainState {
                 // Owner financial action: default lane only (the account balance
                 // is the funding source). The sender account key is already
                 // recorded by the default-lane path; declare the sponsor state key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SponsorshipRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
+                self.apply_native_register_app_sponsor(
+                    NativeApplicationContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *namespace,
+                    *daily_budget_cap,
+                    *initial_funding,
+                    &config.sponsorship,
+                )?;
                 // The app-chosen per-day cap must stay within the protocol ceiling
                 // (§15.35 "within hard protocol caps").
-                if *daily_budget_cap > config.sponsorship.max_app_daily_budget {
-                    return Err(ChainError::AppSponsorDailyCapTooHigh);
-                }
-                if self.sponsors.contains_key(namespace) {
-                    return Err(ChainError::AppSponsorAlreadyExists);
-                }
                 // Lock the initial funding: liquid -> sponsor_budgets. `debit_native`
                 // fails closed if the owner cannot afford it, rolling back the tx.
-                self.debit_native(tx.sender, *initial_funding)?;
-                self.sponsor_budgets = self
-                    .sponsor_budgets
-                    .checked_add(*initial_funding)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let mut sponsor = AppSponsor::new(tx.sender, *daily_budget_cap);
-                sponsor.budget = *initial_funding;
-                self.sponsors.insert(*namespace, sponsor);
-                events.push(Event::AppSponsorRegistered {
-                    application: *namespace,
-                    owner: tx.sender,
-                    daily_budget_cap: *daily_budget_cap,
-                    funded: *initial_funding,
-                });
             }
             Operation::FundAppSponsor { namespace, amount } => {
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SponsorshipRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
-                // Validate existence and ownership before touching balances; only
-                // the owner may fund. Read-only borrow is dropped before `debit`.
-                {
-                    let sponsor = self
-                        .sponsors
-                        .get(namespace)
-                        .ok_or(ChainError::AppSponsorNotFound)?;
-                    if sponsor.owner != tx.sender {
-                        return Err(ChainError::AppSponsorNotOwner);
-                    }
-                }
-                self.debit_native(tx.sender, *amount)?;
-                self.sponsor_budgets = self
-                    .sponsor_budgets
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let sponsor = self
-                    .sponsors
-                    .get_mut(namespace)
-                    .ok_or(ChainError::AppSponsorNotFound)?;
-                sponsor.budget = sponsor
-                    .budget
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::AppSponsorFunded {
-                    application: *namespace,
-                    amount: *amount,
-                });
+                self.apply_native_fund_app_sponsor(
+                    NativeApplicationContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *namespace,
+                    *amount,
+                )?;
             }
             Operation::WithdrawAppSponsor { namespace, amount } => {
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::SponsorshipRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::application(*namespace, sponsor_state_key_hash()))?;
-                // Validate ownership and sufficient budget before moving units.
-                {
-                    let sponsor = self
-                        .sponsors
-                        .get(namespace)
-                        .ok_or(ChainError::AppSponsorNotFound)?;
-                    if sponsor.owner != tx.sender {
-                        return Err(ChainError::AppSponsorNotOwner);
-                    }
-                    if sponsor.budget < *amount {
-                        return Err(ChainError::AppSponsorBudgetInsufficient {
-                            needed: *amount,
-                            available: sponsor.budget,
-                        });
-                    }
-                }
-                // Move sponsor_budgets -> owner liquid, keeping the per-app budget
-                // and the aggregate bucket in lockstep (no mint, no loss).
-                {
-                    let sponsor = self
-                        .sponsors
-                        .get_mut(namespace)
-                        .ok_or(ChainError::AppSponsorNotFound)?;
-                    sponsor.budget = sponsor
-                        .budget
-                        .checked_sub(*amount)
-                        .ok_or(ChainError::ArithmeticOverflow)?;
-                }
-                self.sponsor_budgets = self
-                    .sponsor_budgets
-                    .checked_sub(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.credit_native(tx.sender, *amount)?;
-                events.push(Event::AppSponsorWithdrawn {
-                    application: *namespace,
-                    amount: *amount,
-                });
+                self.apply_native_withdraw_app_sponsor(
+                    NativeApplicationContext::new(
+                        tx.sender,
+                        tx.authorization_lane,
+                        NativeActionEffects::new(&mut access, &mut events),
+                    ),
+                    *namespace,
+                    *amount,
+                )?;
             }
             Operation::RegisterNamespace { namespace } => {
                 // Claiming a namespace records an owner; it locks no native units,
                 // so the supply invariant is unaffected (only the ordinary fee
                 // moves). Any authorization lane may pay the fee — there is no
                 // account balance to draw from — so no default-lane restriction.
-                access.write(StateKey::application(
+                self.apply_native_register_namespace(
+                    tx.sender,
                     *namespace,
-                    namespace_state_key_hash(),
-                ))?;
-                if self.namespaces.contains_key(namespace) {
-                    return Err(ChainError::NamespaceAlreadyRegistered);
-                }
-                self.namespaces
-                    .insert(*namespace, NamespaceRecord::new(tx.sender));
-                events.push(Event::NamespaceRegistered {
-                    namespace: *namespace,
-                    owner: tx.sender,
-                });
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::TransferNamespace {
                 namespace,
                 new_owner,
             } => {
-                access.write(StateKey::application(
+                self.apply_native_transfer_namespace(
+                    tx.sender,
                     *namespace,
-                    namespace_state_key_hash(),
-                ))?;
+                    *new_owner,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
                 // Only the current owner may transfer. Validate existence and
                 // ownership before mutating, so a non-owner's attempt fails closed
                 // and leaves the record unchanged (the whole tx rolls back).
-                let record = self
-                    .namespaces
-                    .get_mut(namespace)
-                    .ok_or(ChainError::NamespaceNotFound)?;
-                if record.owner != tx.sender {
-                    return Err(ChainError::NamespaceNotOwner);
-                }
-                record.owner = *new_owner;
-                events.push(Event::NamespaceTransferred {
-                    namespace: *namespace,
-                    from: tx.sender,
-                    to: *new_owner,
-                });
             }
             Operation::CreateFeed { feed_id } => {
-                // Permissionless-for-a-fee (§15.6): default lane only (the creation
-                // fee draws from the sender's liquid balance) and the fee is BURNED,
-                // so a creation is never free. Supply-neutral: liquid -> burned.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_feed(*feed_id))?;
-                if self.oracle_feeds.contains_key(feed_id) {
-                    return Err(ChainError::OracleFeedAlreadyExists);
-                }
-                let creation_fee = config.oracle.feed_creation_fee;
-                self.debit_native(tx.sender, creation_fee)?;
-                self.burned_fees = self
-                    .burned_fees
-                    .checked_add(creation_fee)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let bond = config.oracle.min_reporter_bond;
-                self.oracle_feeds
-                    .insert(*feed_id, Feed::new(tx.sender, bond));
-                events.push(Event::FeedCreated {
-                    feed_id: *feed_id,
-                    creator: tx.sender,
-                    bond,
-                    fee_burned: creation_fee,
-                });
+                self.apply_native_create_feed(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    &config.oracle,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::RegisterReporter { feed_id } => {
-                // Default lane only: the bond draws from the sender's liquid
-                // balance. Supply-neutral: liquid -> oracle_bonds.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.read(StateKey::oracle_feed(*feed_id))?;
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
-                // The bond is the feed's frozen bond class (reading it also
-                // confirms the feed exists).
-                let bond = self
-                    .oracle_feeds
-                    .get(feed_id)
-                    .ok_or(ChainError::OracleFeedNotFound)?
-                    .bond;
-                if self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
-                    return Err(ChainError::OracleReporterAlreadyRegistered);
-                }
-                self.debit_native(tx.sender, bond)?;
-                self.oracle_bonds = self
-                    .oracle_bonds
-                    .checked_add(bond)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.oracle_reporters
-                    .insert((*feed_id, tx.sender), OracleReporter::new());
-                events.push(Event::ReporterRegistered {
-                    feed_id: *feed_id,
-                    reporter: tx.sender,
-                    bond,
-                });
+                self.apply_native_register_reporter(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::DeregisterReporter { feed_id } => {
-                // Default lane only: the bond returns to the sender's liquid
-                // balance. Supply-neutral: oracle_bonds -> liquid.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.read(StateKey::oracle_feed(*feed_id))?;
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
-                // The reporter's locked bond equals its feed's frozen bond.
-                let bond = self
-                    .oracle_feeds
-                    .get(feed_id)
-                    .ok_or(ChainError::OracleFeedNotFound)?
-                    .bond;
-                if !self.oracle_reporters.contains_key(&(*feed_id, tx.sender)) {
-                    return Err(ChainError::OracleReporterNotFound);
-                }
-                self.oracle_bonds = self
-                    .oracle_bonds
-                    .checked_sub(bond)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.oracle_reporters.remove(&(*feed_id, tx.sender));
-                self.credit_native(tx.sender, bond)?;
-                events.push(Event::ReporterDeregistered {
-                    feed_id: *feed_id,
-                    reporter: tx.sender,
-                    bond,
-                });
+                self.apply_native_deregister_reporter(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::SubmitReport { feed_id, value } => {
-                // Reporting moves no native units (only the ordinary tx fee), so it
-                // may run on any authorization lane. It records the value and the
-                // epoch it was reported for (liveness).
-                access.read(StateKey::oracle_feed(*feed_id))?;
-                access.write(StateKey::oracle_reporter(*feed_id, tx.sender))?;
-                if !self.oracle_feeds.contains_key(feed_id) {
-                    return Err(ChainError::OracleFeedNotFound);
-                }
-                let epoch = self.current_epoch;
-                let reporter = self
-                    .oracle_reporters
-                    .get_mut(&(*feed_id, tx.sender))
-                    .ok_or(ChainError::OracleReporterNotFound)?;
-                reporter.value = Some(*value);
-                reporter.reported_epoch = epoch;
-                events.push(Event::ReportSubmitted {
-                    feed_id: *feed_id,
-                    reporter: tx.sender,
-                    value: *value,
-                    epoch,
-                });
+                self.apply_native_submit_report(
+                    tx.sender,
+                    *feed_id,
+                    *value,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::PayFeedRead { feed_id, amount } => {
-                // A consumer pays a read fee into the feed's revenue pool
-                // (§15.17). Default lane only: the payment draws from the payer's
-                // liquid balance. Supply-neutral: liquid -> oracle_revenue.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::OracleRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::oracle_feed(*feed_id))?;
-                if amount.is_zero() {
-                    return Err(ChainError::OracleReadAmountZero);
-                }
-                if !self.oracle_feeds.contains_key(feed_id) {
-                    return Err(ChainError::OracleFeedNotFound);
-                }
-                self.debit_native(tx.sender, *amount)?;
-                self.oracle_revenue = self
-                    .oracle_revenue
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                let feed = self
-                    .oracle_feeds
-                    .get_mut(feed_id)
-                    .ok_or(ChainError::OracleFeedNotFound)?;
-                feed.revenue = feed
-                    .revenue
-                    .checked_add(*amount)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                events.push(Event::FeedReadPaid {
-                    feed_id: *feed_id,
-                    payer: tx.sender,
-                    amount: *amount,
-                });
+                self.apply_native_pay_feed_read(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *feed_id,
+                    *amount,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::SubmitOrder {
                 order_id,
@@ -4077,93 +3722,29 @@ impl ChainState {
                 deadline_height,
                 fill_or_cancel,
             } => {
-                // Default lane only: the order's input is locked from the sender's
-                // liquid balance (native leg -> dex_escrow) or asset balance
-                // (non-native leg). The block-level batch pass later settles/refunds
-                // it; that pass is not access-list-bound (like epoch settlement).
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::DexRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::dex_order(*order_id))?;
-                // Validate the hostile order intent before touching any supply.
-                pair.validate()?;
-                if amount.is_zero() || *amount < config.dex.min_order_amount {
-                    return Err(ChainError::DexOrderAmountTooSmall);
-                }
-                if limit_price.is_zero() {
-                    return Err(ChainError::DexOrderPriceZero);
-                }
-                if self.dex_orders.contains_key(order_id) {
-                    return Err(ChainError::DexOrderAlreadyExists);
-                }
-                // Resolve the effective deadline: 0 is the "use the default window"
-                // sentinel; an explicit deadline must not already be in the past.
-                let effective_deadline = if *deadline_height == 0 {
-                    self.current_height
-                        .checked_add(config.dex.default_deadline_blocks)
-                        .ok_or(ChainError::ArithmeticOverflow)?
-                } else {
-                    if *deadline_height < self.current_height {
-                        return Err(ChainError::DexOrderDeadlineInPast);
-                    }
-                    *deadline_height
-                };
-                // The locked leg and its asset: a buy locks quote = amount*price, a
-                // sell locks base = amount. Compute the quote lock overflow-safely.
-                let (locked_asset, locked_amount) = match side {
-                    OrderSide::Buy => (
-                        pair.quote.clone(),
-                        limit_price
-                            .quote_for(*amount)
-                            .ok_or(ChainError::ArithmeticOverflow)?,
+                self.apply_native_submit_order(
+                    tx.sender,
+                    tx.authorization_lane,
+                    NativeDexOrderSubmission::new(
+                        *order_id,
+                        pair,
+                        *side,
+                        *amount,
+                        *limit_price,
+                        *deadline_height,
+                        *fill_or_cancel,
                     ),
-                    OrderSide::Sell => (pair.base.clone(), *amount),
-                };
-                if locked_asset != AssetId::NativeWebc {
-                    access.write(StateKey::asset_balance(locked_asset.clone(), tx.sender))?;
-                }
-                self.dex_lock(tx.sender, &locked_asset, locked_amount)?;
-                let order = Order {
-                    owner: tx.sender,
-                    pair: pair.clone(),
-                    side: *side,
-                    amount: *amount,
-                    remaining: *amount,
-                    limit_price: *limit_price,
-                    deadline_height: effective_deadline,
-                    fill_or_cancel: *fill_or_cancel,
-                    cancel_requested: false,
-                };
-                self.dex_orders.insert(*order_id, order);
-                events.push(Event::OrderSubmitted {
-                    order_id: *order_id,
-                    owner: tx.sender,
-                    pair: pair.clone(),
-                    side: *side,
-                    amount: *amount,
-                    limit_price: *limit_price,
-                    deadline_height: effective_deadline,
-                });
+                    &config.dex,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::CancelOrder { order_id } => {
-                // Default lane only. Only marks the order for the block-level batch
-                // pass, which performs the refund (possibly a non-native asset the
-                // access list cannot name) and removal. Marking is a write to the
-                // order's own state key; the fee already touches the account.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::DexRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::dex_order(*order_id))?;
-                let order = self
-                    .dex_orders
-                    .get_mut(order_id)
-                    .ok_or(ChainError::DexOrderNotFound)?;
-                if order.owner != tx.sender {
-                    return Err(ChainError::DexOrderNotOwner);
-                }
-                order.cancel_requested = true;
+                self.apply_native_cancel_order(
+                    tx.sender,
+                    tx.authorization_lane,
+                    *order_id,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::GrantMandate {
                 agent_key,
@@ -5663,33 +5244,13 @@ impl ChainState {
                 });
             }
             Operation::RegisterContract { manifest } => {
-                // Default lane only: the registration fee draws from and burns
-                // liquid (supply-neutral, like feed creation). The manifest record
-                // is committed under the reserved module key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::ContractRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::module(manifest.code_id))?;
-                // Validate the hostile manifest before touching supply or state.
-                manifest.validate(tx.sender)?;
-                if self.contracts.contains_key(&manifest.code_id) {
-                    return Err(ChainError::ContractAlreadyExists);
-                }
-                let fee = config.contracts.registration_fee;
-                self.debit_native(tx.sender, fee)?;
-                self.burned_fees = self
-                    .burned_fees
-                    .checked_add(fee)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.contracts.insert(manifest.code_id, manifest.clone());
-                events.push(Event::ContractRegistered {
-                    code_id: manifest.code_id,
-                    namespace: manifest.namespace,
-                    owner: tx.sender,
-                    builtin: manifest.builtin,
-                    fee_burned: fee,
-                });
+                self.apply_native_register_contract(
+                    tx.sender,
+                    tx.authorization_lane,
+                    manifest,
+                    &config.contracts,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::InvokeContract {
                 code_id,
@@ -5697,92 +5258,28 @@ impl ChainState {
                 declared_keys,
                 input,
             } => {
-                // Bound the hostile input before any work.
-                if input.len() > MAX_CONTRACT_INPUT_BYTES {
-                    return Err(ChainError::ContractInputTooLarge {
-                        actual: input.len(),
-                        maximum: MAX_CONTRACT_INPUT_BYTES,
-                    });
-                }
-                // Resolve the manifest through the declared (read-only) module key.
-                access.read(StateKey::module(*code_id))?;
-                let manifest = self
-                    .contracts
-                    .get(code_id)
-                    .ok_or(ChainError::ContractNotFound)?
-                    .clone();
-                // Bind the signed operation to the committed manifest so the access
-                // list and the scheduler agree with the manifest and a call cannot
-                // under- or mis-declare what it touches.
-                if *namespace != manifest.namespace {
-                    return Err(ChainError::ContractNamespaceMismatch);
-                }
-                if declared_keys.as_slice() != manifest.footprint.as_slice() {
-                    return Err(ChainError::ContractFootprintMismatch);
-                }
-                // Run the audited built-in handler over its declared footprint under
-                // the shared contract-call discipline (fresh gas meter seeded with
-                // the admission `units` and capped at `gas_limit`, working-set load,
-                // atomic write-back). The native and wasm paths differ ONLY in how the
-                // handler is resolved; the metering, access enforcement, and rollback
-                // are identical because both go through `run_contract_call`.
-                let handler = builtin_contract(manifest.builtin);
-                let (output, gas_consumed) = self.run_contract_call(
-                    ContractCall {
-                        namespace: manifest.namespace,
-                        footprint: &manifest.footprint,
-                        handler,
+                self.apply_native_invoke_contract(
+                    tx.sender,
+                    NativeContractInvocation::new(
+                        *code_id,
+                        *namespace,
+                        declared_keys,
                         input,
-                        admission_units: units,
-                        gas_limit: tx.fee.gas_limit,
-                    },
-                    &mut access,
+                        units,
+                        tx.fee.gas_limit,
+                    ),
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::ContractInvoked {
-                    code_id: *code_id,
-                    namespace: *namespace,
-                    caller: tx.sender,
-                    gas_consumed,
-                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
-                });
             }
             Operation::RegisterWasmContract { manifest, code } => {
-                // Default lane only, like the native registration: the fee draws from
-                // and burns liquid (supply-neutral). The manifest and its bytecode are
-                // committed under the reserved module key.
-                if !tx.authorization_lane.is_default() {
-                    return Err(ChainError::ContractRequiresDefaultLane);
-                }
-                access.write(StateKey::account(tx.sender))?;
-                access.write(StateKey::module(manifest.code_id))?;
-                // Validate the hostile manifest AND its module bytes (size cap,
-                // code-hash binding, deterministic-engine acceptance) before touching
-                // supply or state — an invalid module is never stored.
-                manifest.validate(tx.sender, code)?;
-                // A `code_id` is unique across BOTH contract paths, since both address
-                // their record by `StateKey::module(code_id)`.
-                if self.contracts.contains_key(&manifest.code_id)
-                    || self.wasm_contracts.contains_key(&manifest.code_id)
-                {
-                    return Err(ChainError::ContractAlreadyExists);
-                }
-                let fee = config.contracts.registration_fee;
-                self.debit_native(tx.sender, fee)?;
-                self.burned_fees = self
-                    .burned_fees
-                    .checked_add(fee)
-                    .ok_or(ChainError::ArithmeticOverflow)?;
-                self.wasm_contracts
-                    .insert(manifest.code_id, manifest.clone());
-                self.wasm_code.insert(manifest.code_id, code.clone());
-                events.push(Event::WasmContractRegistered {
-                    code_id: manifest.code_id,
-                    namespace: manifest.namespace,
-                    owner: tx.sender,
-                    code_hash: manifest.code_hash,
-                    code_len: u64::try_from(code.len()).unwrap_or(u64::MAX),
-                    fee_burned: fee,
-                });
+                self.apply_native_register_wasm_contract(
+                    tx.sender,
+                    tx.authorization_lane,
+                    manifest,
+                    code,
+                    &config.contracts,
+                    NativeActionEffects::new(&mut access, &mut events),
+                )?;
             }
             Operation::InvokeWasmContract {
                 code_id,
@@ -5790,56 +5287,18 @@ impl ChainState {
                 declared_keys,
                 input,
             } => {
-                // Bound the hostile input before any work.
-                if input.len() > MAX_CONTRACT_INPUT_BYTES {
-                    return Err(ChainError::ContractInputTooLarge {
-                        actual: input.len(),
-                        maximum: MAX_CONTRACT_INPUT_BYTES,
-                    });
-                }
-                // Resolve the manifest through the declared (read-only) module key.
-                access.read(StateKey::module(*code_id))?;
-                let manifest = self
-                    .wasm_contracts
-                    .get(code_id)
-                    .ok_or(ChainError::ContractNotFound)?
-                    .clone();
-                // Bind the signed operation to the committed manifest (identical
-                // discipline to the native invoke): a call cannot under- or
-                // mis-declare what it touches.
-                if *namespace != manifest.namespace {
-                    return Err(ChainError::ContractNamespaceMismatch);
-                }
-                if declared_keys.as_slice() != manifest.footprint.as_slice() {
-                    return Err(ChainError::ContractFootprintMismatch);
-                }
-                // Load the immutable module bytes (committed under the same module
-                // key) and run them on the deterministic engine through the SAME
-                // shared discipline as the native path.
-                let code = self
-                    .wasm_code
-                    .get(code_id)
-                    .ok_or(ChainError::ContractNotFound)?
-                    .clone();
-                let handler = WasmContract::new(&code.0);
-                let (output, gas_consumed) = self.run_contract_call(
-                    ContractCall {
-                        namespace: manifest.namespace,
-                        footprint: &manifest.footprint,
-                        handler: &handler,
+                self.apply_native_invoke_wasm_contract(
+                    tx.sender,
+                    NativeContractInvocation::new(
+                        *code_id,
+                        *namespace,
+                        declared_keys,
                         input,
-                        admission_units: units,
-                        gas_limit: tx.fee.gas_limit,
-                    },
-                    &mut access,
+                        units,
+                        tx.fee.gas_limit,
+                    ),
+                    NativeActionEffects::new(&mut access, &mut events),
                 )?;
-                events.push(Event::WasmContractInvoked {
-                    code_id: *code_id,
-                    namespace: *namespace,
-                    caller: tx.sender,
-                    gas_consumed,
-                    output_len: u64::try_from(output.len()).unwrap_or(u64::MAX),
-                });
             }
         }
 
@@ -6290,6 +5749,1186 @@ impl ChainState {
             .ok_or(ChainError::AccountNotFound(address))?
             .balance = next_balance;
         self.storage_deposits = next_storage_deposits;
+        Ok(())
+    }
+
+    /// Installs one root-authorized constrained session key.
+    ///
+    /// `signed_nonce` is the nonce carried by the surrounding transaction before
+    /// its parent overlay advances replay state. Both transaction envelope
+    /// versions call this exact transition, so the root-signature domain,
+    /// lifetime calculation, account limit, access recording, and event stay
+    /// byte-for-byte aligned.
+    pub(crate) fn apply_native_install_session_key(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        session_public_key: webc_crypto::PublicKeyBytes,
+        constraints: &SessionKeyConstraints,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+        config: &SessionKeyConfig,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+        }
+        let (policy_revision, root) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (policy.revision(), *policy.post_quantum_root())
+        };
+        let authorization = SessionKeyAuthorizationAction::Install {
+            session_public_key,
+            constraints: constraints.clone(),
+        };
+        let message = session_key_authorization_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &authorization,
+        )?;
+        if !post_quantum_root_reveal.verify(&root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        constraints.validate()?;
+        if constraints.lifetime_epochs > config.max_lifetime_epochs {
+            return Err(ChainError::SessionKeyLifetimeTooLong);
+        }
+        let expires_after_epoch = Epoch::new(
+            self.current_epoch
+                .checked_add(constraints.lifetime_epochs)
+                .ok_or(ChainError::ArithmeticOverflow)?,
+        );
+        let id = SessionKeyId::derive(&session_public_key);
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::session_key(sender, id))?;
+        if self.session_keys.contains_key(&(sender, id)) {
+            return Err(ChainError::SessionKeyAlreadyExists);
+        }
+        let installed = self
+            .session_keys
+            .keys()
+            .filter(|(owner, _)| *owner == sender)
+            .count();
+        if installed >= config.max_session_keys_per_account as usize {
+            return Err(ChainError::SessionKeyLimitExceeded);
+        }
+        let record = SessionKey::new(
+            sender,
+            session_public_key,
+            policy_revision,
+            constraints.clone(),
+            expires_after_epoch,
+        )?;
+        self.session_keys.insert((sender, id), record);
+        events.push(Event::SessionKeyInstalled {
+            owner: sender,
+            session_key: id,
+            expires_after_epoch,
+        });
+        Ok(())
+    }
+
+    /// Immediately removes one root-authorized session key.
+    ///
+    /// The root signature binds the current policy revision and signed nonce;
+    /// therefore a captured revocation cannot be replayed after either the
+    /// transaction or policy advances.
+    pub(crate) fn apply_native_revoke_session_key(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        session_key: SessionKeyId,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SessionKeyManagementRequiresDefaultLane);
+        }
+        let (policy_revision, root) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::SessionKeyRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (policy.revision(), *policy.post_quantum_root())
+        };
+        let authorization = SessionKeyAuthorizationAction::Revoke { session_key };
+        let message = session_key_authorization_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &authorization,
+        )?;
+        if !post_quantum_root_reveal.verify(&root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::session_key(sender, session_key))?;
+        if self.session_keys.remove(&(sender, session_key)).is_none() {
+            return Err(ChainError::SessionKeyNotFound);
+        }
+        events.push(Event::SessionKeyRevoked {
+            owner: sender,
+            session_key,
+        });
+        Ok(())
+    }
+
+    /// Replaces an account's active transaction key under its recovery root.
+    ///
+    /// The transition deliberately leaves session records in place: advancing
+    /// the policy revision invalidates them lazily without scanning an
+    /// attacker-sized per-account collection.
+    pub(crate) fn apply_native_rotate_active_transaction_key(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        new_active_transaction_key: webc_crypto::PublicKeyBytes,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::ActiveKeyRotationRequiresDefaultLane);
+        }
+        let (policy_revision, root, current_active) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (
+                policy.revision(),
+                *policy.post_quantum_root(),
+                *policy.active_transaction_key(),
+            )
+        };
+        if new_active_transaction_key == current_active {
+            return Err(ChainError::ActiveKeyRotationToSameKey);
+        }
+        let message = active_key_rotation_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &new_active_transaction_key,
+        )?;
+        if !post_quantum_root_reveal.verify(&root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::authorization_policy(sender))?;
+        let rotated = self
+            .authorization_policies
+            .get(&sender)
+            .ok_or(ChainError::ActiveKeyRotationRequiresInstalledPolicy)?
+            .rotate_active_key(new_active_transaction_key)?;
+        let new_revision = rotated.revision();
+        self.authorization_policies.insert(sender, rotated);
+        events.push(Event::ActiveTransactionKeyRotated {
+            owner: sender,
+            new_revision,
+            new_active_transaction_key,
+        });
+        Ok(())
+    }
+
+    /// Replaces an account's recovery root under its current recovery root.
+    ///
+    /// The active transaction key still authorizes the envelope, while this
+    /// helper verifies the independent root signature over the exact new root.
+    pub(crate) fn apply_native_rotate_post_quantum_root(
+        &mut self,
+        context: NativeAccountControlContext<'_, '_>,
+        new_post_quantum_root: crate::PostQuantumRoot,
+        post_quantum_root_reveal: &crate::PostQuantumRootReveal,
+    ) -> Result<(), ChainError> {
+        let NativeAccountControlContext {
+            sender,
+            authorization_lane,
+            chain_id,
+            signed_nonce,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::PostQuantumRootRotationRequiresDefaultLane);
+        }
+        let (policy_revision, current_root) = {
+            let policy = self
+                .authorization_policies
+                .get(&sender)
+                .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?;
+            policy.validate()?;
+            (policy.revision(), *policy.post_quantum_root())
+        };
+        new_post_quantum_root.validate()?;
+        if new_post_quantum_root == current_root {
+            return Err(ChainError::PostQuantumRootRotationToSameRoot);
+        }
+        let message = post_quantum_root_rotation_message(
+            chain_id,
+            sender,
+            policy_revision,
+            signed_nonce,
+            &new_post_quantum_root,
+        )?;
+        if !post_quantum_root_reveal.verify(&current_root, &message)? {
+            return Err(ChainError::InvalidPostQuantumRootReveal);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::authorization_policy(sender))?;
+        let rotated = self
+            .authorization_policies
+            .get(&sender)
+            .ok_or(ChainError::PostQuantumRootRotationRequiresInstalledPolicy)?
+            .rotate_post_quantum_root(new_post_quantum_root)?;
+        let new_revision = rotated.revision();
+        self.authorization_policies.insert(sender, rotated);
+        events.push(Event::PostQuantumRootRotated {
+            owner: sender,
+            new_revision,
+            new_post_quantum_root,
+        });
+        Ok(())
+    }
+
+    /// Moves all pending operator rewards directly into self stake.
+    pub(crate) fn apply_native_compound_validator_rewards(
+        &mut self,
+        sender: Address,
+        staking: &StakingConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::validator(sender))?;
+        access.write(StateKey::account(sender))?;
+        let reward = {
+            let validator = self
+                .validators
+                .get_mut(&sender)
+                .ok_or(ChainError::ValidatorNotFound(sender))?;
+            let reward = validator.accumulated_rewards;
+            validator.accumulated_rewards = Amount::ZERO;
+            validator.self_stake = validator
+                .self_stake
+                .checked_add(reward)
+                .ok_or(ChainError::ArithmeticOverflow)?;
+            validator.refresh_stake_status(staking)?;
+            reward
+        };
+        let account = self.account_mut(sender)?;
+        account.staked = account
+            .staked
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::ValidatorRewardsCompounded {
+            validator: sender,
+            amount: reward,
+        });
+        Ok(())
+    }
+
+    /// Moves all pending delegation rewards into the same delegation position.
+    ///
+    /// The ratio check includes queued operator exits, matching a fresh
+    /// delegation and preventing compounding from exceeding pool capacity.
+    pub(crate) fn apply_native_compound_delegator_rewards(
+        &mut self,
+        sender: Address,
+        validator: Address,
+        staking: &StakingConfig,
+        unbonding_requests: Option<&UnbondingRequestJournalV1>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::validator(validator))?;
+        access.write(StateKey::delegation(sender, validator))?;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::unbonding_queue(validator))?;
+        let target = self
+            .validators
+            .get(&validator)
+            .ok_or(ChainError::ValidatorNotFound(validator))?;
+        if matches!(
+            target.status,
+            ValidatorStatus::Jailed { .. } | ValidatorStatus::Tombstoned { .. }
+        ) {
+            return Err(ChainError::ValidatorNotActive(validator));
+        }
+        let reward = self
+            .delegations
+            .get(&(sender, validator))
+            .ok_or(ChainError::DelegationNotFound)?
+            .accumulated_rewards;
+        let queued_operator_stake = match unbonding_requests {
+            Some(journal) => {
+                journal.queued_for(validator, validator, UnbondingKind::OperatorStake)?
+            }
+            None => {
+                self.unbonding
+                    .queued_for(validator, validator, UnbondingKind::OperatorStake)?
+            }
+        };
+        let available_operator_stake = target
+            .self_stake
+            .checked_sub(queued_operator_stake)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let maximum_delegated = available_operator_stake
+            .checked_mul_u64(4)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let proposed_delegated = target
+            .delegated_stake
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        if proposed_delegated > maximum_delegated {
+            return Err(ChainError::DelegationRatioExceeded);
+        }
+
+        let delegation = self
+            .delegations
+            .get_mut(&(sender, validator))
+            .ok_or(ChainError::DelegationNotFound)?;
+        delegation.accumulated_rewards = Amount::ZERO;
+        delegation.amount = delegation
+            .amount
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let validator_state = self
+            .validators
+            .get_mut(&validator)
+            .ok_or(ChainError::ValidatorNotFound(validator))?;
+        validator_state.delegated_stake = validator_state
+            .delegated_stake
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        validator_state.refresh_stake_status(staking)?;
+        let account = self.account_mut(sender)?;
+        account.delegated = account
+            .delegated
+            .checked_add(reward)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::DelegatorRewardsCompounded {
+            delegator: sender,
+            validator,
+            amount: reward,
+        });
+        Ok(())
+    }
+
+    /// Escrows native WEBC and emits its replay-bound outgoing bridge message.
+    pub(crate) fn apply_native_bridge_lock(
+        &mut self,
+        context: NativeBridgeContext<'_>,
+        asset: &AssetId,
+        destination_chain: &ExternalChain,
+        recipient: &[u8],
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeBridgeContext {
+            sender,
+            source_transaction,
+            effects,
+        } = context;
+        if amount.is_zero() {
+            return Err(ChainError::BridgeAmountZero);
+        }
+        if *asset != AssetId::NativeWebc || *destination_chain == ExternalChain::Webc {
+            return Err(ChainError::InvalidBridgeAssetFlow);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::bridge_escrow(destination_chain.clone()))?;
+        self.debit_asset_or_native(sender, asset, amount)?;
+        self.credit_native_bridge_escrow(destination_chain.clone(), amount)?;
+        let message = self.next_bridge_message(
+            OutgoingBridgeMessage {
+                source_chain: ExternalChain::Webc,
+                destination_chain: destination_chain.clone(),
+                asset: asset.clone(),
+                sender: sender.as_bytes().to_vec(),
+                recipient: recipient.to_vec(),
+                amount,
+                source_tx: source_transaction,
+            },
+            access,
+        )?;
+        let message_hash = message.hash()?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Locked {
+                message,
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Burns an external representation and emits its origin-release message.
+    pub(crate) fn apply_native_bridge_burn(
+        &mut self,
+        context: NativeBridgeContext<'_>,
+        asset: &AssetId,
+        destination_chain: &ExternalChain,
+        recipient: &[u8],
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeBridgeContext {
+            sender,
+            source_transaction,
+            effects,
+        } = context;
+        if amount.is_zero() {
+            return Err(ChainError::BridgeAmountZero);
+        }
+        let AssetId::External { origin_chain, .. } = asset else {
+            return Err(ChainError::InvalidBridgeAssetFlow);
+        };
+        if *origin_chain != *destination_chain || *destination_chain == ExternalChain::Webc {
+            return Err(ChainError::BridgeSourceMismatch);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::asset_balance(asset.clone(), sender))?;
+        self.debit_asset_or_native(sender, asset, amount)?;
+        let message = self.next_bridge_message(
+            OutgoingBridgeMessage {
+                source_chain: ExternalChain::Webc,
+                destination_chain: destination_chain.clone(),
+                asset: asset.clone(),
+                sender: sender.as_bytes().to_vec(),
+                recipient: recipient.to_vec(),
+                amount,
+                source_tx: source_transaction,
+            },
+            access,
+        )?;
+        let message_hash = message.hash()?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Burned {
+                message,
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Applies one authorized incoming representation mint with replay defense.
+    pub(crate) fn apply_native_bridge_mint(
+        &mut self,
+        sender: Address,
+        message: &BridgeMessage,
+        config: &BridgeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !config.can_submit_incoming(sender) {
+            return Err(ChainError::UnauthorizedBridgeRelayer);
+        }
+        let NativeActionEffects { access, events } = effects;
+        let message_hash = self.process_incoming_bridge_message(
+            message,
+            IncomingBridgeAction::MintRepresentation,
+            access,
+        )?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Minted {
+                message: message.clone(),
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Applies one authorized incoming native release with replay defense.
+    pub(crate) fn apply_native_bridge_release(
+        &mut self,
+        sender: Address,
+        message: &BridgeMessage,
+        config: &BridgeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !config.can_submit_incoming(sender) {
+            return Err(ChainError::UnauthorizedBridgeRelayer);
+        }
+        let NativeActionEffects { access, events } = effects;
+        let message_hash = self.process_incoming_bridge_message(
+            message,
+            IncomingBridgeAction::ReleaseNative,
+            access,
+        )?;
+        events.push(Event::Bridge {
+            event: BridgeEvent::Released {
+                message: message.clone(),
+                message_hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Registers and funds one application fee-sponsor budget.
+    pub(crate) fn apply_native_register_app_sponsor(
+        &mut self,
+        context: NativeApplicationContext<'_>,
+        namespace: Hash256,
+        daily_budget_cap: Amount,
+        initial_funding: Amount,
+        config: &SponsorshipConfig,
+    ) -> Result<(), ChainError> {
+        let NativeApplicationContext {
+            sender,
+            authorization_lane,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+        if daily_budget_cap > config.max_app_daily_budget {
+            return Err(ChainError::AppSponsorDailyCapTooHigh);
+        }
+        if self.sponsors.contains_key(&namespace) {
+            return Err(ChainError::AppSponsorAlreadyExists);
+        }
+        self.debit_native(sender, initial_funding)?;
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_add(initial_funding)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let mut sponsor = AppSponsor::new(sender, daily_budget_cap);
+        sponsor.budget = initial_funding;
+        self.sponsors.insert(namespace, sponsor);
+        events.push(Event::AppSponsorRegistered {
+            application: namespace,
+            owner: sender,
+            daily_budget_cap,
+            funded: initial_funding,
+        });
+        Ok(())
+    }
+
+    /// Adds native units to an owner-controlled application sponsor budget.
+    pub(crate) fn apply_native_fund_app_sponsor(
+        &mut self,
+        context: NativeApplicationContext<'_>,
+        namespace: Hash256,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeApplicationContext {
+            sender,
+            authorization_lane,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+        let sponsor = self
+            .sponsors
+            .get(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        if sponsor.owner != sender {
+            return Err(ChainError::AppSponsorNotOwner);
+        }
+        self.debit_native(sender, amount)?;
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let sponsor = self
+            .sponsors
+            .get_mut(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        sponsor.budget = sponsor
+            .budget
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::AppSponsorFunded {
+            application: namespace,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Returns unspent application sponsor budget to its owner.
+    pub(crate) fn apply_native_withdraw_app_sponsor(
+        &mut self,
+        context: NativeApplicationContext<'_>,
+        namespace: Hash256,
+        amount: Amount,
+    ) -> Result<(), ChainError> {
+        let NativeApplicationContext {
+            sender,
+            authorization_lane,
+            effects,
+        } = context;
+        if !authorization_lane.is_default() {
+            return Err(ChainError::SponsorshipRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::application(namespace, sponsor_state_key_hash()))?;
+        let sponsor = self
+            .sponsors
+            .get(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        if sponsor.owner != sender {
+            return Err(ChainError::AppSponsorNotOwner);
+        }
+        if sponsor.budget < amount {
+            return Err(ChainError::AppSponsorBudgetInsufficient {
+                needed: amount,
+                available: sponsor.budget,
+            });
+        }
+        let sponsor = self
+            .sponsors
+            .get_mut(&namespace)
+            .ok_or(ChainError::AppSponsorNotFound)?;
+        sponsor.budget = sponsor
+            .budget
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.sponsor_budgets = self
+            .sponsor_budgets
+            .checked_sub(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.credit_native(sender, amount)?;
+        events.push(Event::AppSponsorWithdrawn {
+            application: namespace,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Claims an unregistered application namespace for the sender.
+    pub(crate) fn apply_native_register_namespace(
+        &mut self,
+        sender: Address,
+        namespace: Hash256,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::application(namespace, namespace_state_key_hash()))?;
+        if self.namespaces.contains_key(&namespace) {
+            return Err(ChainError::NamespaceAlreadyRegistered);
+        }
+        self.namespaces
+            .insert(namespace, NamespaceRecord::new(sender));
+        events.push(Event::NamespaceRegistered {
+            namespace,
+            owner: sender,
+        });
+        Ok(())
+    }
+
+    /// Transfers one registered namespace after checking its current owner.
+    pub(crate) fn apply_native_transfer_namespace(
+        &mut self,
+        sender: Address,
+        namespace: Hash256,
+        new_owner: Address,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::application(namespace, namespace_state_key_hash()))?;
+        let record = self
+            .namespaces
+            .get_mut(&namespace)
+            .ok_or(ChainError::NamespaceNotFound)?;
+        if record.owner != sender {
+            return Err(ChainError::NamespaceNotOwner);
+        }
+        record.owner = new_owner;
+        events.push(Event::NamespaceTransferred {
+            namespace,
+            from: sender,
+            to: new_owner,
+        });
+        Ok(())
+    }
+
+    /// Creates a permissionless oracle feed and burns its configured fee.
+    pub(crate) fn apply_native_create_feed(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        config: &OracleConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_feed(feed_id))?;
+        if self.oracle_feeds.contains_key(&feed_id) {
+            return Err(ChainError::OracleFeedAlreadyExists);
+        }
+        self.debit_native(sender, config.feed_creation_fee)?;
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(config.feed_creation_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.oracle_feeds
+            .insert(feed_id, Feed::new(sender, config.min_reporter_bond));
+        events.push(Event::FeedCreated {
+            feed_id,
+            creator: sender,
+            bond: config.min_reporter_bond,
+            fee_burned: config.feed_creation_fee,
+        });
+        Ok(())
+    }
+
+    /// Bonds the sender as a reporter on an existing oracle feed.
+    pub(crate) fn apply_native_register_reporter(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::oracle_feed(feed_id))?;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_reporter(feed_id, sender))?;
+        let bond = self
+            .oracle_feeds
+            .get(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?
+            .bond;
+        if self.oracle_reporters.contains_key(&(feed_id, sender)) {
+            return Err(ChainError::OracleReporterAlreadyRegistered);
+        }
+        self.debit_native(sender, bond)?;
+        self.oracle_bonds = self
+            .oracle_bonds
+            .checked_add(bond)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.oracle_reporters
+            .insert((feed_id, sender), OracleReporter::new());
+        events.push(Event::ReporterRegistered {
+            feed_id,
+            reporter: sender,
+            bond,
+        });
+        Ok(())
+    }
+
+    /// Removes one reporter and returns its feed-frozen bond.
+    pub(crate) fn apply_native_deregister_reporter(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::oracle_feed(feed_id))?;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_reporter(feed_id, sender))?;
+        let bond = self
+            .oracle_feeds
+            .get(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?
+            .bond;
+        if !self.oracle_reporters.contains_key(&(feed_id, sender)) {
+            return Err(ChainError::OracleReporterNotFound);
+        }
+        self.oracle_bonds = self
+            .oracle_bonds
+            .checked_sub(bond)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.oracle_reporters.remove(&(feed_id, sender));
+        self.credit_native(sender, bond)?;
+        events.push(Event::ReporterDeregistered {
+            feed_id,
+            reporter: sender,
+            bond,
+        });
+        Ok(())
+    }
+
+    /// Records the reporter's latest value at the deterministic current epoch.
+    pub(crate) fn apply_native_submit_report(
+        &mut self,
+        sender: Address,
+        feed_id: FeedId,
+        value: FeedValue,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::oracle_feed(feed_id))?;
+        access.write(StateKey::oracle_reporter(feed_id, sender))?;
+        if !self.oracle_feeds.contains_key(&feed_id) {
+            return Err(ChainError::OracleFeedNotFound);
+        }
+        let reporter = self
+            .oracle_reporters
+            .get_mut(&(feed_id, sender))
+            .ok_or(ChainError::OracleReporterNotFound)?;
+        reporter.value = Some(value);
+        reporter.reported_epoch = self.current_epoch;
+        events.push(Event::ReportSubmitted {
+            feed_id,
+            reporter: sender,
+            value,
+            epoch: self.current_epoch,
+        });
+        Ok(())
+    }
+
+    /// Moves a consumer payment into one feed's revenue pool.
+    pub(crate) fn apply_native_pay_feed_read(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        feed_id: FeedId,
+        amount: Amount,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::OracleRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::oracle_feed(feed_id))?;
+        if amount.is_zero() {
+            return Err(ChainError::OracleReadAmountZero);
+        }
+        if !self.oracle_feeds.contains_key(&feed_id) {
+            return Err(ChainError::OracleFeedNotFound);
+        }
+        self.debit_native(sender, amount)?;
+        self.oracle_revenue = self
+            .oracle_revenue
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        let feed = self
+            .oracle_feeds
+            .get_mut(&feed_id)
+            .ok_or(ChainError::OracleFeedNotFound)?;
+        feed.revenue = feed
+            .revenue
+            .checked_add(amount)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        events.push(Event::FeedReadPaid {
+            feed_id,
+            payer: sender,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Validates and escrows one order for deterministic block-level settlement.
+    pub(crate) fn apply_native_submit_order(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        submission: NativeDexOrderSubmission<'_>,
+        config: &DexConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::DexRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::dex_order(submission.order_id))?;
+        submission.pair.validate()?;
+        if submission.amount.is_zero() || submission.amount < config.min_order_amount {
+            return Err(ChainError::DexOrderAmountTooSmall);
+        }
+        if submission.limit_price.is_zero() {
+            return Err(ChainError::DexOrderPriceZero);
+        }
+        if self.dex_orders.contains_key(&submission.order_id) {
+            return Err(ChainError::DexOrderAlreadyExists);
+        }
+        let effective_deadline = if submission.deadline_height == 0 {
+            self.current_height
+                .checked_add(config.default_deadline_blocks)
+                .ok_or(ChainError::ArithmeticOverflow)?
+        } else {
+            if submission.deadline_height < self.current_height {
+                return Err(ChainError::DexOrderDeadlineInPast);
+            }
+            submission.deadline_height
+        };
+        let (locked_asset, locked_amount) = match submission.side {
+            OrderSide::Buy => (
+                submission.pair.quote.clone(),
+                submission
+                    .limit_price
+                    .quote_for(submission.amount)
+                    .ok_or(ChainError::ArithmeticOverflow)?,
+            ),
+            OrderSide::Sell => (submission.pair.base.clone(), submission.amount),
+        };
+        if locked_asset != AssetId::NativeWebc {
+            access.write(StateKey::asset_balance(locked_asset.clone(), sender))?;
+        }
+        self.dex_lock(sender, &locked_asset, locked_amount)?;
+        self.dex_orders.insert(
+            submission.order_id,
+            Order {
+                owner: sender,
+                pair: submission.pair.clone(),
+                side: submission.side,
+                amount: submission.amount,
+                remaining: submission.amount,
+                limit_price: submission.limit_price,
+                deadline_height: effective_deadline,
+                fill_or_cancel: submission.fill_or_cancel,
+                cancel_requested: false,
+            },
+        );
+        events.push(Event::OrderSubmitted {
+            order_id: submission.order_id,
+            owner: sender,
+            pair: submission.pair.clone(),
+            side: submission.side,
+            amount: submission.amount,
+            limit_price: submission.limit_price,
+            deadline_height: effective_deadline,
+        });
+        Ok(())
+    }
+
+    /// Marks an owned live order for refund/removal by the block batch pass.
+    pub(crate) fn apply_native_cancel_order(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        order_id: OrderId,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::DexRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, .. } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::dex_order(order_id))?;
+        let order = self
+            .dex_orders
+            .get_mut(&order_id)
+            .ok_or(ChainError::DexOrderNotFound)?;
+        if order.owner != sender {
+            return Err(ChainError::DexOrderNotOwner);
+        }
+        order.cancel_requested = true;
+        Ok(())
+    }
+
+    /// Registers one audited built-in contract and burns the configured fee.
+    pub(crate) fn apply_native_register_contract(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        manifest: &ContractManifest,
+        config: &ContractRuntimeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::ContractRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::module(manifest.code_id))?;
+        manifest.validate(sender)?;
+        // Native and WASM modules share the same state-key namespace. Check both
+        // registries in both directions so one logical key can never resolve to
+        // two handlers after a sparse overlay commit.
+        if self.contracts.contains_key(&manifest.code_id)
+            || self.wasm_contracts.contains_key(&manifest.code_id)
+        {
+            return Err(ChainError::ContractAlreadyExists);
+        }
+        self.debit_native(sender, config.registration_fee)?;
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(config.registration_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.contracts.insert(manifest.code_id, manifest.clone());
+        events.push(Event::ContractRegistered {
+            code_id: manifest.code_id,
+            namespace: manifest.namespace,
+            owner: sender,
+            builtin: manifest.builtin,
+            fee_burned: config.registration_fee,
+        });
+        Ok(())
+    }
+
+    /// Invokes one registered built-in contract through the shared gas/access core.
+    pub(crate) fn apply_native_invoke_contract(
+        &mut self,
+        sender: Address,
+        invocation: NativeContractInvocation<'_>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if invocation.input.len() > MAX_CONTRACT_INPUT_BYTES {
+            return Err(ChainError::ContractInputTooLarge {
+                actual: invocation.input.len(),
+                maximum: MAX_CONTRACT_INPUT_BYTES,
+            });
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::module(invocation.code_id))?;
+        let manifest = self
+            .contracts
+            .get(&invocation.code_id)
+            .ok_or(ChainError::ContractNotFound)?
+            .clone();
+        if invocation.namespace != manifest.namespace {
+            return Err(ChainError::ContractNamespaceMismatch);
+        }
+        if invocation.declared_keys != manifest.footprint.as_slice() {
+            return Err(ChainError::ContractFootprintMismatch);
+        }
+        let handler = builtin_contract(manifest.builtin);
+        let (output, gas_consumed) = self.run_contract_call(
+            ContractCall {
+                namespace: manifest.namespace,
+                footprint: &manifest.footprint,
+                handler,
+                input: invocation.input,
+                admission_units: invocation.admission_units,
+                gas_limit: invocation.gas_limit,
+            },
+            access,
+        )?;
+        let output_len = u64::try_from(output.len()).map_err(|_| ChainError::ArithmeticOverflow)?;
+        events.push(Event::ContractInvoked {
+            code_id: invocation.code_id,
+            namespace: invocation.namespace,
+            caller: sender,
+            gas_consumed,
+            output_len,
+        });
+        Ok(())
+    }
+
+    /// Registers one deterministic WASM module and burns the configured fee.
+    pub(crate) fn apply_native_register_wasm_contract(
+        &mut self,
+        sender: Address,
+        authorization_lane: AuthorizationLaneId,
+        manifest: &WasmContractManifest,
+        code: &WasmBytecode,
+        config: &ContractRuntimeConfig,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if !authorization_lane.is_default() {
+            return Err(ChainError::ContractRequiresDefaultLane);
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.write(StateKey::account(sender))?;
+        access.write(StateKey::module(manifest.code_id))?;
+        manifest.validate(sender, code)?;
+        if self.contracts.contains_key(&manifest.code_id)
+            || self.wasm_contracts.contains_key(&manifest.code_id)
+        {
+            return Err(ChainError::ContractAlreadyExists);
+        }
+        self.debit_native(sender, config.registration_fee)?;
+        self.burned_fees = self
+            .burned_fees
+            .checked_add(config.registration_fee)
+            .ok_or(ChainError::ArithmeticOverflow)?;
+        self.wasm_contracts
+            .insert(manifest.code_id, manifest.clone());
+        self.wasm_code.insert(manifest.code_id, code.clone());
+        let code_len = u64::try_from(code.len()).map_err(|_| ChainError::ArithmeticOverflow)?;
+        events.push(Event::WasmContractRegistered {
+            code_id: manifest.code_id,
+            namespace: manifest.namespace,
+            owner: sender,
+            code_hash: manifest.code_hash,
+            code_len,
+            fee_burned: config.registration_fee,
+        });
+        Ok(())
+    }
+
+    /// Invokes one stored WASM module through the shared gas/access core.
+    pub(crate) fn apply_native_invoke_wasm_contract(
+        &mut self,
+        sender: Address,
+        invocation: NativeContractInvocation<'_>,
+        effects: NativeActionEffects<'_>,
+    ) -> Result<(), ChainError> {
+        if invocation.input.len() > MAX_CONTRACT_INPUT_BYTES {
+            return Err(ChainError::ContractInputTooLarge {
+                actual: invocation.input.len(),
+                maximum: MAX_CONTRACT_INPUT_BYTES,
+            });
+        }
+        let NativeActionEffects { access, events } = effects;
+        access.read(StateKey::module(invocation.code_id))?;
+        let manifest = self
+            .wasm_contracts
+            .get(&invocation.code_id)
+            .ok_or(ChainError::ContractNotFound)?
+            .clone();
+        if invocation.namespace != manifest.namespace {
+            return Err(ChainError::ContractNamespaceMismatch);
+        }
+        if invocation.declared_keys != manifest.footprint.as_slice() {
+            return Err(ChainError::ContractFootprintMismatch);
+        }
+        let code = self
+            .wasm_code
+            .get(&invocation.code_id)
+            .ok_or(ChainError::ContractNotFound)?
+            .clone();
+        let handler = WasmContract::new(&code.0);
+        let (output, gas_consumed) = self.run_contract_call(
+            ContractCall {
+                namespace: manifest.namespace,
+                footprint: &manifest.footprint,
+                handler: &handler,
+                input: invocation.input,
+                admission_units: invocation.admission_units,
+                gas_limit: invocation.gas_limit,
+            },
+            access,
+        )?;
+        let output_len = u64::try_from(output.len()).map_err(|_| ChainError::ArithmeticOverflow)?;
+        events.push(Event::WasmContractInvoked {
+            code_id: invocation.code_id,
+            namespace: invocation.namespace,
+            caller: sender,
+            gas_consumed,
+            output_len,
+        });
         Ok(())
     }
 
@@ -17261,6 +17900,36 @@ mod tests {
                 1,
                 wasm_manifest(code_id, namespace, alice.address(), &code),
                 code.clone(),
+            ),
+            Err(ChainError::ContractAlreadyExists)
+        ));
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn register_native_rejects_an_existing_wasm_code_id() {
+        let (config, mut state, alice, ..) = contract_fixture();
+        let code_id = Hash256([0xc1; 32]);
+        let namespace = Hash256([0x12; 32]);
+        let code = store_and_echo_module();
+
+        register_wasm(
+            &mut state,
+            &config,
+            &alice,
+            0,
+            wasm_manifest(code_id, namespace, alice.address(), &code),
+            code,
+        )
+        .expect("register wasm first");
+        let snapshot = state.clone();
+        assert!(matches!(
+            register_kv(
+                &mut state,
+                &config,
+                &alice,
+                1,
+                kv_manifest(code_id, namespace, alice.address()),
             ),
             Err(ChainError::ContractAlreadyExists)
         ));

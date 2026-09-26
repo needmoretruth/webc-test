@@ -17,7 +17,8 @@
 use crate::{
     AccessList, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, BlockHeight, ChainId,
     FeeBid, Nonce, Operation, PostQuantumRootReveal, ProtocolVersion, SessionKeyId, StateKey,
-    MAX_OBJECT_DATA_BYTES, MAX_TRANSACTION_STATE_KEYS,
+    MAX_CONTRACT_FOOTPRINT_KEYS, MAX_CONTRACT_INPUT_BYTES, MAX_OBJECT_DATA_BYTES,
+    MAX_TRANSACTION_STATE_KEYS, MAX_WASM_MODULE_BYTES,
 };
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -616,8 +617,34 @@ impl ActionV1 {
                         | Operation::InstallAuthorizationPolicy { .. }
                         | Operation::OpenAuthorizationLane { .. }
                         | Operation::FundAuthorizationLane { .. }
+                        | Operation::InstallSessionKey { .. }
+                        | Operation::RevokeSessionKey { .. }
+                        | Operation::RotateActiveTransactionKey { .. }
+                        | Operation::RotatePostQuantumRoot { .. }
                         | Operation::ClaimValidatorRewards
                         | Operation::ClaimDelegatorRewards { .. }
+                        | Operation::CompoundValidatorRewards
+                        | Operation::CompoundDelegatorRewards { .. }
+                        | Operation::BridgeLock { .. }
+                        | Operation::BridgeBurn { .. }
+                        | Operation::BridgeMint { .. }
+                        | Operation::BridgeRelease { .. }
+                        | Operation::RegisterAppSponsor { .. }
+                        | Operation::FundAppSponsor { .. }
+                        | Operation::WithdrawAppSponsor { .. }
+                        | Operation::RegisterNamespace { .. }
+                        | Operation::TransferNamespace { .. }
+                        | Operation::CreateFeed { .. }
+                        | Operation::RegisterReporter { .. }
+                        | Operation::DeregisterReporter { .. }
+                        | Operation::SubmitReport { .. }
+                        | Operation::PayFeedRead { .. }
+                        | Operation::SubmitOrder { .. }
+                        | Operation::CancelOrder { .. }
+                        | Operation::RegisterContract { .. }
+                        | Operation::InvokeContract { .. }
+                        | Operation::RegisterWasmContract { .. }
+                        | Operation::InvokeWasmContract { .. }
                         | Operation::ClaimUnbonded { .. }
                         | Operation::CreateObject { .. }
                         | Operation::MutateObject { .. }
@@ -677,6 +704,66 @@ impl ActionV1 {
             }
             Operation::FundAuthorizationLane { lane, fee_deposit }
                 if lane.is_default() || fee_deposit.is_zero() =>
+            {
+                Err(TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::InstallSessionKey {
+                constraints,
+                post_quantum_root_reveal,
+                ..
+            } => {
+                constraints
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)?;
+                post_quantum_root_reveal
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::RevokeSessionKey {
+                post_quantum_root_reveal,
+                ..
+            }
+            | Operation::RotateActiveTransactionKey {
+                post_quantum_root_reveal,
+                ..
+            } => post_quantum_root_reveal
+                .validate()
+                .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction),
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root,
+                post_quantum_root_reveal,
+            } => {
+                new_post_quantum_root
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)?;
+                post_quantum_root_reveal
+                    .validate()
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::RegisterContract { manifest } => manifest
+                .validate(manifest.owner)
+                .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction),
+            Operation::RegisterWasmContract { manifest, code } => {
+                if code.len() > MAX_WASM_MODULE_BYTES {
+                    return Err(TransactionValidationErrorV1::InvalidNativeAction);
+                }
+                manifest
+                    .validate(manifest.owner, code)
+                    .map_err(|_| TransactionValidationErrorV1::InvalidNativeAction)
+            }
+            Operation::InvokeContract {
+                declared_keys,
+                input,
+                ..
+            }
+            | Operation::InvokeWasmContract {
+                declared_keys,
+                input,
+                ..
+            } if input.len() > MAX_CONTRACT_INPUT_BYTES
+                || declared_keys.is_empty()
+                || declared_keys.len() > MAX_CONTRACT_FOOTPRINT_KEYS
+                || !declared_keys.windows(2).all(|pair| pair[0] < pair[1]) =>
             {
                 Err(TransactionValidationErrorV1::InvalidNativeAction)
             }
@@ -745,6 +832,29 @@ impl ActionProgramV1 {
         }
         for action in &self.actions {
             action.validate_structure()?;
+        }
+        // Recovery-root signatures use the legacy native-operation message
+        // domains, which bind the exact operation and envelope nonce but do not
+        // carry an action ordinal. Keep these critical controls single-action
+        // until a future version introduces an ordinal-bound authorization
+        // format; this prevents an otherwise valid root proof from authorizing
+        // surprising sibling actions in the same atomic program.
+        if self.actions.len() != 1
+            && self.actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ActionV1::Native { operation }
+                        if matches!(
+                            operation.as_ref(),
+                            Operation::InstallSessionKey { .. }
+                                | Operation::RevokeSessionKey { .. }
+                                | Operation::RotateActiveTransactionKey { .. }
+                                | Operation::RotatePostQuantumRoot { .. }
+                        )
+                )
+            })
+        {
+            return Err(TransactionValidationErrorV1::InvalidNativeAction);
         }
         self.required_units()?;
         Ok(())
@@ -1281,14 +1391,28 @@ impl TransactionV5 {
         if let TransactionKindV1::Actions(program) = &self.kind {
             validate_native_action_lane(program, self.authorization.lane)?;
             for action in &program.actions {
-                let ActionV1::RevokeSignedSponsorGrant { grant } = action else {
-                    continue;
-                };
-                if grant.sponsor != self.sender
-                    || grant.chain_id != self.chain_id
-                    || grant.protocol_version != self.protocol_version
-                {
-                    return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
+                match action {
+                    ActionV1::RevokeSignedSponsorGrant { grant }
+                        if grant.sponsor != self.sender
+                            || grant.chain_id != self.chain_id
+                            || grant.protocol_version != self.protocol_version =>
+                    {
+                        return Err(TransactionValidationErrorV1::SponsorBindingMismatch);
+                    }
+                    ActionV1::Native { operation } => match operation.as_ref() {
+                        Operation::RegisterContract { manifest }
+                            if manifest.owner != self.sender =>
+                        {
+                            return Err(TransactionValidationErrorV1::InvalidNativeAction);
+                        }
+                        Operation::RegisterWasmContract { manifest, .. }
+                            if manifest.owner != self.sender =>
+                        {
+                            return Err(TransactionValidationErrorV1::InvalidNativeAction);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
         }
@@ -1823,7 +1947,215 @@ mod fee_bid_decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectId, ObjectVersion, Operation};
+    use crate::{
+        AssetId, BridgeMessage, BuiltinContract, ContractManifest, ExternalChain, FeedId,
+        FeedValue, ObjectId, ObjectVersion, Operation, OrderId, OrderSide, PostQuantumRoot,
+        PostQuantumRootReveal, PostQuantumScheme, Price, SessionAllowedOperations,
+        SessionKeyConstraints, TradingPair, WasmBytecode, WasmContractManifest,
+    };
+
+    #[test]
+    fn protocol_two_supports_native_account_controls_and_reward_compounding() {
+        let replacement = Keypair::from_seed([41; 32]).public_key();
+        let reveal = PostQuantumRootReveal {
+            scheme: PostQuantumScheme::MlDsa65,
+            public_key: vec![1],
+            signature: vec![2],
+        };
+        let constraints = SessionKeyConstraints {
+            authorization_lane: AuthorizationLaneId::DEFAULT,
+            allowed_operations: SessionAllowedOperations::transfers_only(),
+            max_amount_per_use: Amount::from_units(1),
+            total_amount_budget: Amount::from_units(1),
+            max_fee_per_use: Amount::from_units(1),
+            total_fee_budget: Amount::from_units(1),
+            lifetime_epochs: 1,
+        };
+        let root = PostQuantumRoot::new(PostQuantumScheme::MlDsa65, Hash256([3; 32]))
+            .expect("non-zero root commitment");
+        let operations = [
+            Operation::InstallSessionKey {
+                session_public_key: replacement,
+                constraints,
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RevokeSessionKey {
+                session_key: SessionKeyId::derive(&replacement),
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotateActiveTransactionKey {
+                new_active_transaction_key: replacement,
+                post_quantum_root_reveal: reveal.clone(),
+            },
+            Operation::RotatePostQuantumRoot {
+                new_post_quantum_root: root,
+                post_quantum_root_reveal: reveal,
+            },
+            Operation::CompoundValidatorRewards,
+            Operation::CompoundDelegatorRewards {
+                validator: Keypair::from_seed([42; 32]).address(),
+            },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_bridge_sponsor_and_namespace_operations() {
+        let external = AssetId::External {
+            origin_chain: ExternalChain::Ethereum,
+            symbol: "TEST".to_owned(),
+            contract_or_mint: "0x01".to_owned(),
+        };
+        let message = BridgeMessage {
+            source_chain: ExternalChain::Ethereum,
+            destination_chain: ExternalChain::Webc,
+            nonce: 1,
+            asset: external.clone(),
+            sender: vec![1],
+            recipient: vec![2; 32],
+            amount: Amount::from_units(1),
+            source_tx: Hash256([4; 32]),
+        };
+        let namespace = Hash256([5; 32]);
+        let operations = [
+            Operation::BridgeLock {
+                asset: AssetId::NativeWebc,
+                destination_chain: ExternalChain::Ethereum,
+                recipient: vec![1],
+                amount: Amount::from_units(1),
+            },
+            Operation::BridgeBurn {
+                asset: external,
+                destination_chain: ExternalChain::Ethereum,
+                recipient: vec![1],
+                amount: Amount::from_units(1),
+            },
+            Operation::BridgeMint {
+                message: message.clone(),
+            },
+            Operation::BridgeRelease { message },
+            Operation::RegisterAppSponsor {
+                namespace,
+                daily_budget_cap: Amount::from_units(10),
+                initial_funding: Amount::from_units(1),
+            },
+            Operation::FundAppSponsor {
+                namespace,
+                amount: Amount::from_units(1),
+            },
+            Operation::WithdrawAppSponsor {
+                namespace,
+                amount: Amount::from_units(1),
+            },
+            Operation::RegisterNamespace { namespace },
+            Operation::TransferNamespace {
+                namespace,
+                new_owner: Keypair::from_seed([43; 32]).address(),
+            },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_oracle_operations() {
+        let feed_id = FeedId::new(Hash256([6; 32]));
+        let operations = [
+            Operation::CreateFeed { feed_id },
+            Operation::RegisterReporter { feed_id },
+            Operation::DeregisterReporter { feed_id },
+            Operation::SubmitReport {
+                feed_id,
+                value: FeedValue::new(42),
+            },
+            Operation::PayFeedRead {
+                feed_id,
+                amount: Amount::from_units(1),
+            },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_dex_operations() {
+        let order_id = OrderId::new(Hash256([7; 32]));
+        let pair = TradingPair::new(
+            AssetId::NativeWebc,
+            AssetId::External {
+                origin_chain: ExternalChain::Ethereum,
+                symbol: "TEST".to_owned(),
+                contract_or_mint: "0x01".to_owned(),
+            },
+        );
+        let operations = [
+            Operation::SubmitOrder {
+                order_id,
+                pair,
+                side: OrderSide::Sell,
+                amount: Amount::from_units(1),
+                limit_price: Price::new(2),
+                deadline_height: 0,
+                fill_or_cancel: false,
+            },
+            Operation::CancelOrder { order_id },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
+
+    #[test]
+    fn protocol_two_supports_native_contract_operations() {
+        let owner = Keypair::from_seed([44; 32]).address();
+        let native_code_id = Hash256([8; 32]);
+        let wasm_code_id = Hash256([9; 32]);
+        let namespace = Hash256([10; 32]);
+        let footprint = [Hash256([11; 32])];
+        let native_manifest = ContractManifest::new(
+            native_code_id,
+            namespace,
+            BuiltinContract::KeyValue,
+            footprint,
+            owner,
+        );
+        let code = WasmBytecode(vec![0]);
+        let wasm_manifest =
+            WasmContractManifest::new(wasm_code_id, namespace, code.code_hash(), footprint, owner);
+        let operations = [
+            Operation::RegisterContract {
+                manifest: native_manifest.clone(),
+            },
+            Operation::InvokeContract {
+                code_id: native_code_id,
+                namespace,
+                declared_keys: native_manifest.footprint,
+                input: vec![1],
+            },
+            Operation::RegisterWasmContract {
+                manifest: wasm_manifest.clone(),
+                code,
+            },
+            Operation::InvokeWasmContract {
+                code_id: wasm_code_id,
+                namespace,
+                declared_keys: wasm_manifest.footprint,
+                input: vec![2],
+            },
+        ];
+
+        assert!(operations
+            .iter()
+            .all(|operation| ActionV1::native(operation.clone()).execution_supported()));
+    }
 
     #[test]
     fn staking_control_authorization_message_is_bounded_and_cross_language_stable() {
