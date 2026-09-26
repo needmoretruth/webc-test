@@ -48,7 +48,8 @@ pub use mempool_v1::{
 pub use node::{FinalizedTransactionProofBundleV1, Node, NodeError, V4FinalizationResult};
 pub use run_v1::{
     load_consensus_credentials, load_devnet_keypair, load_protocol2_genesis, start_protocol2,
-    Protocol2Node, Protocol2RunConfig,
+    start_protocol2_with_runtime_config, Protocol2Node, Protocol2RunConfig, Protocol2RuntimeConfig,
+    DEFAULT_PENDING_EXPIRY_INTERVAL, MAX_PENDING_EXPIRY_INTERVAL, MIN_PENDING_EXPIRY_INTERVAL,
 };
 pub use runtime_v1::{
     CertifiedBlockSnapshotV1, ConsensusContextV1, NodeHandle, NodeRuntime, NodeRuntimeError,

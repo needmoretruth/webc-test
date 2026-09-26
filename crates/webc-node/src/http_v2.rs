@@ -37,7 +37,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::{broadcast, Semaphore};
 use webc_chain::{
-    BlockPositionV1, ReceiptV1, TransactionId, TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION,
+    ActionIndex, BlockPositionV1, ExecutionFailureCodeV1, ReceiptStatusV1, ReceiptV1,
+    TransactionId, TransactionV5, TRANSACTION_V5_PROTOCOL_VERSION,
 };
 use webc_net::{NetMessage, NetworkHandle};
 use webc_proof::{CheckpointV1, FinalizedTransactionProofV1};
@@ -132,15 +133,50 @@ pub enum V2TransactionStatus {
         /// Node-local expiry time in Unix milliseconds.
         observed_at_ms: LocalTimestampMs,
     },
-    /// The node observed a non-final candidate inclusion.
+    /// A legacy stored observation knows the candidate position but not outcome.
+    ///
+    /// New candidates always use `IncludedSuccess` or `IncludedFailure`; this
+    /// variant remains only so pre-outcome persisted records are not guessed.
     Included {
         /// Candidate block position, not yet an authoritative result.
         position: BlockPositionV1,
     },
-    /// Consensus finalized this transaction at the exact block position.
+    /// A legacy stored finality fact knows the position but not outcome.
+    ///
+    /// Storage normally enriches this from its canonical receipt before the API
+    /// sees it. Keeping the variant makes the pure projection fail safe if an
+    /// older in-memory caller supplies an un-enriched record.
     Finalized {
         /// Authoritative finalized position.
         position: BlockPositionV1,
+    },
+    /// A candidate included a transaction whose V1 receipt succeeded.
+    IncludedSuccess {
+        /// Candidate block position, not yet an authoritative finality fact.
+        position: BlockPositionV1,
+    },
+    /// A candidate included a transaction whose V1 receipt recorded failure.
+    IncludedFailure {
+        /// Candidate block position, not yet an authoritative finality fact.
+        position: BlockPositionV1,
+        /// Stable consensus receipt failure code.
+        code: ExecutionFailureCodeV1,
+        /// Zero-based failed action, absent for transaction-wide execution work.
+        failed_action_index: Option<ActionIndex>,
+    },
+    /// Consensus finalized a successful V1 receipt.
+    FinalizedSuccess {
+        /// Authoritative finalized position.
+        position: BlockPositionV1,
+    },
+    /// Consensus finalized a failed V1 receipt after charging bounded work.
+    FinalizedFailure {
+        /// Authoritative finalized position.
+        position: BlockPositionV1,
+        /// Stable consensus receipt failure code.
+        code: ExecutionFailureCodeV1,
+        /// Zero-based failed action, absent for transaction-wide execution work.
+        failed_action_index: Option<ActionIndex>,
     },
 }
 
@@ -168,12 +204,14 @@ impl V2LifecycleResponse {
                 status: V2TransactionStatus::Unknown,
             };
         };
-        let status = if let Some(TransactionConsensusFactV1::Finalized { position }) =
-            lifecycle.consensus_fact
-        {
-            V2TransactionStatus::Finalized { position }
-        } else {
-            match lifecycle.local_observation {
+        let status = match lifecycle.consensus_fact {
+            Some(TransactionConsensusFactV1::Finalized { position }) => {
+                V2TransactionStatus::Finalized { position }
+            }
+            Some(TransactionConsensusFactV1::FinalizedWithOutcome { position, status }) => {
+                project_finalized_outcome(position, status)
+            }
+            None => match lifecycle.local_observation {
                 Some(LocalTransactionObservationV1::Queued { observed_at_ms }) => {
                     V2TransactionStatus::Queued { observed_at_ms }
                 }
@@ -197,8 +235,11 @@ impl V2LifecycleResponse {
                 Some(LocalTransactionObservationV1::Included { position }) => {
                     V2TransactionStatus::Included { position }
                 }
+                Some(LocalTransactionObservationV1::IncludedWithOutcome { position, status }) => {
+                    project_included_outcome(position, status)
+                }
                 None => V2TransactionStatus::Unknown,
-            }
+            },
         };
         Self {
             api_version: TRANSACTION_API_VERSION_V2,
@@ -206,6 +247,40 @@ impl V2LifecycleResponse {
             sequence: Some(lifecycle.sequence),
             status,
         }
+    }
+}
+
+fn project_included_outcome(
+    position: BlockPositionV1,
+    status: ReceiptStatusV1,
+) -> V2TransactionStatus {
+    match status {
+        ReceiptStatusV1::Succeeded => V2TransactionStatus::IncludedSuccess { position },
+        ReceiptStatusV1::Failed {
+            code,
+            failed_action_index,
+        } => V2TransactionStatus::IncludedFailure {
+            position,
+            code,
+            failed_action_index,
+        },
+    }
+}
+
+fn project_finalized_outcome(
+    position: BlockPositionV1,
+    status: ReceiptStatusV1,
+) -> V2TransactionStatus {
+    match status {
+        ReceiptStatusV1::Succeeded => V2TransactionStatus::FinalizedSuccess { position },
+        ReceiptStatusV1::Failed {
+            code,
+            failed_action_index,
+        } => V2TransactionStatus::FinalizedFailure {
+            position,
+            code,
+            failed_action_index,
+        },
     }
 }
 
@@ -1143,6 +1218,91 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use webc_storage::StorageError;
+
+    #[test]
+    fn receipt_outcomes_project_to_distinct_included_and_finalized_statuses() {
+        let transaction_id = TransactionId::new(webc_crypto::Hash256([0x61; 32]));
+        let position = BlockPositionV1::new(
+            webc_chain::BlockHeight::new(7),
+            webc_chain::TransactionIndex::new(1),
+        );
+        let failure = webc_chain::ReceiptStatusV1::Failed {
+            code: webc_chain::ExecutionFailureCodeV1::ObjectNotFound,
+            failed_action_index: Some(webc_chain::ActionIndex::new(2)),
+        };
+        let lifecycle = |local_observation, consensus_fact| TransactionLifecycleV1 {
+            version: webc_storage::TRANSACTION_LIFECYCLE_RECORD_V1,
+            transaction_id,
+            sequence: LifecycleSequence::new(9),
+            local_observation,
+            consensus_fact,
+        };
+
+        assert_eq!(
+            V2LifecycleResponse::project(
+                transaction_id,
+                Some(lifecycle(
+                    Some(LocalTransactionObservationV1::IncludedWithOutcome {
+                        position,
+                        status: webc_chain::ReceiptStatusV1::Succeeded,
+                    }),
+                    None,
+                )),
+            )
+            .status,
+            V2TransactionStatus::IncludedSuccess { position }
+        );
+        assert_eq!(
+            V2LifecycleResponse::project(
+                transaction_id,
+                Some(lifecycle(
+                    Some(LocalTransactionObservationV1::IncludedWithOutcome {
+                        position,
+                        status: failure,
+                    }),
+                    None,
+                )),
+            )
+            .status,
+            V2TransactionStatus::IncludedFailure {
+                position,
+                code: webc_chain::ExecutionFailureCodeV1::ObjectNotFound,
+                failed_action_index: Some(webc_chain::ActionIndex::new(2)),
+            }
+        );
+        assert_eq!(
+            V2LifecycleResponse::project(
+                transaction_id,
+                Some(lifecycle(
+                    None,
+                    Some(TransactionConsensusFactV1::FinalizedWithOutcome {
+                        position,
+                        status: webc_chain::ReceiptStatusV1::Succeeded,
+                    }),
+                )),
+            )
+            .status,
+            V2TransactionStatus::FinalizedSuccess { position }
+        );
+        assert_eq!(
+            V2LifecycleResponse::project(
+                transaction_id,
+                Some(lifecycle(
+                    None,
+                    Some(TransactionConsensusFactV1::FinalizedWithOutcome {
+                        position,
+                        status: failure,
+                    }),
+                )),
+            )
+            .status,
+            V2TransactionStatus::FinalizedFailure {
+                position,
+                code: webc_chain::ExecutionFailureCodeV1::ObjectNotFound,
+                failed_action_index: Some(webc_chain::ActionIndex::new(2)),
+            }
+        );
+    }
 
     #[tokio::test]
     async fn internal_error_body_is_correlated_and_redacted() {

@@ -1000,7 +1000,7 @@ where
     }
 
     fn build_candidate_v4(
-        &self,
+        &mut self,
         proposer: webc_crypto::Address,
         timestamp_ms: u64,
         now_ms: LocalTimestampMs,
@@ -1017,7 +1017,20 @@ where
                 proposer,
                 timestamp_ms,
             ) {
-                Ok(candidate) => return Ok(candidate),
+                Ok(candidate) => {
+                    // A successfully executed candidate owns complete V1
+                    // receipts. Persist their exact outcomes before consensus
+                    // can advertise the proposal, then publish only newly
+                    // allocated lifecycle sequences in block order.
+                    let lifecycles = self
+                        .node
+                        .store_mut()
+                        .observe_candidate_included_v1(&candidate.block)?;
+                    for lifecycle in lifecycles {
+                        let _no_live_subscribers = self.lifecycle_events.send(lifecycle);
+                    }
+                    return Ok(candidate);
+                }
                 Err(NodeError::BlockV4(error))
                     if matches!(error.as_ref(), BlockV4ExecutionError::BlockTooLarge)
                         && !transactions.is_empty() =>
@@ -1219,8 +1232,9 @@ mod tests {
     use super::*;
     use webc_chain::{
         ActionV1, Amount, AuthorizationLaneId, AuthorizationPolicyRevision, ChainConfig, ChainId,
-        FeeBid, FeePaymentV1, GenesisAccount, GenesisConfig, GenesisValidator, Nonce, Operation,
-        SignedVote, TransactionAuthorizationV1, ValidatorSet, ValidityWindowV1, Vote, VoteType,
+        ExecutionFailureCodeV1, FeeBid, FeePaymentV1, GenesisAccount, GenesisConfig,
+        GenesisValidator, Nonce, Operation, ReceiptStatusV1, SignedVote,
+        TransactionAuthorizationV1, ValidatorSet, ValidityWindowV1, Vote, VoteType,
     };
     use webc_crypto::Keypair;
     use webc_storage::{KvEntry, MemoryKvStore, RedbKvStore, Table, WriteBatch};
@@ -1309,6 +1323,22 @@ mod tests {
         nonce: u64,
         max_fee_per_unit: u64,
     ) -> TransactionV5 {
+        transfer_amount(
+            sender,
+            recipient,
+            nonce,
+            max_fee_per_unit,
+            Amount::from_units(1),
+        )
+    }
+
+    fn transfer_amount(
+        sender: &Keypair,
+        recipient: &Keypair,
+        nonce: u64,
+        max_fee_per_unit: u64,
+        amount: Amount,
+    ) -> TransactionV5 {
         let mut transaction = TransactionV5::for_actions_unsigned(
             ChainId::devnet(),
             sender.address(),
@@ -1321,7 +1351,7 @@ mod tests {
             ValidityWindowV1::new(BlockHeight::new(1), BlockHeight::new(20)),
             vec![ActionV1::native(Operation::Transfer {
                 to: recipient.address(),
-                amount: Amount::from_units(1),
+                amount,
             })],
             FeeBid {
                 gas_limit: 1_000,
@@ -1335,6 +1365,123 @@ mod tests {
             .sign(sender)
             .expect("test transaction signature is valid");
         transaction
+    }
+
+    #[tokio::test]
+    async fn candidate_build_durably_publishes_ordered_receipt_outcomes_once() {
+        let validator = Keypair::from_seed([0x19; 32]);
+        let recipient = Keypair::from_seed([0x1a; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let node = Node::open(MemoryKvStore::new(), &genesis).expect("validator node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+        let amount = Amount::from_webc(500);
+        let first = transfer_amount(&validator, &recipient, 0, 5, amount);
+        let second = transfer_amount(&validator, &recipient, 1, 5, amount);
+        let first_id = first.transaction_id().expect("first transaction ID");
+        let second_id = second.transaction_id().expect("second transaction ID");
+        handle
+            .submit(first, LocalTimestampMs::new(NOW))
+            .await
+            .expect("first transaction enters the durable mempool");
+        handle
+            .submit(second, LocalTimestampMs::new(NOW))
+            .await
+            .expect("future nonce enters the durable mempool");
+        let mut events = handle.subscribe_lifecycle();
+
+        let candidate = handle
+            .build_candidate_v4(
+                validator.address(),
+                NOW + 1,
+                LocalTimestampMs::new(NOW + 1),
+                Vec::new(),
+            )
+            .await
+            .expect("candidate builds and inclusion observations commit");
+        assert_eq!(candidate.block.transactions.len(), 2);
+        assert_eq!(
+            candidate.block.receipts[0].status,
+            ReceiptStatusV1::Succeeded
+        );
+        assert_eq!(
+            candidate.block.receipts[1].status,
+            ReceiptStatusV1::Failed {
+                code: ExecutionFailureCodeV1::InsufficientBalance,
+                failed_action_index: Some(webc_chain::ActionIndex::new(0)),
+            }
+        );
+
+        let first_lifecycle = handle
+            .lifecycle(first_id)
+            .await
+            .expect("first lifecycle query succeeds")
+            .expect("first lifecycle exists");
+        let second_lifecycle = handle
+            .lifecycle(second_id)
+            .await
+            .expect("second lifecycle query succeeds")
+            .expect("second lifecycle exists");
+        assert!(matches!(
+            first_lifecycle.local_observation,
+            Some(LocalTransactionObservationV1::IncludedWithOutcome {
+                status: ReceiptStatusV1::Succeeded,
+                ..
+            })
+        ));
+        assert!(matches!(
+            second_lifecycle.local_observation,
+            Some(LocalTransactionObservationV1::IncludedWithOutcome {
+                status: ReceiptStatusV1::Failed {
+                    code: ExecutionFailureCodeV1::InsufficientBalance,
+                    failed_action_index: Some(index),
+                },
+                ..
+            }) if index == webc_chain::ActionIndex::new(0)
+        ));
+        assert!(first_lifecycle.sequence < second_lifecycle.sequence);
+        let first_event = events
+            .try_recv()
+            .expect("first inclusion event is published");
+        let second_event = events
+            .try_recv()
+            .expect("second inclusion event is published");
+        assert_eq!(first_event, first_lifecycle);
+        assert_eq!(second_event, second_lifecycle);
+
+        let repeated = handle
+            .build_candidate_v4(
+                validator.address(),
+                NOW + 1,
+                LocalTimestampMs::new(NOW + 1),
+                Vec::new(),
+            )
+            .await
+            .expect("identical candidate observation is idempotent");
+        assert_eq!(repeated, candidate);
+        assert_eq!(
+            handle
+                .lifecycle(second_id)
+                .await
+                .expect("second lifecycle query succeeds")
+                .expect("second lifecycle exists")
+                .sequence,
+            second_lifecycle.sequence
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
     }
 
     #[tokio::test]
@@ -2022,6 +2169,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_observation_failure_prevents_proposal_and_is_retriable() {
+        let validator = Keypair::from_seed([0x4d; 32]);
+        let recipient = Keypair::from_seed([0x4e; 32]);
+        let genesis = genesis_with_validator(&validator);
+        let fail_next_commit = Arc::new(AtomicBool::new(false));
+        let backend = FailSwitchStore {
+            inner: MemoryKvStore::new(),
+            fail_next_commit: Arc::clone(&fail_next_commit),
+        };
+        let node = Node::open(backend, &genesis).expect("validator node opens");
+        let (handle, task) = NodeRuntime::spawn(
+            node,
+            V5MempoolConfig::default(),
+            8,
+            LocalTimestampMs::new(NOW),
+        )
+        .expect("runtime starts");
+        let transaction = transfer(&validator, &recipient, 0, 5);
+        let transaction_id = transaction.transaction_id().expect("transaction ID");
+        let queued = handle
+            .submit(transaction, LocalTimestampMs::new(NOW))
+            .await
+            .expect("pending transaction commits")
+            .lifecycle;
+        let mut events = handle.subscribe_lifecycle();
+
+        fail_next_commit.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            handle
+                .build_candidate_v4(
+                    validator.address(),
+                    NOW + 1,
+                    LocalTimestampMs::new(NOW + 1),
+                    Vec::new(),
+                )
+                .await,
+            Err(NodeRuntimeError::Storage(StorageError::Io(_)))
+        ));
+        assert_eq!(
+            handle
+                .lifecycle(transaction_id)
+                .await
+                .expect("lifecycle query succeeds"),
+            Some(queued)
+        );
+        assert_eq!(
+            handle
+                .stats()
+                .await
+                .expect("runtime remains responsive")
+                .mempool_size,
+            1
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        handle
+            .build_candidate_v4(
+                validator.address(),
+                NOW + 1,
+                LocalTimestampMs::new(NOW + 1),
+                Vec::new(),
+            )
+            .await
+            .expect("identical candidate retries after the failed batch");
+        assert!(matches!(
+            handle
+                .lifecycle(transaction_id)
+                .await
+                .expect("lifecycle query succeeds")
+                .and_then(|value| value.local_observation),
+            Some(LocalTransactionObservationV1::IncludedWithOutcome { .. })
+        ));
+
+        handle.shutdown().await.expect("shutdown is acknowledged");
+        task.await
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+    }
+
+    #[tokio::test]
     async fn certified_v4_finalization_is_disk_first_and_retriable() {
         let validator = Keypair::from_seed([0x51; 32]);
         let recipient = Keypair::from_seed([0x52; 32]);
@@ -2106,7 +2336,7 @@ mod tests {
                 .await
                 .expect("lifecycle query succeeds")
                 .and_then(|lifecycle| lifecycle.consensus_fact),
-            Some(webc_storage::TransactionConsensusFactV1::Finalized { .. })
+            Some(webc_storage::TransactionConsensusFactV1::FinalizedWithOutcome { .. })
         ));
 
         handle.shutdown().await.expect("shutdown is acknowledged");
@@ -2167,7 +2397,7 @@ mod tests {
                 .await
                 .expect("finalized lifecycle query")
                 .and_then(|lifecycle| lifecycle.consensus_fact),
-            Some(webc_storage::TransactionConsensusFactV1::Finalized { .. })
+            Some(webc_storage::TransactionConsensusFactV1::FinalizedWithOutcome { .. })
         ));
 
         handle.shutdown().await.expect("shutdown is acknowledged");
