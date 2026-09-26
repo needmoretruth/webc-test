@@ -703,7 +703,7 @@ impl V2AppState {
         let sequence = self
             .inner
             .correlation_sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .unwrap_or(u64::MAX);

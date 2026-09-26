@@ -112,7 +112,7 @@ impl KvStore for FinalizationFailingStore {
         if is_v4_finalization
             && self
                 .failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
