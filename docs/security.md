@@ -180,6 +180,9 @@ fixed):
 - **Dependencies (D4).** `fips204 0.4.6` is pre-1.0 and on the ML-DSA
   recovery-root verify path; `bincode 1.3.3` is unmaintained and its advisory is
   ignored in `deny.toml` until the 2.x migration.
+- **Address checksum (A1).** Addresses are `webc1` + Base58 with no checksum,
+  so a mistyped character usually yields another valid address. A checksummed
+  text format must be chosen before genesis.
 - **External assurance.** The Phase 5.5 independent security review, redb
   crash-atomicity fault injection, and long external fuzz campaigns are still
   owed. Lower-severity residuals (E3, S8, X5) are in `findings.md`.

@@ -1,6 +1,7 @@
 # WEBC code review findings log
 
-Last updated: 2026-07-16 (plan-review session).
+Last updated: 2026-09-26 (status updates: C9, F3, A1, D2, E7; original review
+2026-07-16).
 
 **Status of these findings:** produced by a read-only review (focused sub-agents +
 direct sampling) during a docs-only session. They are **reported, not yet
@@ -218,6 +219,30 @@ not deeply audited.
   ignored; hostile `on_event` errors are swallowed, not panicked. Nil sentinel
   (all-zero hash) is not practically forgeable, though an explicit
   `block_hash != NIL` guard would be good defense-in-depth.
+- **C9 — LOW — OPEN (hardening; reported 2026-07-14 by an unmerged review,
+  re-checked 2026-09-26 by code reading) — vote verification is not
+  type-enforced.** `record_vote` and `tally` (`round.rs`) accept plain
+  `SignedVote` values. Every current entry path verifies the signature and set
+  membership first: network votes (`round.rs:813-815`), write-ahead-log replay
+  (`round.rs:653-654`), proof-of-lock votes (`consensus.rs`
+  `verify_proof_of_lock`, duplicate validators rejected), and finality
+  certificates (`FinalityCertificate::verify`, duplicates rejected). No
+  exploitable path was found. **Fix direction:** a `VerifiedVote` type that only
+  `ValidatorSet::verify_vote` can produce, so a future unverified path fails to
+  compile.
+
+## webc-crypto — address encoding
+
+- **A1 — MEDIUM — OPEN (reported 2026-07-14 by an unmerged review, confirmed
+  2026-09-26 by code reading; not yet reproduced) — addresses carry no
+  checksum.** An address is `webc1` + Base58 of the 32-byte commitment
+  (`crates/webc-crypto/src/address.rs:49-75`, `sdk/webc-js/src/address.ts`).
+  Decoding checks only the prefix, the Base58 alphabet, the 32-byte length, and
+  (TypeScript) canonical re-encoding, so a single mistyped character almost
+  always decodes to a different valid address, and funds sent there are
+  unrecoverable. **Fix direction:** an error-detecting checksum (for example
+  bech32m under the `webc` prefix) with cross-language vectors, before genesis;
+  the text format is permanent once addresses are in use.
 
 ## webc-net — transport / handshake / wire
 
@@ -517,9 +542,18 @@ token's trust model and fee-cost-bounded — noted, no change.
   integer/rational math and a telescoping cumulative-integer per-period budget that
   distributes exactly the annual units with no drift (`inflation.rs:48-104`); the
   `Amount` type is fully checked (`checked_mul_bps`/`checked_mul_ratio` split
-  whole/remainder to avoid intermediate overflow and compute exact floors), with no
+  whole/remainder to avoid intermediate overflow), with no
   unchecked `as` narrowing anywhere; reward accrual is `checked_add`-only with the
-  claim path zeroing on payout (no double-credit).
+  claim path zeroing on payout (no double-credit). **Correction (2026-09-26):**
+  the `checked_mul_ratio` split was not exact in every case — see F3.
+- **F3 — MEDIUM — RESOLVED (commit `aaf87b8`) — spurious overflow in
+  `checked_mul_ratio`.** The whole/remainder split returned `None` whenever
+  `remainder * numerator` exceeded `u128`, even when the exact floor fits (for
+  example `2^64 * 2^64 / (2^64 + 1)`), so reward splits and DEX pro-rata fills
+  could fail with `ArithmeticOverflow`. **Fix:** an exact floor over a 256-bit
+  intermediate; results are unchanged wherever the old code succeeded. Tests
+  written first: both reproducers, identities, and a 50,000-input sweep against
+  an independent 256-bit oracle.
 - Not traced by this pass: `effective_fee_per_unit`, `required_units`,
   `debit_native`, `total_stake()`/`is_active()` bodies, the reward claim/withdraw
   path beyond grep confirmation, and `Amount`'s `Deserialize`.
@@ -583,7 +617,9 @@ token's trust model and fee-cost-bounded — noted, no change.
   **Fix:** a `pnpm audit --audit-level=high --prod` CI job scans the shipped SDK
   dependencies (`@noble/*`, `@scure/*`, `micro-key-producer`); production deps
   are clean today. Scoped to production so dev-only tooling advisories
-  (vitest/esbuild dev server) do not block the merge gate.
+  (vitest/esbuild dev server) do not block the merge gate. **Update:** CI now
+  runs `pnpm audit --audit-level=moderate` over all dependencies, development
+  tooling included (`ecfeebe`), plus `pnpm licenses:check` (`0e04306`).
 - **D3 — LOW — RESOLVED (commit `607035d`) — duplicate major versions in the
   lock** (getrandom 0.2/0.3, rand_core 0.6/0.9, thiserror 1/2, tokio-tungstenite
   0.24/0.29). **Fix:** the one duplicate we directly controlled — a webc-node
@@ -708,12 +744,13 @@ These were surfaced but not fully audited; several are latent-but-serious.
   separate certificate signing key). **Fix:** the one gap — `verify_signature` used
   ed25519-dalek's malleable `verify` — is now `verify_strict`, rejecting
   non-canonical signatures and small-order keys.
-- **E7 — P2 — DEFERRED (phase-gated; no VM) — reentrancy/metering once a VM
-  exists.** No contract VM exists today, so there is nothing to reproduce or fix.
-  This is the standing review checklist (cross-object reentrancy, deterministic gas
-  metering, no float/clock/iteration-order nondeterminism inside contracts, escrow
-  release reachability) that MUST run the moment the contract runtime lands
-  (Phase 7 gate; ADR-0006). Building it now would violate the phase gate.
+- **E7 — P2 — OPEN (the VM has landed; the checklist has not been run) —
+  contract reentrancy/metering.** The WASM runtime (`webc-vm`, `2742201`,
+  `4ca3483`) is in the tree, but this checklist has not been recorded as run
+  against it. This is the standing review checklist (cross-object reentrancy,
+  deterministic gas metering, no float/clock/iteration-order nondeterminism
+  inside contracts, escrow release reachability) that MUST run now that the
+  contract runtime has landed (Phase 7 gate; ADR-0006).
 - **E8 — P2 — RESOLVED (commit `7e6412d`) — dual state encoders.** `state_root`
   uses canonical JSON while restart round-trips maps via bincode. Verified by
   inspection that every `ChainState` field is committed by the state root (map
@@ -749,6 +786,7 @@ Still NOT audited / owed:
   and C7 were each reproduced with a failing test first, then fixed and kept
   (per `AGENTS.md` pitfall 7); and continuous fuzz harnesses now exist for the
   wire decoder, canonical encoder, transaction decode/verify, and mempool
-  admission (`fuzz/`, run in CI's `fuzz-smoke` job). Remaining consensus finding:
-  C5 (proof-of-lock re-proposals). The other under-covered areas (E1–E8, redb
+  admission (`fuzz/`, run in CI's `fuzz-smoke` job). C5 (proof-of-lock
+  re-proposals) was later resolved in `3b2b460`; C9 is a hardening item. The
+  other under-covered areas (E1–E8, redb
   fault injection, crypto primitives) are still owed.

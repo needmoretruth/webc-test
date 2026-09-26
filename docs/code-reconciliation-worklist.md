@@ -28,6 +28,8 @@ The Phase 4 consensus-safety findings (C1–C8) are tracked in
    the tree), but the helper + convention must exist **before** Phase 8 pool
    math is written, or overflow bugs get designed in. Land the shared
    `webc-chain` widening-math utility with property tests by Phase 7a.
+   **Done (2026-09-26, `aaf87b8`):** `Amount::checked_mul_ratio` computes the
+   exact floor over a 256-bit intermediate, with oracle and sweep tests.
 3. **Committee sampling + aggregated votes are unbuilt while the validator
    set is uncapped** (§8, §15.19, §15.28). Code: the finality certificate
    requires >2/3 of the *whole* validator-set snapshot and carries
@@ -107,8 +109,7 @@ The Phase 4 consensus-safety findings (C1–C8) are tracked in
 ## Explicit non-items
 
 - **u128 amounts** — already implemented (`webc-chain/src/amount.rs`,
-  `protocol.rs`); only the encoding/widening halves of §15.14 remain (items
-  1–2).
+  `protocol.rs`); the widening half of §15.14 landed in `aaf87b8` (item 2).
 - **50/50 fee split, inflation curve, staking rules (100/20/80/1),
   ADR-0008 exit lifecycle, declared access enforcement, hybrid
   account/object state, session keys, PQ recovery root** — code matches the

@@ -13,9 +13,9 @@ its deciding section. Labels follow the honesty rule (§11): **confirmed**
 - Amount representation: **u128** for storage and compute; **256-bit
   intermediates** for multiply/divide paths (widening arithmetic);
   **variable-length integer encoding** at rest and on the wire so small values
-  stay small (§15.14). The u128 storage type is implemented; widening
-  intermediates and varint encoding are not-yet-built (see
-  `code-reconciliation-worklist.md`).
+  stay small (§15.14). The u128 storage type and the 256-bit multiply/divide
+  intermediate (`Amount::checked_mul_ratio`) are implemented; see
+  `code-reconciliation-worklist.md` for the encoding status.
 
 All protocol arithmetic uses checked integers. Floating-point numbers never
 decide balances, fees, rewards, supply, or stake (§7).
