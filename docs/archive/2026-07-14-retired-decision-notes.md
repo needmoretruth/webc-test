@@ -2,8 +2,8 @@
 
 Status: **archive — not current policy.** These sections were recorded with the
 owner on 2026-07-14 on a review branch that was never merged. The branch was
-retired on 2026-09-26: its code fixes that still applied were ported (`aaf87b8`,
-`ad7946f`), and its two open review findings are tracked as A1 and C9 in
+retired on 2026-09-26: its code fixes that still applied were ported (`441bc22`,
+`e65056a`), and its two open review findings are tracked as A1 and C9 in
 `docs/review/findings.md`. The decision text below is kept verbatim so nothing
 is lost. `WEBC-DEFINITION.md` (then `docs/decision-record.md`) wins wherever it
 differs.

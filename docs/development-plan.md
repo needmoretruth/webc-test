@@ -623,13 +623,13 @@ The remaining Phase 4 work (P0 items first, from the 2026-07-16 plan review —
    rounds;
 4. **(P0, C4) persist a durable WAL of own votes/locks before broadcasting**
    — a crash-restart must not self-equivocate. **Urgent: the
-   equivocation→slash loop is already live (commit `a6197ac`), so an honest
+   equivocation→slash loop is already live (commit `0e4b4c5`), so an honest
    restart today can actually be slashed. This must land before any network
    run with honest restarts;**
 5. publish a reference-machine finality-timing number (cannot be produced in
    a cloud container);
-6. **DONE (commit `a6197ac`)** — equivocation-to-slash wired end to end;
-7. **Largely DONE (commit `75d054b`)** — machine-level Byzantine safety test;
+6. **DONE (commit `0e4b4c5`)** — equivocation-to-slash wired end to end;
+7. **Largely DONE (commit `a2e774e`)** — machine-level Byzantine safety test;
    a multi-node-over-TCP version is optional follow-up;
 8. carry a proof-of-lock certificate with re-proposals and scale timeouts by
    round (C5/C6), gate state-sync replies on a verified higher-height

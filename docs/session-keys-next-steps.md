@@ -7,7 +7,7 @@ file is.
 
 ## Where things stand
 
-- **Done and committed** (`ecdd8fc`): plan steps 1–5 of
+- **Done and committed** (`cfc662d`): plan steps 1–5 of
   `session-keys-implementation-plan.md` §13 — the full on-chain single-node state
   machine for constrained session keys, plus Rust tests and an adversarial review
   with two medium findings fixed (unbounded fee drain → cumulative

@@ -456,12 +456,12 @@ coordinated receipt-schema change to modify.
 ## Goal progress checkpoint
 
 Implementation checkpoint on 2026-07-18: the isolated branch contains code
-through `ee25016`; the paused-goal record below is a later docs-only handoff.
-ADR-0016 and `4d54170` freeze the shared interfaces. `d25eb57` adds the
+through `8f57132`; the paused-goal record below is a later docs-only handoff.
+ADR-0016 and `e266bb3` freeze the shared interfaces. `16bd1c0` adds the
 versioned `FeeSummaryV1` accounting boundary without changing V4 execution.
-`ee09e61` routes every schema-1 `ChainStore` record through a bounded,
-trailing-rejecting codec while preserving its legacy bytes. `b405e6b` adds the
-pure `webc-proof` crate and bounded `IndexedMerkleProofV1`; `528ef4d` integrates
+`aa91117` routes every schema-1 `ChainStore` record through a bounded,
+trailing-rejecting codec while preserving its legacy bytes. `936ace3` adds the
+pure `webc-proof` crate and bounded `IndexedMerkleProofV1`; `bcd86f4` integrates
 the Rust/browser V5 multi-action, cancellation, transaction-ID, exact-decimal,
 and scoped-sponsor wire foundation without activating protocol version 2.
 
@@ -489,18 +489,18 @@ integration.
 The owner asked to stop implementation and leave a durable continuation point.
 Before this handoff edit, `codex/transaction-system` was clean and local `HEAD`,
 the local tracking ref, and `refs/heads/codex/transaction-system` on `origin`
-were all verified equal at `ee2501603ec2736eb193854e1be6d6d8f8da345c`. The
+were all verified equal at `8f57132068de1143f27ba046052e447e5d71935b`. The
 goal is **not complete** and must not be merged to `main` from this checkpoint.
 
 What is durable on the goal branch:
 
-- `4d54170`: ADR-0016 shared lifecycle/proof interface freeze;
-- `d25eb57`: checked `FeeSummaryV1` base/priority/reserve/refund accounting;
-- `ee09e61`: bounded schema-1 storage codec integration;
-- `b405e6b`: pure indexed transparent Merkle proof integration;
-- `528ef4d`: V5 Rust/browser wire, action/cancel, ID, exact-decimal, and
+- `e266bb3`: ADR-0016 shared lifecycle/proof interface freeze;
+- `16bd1c0`: checked `FeeSummaryV1` base/priority/reserve/refund accounting;
+- `aa91117`: bounded schema-1 storage codec integration;
+- `936ace3`: pure indexed transparent Merkle proof integration;
+- `bcd86f4`: V5 Rust/browser wire, action/cancel, ID, exact-decimal, and
   sponsor foundation integration;
-- `ee25016`: tested-foundation checkpoint and honest remaining-scope record.
+- `8f57132`: tested-foundation checkpoint and honest remaining-scope record.
 
 The last integrated focused gate, run from the goal worktree, passed:
 
@@ -537,10 +537,10 @@ Important boundaries a continuation must not mistake for completion:
 Exact continuation sequence:
 
 1. Start from the current clean `origin/codex/transaction-system` (its last code
-   checkpoint is `ee25016` followed by this docs-only handoff), then re-run
+   checkpoint is `8f57132` followed by this docs-only handoff), then re-run
    `git status`, `git log`, and the required-document protocol. Do not continue
-   directly on the three old agent branches: their tips (`bc1e75f`, `a5cd93b`,
-   `e3e417d`) are already merged. Fast-forward an old worktree to the goal branch
+   directly on the three old agent branches: their tips (`b2ed3f6`, `c4fac05`,
+   `75aee7d`) are already merged. Fast-forward an old worktree to the goal branch
    and create a new `codex/tx-*` branch, or create a fresh verified
    worktree/branch from `origin/codex/transaction-system`.
 2. Add one immutable V5 vector to the inline Rust transaction tests and a new
@@ -625,7 +625,7 @@ only on success. Tests cover cancellation, default and non-default fee lanes,
 sponsored failure, session principal-versus-fee budgets, unused failure suffixes,
 and a failed transaction followed by an unrelated success.
 
-Commit `8b29cea` extends the reusable native action boundary beyond transfers:
+Commit `0d0becd` extends the reusable native action boundary beyond transfers:
 V4 and V5 now share the exact object create, mutate, and ownership-transfer
 transitions. Ordered object actions commit typed events on success, while an
 object version failure produces the stable chargeable receipt code and discards
@@ -633,7 +633,7 @@ all child object state and events. The focused gate passed all 16 execution V1
 tests, strict all-target `webc-chain` clippy, formatting, and all 209
 `webc-chain` tests.
 
-Commits `2d60cc3`, `436baae`, `1f2e6a0`, and `84ef04e` extend that checkpoint.
+Commits `9da4384`, `968b614`, `f67e1c2`, and `a957e55` extend that checkpoint.
 V5 now shares V4 transitions for fee-lane open/fund, validator/delegator reward
 claims, matured unbonding claims, and first authorization-policy installation.
 Statically invalid lane selection, zero deposits, oversized object data, and an
@@ -663,7 +663,7 @@ gate passes, move to storage schema 2 and its resumable migration.
 
 ### Adversarial sponsorship checkpoint (2026-07-22)
 
-Commit `2ba13f4` closes the signed pre-use revocation lifecycle without
+Commit `8ab191d` closes the signed pre-use revocation lifecycle without
 activating protocol 2. A signed grant can be revoked before its first fee use;
 the durable record authenticates its inclusive expiry; the state commitment
 binds the complete grant book; and a derived, canonically ordered expiry index
@@ -679,7 +679,7 @@ default live set at approximately 163,840 records.
 The same commit preflights every sparse grant-book write before any base state
 mutation, replaces expired identities without prepare/execute divergence, and
 keeps Rust and TypeScript sender-first validation, signer ordering, identity
-conflict detection, and unit accounting aligned. Commit `8b92a75` freezes the
+conflict detection, and unit accounting aligned. Commit `dfe20d1` freezes the
 adversarial boundaries: exact duplicate revocations remain valid and are
 verified once, cross-source fee/action identity conflicts fail closed, failed
 child actions discard revocations while the outer fee grant still advances,
@@ -707,7 +707,7 @@ request IDs against a large unrelated queue.
 
 ### Request-scoped unbonding checkpoint (2026-07-22)
 
-Commit `6865eb2` completes that exact item. V5 execution no longer copies the
+Commit `1b45004` completes that exact item. V5 execution no longer copies the
 global `UnbondingQueue` into its sparse parent and child states. It captures only
 the fixed-size owner, validator, kind, request ID, withdrawable, and claimed
 fields for the at-most-32 signed action IDs. Ordered duplicate claims share one
@@ -738,7 +738,7 @@ state preconditions that can change after admission as chargeable failures.
 
 ### Latest-main integration checkpoint (2026-07-22)
 
-The transaction branch now integrates `origin/main` at `ef1fb9d8913d`, including
+The transaction branch now integrates `origin/main` at `89c3375822dd`, including
 the V20 state commitment, the complete current native operation set, localized
 fees, storage deposits, native token/NFT/governance/DEX/oracle/agent systems,
 the WASM runtime, Weft, and the latest bounded/compressed storage stack. Conflict
@@ -1037,7 +1037,7 @@ before accepting its finality certificate in the atomic storage batch.
 
 ### Atomic finalized-lifecycle checkpoint (2026-07-27)
 
-Commit `db55f65` completes the protocol-2 storage finalization unit. One backend
+Commit `cbd6aa9` completes the protocol-2 storage finalization unit. One backend
 transaction now persists the validated V4 block and hash index, latest schema-2
 state, immutable current/next authority sets, mandatory exact-block finality
 certificate, consensus-WAL deletion, pending-slot/transaction deletions,
@@ -1064,7 +1064,7 @@ replacement/expiry/eviction policy, and keep the protocol-1 runtime behavior
 unchanged. Then expose the resulting lifecycle through the bounded V2 HTTP and
 WebSocket APIs before starting finalized checkpoint/proof/browser verification.
 
-The first half of that item is durable in commit `ec8e84f`.
+The first half of that item is durable in commit `2310c5a`.
 `webc-node::V5Mempool` is a separate protocol-2 policy boundary, leaving the
 frozen V4 pool unchanged. Pure admission plans enforce the 64 MiB canonical-byte
 budget, 8,192 global count, 64 per sender/lane, future nonce/start bounds, and
@@ -1086,7 +1086,7 @@ prove queue backpressure plus database-failure rollback.
 
 ### Protocol-2 single-owner runtime checkpoint (2026-07-27)
 
-Commits `8053d80` and `4acaaf8` complete that runtime half. A protocol-2
+Commits `f9d21e8` and `55f187f` complete that runtime half. A protocol-2
 `NodeRuntime` now exclusively owns `Node` plus `V5Mempool` behind a bounded
 Tokio mailbox and cloneable `NodeHandle`. Submission plans against one committed
 state view, writes queued/replaced/capacity-evicted lifecycle and pending records
@@ -1122,7 +1122,7 @@ starting finalized checkpoint/proof/browser verification.
 
 ### V2 transport, gossip, and certified V4 runtime checkpoint (2026-07-27)
 
-Commits `5cf0e35`, `a2ea41e`, and `3c058f4` expose the single actor-owned V5
+Commits `f84f91d`, `1555cf2`, and `d1f9819` expose the single actor-owned V5
 lifecycle without creating a second node or mempool. The bounded V2 surface now
 supports durable submission, lifecycle and finalized-receipt queries, and an
 explicit-ID WebSocket stream with actor-consistent snapshots, monotonic durable
@@ -1133,7 +1133,7 @@ admission is gossiped as a versioned authenticated network message; a real
 two-node HTTP-to-TCP-to-remote-runtime test passes. Legacy consumers ignore V5
 without reinterpreting it.
 
-Commits `09aaee5`, `97afba3`, and `8714660` close the next execution/finality
+Commits `264619e`, `ceb531f`, and `f524117` close the next execution/finality
 unit. One protocol-2 block transition now validates metadata and authority
 domains, applies objective evidence before user work, prunes expired grant state,
 executes ordered V5 transactions into position-bound V1 receipts, treats a
@@ -1179,8 +1179,8 @@ proposal bytes.
 
 ### Protocol-2 consensus and public-runtime checkpoint (2026-07-27)
 
-Commits `454fe06`, `88fd46d`, `7f881cc`, `9aae82f`, `89609a2`, `afbcb66`,
-and `3f34ef2` close the distinct protocol-2 consensus path without changing the
+Commits `a3445e9`, `325cdba`, `8c02152`, `0b5ea64`, `b446543`, `e08422d`,
+and `a10695a` close the distinct protocol-2 consensus path without changing the
 legacy wire format. Authenticated V4 proposals bind the chain, epoch, round,
 scheduled proposer, current authority commitment, complete block, and derived
 next authority set. Hostile outer and binary collection lengths are bounded
@@ -1192,23 +1192,23 @@ broadcast; restart restores the lock and refuses to sign a conflicting value.
 
 `NodeRuntime` remains the only state/mempool owner. Its actor commands build a
 candidate, replay proposal validity against committed state, and atomically
-finalize a certified V4 block. Commit `bd2dcf8` adds the asynchronous driver over
+finalize a certified V4 block. Commit `b714092` adds the asynchronous driver over
 only `NodeHandle` plus authenticated gossip: it verifies peer identity and
 signatures before replay accounting, deduplicates bounded rounds, synchronizes
 certified missing blocks, and retries transient finalization failures. A real
 three-validator TCP test submits V5 over HTTP, propagates it through V5 gossip,
 runs V4 proposal/vote consensus, and observes the finalized V1 receipt.
 
-Commit `3be828f` red-teams recovery rather than only the happy path. A real redb
+Commit `a8c14fd` red-teams recovery rather than only the happy path. A real redb
 restart in the middle of a height proves that the validator never emits a
 conflicting signed message. Injected transient finalization I/O is retried and
 survives; persistent I/O exits with a typed error after the bounded retry budget.
-Commit `30d14a2` makes network rate limiting charge expanded work in 16 KiB
+Commit `552d1fb` makes network rate limiting charge expanded work in 16 KiB
 units using the greater encoded or declared-decoded frame size before hashing,
 decompression, decoding, or reflooding. Locally compressed zstd frames declare
 their content size, and an attacker hiding it is charged the full 8 MiB budget.
 
-Commit `cb54931` exposes this stack through `webc-node run
+Commit `c933ba3` exposes this stack through `webc-node run
 --protocol2-genesis <path>` while leaving the no-flag legacy command unchanged.
 The public process loads and validates the bounded protocol-2 genesis, starts one
 redb actor, authenticated network, V4 driver, V2 transaction API, lifecycle
@@ -1222,7 +1222,7 @@ an explicit operator responsibility.
 The public assembly test starts the actual database, actor, P2P network, driver,
 and HTTP server. Node library/CLI/integration suites, strict Clippy, Rustdoc, V1
 network convergence/resilience, and the focused restart and retry suites pass.
-Commit `d31423f` additionally upgrades the deterministic interpreter to stable
+Commit `bf63045` additionally upgrades the deterministic interpreter to stable
 `wasmi` 0.46 (MIT OR Apache-2.0), removes the unmaintained transitive `paste`
 crate (`RUSTSEC-2024-0436`), and keeps a protocol-owned invocation fuel floor so
 engine optimization cannot silently make tiny-budget calls free. All VM tests,
@@ -1237,18 +1237,18 @@ authority checkpoint, so a browser must still trust the queried node. Localized
 multi-namespace receipt pricing remains a separately versioned follow-up, and
 Windows validator-key ACLs require deployment enforcement.
 
-The finalized-proof path is now implemented through commit `0acc5c9`.
+The finalized-proof path is now implemented through commit `e9d1276`.
 `webc-proof` reuses the indexed Merkle implementation for bounded V1 authority
-checkpoints and transitions (`725922c`) and complete transaction/receipt proofs
-(`2e32845`). The node assembles and self-verifies those proofs only from durable
-blocks, certificates, receipt indexes, and authority snapshots (`2474dd7`), then
-serves them through a concurrency- and size-bounded V2 route (`b2f733e`). A
+checkpoints and transitions (`17ae17b`) and complete transaction/receipt proofs
+(`c3d0641`). The node assembles and self-verifies those proofs only from durable
+blocks, certificates, receipt indexes, and authority snapshots (`5ab5a89`), then
+serves them through a concurrency- and size-bounded V2 route (`0170e0c`). A
 checkpoint remains explicitly untrusted until configured source identities
 reach exact quorum agreement or an operator deliberately selects visibly
-labelled explicit trust (`3f2860a`). The browser SDK mirrors every signature,
+labelled explicit trust (`80fed67`). The browser SDK mirrors every signature,
 quorum, transition, indexed Merkle, V5 identity, validity, and receipt/fee rule;
 Rust generates the exact shared JSON fixture consumed by TypeScript, and the SDK
-fetches the V2 envelope without silently trusting its checkpoint (`0acc5c9`).
+fetches the V2 envelope without silently trusting its checkpoint (`e9d1276`).
 
 The focused gates passed 25 Rust proof tests, strict all-target proof Clippy,
 Rustdoc, both SDK package builds, 273 browser SDK tests, 3 widget tests, package
@@ -1269,8 +1269,8 @@ when the branch is ready for integration.
 
 ### Proof/resource red-team and capacity checkpoint (2026-07-27)
 
-Commits `b2ceecf`, `ea44ba3`, `13656f7`, `ab7ce9c`, `cef9503`, `6406860`,
-and `9cd006b` close the proof/resource work named above. A durable three-block
+Commits `5255072`, `3102f5d`, `639fcb4`, `837ea50`, `6b0159f`, `1307d96`,
+and `33c4f6e` close the proof/resource work named above. A durable three-block
 fixture now proves checkpoint-below-target assembly across a real epoch
 transition. The finalized-proof benchmark constructs the largest practical V4
 block accepted on this host (1,750 transactions, 4,042,951 canonical bytes),
@@ -1385,18 +1385,18 @@ full local gate was green but did **not** yet prove the transaction system
 merge-ready. The following coherent remediations are already committed and
 pushed:
 
-- `00e0f71` bounds adversarial browser response fragmentation and performs one
+- `c3ef7ee` bounds adversarial browser response fragmentation and performs one
   fatal UTF-8 decode after geometric coalescing;
-- `952a65a` adds a table-driven free-rejection/state-preservation matrix and a
+- `d62c9d3` adds a table-driven free-rejection/state-preservation matrix and a
   protocol-2 mempool libFuzzer target;
-- `0e04306`, `11e765d`, and merge `3e1093a` make CI fail closed for an empty or
+- `f2aed7e`, `2e3aa11`, and merge `ab365b6` make CI fail closed for an empty or
   failed fuzz-target list, restore the node demo gate, pin Actions/toolchains/
   cargo-fuzz, require lockfiles/timeouts/non-persisted checkout credentials,
   preserve checked conversions, and enforce Rust and JavaScript license policy;
-- `ca17640` reproduces and fixes the V2 WebSocket request-order bug where a
+- `bad5d80` reproduces and fixes the V2 WebSocket request-order bug where a
   newer initial snapshot advanced the shared cursor past an older unseen one.
 
-Commit `7927450` closes the sponsor-capacity memory-evidence gap. The ignored
+Commit `32325dc` closes the sponsor-capacity memory-evidence gap. The ignored
 release benchmark now uses pinned, test-only `sysinfo 0.39.6` (MIT) to poll its
 own resident set at one-millisecond intervals and prints the starting RSS, peak
 RSS, and peak growth alongside the existing timings and deterministic root.
@@ -1422,18 +1422,18 @@ Remaining merge blockers, in execution order:
 1. integrate every current non-legacy-staking native `Operation` through the V5
    shared action executor, retaining the dedicated post-quantum staking-control
    path and free rejection of the four legacy direct-staking operations —
-   **done:** merged in `b91f909` (lane head `cd9cdb3`);
+   **done:** merged in `2f57f36` (lane head `37912a3`);
 2. bound/prune consensus evidence on both local finality and state sync; bound
    proof-material retention before cloning; harden malformed key JSON
    zeroization; remove redundant whole-state clones without changing V4/V5
-   roots or receipts — **done:** merged in `de9b996`;
+   roots or receipts — **done:** merged in `cbf46fa`;
 3. complete strict browser SDK V2 submit/lifecycle/receipt/WebSocket APIs and
-   hostile-input bounds — **done:** merged in `69f750e` and `37f366d`;
+   hostile-input bounds — **done:** merged in `60e090c` and `27b145f`;
 4. expose included/finalized success versus typed chargeable failure, wire
    candidate inclusion as a real production lifecycle observation, periodically
    expire local pending entries, and re-gossip valid recovered pending bytes
-   only after restart validation — **done:** merged in `0f4d4a6` (lane head
-   `969e302`) plus `751fbce`; its restart/expiry acceptance proof is part of
+   only after restart validation — **done:** merged in `083d780` (lane head
+   `2435e2f`) plus `a56ccb7`; its restart/expiry acceptance proof is part of
    blocker 5;
 5. add the required three-validator public HTTP-to-gossip-to-consensus-to-
    finalized-query acceptance coverage across restart, duplicate submission,
@@ -1462,19 +1462,19 @@ By owner decision this branch was merged into `main` before blockers 5–7 were
 finished; the remaining work continues on `main`, and every other branch was
 retired.
 
-- `b91f909` merges the native-completion lane (`cd9cdb3`, blocker 1).
-- `0f4d4a6` merges the lifecycle-outcomes lane (`969e302`, blocker 4).
-- `82b5bc5` refreshes `fuzz/Cargo.lock` (webc-crypto's `zeroize`), which the
+- `2f57f36` merges the native-completion lane (`37912a3`, blocker 1).
+- `083d780` merges the lifecycle-outcomes lane (`2435e2f`, blocker 4).
+- `553634c` refreshes `fuzz/Cargo.lock` (webc-crypto's `zeroize`), which the
   fuzz-smoke `cargo metadata --locked` step rejected.
-- `1a880e0` replaces `fetch_update`, deprecated on the pinned fuzz nightly and
+- `70e50aa` replaces `fetch_update`, deprecated on the pinned fuzz nightly and
   fatal under `warnings = "deny"`, with the identical `try_update`.
-- `0557e68` updates vitest to 4.1.11 and the postcss override to 8.5.28 for new
+- `af0d675` updates vitest to 4.1.11 and the postcss override to 8.5.28 for new
   development-dependency advisories reported by `pnpm audit`.
-- `aaf87b8` makes `Amount::checked_mul_ratio` an exact floor over a 256-bit
+- `441bc22` makes `Amount::checked_mul_ratio` an exact floor over a 256-bit
   intermediate; the old whole/remainder split returned a spurious overflow
   whenever `remainder * numerator` exceeded `u128` (reward splits, DEX pro-rata
   fills).
-- `d4471e0` and `ad7946f` refresh the `docs/security.md` review status and
+- `80672fb` and `e65056a` refresh the `docs/security.md` review status and
   declare Apache-2.0 as the only license.
 
 Local gates on the integrated tree before the push: format, both clippy
@@ -1485,7 +1485,7 @@ fuzz smoke over every target (30 s each), `pnpm check`,
 ### Step 3 implementation brief (2026-07-18 pre-implementation handoff; completed 2026-07-19)
 
 Step 3 was scoped and researched but not started (working tree clean at
-`d48f930`). This brief captures the ADR-0016 spec and the exact current-code
+`ec088f1`). This brief captures the ADR-0016 spec and the exact current-code
 reuse map so the next session implements it directly without re-exploring. Do not
 duplicate any listed foundation; extend/reuse it.
 
@@ -1555,7 +1555,7 @@ Functions:
 
 Serialization: heights/amounts/gas/rates/nonces -> canonical decimal strings;
 bounded indexes/versions -> JSON numbers. Harvest frozen vectors with a temporary
-Rust dump test (same technique as the Step 2 commit `d48f930`), then bake them in:
+Rust dump test (same technique as the Step 2 commit `ec088f1`), then bake them in:
 a Succeeded receipt and a Failed receipt (canonical JSON + digest + leaf), the
 `transaction_leaf_v1` for the sender-paid fixture (`transaction_id`
 `c268d7d3...b143f50f`) at a fixed position, and a two-leaf `receipt_root_v1` +

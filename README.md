@@ -100,7 +100,7 @@ The code remains a prototype with important incomplete boundaries, including:
   HIGH-severity safety/liveness/DoS gaps (see `docs/review/findings.md`); it
   is not complete or safe;
 - consensus-detected equivocation IS wired to an applied slash (commit
-  a6197ac), but the no-vote-WAL gap (finding C4) means an honest validator
+  0e4b4c5), but the no-vote-WAL gap (finding C4) means an honest validator
   restart can self-equivocate and be slashed — fix that before running on a
   network;
 - the fast path, DEX/batch settlement, oracle, agent mandates, storage

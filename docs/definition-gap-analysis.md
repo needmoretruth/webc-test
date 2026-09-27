@@ -199,7 +199,7 @@ integer". The definition finalizes (§15.14, §15.19): u128 storage/compute +
 rest and on the wire**. Code already stores `Amount(u128)` (confirmed); the
 widening-intermediate and varint-encoding parts are not yet built — carried in
 the code worklist, and the docs must state the full decided shape. (Update
-2026-09-26: the 256-bit intermediate landed in `aaf87b8`.)
+2026-09-26: the 256-bit intermediate landed in `441bc22`.)
 
 ### A12. Governance and launch process: minimal process sketched — LOW
 

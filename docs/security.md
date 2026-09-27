@@ -130,20 +130,20 @@ Resolved in the current code (tests and fix commits per finding are in
 `docs/review/2026-07-16-plan-review.md` §6):
 
 - **Consensus C1–C4.** A proposal is fully re-executed before it can be
-  prevoted (C1, `45f7396`). A failed finalized-block import stops the driver
+  prevoted (C1, `4b6ebcb`). A failed finalized-block import stops the driver
   with a typed reason instead of halting silently; only transient storage
-  errors are retried, a bounded number of times (C2, `5ca197d`). Per-height
-  consensus storage is limited to a sliding round window (C3, `bc3869b`). A
+  errors are retried, a bounded number of times (C2, `253607a`). Per-height
+  consensus storage is limited to a sliding round window (C3, `4ae4f53`). A
   validator durably journals its own proposals, votes, and lock before
-  broadcasting and replays them on restart (C4, `90c28ac`). Both consensus
+  broadcasting and replays them on restart (C4, `09f9348`). Both consensus
   drivers (legacy and protocol-2) implement these protections, so a
   crash-restart with intact storage no longer makes an honest validator
-  self-equivocate into the live slash path (`a6197ac`). The open note from the
-  follow-up trace of that evidence path (`23387f5`) is listed under H5 below.
-- **Network and node.** N1 handshake timeout (`52b87a4`), N2 inbound-connection
-  and per-IP caps (`478ebed`), N3 peer-table cap (`5b0955f`), H1 global faucet
-  rate limit and H3 WebSocket subscription cap (`ec327c7`).
-- **Supply chain D1–D2** (`91760e2`, extended in `ecfeebe` and `0e04306`). CI
+  self-equivocate into the live slash path (`0e4b4c5`). The open note from the
+  follow-up trace of that evidence path (`1294608`) is listed under H5 below.
+- **Network and node.** N1 handshake timeout (`d032104`), N2 inbound-connection
+  and per-IP caps (`2c2c13a`), N3 peer-table cap (`b47fafc`), H1 global faucet
+  rate limit and H3 WebSocket subscription cap (`98f2f03`).
+- **Supply chain D1–D2** (`b346226`, extended in `d2adab9` and `f2aed7e`). CI
   runs `cargo-deny` (advisories, bans, licenses, sources) on the root and fuzz
   dependency graphs, `pnpm audit --audit-level=moderate` over all JavaScript
   dependencies including development tooling, `pnpm licenses:check`, and a

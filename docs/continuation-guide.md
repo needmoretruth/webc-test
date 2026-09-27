@@ -2,8 +2,8 @@
 
 **2026-09-26 update:** the transaction system (`codex/transaction-system` with
 its native-completion and lifecycle-outcomes lanes) is integrated into `main`
-(merges `b91f909`, `0f4d4a6`), followed by CI fixes, an exact 256-bit
-`checked_mul_ratio` (`aaf87b8`), and a refreshed `docs/security.md` review
+(merges `2f57f36`, `083d780`), followed by CI fixes, an exact 256-bit
+`checked_mul_ratio` (`441bc22`), and a refreshed `docs/security.md` review
 status. Every other branch was retired; all work continues on `main` only. The
 open transaction-system work is merge blockers 5–7 in
 `docs/transaction-system-plan.md` ("Main integration checkpoint").
@@ -11,11 +11,11 @@ open transaction-system work is merge blockers 5–7 in
 Last updated: 2026-07-18 (Phases 5–13 done on `main`; owner direction is
 "practical L1 완성" plus an owner-approved **earliest-skeleton Weft** front end.
 Owner is **pausing here to resume later** — this session wrapped up at a clean,
-all-green, fully-pushed state; `main` HEAD is the memory-cap fix `a162bfe`.
+all-green, fully-pushed state; `main` HEAD is the memory-cap fix `07d127d`.
 **START AT the "SESSION HANDOFF" block in the "Exact next work" section below** —
 it has the live state: the WASM contract runtime is **wired end-to-end**
-(`webc-vm` bridged into `webc-chain`, `4ca3483`) and **adversarially reviewed** (one
-HIGH finding fixed in `a162bfe`); the **Weft skeleton compiler** (`webc-weft`) is
+(`webc-vm` bridged into `webc-chain`, `5cf80ba`) and **adversarially reviewed** (one
+HIGH finding fixed in `07d127d`); the **Weft skeleton compiler** (`webc-weft`) is
 **built and runs on-chain end-to-end** (its own review is an open follow-up). The
 swappable-engine design still applies; the Codex pause decision below was
 superseded on 2026-09-26.) All work, including separately assigned feature
@@ -87,7 +87,7 @@ explain unavoidable technical terms plainly.
   the A-3 multi-round Tendermint `ConsensusMachine` with locking and safe
   round changes, `Node::import_block`, the async `ConsensusDriver` over real
   TCP with a mempool, certificate-verified state sync, and
-  equivocation-to-slash wired end to end (commit `a6197ac`) — all proven by
+  equivocation-to-slash wired end to end (commit `0e4b4c5`) — all proven by
   deterministic/loopback tests (three validators converge; a gossiped
   transfer finalizes everywhere; a late node catches up via sync).
 - Last verified gates (2026-07-15, cloud Linux): `cargo fmt --check`, strict
@@ -101,7 +101,7 @@ explain unavoidable technical terms plainly.
 **Documentation (2026-07-17):** fully realigned to `WEBC-DEFINITION.md`;
 seven system plans added; development plan rebuilt (phases 0–7 numbering
 preserved, 8–19 new); AGENTS.md facts updated. Committed and pushed through
-`3a327c3`.
+`8ff36a8`.
 
 ## Exact next work
 
@@ -127,12 +127,12 @@ audit remain. **Weft language is EXCLUDED** (later separate project). Work on
 endpoints; the full SDK high-level client layer (Agent-commerce / Governance /
 Token / Nft clients); and the **`webc-proof` crate** (transparent indexed Merkle
 proofs — the **Phase 10** foundation), adopted early from
-`codex/transaction-system` (commit `b21a525`).
+`codex/transaction-system` (commit `e8c572b`).
 
 **Codex decision (owner-delegated, 2026-07-18) — superseded 2026-09-26:** the
 branch was paused then and only its `webc-proof` crate was adopted. It was later
 completed through merge blockers 1–4 and integrated into `main` with its
-native-completion and lifecycle-outcomes lanes (`b91f909`, `0f4d4a6`); blockers
+native-completion and lifecycle-outcomes lanes (`2f57f36`, `083d780`); blockers
 5–7 remain (`docs/transaction-system-plan.md`, "Remaining merge blockers").
 
 **DONE — Phase 7b: real WASM contract runtime, wired end-to-end.** Owner-endorsed
@@ -142,13 +142,13 @@ model and contract ABI are engine-independent, so `wasmtime` (JIT) can replace i
 later without touching the chain. Production engine choice stays owner-deferred.
 (Perf note: an interpreter does NOT raise user fees — fees are protocol
 gas-metering, independent of node exec speed.)
-- **`webc-vm` engine — DONE and MERGED (`2742201`).** Deterministic interpreter +
+- **`webc-vm` engine — DONE and MERGED (`ad01bfa`).** Deterministic interpreter +
   host ABI (module `webc`: `webc_input_len/webc_input_read/webc_get/webc_set/
   webc_epoch/webc_output`; guest exports `memory` + `webc_call`), `VmHost` trait
   (`get/set/epoch/charge_gas`), `validate_module` (fail-closed on floats/SIMD/
   threads/bulk-memory/reference-types/foreign-imports/oversized), `VmLimits`, 22
   tests.
-- **Chain wiring — DONE and MERGED (`4ca3483`).** `crates/webc-chain/src/
+- **Chain wiring — DONE and MERGED (`5cf80ba`).** `crates/webc-chain/src/
   wasm_contract.rs`: a thin adapter — `ContractVmHost` maps `VmHost` 1:1 onto
   `ContractContext`+`GasMeter`; `WasmContract` implements the existing `Contract`
   trait via `webc_vm::execute`; `WasmContractManifest` + content-hashed
@@ -166,7 +166,7 @@ gas-metering, independent of node exec speed.)
   invalid-module + code-hash rejection, state-root commitment across restart. **Full
   workspace test suite green** (V19→V20 bump broke nothing).
 - **Reviewed (adversarial, 6 dimensions, skeptic-verified).** One HIGH finding
-  CONFIRMED and **FIXED** (commit `a162bfe`): the linear-memory page cap was
+  CONFIRMED and **FIXED** (commit `07d127d`): the linear-memory page cap was
   enforced only on a module's *declared* memory, so a `(memory 1)` with no maximum
   could `memory.grow` toward 4 GiB within the fuel budget — a per-invocation
   memory-exhaustion DoS + a liveness split between differently-provisioned
@@ -253,31 +253,31 @@ The following Phase 4 hardening work is complete; do not resume it as the next
 task.
 
 1. ~~**C4 — durable WAL of own votes/locks before broadcasting.**~~ **DONE
-   (commit `90c28ac`).** The driver journals every own signed message durably
+   (commit `09f9348`).** The driver journals every own signed message durably
    before broadcast (`Table::ConsensusWal`) and replays the journal on
    restart (`ConsensusMachine::restore`); reproduced first by
    `webc-node/tests/consensus_restart.rs`.
 2. ~~**C1 — validate a proposed block before prevote/lock/finalize.**~~
-   **DONE (commit `45f7396`).** The driver dry-runs `apply_block` (after the
+   **DONE (commit `4b6ebcb`).** The driver dry-runs `apply_block` (after the
    cheap authenticity gate and a chain-position pin) before any proposal
    reaches the machine; reproduced first by
    `webc-node/tests/consensus_byzantine_proposal.rs`.
 3. ~~**C2 — no silent halt on failed finalized-block import.**~~ **DONE
-   (commit `5ca197d`).** `run()` returns a typed `DriverExit`; transient
+   (commit `253607a`).** `run()` returns a typed `DriverExit`; transient
    storage I/O retries with backoff; a certified-but-unimportable block is a
    surfaced consensus emergency; tests in
    `webc-node/tests/consensus_import_failure.rs`.
 4. ~~**C3 — bound per-height consensus memory.**~~ **DONE (commit
-   `bc3869b`).** Sliding round window (`MAX_FUTURE_ROUNDS`/`MAX_PAST_ROUNDS`
+   `4ae4f53`).** Sliding round window (`MAX_FUTURE_ROUNDS`/`MAX_PAST_ROUNDS`
    = 32) at machine ingestion + eviction on round change + the same horizon
    in the driver before block re-execution.
-5. ~~**C6 — round-scaled timeouts.**~~ **DONE (commit `90ae433`).**
+5. ~~**C6 — round-scaled timeouts.**~~ **DONE (commit `bf0e131`).**
    ~~**C7 — directed + certificate-gated state sync.**~~ **DONE (commit
-   `0813e7c`).** ~~**CI gates — `cargo-deny` + fuzz targets.**~~ **DONE (commit
-   `91760e2`:** `deny.toml` + cargo-deny job, `pnpm audit --prod` job, and a
+   `a58d7e1`).** ~~**CI gates — `cargo-deny` + fuzz targets.**~~ **DONE (commit
+   `b346226`:** `deny.toml` + cargo-deny job, `pnpm audit --prod` job, and a
    `fuzz/` crate with four libFuzzer targets run by a `fuzz-smoke` CI job).
 6. ~~**C5 — carry proof-of-lock with re-proposals.**~~ **DONE (commit
-   `3b2b460`).** `SignedProposal` carries a `proof_of_lock` prevote set; a node
+   `140f660`).** `SignedProposal` carries a `proof_of_lock` prevote set; a node
    that missed round `vr` now follows a re-proposal via its attached 2f+1
    prevotes (wire bumped to `NET_PROTOCOL_VERSION = 2`, Rust-only format).
 
@@ -326,7 +326,7 @@ What landed this session (per-finding detail + commit hashes in `findings.md`):
 After the backlog was cleared, an adversarial verification pass (parallel
 subagents, each told to *refute* a fix by reading the code, not just confirm its
 tests) re-checked the highest-risk fixes. It surfaced **one additional real
-defect** in the H2 mempool eviction, now fixed (commit `370f231`): the eviction
+defect** in the H2 mempool eviction, now fixed (commit `25ae72c`): the eviction
 rule ranked purely by effective fee and was *runnability-blind*, so a gapped-nonce
 bid (never sealable — `select_block` skips gaps, so it never pays) could evict an
 honest *runnable* transaction for free — the exact "free churn" the guard claimed
@@ -557,7 +557,7 @@ counterparty policy (Open | Allowlist of recipients/category tags), no
 re-delegation, agent-key-signed spends, full audit trail. New `mandate_escrow`
 supply bucket (grant locks, spend draws, revoke/expire-reclaim returns the
 remainder); state-commitment domain V14→V15; adversarial coverage of every
-rejection path + supply-balanced assertions. Merged 69a4840.
+rejection path + supply-balanced assertions. Merged a8846b3.
 
 **Service registry — DONE (9b).** A bounded, namespace-scoped, fee-priced
 native registry (`service_registry.rs`, §15.5b/§3 of `agent-commerce.md`) where
@@ -566,7 +566,7 @@ discovery — built like the oracle-feed / namespace registries, only the curren
 revision in committed state (monotonic `revision`; history is archival). Closes
 the mandate category-allowlist loop with a service-scoped spend
 (`SpendUnderMandateToService`) that resolves `Category` tags against a service's
-registered categories. Domain V15→V16. Merged 161522d.
+registered categories. Domain V15→V16. Merged ded764c.
 
 **M1 fee-cap fix (post-9b adversarial review) — DONE.** A read-only adversarial
 review of the merged mandate found the per-tx cap bounded only the principal
@@ -575,7 +575,7 @@ escrow, one high-fee spend could drain the whole budget past `per_tx_max` /
 `rate_limit_per_day` (value extraction, supply stayed conserved). Both spend arms
 now reject `amount + total_fee > per_tx_max` and zero-amount spends; reproduced
 first (`fee_bid_cannot_inflate_a_spend_past_per_tx_max`). Validation-only, no
-domain bump. Recorded as finding M1 in `docs/review/findings.md`. Commit 13c7b9e.
+domain bump. Recorded as finding M1 in `docs/review/findings.md`. Commit f469d6c.
 
 **Phase 9 native core is COMPLETE.** The tail (SDK agent toolkit, HTTP-402
 challenge/verify middleware, docs-as-data registry snapshot, flagship
@@ -603,7 +603,7 @@ PERMANENT. TWO invariants both enforced+tested: native WEBC supply stays balance
 (non-refundable creation deposit locked into a new `token_deposits` bucket; mint/
 burn never touch WEBC) and per-token `sum(balances)==issued_supply`. Transfers
 write only the two `(token,addr)` balance keys — no global mint bottleneck. Domain
-V16→V17. Merged 4cc47ca. **Post-merge adversarial review** confirmed supply/
+V16→V17. Merged e83a2ba. **Post-merge adversarial review** confirmed supply/
 authority/native-WEBC/arithmetic/determinism clean and found one latent defect
 (**T1**): `TransferToken` read freeze state without declaring the `TokenFreeze`
 keys, so under the (not-yet-wired) parallel executor a transfer could share a
@@ -621,7 +621,7 @@ optional `max_supply`, recorded-but-unenforced `royalty_bps`. Two invariants bot
 enforced+tested: native WEBC supply balanced (deposit locked into a new
 `nft_deposits` bucket) and `minted_count - burned_count == live items`. Transfers
 write only the one item key; MintNft serializes on the collection record (serial
-is chain-assigned). Domain V17→V18. Merged 200c4fa. **Post-merge adversarial
+is chain-assigned). Domain V17→V18. Merged b6a2c4e. **Post-merge adversarial
 review returned CLEAN** — the subagent had applied the token-T1 lesson
 (declared==actual access verified end-to-end, mint/op races checked via
 `parallel_batches`); only a stale pause doc comment was corrected. Two invariants,
@@ -639,7 +639,7 @@ issued_supply` intact automatically. Integer quorum/approval (`u128 checked_mul`
 no float); timelock + Compound-style execution/expiry window; `TreasuryTransfer`
 pays once, re-checking the live treasury. Two supply buckets (`governance_deposits`,
 `governance_treasury`); domain V18→V19. Delegation DEFERRED (does not compose
-cleanly with lock-to-vote; documented). Merged into main f5a4ad8. **Post-merge
+cleanly with lock-to-vote; documented). Merged into main 19bc0c8. **Post-merge
 adversarial review returned CLEAN** — native-supply conservation, no treasury
 double-spend/overspend/timelock-bypass, per-token invariant, declared==actual
 access (no T1-style bug, verified line-by-line + scheduler serialization), integer
@@ -667,19 +667,19 @@ in exact insertion order (including TransferToken's both-parties `TokenFreeze`
 reads); the six state-derived ops (governance vote/resolve/execute/reclaim/open,
 mandate→service spend) expose `accessListFor*` helpers mirroring the Rust `for_*`
 constructors and `signTransaction` refuses to auto-derive them. Merged into main
-e51e7de. A follow-up (75519c6) added the Rust `dex_operations_have_stable_wire_vectors`
+87f9157. A follow-up (16c3f23) added the Rust `dex_operations_have_stable_wire_vectors`
 test so DEX — previously the one family with no Rust vector — now has real
 Rust↔TS byte parity.
 
 ### HTTP-402 agent-payment flow — DONE (Phase 9 §4, agent-commerce flagship)
 
-An SDK helper (`sdk/webc-js/src/http402.ts`, merged e8e8463): an agent validates a
+An SDK helper (`sdk/webc-js/src/http402.ts`, merged 0d07c51): an agent validates a
 `402` challenge against the on-chain registry entry (price + pay-to must match,
 defeating a compromised endpoint), pays via `SpendUnderMandateToService` under its
 mandate, and retries with a verifiable payment reference. 29 tests covering every
 failure mode.
 
-### Node read-APIs — DONE (merged 0c0cb7f)
+### Node read-APIs — DONE (merged af73726)
 
 Additive GET-only endpoints so apps and the SDK can QUERY the Phase 9/13 state:
 `/v1/tokens/{id}(+/balances/{addr},/supply)`, `/v1/nft/collections/{id}(+/items/
@@ -688,7 +688,7 @@ Additive GET-only endpoints so apps and the SDK can QUERY the Phase 9/13 state:
 {id}`. Nine `NodeService` read accessors; unknown id → 404, known-token/no-holder
 → 200 zero.
 
-### Automated invariant evidence — DONE (merged 4223daa)
+### Automated invariant evidence — DONE (merged 703f07f)
 
 `crates/webc-chain/tests/native_ops_invariants.rs`: a proptest driving random
 seeded sequences of all fund-moving ops (tokens/NFT/mandate/governance/DEX, with

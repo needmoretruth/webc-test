@@ -1,7 +1,7 @@
 //! C4 regression: a validator that crashes and restarts mid-height must never
 //! sign a conflicting consensus message for a (height, round, step) it already
 //! signed. Two conflicting signed votes are objective `DoubleVoteEvidence`, and
-//! since commit `a6197ac` peers turn that evidence into an applied 80% slash
+//! since commit `0e4b4c5` peers turn that evidence into an applied 80% slash
 //! plus tombstone — so without a durable vote journal, an ordinary operator
 //! restart destroys the validator's stake.
 //!

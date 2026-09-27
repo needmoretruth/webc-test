@@ -23,7 +23,7 @@ not deeply audited.
 
 ## webc-chain / webc-node — consensus (round.rs, consensus.rs, consensus_driver.rs)
 
-- **C1 — HIGH — RESOLVED (commit `45f7396`) — no block-validity check before
+- **C1 — HIGH — RESOLVED (commit `4b6ebcb`) — no block-validity check before
   prevoting.** `round.rs` (rule_propose) prevoted any hash-consistent,
   leader-signed proposal; the driver fed proposals to the machine without
   re-executing the block. Tendermint Alg.1 (lines 22/28) requires the `valid(v)`
@@ -40,7 +40,7 @@ not deeply audited.
   full `apply_block` dry-run on a scratch state clone; only an importable
   proposal reaches the machine, and each round's first authentic proposal is
   re-executed at most once (leader CPU-spam bounded).
-- **C2 — HIGH — RESOLVED (commit `5ca197d`) — node silently terminates on a
+- **C2 — HIGH — RESOLVED (commit `253607a`) — node silently terminates on a
   failed finalized-block import.** `commit_if_decided` returned `true` on any
   `import_finalized_block` error and `run()` treated that as a clean exit — no
   log, no retry; the sync path swallowed the error entirely. **Fix:** `run()`
@@ -54,7 +54,7 @@ not deeply audited.
   not even express a failure): persistent-failure typed exit after retries,
   transient-failure survival, and a genuinely certified (3-of-4 keys) invalid
   block surfacing as `CertifiedBlockInvalid`.
-- **C3 — HIGH — RESOLVED (commit `bc3869b`) — unbounded per-height memory keyed
+- **C3 — HIGH — RESOLVED (commit `4ae4f53`) — unbounded per-height memory keyed
   by attacker-chosen round (OOM).** `round.rs` stored `prevotes`/`precommits`
   keyed `(u32 round, Address)` and a **full Block** per round in `proposals`,
   with no window around `self.round`; any snapshot member could sign valid
@@ -68,13 +68,13 @@ not deeply audited.
   the same horizon before its C1 block re-execution so far-future leader
   proposals cannot burn CPU. Beyond-window nodes recover via next-height state
   sync.
-- **C4 — HIGH — RESOLVED (commit `90c28ac`) — no durable WAL
+- **C4 — HIGH — RESOLVED (commit `09f9348`) — no durable WAL
   of own votes/locks → crash-restart self-equivocation.** The machine was
   in-memory and the driver rebuilt a fresh machine per height from the seed. A
   validator restarting mid-height forgot it already prevoted/precommitted and
   re-voted (and `build_candidate` uses wall time, so a re-proposal differed),
   producing two signed conflicting votes = objective `DoubleVoteEvidence` →
-  self-slash/tombstone via the live a6197ac slash loop.
+  self-slash/tombstone via the live 0e4b4c5 slash loop.
   **Reproduced first** (per AGENTS.md pitfall 7) by
   `webc-node/tests/consensus_restart.rs::a_restarted_validator_never_signs_a_conflicting_vote`:
   pre-fix, the restarted round-0 proposer re-proposed a different-timestamp
@@ -119,7 +119,7 @@ not deeply audited.
   implementation-status, development-plan) said equivocation-to-slash was NOT wired
   and a Byzantine test was owed. Two commits by the GPT implementer landed on
   2026-07-15 AFTER those docs were last written and were NOT reflected in them:
-  - `a6197ac feat(consensus): apply header-committed equivocation slashes` — the
+  - `0e4b4c5 feat(consensus): apply header-committed equivocation slashes` — the
     block header now commits an `evidence_root` (`block.rs:45`), the block body
     carries `evidence: Vec<SlashingEvidence>`, `build_block`/`apply_block` execute
     `apply_block_slashing_evidence` before user txs inside the atomic overlay
@@ -129,7 +129,7 @@ not deeply audited.
     **equivocation → slash loop is wired end to end** (with a
     `header_committed_evidence_slashes_and_imports_deterministically` test), not
     missing. The docs were stale; they have been corrected.
-  - `75d054b test(consensus): reject sub-third conflicting finality` — adds
+  - `a2e774e test(consensus): reject sub-third conflicting finality` — adds
     `round.rs::less_than_one_third_byzantine_power_cannot_finalize_conflicting_blocks`
     (machine-level; a full multi-NODE-over-TCP Byzantine integration test may still
     be wanted, but the core safety property is now tested).
@@ -139,7 +139,7 @@ not deeply audited.
     that this path will ACTUALLY slash. C4 (durable vote/lock WAL) must be fixed
     BEFORE this is run on any network where honest restarts happen.
 
-- **EQUIVOCATION-PATH VERIFICATION (2026-07-16, independent trace of a6197ac).**
+- **EQUIVOCATION-PATH VERIFICATION (2026-07-16, independent trace of 0e4b4c5).**
   Result: **the evidence path implementation is otherwise CORRECT/SAFE, but running
   it live before C4 is a HIGH/critical operator-fund risk.**
   - Otherwise-safe (verified): the header binds `evidence_root` (altering/reordering
@@ -170,7 +170,7 @@ not deeply audited.
     while-still-a-member (note, not a double-vote blocker); (ii) `pending_evidence`
     can accumulate one entry per real offender per round during a liveness stall
     (LOW — each requires a genuine offense, so not a cheap flood).
-- **C5 — MEDIUM — RESOLVED (commit `3b2b460`) — proof-of-lock (rule 28) not
+- **C5 — MEDIUM — RESOLVED (commit `140f660`) — proof-of-lock (rule 28) not
   carried with re-proposals (liveness).** A node that missed round `vr` could
   never satisfy the local 2f+1-prevote guard and prevoted nil forever while the
   lock holder re-proposed. **Fix:** `SignedProposal` now carries a
@@ -182,13 +182,13 @@ not deeply audited.
   verified PoL prevotes into its tally so the rule-28 guard passes for a node
   that missed the round. Wire bumped to `NET_PROTOCOL_VERSION = 2` (Rust-only
   consensus format, no cross-language fixture). Tests in `round.rs`.
-- **C6 — MEDIUM — RESOLVED (commit `90ae433`) — constant timeouts instead of
+- **C6 — MEDIUM — RESOLVED (commit `bf0e131`) — constant timeouts instead of
   round-scaled.** `DriverTimeouts` now carries an `increment` and `for_kind`
   computes `base + round·increment` (saturating), the standard Tendermint
   `timeout(r) = init + r·delta`, so some round eventually outlasts any finite
   delay and liveness is restored once the network stabilizes. Unit-tested for
   linear scaling and overflow saturation.
-- **C7 — MEDIUM — RESOLVED (commit `0813e7c`) — state-sync bandwidth
+- **C7 — MEDIUM — RESOLVED (commit `a58d7e1`) — state-sync bandwidth
   amplification.** The driver answered a `BlockRequest` via network-wide
   `broadcast` and requested sync on any higher-height claim. **Fix:**
   `NetworkHandle::send_to` delivers a directed reply and the transport no longer
@@ -200,7 +200,7 @@ not deeply audited.
   with proof). Cross-epoch certificate anchoring stays E4. Tests:
   `webc-net::send_to_reaches_only_the_named_peer` and
   `webc-node/tests/consensus_sync_gating.rs`.
-- **C8 — LOW — RESOLVED (commit `ff289e3`) — `has_two_thirds_power` threshold
+- **C8 — LOW — RESOLVED (commit `f1740bf`) — `has_two_thirds_power` threshold
   arithmetic is correct but fragile/undocumented.** `consensus.rs:170-178`. The
   nonstandard form `(total/3)*2 + ((total%3)*2)/3` is a strict >2/3 test that
   avoids the `total*2` u128 overflow the naive `power*3 > total*2` would risk near
@@ -246,28 +246,28 @@ not deeply audited.
 
 ## webc-net — transport / handshake / wire
 
-- **N1 — HIGH — RESOLVED (commit `52b87a4`) — no handshake timeout (slowloris).** `transport.rs` (~258-289):
+- **N1 — HIGH — RESOLVED (commit `d032104`) — no handshake timeout (slowloris).** `transport.rs` (~258-289):
   the four-step handshake awaits frames with no deadline; a peer that connects and
   stalls holds a task + socket + FD forever. Fix: wrap the whole handshake in
   `tokio::time::timeout`.
-- **N2 — HIGH — RESOLVED (commit `478ebed`) — inbound connections are unbounded.** `transport.rs` (~209-223):
+- **N2 — HIGH — RESOLVED (commit `2c2c13a`) — inbound connections are unbounded.** `transport.rs` (~209-223):
   every `accept()` spawns a handler with no concurrency cap, per-IP limit, or
   accept rate limit. With N1, unlimited half-open handshakes. Fix: bound in-flight
   inbound connections with a `Semaphore`; add a per-IP cap.
-- **N3 — HIGH — RESOLVED (commit `5b0955f`) — peer table has no size cap.** `transport.rs` (~354, 374-379):
+- **N3 — HIGH — RESOLVED (commit `b47fafc`) — peer table has no size cap.** `transport.rs` (~354, 374-379):
   `peers` grows one entry per successful handshake; identity keys are unauthenticated
   names anyone can mint, so a Sybil inflates the table without bound (memory +
   gossip amplification via `flood()`). Fix: cap peer count; reject/evict beyond a
   limit (with peer scoring later).
-- **N4 — MEDIUM — RESOLVED (commit `8f08257`) — no per-peer inbound rate limiting.** `transport.rs` (~384-395):
+- **N4 — MEDIUM — RESOLVED (commit `c1d8766`) — no per-peer inbound rate limiting.** `transport.rs` (~384-395):
   one fast peer can monopolize the shared worker (hash/decode/re-flood) and crowd
   out honest peers. `try_send` avoids a hard stall, so this is fairness/throughput.
   Fix: per-peer token bucket before re-flood.
-- **N5 — LOW — RESOLVED (commit `647e472`) — dial backoff resets on TCP connect, not on authenticated success.**
+- **N5 — LOW — RESOLVED (commit `985c0d9`) — dial backoff resets on TCP connect, not on authenticated success.**
   `transport.rs` (~226-244): a host that accepts TCP but fails the handshake is
   redialed every 500 ms forever. Fix: reset backoff only after a successful
   authenticated connection.
-- **N6 — LOW — RESOLVED (commit `123e528`) — bincode has no explicit `.with_limit()`.** `codec.rs` (13-17): a
+- **N6 — LOW — RESOLVED (commit `7161aa2`) — bincode has no explicit `.with_limit()`.** `codec.rs` (13-17): a
   hostile 4 MiB frame can embed a length prefix claiming billions of elements;
   mitigated in practice by the 4 MiB frame bound + serde cautious capacity, but
   that is defense-by-accident. Fix: add `.with_limit(MAX_FRAME_BYTES)`.
@@ -280,7 +280,7 @@ not deeply audited.
 
 ## webc-node — HTTP / service / mempool / secrets
 
-- **H1 — HIGH — RESOLVED (commit `ec327c7`) — faucet DoS via unlimited fresh
+- **H1 — HIGH — RESOLVED (commit `98f2f03`) — faucet DoS via unlimited fresh
   addresses.** Per-recipient cooldown/`max_recipient_balance` did not bound work
   from an attacker rotating fresh addresses (each drip builds and commits a block).
   **Fix:** a global token bucket (`FAUCET_GLOBAL_BURST = 100`, ~1 drip/s refill)
@@ -288,7 +288,7 @@ not deeply audited.
   cooldown so it cannot grow without bound. Reproduced first by
   `faucet_global_rate_limit_bounds_total_drips` and
   `faucet_token_bucket_refills_over_time_and_caps_at_burst`.
-- **H2 — MEDIUM — RESOLVED (commit `ec327c7`) — mempool has no fee-priority
+- **H2 — MEDIUM — RESOLVED (commit `98f2f03`) — mempool has no fee-priority
   eviction, and `prune_expired` is never called in the `run` path.** A full pool
   `Full`-rejected every newcomer (a base-fee flood permanently blocked higher-fee
   honest txs), and the seal tick never pruned TTL-expired txs. **Fix:** a full pool
@@ -309,13 +309,13 @@ not deeply audited.
     runnable entry, and a runnable newcomer actively clears parked non-runnable junk.
     Reproduced first by `full_pool_gapped_bid_cannot_evict_a_runnable_transaction`
     (with `full_pool_runnable_bid_evicts_a_parked_gap_entry` locking the dual).
-- **H3 — MEDIUM — RESOLVED (commit `ec327c7`) — unbounded WebSocket
+- **H3 — MEDIUM — RESOLVED (commit `98f2f03`) — unbounded WebSocket
   subscriptions.** `ws.on_upgrade` accepted unlimited concurrent, unauthenticated
   subscribers (FD/memory DoS). **Fix:** an atomic counter caps live subscriptions
   at `MAX_WS_SUBSCRIPTIONS = 256` (503 past the cap), released by an RAII guard when
   the connection ends or the upgrade never completes. Reproduced first by
   `reserve_slot_bounds_concurrent_reservations`.
-- **H4 — LOW/MEDIUM — RESOLVED (commit `ec327c7`) — internal error strings leak to
+- **H4 — LOW/MEDIUM — RESOLVED (commit `98f2f03`) — internal error strings leak to
   clients.** 5xx bodies returned `to_string()` of `Internal`/`Storage`/`Node`
   errors (storage detail, chain internals). **Fix:** a 5xx logs the detail
   server-side and returns a generic message; 4xx client errors still return their
@@ -339,38 +339,38 @@ not deeply audited.
 No critical key-exfiltration path found. WeakMap isolation, exact-origin
 postMessage, keystore AAD binding, and bigint accounting are fundamentally sound.
 
-- **S1 — MEDIUM — RESOLVED (commit `e71a842`) — confirmation double-click can approve two transfers.**
+- **S1 — MEDIUM — RESOLVED (commit `3ce1b7b`) — confirmation double-click can approve two transfers.**
   `wallet-confirmation-ui.ts` (~131-144): the next queued request's Approve button
   mounts in the same position the instant the previous resolves; a hostile host
   queues two `sign_native_transfer` and a double-click on tx1 lands on tx2. Fix:
   disable Approve ~500 ms–1 s after render; require pointerdown+pointerup both
   after render.
-- **S2 — LOW/MEDIUM — RESOLVED (commit `f01b47d`) — unbounded hostile strings hang the trusted popup.**
+- **S2 — LOW/MEDIUM — RESOLVED (commit `1ccd4c2`) — unbounded hostile strings hang the trusted popup.**
   `wallet-request.ts` (~391-458): `recipient` (O(n²) base58 decode) and `amount`
   (`BigInt()` on an arbitrarily long string) are parsed before length bounds; a
   megabyte payload freezes the popup main thread mid-confirmation. Fix: bound
   `recipient` (~64) and `amount` (≤39) before any decode.
-- **S3 — LOW — RESOLVED (commit `3215e1e`) — no KDF purpose separation between keystore and permission store.**
+- **S3 — LOW — RESOLVED (commit `436cc4b`) — no KDF purpose separation between keystore and permission store.**
   Both derive AES-256 from (password, salt) with identical Argon2id params and no
   domain/info; same password+salt ⇒ same key across formats. AAD domains differ so
   ciphertext swapping fails, but key reuse across contexts erodes the GCM margin.
   Fix: mix a purpose string (HKDF-expand with distinct `info`, or domain-prefixed
   salt).
-- **S4 — LOW — RESOLVED (commit `e177545`) — replay-ID FIFO eviction is attacker-pumpable.** `wallet-service.ts`
+- **S4 — LOW — RESOLVED (commit `18241f5`) — replay-ID FIFO eviction is attacker-pumpable.** `wallet-service.ts`
   (~401-407): 2049 cheap messages evict any prior `request_id`. Transfers stay
   protected by session/sequence; exposure is connect/revoke replay. Fix: per-origin
   quotas or hard-reject when full.
-- **S5 — LOW — RESOLVED (commit `d1a7aed`) — reconnect can create a grant whose carried `spentAmount` exceeds
+- **S5 — LOW — RESOLVED (commit `c6e6319`) — reconnect can create a grant whose carried `spentAmount` exceeds
   the new `max_total_amount`.** `wallet-service.ts` (~277-285): fail-safe (never
   widens spend) but with persistence throws an opaque INTERNAL_ERROR after the user
   approved. Fix: reject/surface when `previous.spentAmount > newLimits.maxTotalAmount`
   at connect.
-- **S6 — LOW — RESOLVED (commit `08c47e7`) — response size cap enforced after full buffering, in UTF-16 units.**
+- **S6 — LOW — RESOLVED (commit `a8bd6ca`) — response size cap enforced after full buffering, in UTF-16 units.**
   `node-client.ts` (~277-289): `response.text()` buffers the whole body before the
   `.length > MAX` check and counts code units, not bytes; error messages carry up
   to 4 MiB of node-controlled text into host UI. Fix: stream with a byte cap;
   truncate server error strings to ~256.
-- **S7/S8 — LOW — RESOLVED (commit `e177545`; S8 sequence-resync residual noted) — retry vs. replay-detection and sequence desync.**
+- **S7/S8 — LOW — RESOLVED (commit `18241f5`; S8 sequence-resync residual noted) — retry vs. replay-detection and sequence desync.**
   `wallet-client.ts`/`wallet-service.ts`: client re-posts the same request_id on
   backoff while the service treats duplicates as `REQUEST_REPLAY`; concurrent
   signs or a client timeout-after-user-approval desync the sequence counter
@@ -452,7 +452,7 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 ## webc-chain — supply / staking / bridge (verified findings)
 
-- **G1 — MEDIUM — RESOLVED (commit `9c77a35`) — genesis supply invariant is
+- **G1 — MEDIUM — RESOLVED (commit `615c612`) — genesis supply invariant is
   tautological; it never pins the 10,000,000 WEBC total.** `state.rs:486-488,
   551-564`: `from_genesis` rejects genesis only when
   `SupplyInvariantReport.balanced` is false, but `balanced` is `accounted ==
@@ -468,7 +468,7 @@ token's trust model and fee-cost-bounded — noted, no change.
   first by `genesis_pins_the_declared_total_supply`,
   `genesis_accepts_an_allocation_matching_the_declared_total`, and
   `genesis_without_a_declared_total_skips_the_pin`.
-- **U1 — MEDIUM — RESOLVED (commit `202126a`) — `slash_locked` over-penalizes and
+- **U1 — MEDIUM — RESOLVED (commit `ee3a1b2`) — `slash_locked` over-penalizes and
   ignores the slashable window.** `unbonding.rs:285-320`: it took no `epoch`
   parameter and applied the penalty to `request.withdrawable` (principal that
   `mature`/`advance_epoch` has already moved past both cooldown and the slashable
@@ -479,14 +479,14 @@ token's trust model and fee-cost-bounded — noted, no change.
   and never touches `withdrawable`. Reproduced first by
   `slash_locked_skips_cooling_past_its_slashable_window` and
   `slash_locked_never_slashes_matured_withdrawable_principal`.
-- **U2 — LOW — RESOLVED (commit `202126a`) — settled unbonding requests are never
+- **U2 — LOW — RESOLVED (commit `ee3a1b2`) — settled unbonding requests are never
   pruned.** `unbonding.rs:402`: claimed requests lingered forever in
   `self.requests`; `mature`/`slash_locked`/`queued_for` re-scanned them every epoch
   (unbounded state + growing per-epoch cost). **Fix:** `advance_epoch` prunes
   fully-settled requests (no live principal in any bucket); IDs are monotonic and
   never reused, so a pruned request cannot be revived or replayed. Reproduced first
   by `advance_epoch_prunes_fully_settled_requests`.
-- **B1 — MEDIUM — RESOLVED (commit `09e6165`) — unbounded bridge-recipient hex
+- **B1 — MEDIUM — RESOLVED (commit `631fffb`) — unbounded bridge-recipient hex
   decode.** `hex_bytes.rs:32-38`: `deserialize` runs `hex::decode(text)` with no
   length bound; it backs the `recipient: Vec<u8>` of `BridgeLock`/`BridgeBurn`
   (`transaction.rs:266,278`), unlike object payloads which use
@@ -503,7 +503,7 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 ### Fund arithmetic (dedicated pass — completed)
 
-- **F1 — HIGH — RESOLVED (commit `33ea4dc`) — epoch reward distribution silently
+- **F1 — HIGH — RESOLVED (commit `1c984bf`) — epoch reward distribution silently
   drops the cross-validator division remainder, breaking supply conservation.**
   **Fix:** `apply_epoch_rewards` now sums the floored per-validator shares and
   retains `total_reward − Σ share` in `validator_fee_pool` (carried to the next
@@ -529,7 +529,7 @@ token's trust model and fee-cost-bounded — noted, no change.
   `leftover = total_reward − Σ validator_share` in `validator_fee_pool` (carry
   forward) instead of zeroing it — mirroring the inner-dust handling — so
   `accounted_new = accounted_old + inflation = minted_supply_new`.
-- **F2 — LOW — RESOLVED (commit `5a0e460`) — `floor_rate_bps == 0` passes
+- **F2 — LOW — RESOLVED (commit `6378794`) — `floor_rate_bps == 0` passes
   `InflationSchedule::validate`.** `inflation.rs:106-115`: a zero floor drives the
   rate loop to an `ArithmeticOverflow` error at large years instead of converging
   (fail-closed, not fund loss). **Fix:** `validate` now rejects
@@ -546,7 +546,7 @@ token's trust model and fee-cost-bounded — noted, no change.
   unchecked `as` narrowing anywhere; reward accrual is `checked_add`-only with the
   claim path zeroing on payout (no double-credit). **Correction (2026-09-26):**
   the `checked_mul_ratio` split was not exact in every case — see F3.
-- **F3 — MEDIUM — RESOLVED (commit `aaf87b8`) — spurious overflow in
+- **F3 — MEDIUM — RESOLVED (commit `441bc22`) — spurious overflow in
   `checked_mul_ratio`.** The whole/remainder split returned `None` whenever
   `remainder * numerator` exceeded `u128`, even when the exact floor fits (for
   example `2^64 * 2^64 / (2^64 + 1)`), so reward splits and DEX pro-rata fills
@@ -560,7 +560,7 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 ## webc-storage — durability
 
-- **ST1 — MEDIUM — RESOLVED (commit `ed61134`) — no chain identity is persisted or
+- **ST1 — MEDIUM — RESOLVED (commit `5e1ee3c`) — no chain identity is persisted or
   validated at the storage layer.** `chainstore.rs:99,131`: `open` took no expected
   chain-id and stored none; `verify_tip_consistency` never checked chain id.
   CONFIRMED. **Fix:** `ChainStore::open` now takes the expected `ChainId`, stamps it
@@ -574,7 +574,7 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 ## webc-chain — scheduler determinism
 
-- **SC1 — HIGH (latent) — RESOLVED (commit `5a0e460`) — greedy first-fit batching
+- **SC1 — HIGH (latent) — RESOLVED (commit `6378794`) — greedy first-fit batching
   is not serializable-order preserving.** `scheduler.rs:20-32`: each tx was placed
   in the FIRST non-conflicting batch, so a later tx could land in an EARLIER batch
   than an earlier tx it conflicts with, reversing their commit order. CONFIRMED.
@@ -582,7 +582,7 @@ token's trust model and fee-cost-bounded — noted, no change.
   `parallel_batches` now places each tx in the first batch at or after every
   earlier batch it conflicts with (highest-conflicting-batch rule). Reproduced
   first by `conflicting_pairs_keep_their_commit_order_across_batches`.
-- **SC2 — LOW — RESOLVED (commit `5a0e460`) — conflict detection keys on the full
+- **SC2 — LOW — RESOLVED (commit `6378794`) — conflict detection keys on the full
   versioned `StateKey`.** `state_key.rs:89`: `version` is part of `Eq`/`Ord`, so
   two keys with the same logical `kind` but different `version` were treated as
   non-conflicting and could share a parallel batch. **Fix:** the scheduler now keys
@@ -594,7 +594,7 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 ## webc-chain — transaction wire
 
-- **T1 — LOW — RESOLVED (commit `09e6165`) — `Operation` enum lacks
+- **T1 — LOW — RESOLVED (commit `631fffb`) — `Operation` enum lacks
   `#[serde(deny_unknown_fields)]`.** `transaction.rs:95-96`: every sibling wire
   type (`AccessList`, `FeeBid`, `Transaction`) has it; the enum variants do not, so
   an externally-tagged variant may accept unknown fields. CONFIRMED (low impact —
@@ -605,7 +605,7 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 ## Dependency supply chain
 
-- **D1 — HIGH — RESOLVED (commit `91760e2`) — no `cargo-deny`/`cargo-audit` gate
+- **D1 — HIGH — RESOLVED (commit `b346226`) — no `cargo-deny`/`cargo-audit` gate
   in CI.** **Fix:** `deny.toml` + a `cargo-deny` CI job enforce advisories
   (RUSTSEC + yanked), a permissive-only license allow-list, no wildcard
   versions, and crates.io-only sources. The bincode 1.3.3 UNMAINTAINED advisory
@@ -613,14 +613,14 @@ token's trust model and fee-cost-bounded — noted, no change.
   finding D4) and a removal condition. Internal crates marked `publish = false`
   so their path deps are not read as public-crate wildcards. Passes locally
   (`advisories ok, bans ok, licenses ok, sources ok`).
-- **D2 — MEDIUM — RESOLVED (commit `91760e2`) — no JS advisory scan in CI.**
+- **D2 — MEDIUM — RESOLVED (commit `b346226`) — no JS advisory scan in CI.**
   **Fix:** a `pnpm audit --audit-level=high --prod` CI job scans the shipped SDK
   dependencies (`@noble/*`, `@scure/*`, `micro-key-producer`); production deps
   are clean today. Scoped to production so dev-only tooling advisories
   (vitest/esbuild dev server) do not block the merge gate. **Update:** CI now
   runs `pnpm audit --audit-level=moderate` over all dependencies, development
-  tooling included (`ecfeebe`), plus `pnpm licenses:check` (`0e04306`).
-- **D3 — LOW — RESOLVED (commit `607035d`) — duplicate major versions in the
+  tooling included (`d2adab9`), plus `pnpm licenses:check` (`f2aed7e`).
+- **D3 — LOW — RESOLVED (commit `912a9e9`) — duplicate major versions in the
   lock** (getrandom 0.2/0.3, rand_core 0.6/0.9, thiserror 1/2, tokio-tungstenite
   0.24/0.29). **Fix:** the one duplicate we directly controlled — a webc-node
   dev-dependency on tokio-tungstenite 0.24 while axum pulls 0.29 — is aligned to
@@ -643,18 +643,18 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 ## Cross-language byte parity (Rust canonical.rs vs TS canonical.ts / transaction.ts)
 
-- **X1 — MEDIUM — RESOLVED (commit `9dfd761`) — bridge recipient hex not lowercase-validated in the SDK.**
+- **X1 — MEDIUM — RESOLVED (commit `280f2f2`) — bridge recipient hex not lowercase-validated in the SDK.**
   `transaction.ts:311-342`: `bridgeLock`/`bridgeBurn` copy `recipient` verbatim
   while `installSessionKey`/rotations call `requireLowercaseHex`; Rust emits
   lowercase and re-serializes during `verify`, so an upper/mixed-case recipient
   produces a silent signing/verification MISMATCH (fail-closed, not a forgery).
   CONFIRMED. Fix: `requireLowercaseHex` in the bridge constructors (or make Rust
   reject non-lowercase so both sides share one norm).
-- **X2 — MEDIUM — RESOLVED (commit `1ef080d`) — object id/namespace/data hex not validated in the SDK.**
+- **X2 — MEDIUM — RESOLVED (commit `64574aa`) — object id/namespace/data hex not validated in the SDK.**
   `transaction.ts:202-248`: `createObject`/`mutateObject`/`transferObject` pass hex
   through unvalidated → same silent mismatch class as X1. CONFIRMED. Fix:
   lowercase-validate these fields in the TS constructors.
-- **X3 — LOW — RESOLVED (commit `ff289e3`) — integer-range parity.**
+- **X3 — LOW — RESOLVED (commit `f1740bf`) — integer-range parity.**
   `canonical.rs:74` accepted any `is_u64()||is_i64()` integer and re-emitted it;
   `canonical.ts:65` rejects anything above `Number.isSafeInteger` (2^53-1). **Fix:**
   `canonicalize_value` now rejects an integer outside ±(2^53-1) via
@@ -663,7 +663,7 @@ token's trust model and fee-cost-bounded — noted, no change.
   already use decimal strings; the authorization-policy revision bound is exactly
   2^53-1, so the same rule is now enforced one layer earlier for every field.
   Reproduced first by `integers_beyond_the_js_safe_range_are_rejected`.
-- **X4 — LOW — RESOLVED (commit `598cd16`) — amount-string parity.** Amounts are decimal strings both sides
+- **X4 — LOW — RESOLVED (commit `614dc48`) — amount-string parity.** Amounts are decimal strings both sides
   (parity holds for well-formed input), but the TS constructors don't validate the
   amount-string shape; a value Rust's u128 decimal form would not produce could be
   signed. Fix: validate `^(0|[1-9][0-9]*)$` in the TS helpers.
@@ -677,7 +677,7 @@ token's trust model and fee-cost-bounded — noted, no change.
 
 These were surfaced but not fully audited; several are latent-but-serious.
 
-- **E1 — HIGH (latent) — RESOLVED (commit `33ea4dc`) — epoch advancement is not
+- **E1 — HIGH (latent) — RESOLVED (commit `1c984bf`) — epoch advancement is not
   wired into the real block path.** `current_epoch` only advanced inside
   `finish_epoch`/`distribute_epoch_rewards`, whose only node-tree caller was the
   demo, so a running node never advanced the epoch (rewards, unbonding maturation,
@@ -688,7 +688,7 @@ These were surfaced but not fully audited; several are latent-but-serious.
   diverge at the boundary. Couples with F1 (the now-live reward path conserves
   supply). Reproduced first by
   `epoch_advances_deterministically_at_height_boundaries`.
-- **E2 — MEDIUM (latent) — RESOLVED (commit `392018d`) — block timestamp is
+- **E2 — MEDIUM (latent) — RESOLVED (commit `c56631b`) — block timestamp is
   unvalidated.** `timestamp_ms` was proposer-supplied, copied verbatim
   (`block_builder.rs:112`), and `apply_block`/`import_validated` never checked
   monotonicity vs parent or a future-drift ceiling. **Fix:** deterministic
@@ -701,7 +701,7 @@ These were surfaced but not fully audited; several are latent-but-serious.
   `block_timestamps_must_strictly_increase`,
   `produce_block_clamps_timestamp_to_stay_monotonic`, and
   `future_drift_bound_tolerates_skew_and_rejects_gross_drift`.
-- **E3 — MEDIUM — RESOLVED (commit `c797f00`; residual documented) — Merkle proof
+- **E3 — MEDIUM — RESOLVED (commit `4dcf572`; residual documented) — Merkle proof
   DoS + leaf/internal domain separation.** `merkle.rs:88` `verify_merkle_proof`
   looped over `proof.steps` with no length bound (browser/light clients verify
   node-supplied proofs → a huge proof pins client CPU); `hash_pair` uses one domain
@@ -735,7 +735,7 @@ These were surfaced but not fully audited; several are latent-but-serious.
   per-sender byte bounds — is tracked with the weak-subjectivity work in ADR-0011
   (a node that can be eclipsed can be fed a hostile checkpoint) and gated to the
   same phase.
-- **E6 — P2 — RESOLVED (commit `7e6412d`) — consensus signing-domain scope.**
+- **E6 — P2 — RESOLVED (commit `a1f9d17`) — consensus signing-domain scope.**
   Verified: proposals (`WEBC_CONSENSUS_PROPOSAL_V1`) and votes
   (`WEBC_CONSENSUS_VOTE_V1`) use distinct domains; a vote's signed payload includes
   `vote_type` and full `height/round/chain_id/protocol_version` binding, so a
@@ -745,13 +745,13 @@ These were surfaced but not fully audited; several are latent-but-serious.
   ed25519-dalek's malleable `verify` — is now `verify_strict`, rejecting
   non-canonical signatures and small-order keys.
 - **E7 — P2 — OPEN (the VM has landed; the checklist has not been run) —
-  contract reentrancy/metering.** The WASM runtime (`webc-vm`, `2742201`,
-  `4ca3483`) is in the tree, but this checklist has not been recorded as run
+  contract reentrancy/metering.** The WASM runtime (`webc-vm`, `ad01bfa`,
+  `5cf80ba`) is in the tree, but this checklist has not been recorded as run
   against it. This is the standing review checklist (cross-object reentrancy,
   deterministic gas metering, no float/clock/iteration-order nondeterminism
   inside contracts, escrow release reachability) that MUST run now that the
   contract runtime has landed (Phase 7 gate; ADR-0006).
-- **E8 — P2 — RESOLVED (commit `7e6412d`) — dual state encoders.** `state_root`
+- **E8 — P2 — RESOLVED (commit `a1f9d17`) — dual state encoders.** `state_root`
   uses canonical JSON while restart round-trips maps via bincode. Verified by
   inspection that every `ChainState` field is committed by the state root (map
   fields via their dedicated sub-roots, scalars directly), so no field is mutable
@@ -781,12 +781,12 @@ Still NOT audited / owed:
   (trusted as reviewed upstream libraries).
 - **Static review only for the original pass.** CONFIRMED verdicts meant two
   independent reads agreed on the code facts, not that a runtime exploit was
-  demonstrated. **Update (commits `90c28ac`, `45f7396`, `5ca197d`, `bc3869b`,
-  `90ae433`, `0813e7c`, `91760e2`):** the consensus P0/P1 findings C1–C4, C6,
+  demonstrated. **Update (commits `09f9348`, `4b6ebcb`, `253607a`, `4ae4f53`,
+  `bf0e131`, `a58d7e1`, `b346226`):** the consensus P0/P1 findings C1–C4, C6,
   and C7 were each reproduced with a failing test first, then fixed and kept
   (per `AGENTS.md` pitfall 7); and continuous fuzz harnesses now exist for the
   wire decoder, canonical encoder, transaction decode/verify, and mempool
   admission (`fuzz/`, run in CI's `fuzz-smoke` job). C5 (proof-of-lock
-  re-proposals) was later resolved in `3b2b460`; C9 is a hardening item. The
+  re-proposals) was later resolved in `140f660`; C9 is a hardening item. The
   other under-covered areas (E1–E8, redb
   fault injection, crypto primitives) are still owed.

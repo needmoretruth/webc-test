@@ -186,7 +186,7 @@ attacker-chosen-round memory (C3), and no vote/lock WAL so a crash-restart
 self-equivocates (C4).
 
 Also corrected in the same review: two commits by the GPT implementer
-(`a6197ac`, `75d054b`) landed 2026-07-15 without updating this file, so two items
+(`0e4b4c5`, `a2e774e`) landed 2026-07-15 without updating this file, so two items
 this document previously listed as remaining are in fact DONE — **equivocation-to-
 slash is wired** (header `evidence_root` + block `evidence` executed atomically in
 `build_block`/`apply_block`, driver auto-includes machine-detected equivocation)
@@ -375,20 +375,20 @@ The safety-critical, deterministic parts of A-3 are implemented and gate-verifie
   observer joins and catches up to height 3 purely via state sync, its finalized
   tips matching the validators' at every height.
 
-**Update (2026-07-16, reconciled with commits `a6197ac`/`75d054b` that this file
+**Update (2026-07-16, reconciled with commits `0e4b4c5`/`a2e774e` that this file
 had not caught up to): consensus-detected equivocation IS now wired to an applied
-slash.** `a6197ac` added an `evidence_root` to the block header, an `evidence:
+slash.** `0e4b4c5` added an `evidence_root` to the block header, an `evidence:
 Vec<SlashingEvidence>` block body, and `build_block`/`apply_block` execution of
 `apply_block_slashing_evidence` (bounded by `MAX_BLOCK_SLASHING_EVIDENCE`, before
 user txs, inside the atomic overlay); the driver auto-includes machine-detected
 equivocation via `pending_evidence` + `build_candidate` +
 `prune_pending_evidence`; there is a
-`header_committed_evidence_slashes_and_imports_deterministically` test. `75d054b`
+`header_committed_evidence_slashes_and_imports_deterministically` test. `a2e774e`
 added the `less_than_one_third_byzantine_power_cannot_finalize_conflicting_blocks`
 machine-level test. The `Operation::SubmitSlashingEvidence` transaction path also
 still exists.
 
-**C4 is fixed (commit `90c28ac`, 2026-07-16 session):** the driver now journals
+**C4 is fixed (commit `09f9348`, 2026-07-16 session):** the driver now journals
 the machine's own signed proposals/votes plus lock state durably
 (`Table::ConsensusWal`, one fsync-backed commit per own broadcast, pruned
 atomically when the height commits) **before** any own message reaches the wire,
@@ -402,7 +402,7 @@ re-prevoted a different block, verifying as objective slashable evidence), then
 fixed; machine/storage/integration tests cover replay, lock preservation,
 corrupt-journal rejection, prune-on-commit, and redb restart survival.
 
-**C1 is fixed (commit `45f7396`):** the driver now implements Tendermint's
+**C1 is fixed (commit `4b6ebcb`):** the driver now implements Tendermint's
 `valid(v)` — after the cheap authenticity gate it pins the proposal's block to
 the local chain position (height/parent/epoch/chain id) and dry-runs the full
 `apply_block` state transition on a scratch clone; only an importable proposal
@@ -412,14 +412,14 @@ at most once. Reproduced first by
 collected an honest prevote+precommit and a fully verifying finality
 certificate).
 
-**C2 is fixed (commit `5ca197d`):** `ConsensusDriver::run` now returns a typed
+**C2 is fixed (commit `253607a`):** `ConsensusDriver::run` now returns a typed
 `DriverExit` instead of exiting silently — transient storage I/O is retried
 with backoff, corruption fails closed immediately, and a
 certified-but-unimportable block is surfaced as a consensus emergency
 (`CertifiedBlockInvalid`) from both the live-commit and state-sync paths.
 Tests: `tests/consensus_import_failure.rs`.
 
-**C3 is fixed (commit `bc3869b`):** the machine now keeps a sliding window of
+**C3 is fixed (commit `4ae4f53`):** the machine now keeps a sliding window of
 rounds — ingestion ignores messages beyond `MAX_FUTURE_ROUNDS` (32) above the
 current round, round changes evict storage beyond `MAX_PAST_ROUNDS` (32) below
 it, and the driver applies the same horizon before its C1 block re-execution.
@@ -427,15 +427,15 @@ A staked attacker can no longer size per-height memory (or CPU) with signed
 votes/proposals for arbitrary rounds.
 
 **All four P0 consensus findings (C1–C4) are resolved, plus C6 and C7.** C6
-(commit `90ae433`) round-scales step timeouts (`base + round·increment`) for
-partial-synchrony liveness. C7 (commit `0813e7c`) makes state-sync replies
+(commit `bf0e131`) round-scales step timeouts (`base + round·increment`) for
+partial-synchrony liveness. C7 (commit `a58d7e1`) makes state-sync replies
 directed to the requester (new `NetworkHandle::send_to`; the transport no longer
 refloods a `BlockResponse`) and gates sync requests on a finality certificate
 for a higher height that verifies against the current snapshot (the driver
 gossips the certificate on commit). The CI supply-chain and fuzz gates are in
-(commit `91760e2`): `deny.toml` + a cargo-deny job, a `pnpm audit --prod` job
+(commit `b346226`): `deny.toml` + a cargo-deny job, a `pnpm audit --prod` job
 (findings D1/D2), and a `fuzz/` crate with four libFuzzer targets run by a
-`fuzz-smoke` CI job. C5 (commit `3b2b460`) attaches a `proof_of_lock` prevote
+`fuzz-smoke` CI job. C5 (commit `140f660`) attaches a `proof_of_lock` prevote
 set to re-proposals so a node that missed round `vr` follows the lock holder
 instead of stalling (wire bumped to `NET_PROTOCOL_VERSION = 2`). **All
 consensus review findings C1–C7 are now resolved**, plus C8.
