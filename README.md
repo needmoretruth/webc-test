@@ -1,5 +1,19 @@
 # WEBC / WEB COIN
 
+> **About this repository**
+>
+> This is personal code written by needmoretruth. As the repository name says,
+> it is `webc-test`, not the official WEBC. The official WEBC will be built
+> later in a separate repository, either by forking `webc-test` or by adopting
+> only its ideas. The name "WEBC" is a working name and is not final.
+>
+> **이 저장소에 대해**
+>
+> 이 저장소는 needmoretruth가 개인적으로 만든 코드입니다. 저장소 이름
+> 그대로 `webc-test`이며, 정식 WEBC가 아닙니다. 정식 WEBC는 나중에 별개의
+> 저장소에서 이 `webc-test`를 포크하거나, 아이디어만 채용하는 방식으로 만들
+> 예정입니다. "WEBC"라는 이름도 아직 확정되지 않았습니다.
+
 WEBC is a prototype foundation for an independent Rust Layer-1 blockchain
 built for the web and the AI era: browser- and website-native payments,
 applications, tokens, and staking; first-class AI-agent participation
